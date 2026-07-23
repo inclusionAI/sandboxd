@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/internal/cgroupops"
 	"github.com/akernel-dev/sandboxd/internal/trace"
 	"github.com/akernel-dev/sandboxd/internal/util"
 	runscapi "github.com/akernel-dev/sandboxd/pkg/runtime/runsc"
@@ -31,7 +30,6 @@ import (
 	"github.com/akernel-dev/sandboxd/config"
 	"github.com/akernel-dev/sandboxd/pkg/networkmanager"
 	"github.com/akernel-dev/sandboxd/pkg/volumemanager"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
@@ -61,46 +59,6 @@ type runscClient interface {
 	Wait(context.Context, string) (int, error)
 	Delete(context.Context, string, bool) error
 	ListJSON(context.Context) ([]byte, error)
-}
-
-func updateCgroup(cgroupPath string, resource *runtime.LinuxSandboxResources) error {
-	if resource == nil {
-		return nil
-	}
-
-	cgroupHandler := &cgroupops.CgroupHandlerImpl{}
-	cgroup, err := cgroupHandler.Load(cg.StaticPath(cgroupPath), cg.WithHiearchy(cg.Default))
-	if err != nil {
-		return err
-	}
-
-	var cpu spec.LinuxCPU
-	if resource.CpuShares > 0 {
-		cpu.Shares = &resource.CpuShares
-	}
-	if resource.CpuQuota > 0 {
-		cpu.Quota = &resource.CpuQuota
-	}
-	if resource.CpuPeriod > 0 {
-		cpu.Period = &resource.CpuPeriod
-	}
-	if resource.CpusetCpus != "" {
-		cpu.Cpus = resource.CpusetCpus
-	}
-	if resource.CpusetMems != "" {
-		cpu.Mems = resource.CpusetMems
-	}
-	var mem spec.LinuxMemory
-	if resource.MemoryLimitInBytes > 0 {
-		mem.Limit = &resource.MemoryLimitInBytes
-	}
-
-	cgroupResource := spec.LinuxResources{
-		CPU:    &cpu,
-		Memory: &mem,
-	}
-
-	return cgroup.Update(&cgroupResource)
 }
 
 // CleanupXFSMount is re-exported from pkg/volumemanager for backwards
@@ -146,13 +104,6 @@ func (r *RunscServiceHandler) StartSandbox(
 	request *StartSandboxRequest,
 	options HandlerOptions,
 ) (*runtime.SandboxMetadata, error) {
-	// Apply cgroup resource limits before starting the container
-	if request.Resource != nil && options.CgroupPath != "" {
-		if err := updateCgroup(options.CgroupPath, request.Resource); err != nil {
-			return nil, fmt.Errorf("set cgroup resource limits on %s failed: %v", options.CgroupPath, err)
-		}
-	}
-
 	// Get Network Info from options
 	device, ok := options.AdditionalAnnotations[config.ResourceAnnotationKeyPrefix+config.ResourceNameInterface]
 	if !ok {

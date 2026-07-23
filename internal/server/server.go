@@ -30,7 +30,6 @@ import (
 
 	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
 	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/internal/cgroupops"
 	"github.com/akernel-dev/sandboxd/internal/metrics"
 	"github.com/akernel-dev/sandboxd/internal/trace"
 	"github.com/akernel-dev/sandboxd/internal/util"
@@ -46,7 +45,6 @@ import (
 	"github.com/akernel-dev/sandboxd/pkg/sandbox"
 	"github.com/akernel-dev/sandboxd/pkg/store"
 	"github.com/akernel-dev/sandboxd/pkg/volumemanager"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/pelletier/go-toml"
 	"github.com/sirupsen/logrus"
@@ -175,6 +173,16 @@ func (h *sandboxService) startSandboxRuntime(ctx context.Context, request *svc.S
 	handler, ok := h.serviceHandler.Get(request.Runtime)
 	if !ok {
 		return response, errord.ToGRPC(errord.ErrNotImplemented)
+	}
+
+	if request.Resource != nil {
+		cgroupPath := resources.Resources[config.ResourceNameCgroup]
+		if h.cgroupMgr == nil || cgroupPath == "" {
+			return response, fmt.Errorf("cgroup manager is not available for resource update")
+		}
+		if err = h.cgroupMgr.Update(cgroupPath, request.Resource); err != nil {
+			return response, fmt.Errorf("set cgroup resource limits on %s failed: %w", cgroupPath, err)
+		}
 	}
 
 	metaData, err := handler.StartSandbox(ctx, request, svc.HandlerOptions{
@@ -329,29 +337,22 @@ func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsReques
 		return nil, errord.ToGRPC(fmt.Errorf("cgroup path not found for sandbox %s", request.ID))
 	}
 
-	cgroupHandler := &cgroupops.CgroupHandlerImpl{}
-	cgroup, err := cgroupHandler.Load(cg.StaticPath(cgroupPath), cg.WithHiearchy(cg.Default))
-	if err != nil {
-		return nil, errord.ToGRPC(fmt.Errorf("load cgroup %s failed: %v", cgroupPath, err))
+	if h.cgroupMgr == nil {
+		return nil, errord.ToGRPC(fmt.Errorf("cgroup manager is not configured"))
 	}
-
-	metrics, err := cgroup.Stat()
+	stats, err := h.cgroupMgr.Stats(cgroupPath)
 	if err != nil {
 		return nil, errord.ToGRPC(fmt.Errorf("stat cgroup %s failed: %v", cgroupPath, err))
 	}
 
-	resp := &runtime.StatsResponse{}
-	if metrics.CPU != nil && metrics.CPU.Usage != nil {
-		resp.CpuUsageNs = metrics.CPU.Usage.Total
-		resp.CpuKernelNs = metrics.CPU.Usage.Kernel
-		resp.CpuUserNs = metrics.CPU.Usage.User
-	}
-	if metrics.Memory != nil && metrics.Memory.Usage != nil {
-		resp.MemoryUsageBytes = metrics.Memory.Usage.Usage
-		resp.MemoryLimitBytes = metrics.Memory.Usage.Limit
-		resp.MemoryMaxUsageBytes = metrics.Memory.Usage.Max
-	}
-	return resp, nil
+	return &runtime.StatsResponse{
+		CpuUsageNs:          stats.CPUUsageNS,
+		CpuKernelNs:         stats.CPUKernelNS,
+		CpuUserNs:           stats.CPUUserNS,
+		MemoryUsageBytes:    stats.MemoryUsageBytes,
+		MemoryLimitBytes:    stats.MemoryLimitBytes,
+		MemoryMaxUsageBytes: stats.MemoryMaxUsageBytes,
+	}, nil
 }
 
 // ListAvailableRuntimes returns a stable snapshot of runtime classes whose
@@ -567,6 +568,16 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	} else if err := toml.NewDecoder(bytes.NewReader(configBytes)).Decode(&cfg); err != nil {
 		return nil, err
 	}
+	normalizedCgroupVersion, err := config.NormalizeCgroupVersion(cfg.CgroupVersion)
+	if err != nil {
+		return nil, fmt.Errorf("resource configuration: %w", err)
+	}
+	cfg.CgroupVersion = normalizedCgroupVersion
+	normalizedCgroupParent, err := config.NormalizeCgroupParent(cfg.CgroupVersion, cfg.CgroupParent)
+	if err != nil {
+		return nil, fmt.Errorf("resource configuration: %w", err)
+	}
+	cfg.CgroupParent = normalizedCgroupParent
 
 	natBackend, err := resolveNATBackend(cfg.NatBackend)
 	if err != nil {
@@ -677,6 +688,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	maxSandboxLimit := networkmanager.MaxSandboxLimit(cfg.MaxInstanceNum)
 	var cgroupMgr *cgroupmanager.CgroupManager
 	if cfg.CgroupCacheSize > 0 {
+		if err = cgroupmanager.ValidateHost(cfg.ResourceConfig); err != nil {
+			return nil, fmt.Errorf("cgroup preflight: %w", err)
+		}
 		cgroupMgr, err = cgroupmanager.NewCgroupManager(s.store, cfg.ResourceConfig, maxSandboxLimit)
 		if err != nil {
 			return nil, err
@@ -688,6 +702,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 				_ = cgroupMgr.ShutDown()
 			}
 		}()
+		if nodeResMod != nil {
+			nodeResMod.SetCgroupManager(cgroupMgr)
+		}
 	}
 
 	var interfaceMgr *networkmanager.InterfaceManager

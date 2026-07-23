@@ -88,6 +88,13 @@ type RuntimeConfig struct {
 type ResourceConfig struct {
 	MaxInstanceNum int `toml:"max_instance_num" json:"maxInstanceNum"`
 
+	// CgroupVersion selects the kernel cgroup driver. Empty preserves the
+	// historical cgroup v1 behavior; v2 must be enabled explicitly.
+	CgroupVersion string `toml:"cgroup_version" json:"cgroupVersion"`
+	// CgroupParent is the already-delegated unified hierarchy beneath which
+	// cgroup v2 creates its owned root. It is ignored by cgroup v1.
+	CgroupParent string `toml:"cgroup_parent" json:"cgroupParent"`
+
 	// CgroupRootName is the path of cgroup. Default is sandbox.
 	CgroupRootName string `toml:"cgroup_root_name" json:"cgroupRootName"`
 	// CgroupCacheSize is the size of cgroup cache. Default is same as max_instance_num.
@@ -139,6 +146,7 @@ func DefaultConfig() Config {
 			},
 			ResourceConfig: ResourceConfig{
 				MaxInstanceNum:     DefaultMaxSandboxNum,
+				CgroupVersion:      CgroupVersionV1,
 				CgroupRootName:     DefaultCgroupRoot,
 				CgroupCacheSize:    DefaultMaxSandboxNum,
 				InterfaceCacheSize: DefaultMaxSandboxNum,

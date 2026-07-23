@@ -15,6 +15,8 @@
 package config
 
 import (
+	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -69,6 +71,48 @@ const (
 	ResourceAnnotationKeyPrefix = "sandbox.akernel.dev/resource-"
 	CgroupPathPrefix            = "/sandbox/"
 )
+
+const (
+	CgroupVersionV1 = "v1"
+	CgroupVersionV2 = "v2"
+)
+
+// NormalizeCgroupVersion preserves the legacy default: configurations that
+// predate cgroup_version continue to select cgroup v1.
+func NormalizeCgroupVersion(version string) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(version)) {
+	case "", CgroupVersionV1:
+		return CgroupVersionV1, nil
+	case CgroupVersionV2:
+		return CgroupVersionV2, nil
+	default:
+		return "", fmt.Errorf("unsupported cgroup_version %q (valid values: %q, %q)", version, CgroupVersionV1, CgroupVersionV2)
+	}
+}
+
+// NormalizeCgroupParent validates the explicit cgroup v2 delegation boundary.
+// cgroup v1 ignores the field so legacy configurations remain unchanged.
+func NormalizeCgroupParent(version, parent string) (string, error) {
+	normalizedVersion, err := NormalizeCgroupVersion(version)
+	if err != nil {
+		return "", err
+	}
+	if normalizedVersion == CgroupVersionV1 {
+		return "", nil
+	}
+	if parent == "" {
+		return "", fmt.Errorf("cgroup_parent is required when cgroup_version is %q", CgroupVersionV2)
+	}
+	if !strings.HasPrefix(parent, "/") || strings.ContainsRune(parent, '\\') || path.Clean(parent) != parent {
+		return "", fmt.Errorf("cgroup_parent %q must be a clean absolute cgroup path", parent)
+	}
+	for _, component := range strings.Split(parent, "/") {
+		if component == ".." {
+			return "", fmt.Errorf("cgroup_parent %q must not contain parent traversal", parent)
+		}
+	}
+	return parent, nil
+}
 
 // RuntimeResources maps runtime handler name → resource pool names that
 // sandbox.Manager.Occupy must allocate before handing the request to that

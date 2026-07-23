@@ -16,6 +16,7 @@ package resourcemanager
 
 import (
 	"context"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -28,6 +29,25 @@ import (
 
 	"github.com/akernel-dev/sandboxd/pkg/sandbox"
 )
+
+func TestSandboxStatsReaderConcurrentReplacement(t *testing.T) {
+	c := &Collector{sandboxStats: func(string) (sandboxStats, error) { return sandboxStats{}, nil }}
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c.setSandboxStatsReader(func(string) (sandboxStats, error) { return sandboxStats{}, nil })
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := c.readSandboxStats("/sandbox/test"); err != nil {
+				t.Errorf("readSandboxStats: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+}
 
 func TestDiskStatfs(t *testing.T) {
 	var stat syscall.Statfs_t

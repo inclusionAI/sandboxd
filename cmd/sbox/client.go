@@ -150,6 +150,12 @@ func (h *SandboxClient) WaitSandbox(request *runtime.WaitRequest) (*runtime.Wait
 	return h.client.Wait(context.Background(), request)
 }
 
+func (h *SandboxClient) WaitSandboxWithTimeout(request *runtime.WaitRequest) (*runtime.WaitResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	defer cancel()
+	return h.client.Wait(ctx, request)
+}
+
 func (h *SandboxClient) Stats(request *runtime.StatsRequest) (*runtime.StatsResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
 	defer cancel()

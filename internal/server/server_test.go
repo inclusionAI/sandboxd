@@ -78,6 +78,7 @@ func newTestService(t *testing.T, handlers map[string]svc.RealRuntimeHandler) *s
 		},
 		serviceHandler:                    handlerMap,
 		sandboxManager:                    cm,
+		cgroupMgr:                         cgMgr,
 		store:                             store.NewMockStore(),
 		UnimplementedSandboxServiceServer: runtime.UnimplementedSandboxServiceServer{},
 		fsMgr:                             newFSManager(nil),
@@ -135,6 +136,24 @@ func TestResetMetadataIfResourceStateIncompatible_KeepsJSONResourceState(t *test
 
 	assert.NoError(t, resetMetadataIfResourceStateIncompatible(storePath))
 	assert.FileExists(t, storePath)
+}
+
+func TestNewSandboxServiceRejectsInvalidCgroupVersion(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.toml")
+	contents := fmt.Sprintf("rootDir = %q\nstoreDir = %q\n[plugin.resource]\ncgroup_version = %q\n", filepath.Join(root, "root"), filepath.Join(root, "store"), "auto")
+	assert.NoError(t, os.WriteFile(configPath, []byte(contents), 0600))
+	_, err := NewSandboxService(root, configPath)
+	assert.EqualError(t, err, `resource configuration: unsupported cgroup_version "auto" (valid values: "v1", "v2")`)
+}
+
+func TestNewSandboxServiceRequiresExplicitV2Parent(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.toml")
+	contents := fmt.Sprintf("rootDir = %q\nstoreDir = %q\n[plugin.resource]\ncgroup_version = %q\n", filepath.Join(root, "root"), filepath.Join(root, "store"), "v2")
+	assert.NoError(t, os.WriteFile(configPath, []byte(contents), 0600))
+	_, err := NewSandboxService(root, configPath)
+	assert.EqualError(t, err, `resource configuration: cgroup_parent is required when cgroup_version is "v2"`)
 }
 
 func TestList_Empty(t *testing.T) {

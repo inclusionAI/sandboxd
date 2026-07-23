@@ -50,7 +50,7 @@ PROTOBUF_BUILD_IMAGE ?= golang:1.25.5-bookworm
 PROTOBUF_TOOL_IMAGE ?= sandboxd-protobuf:$(PROTOC_VERSION)-go-$(PROTOC_GEN_GO_VERSION)-grpc-$(PROTOC_GEN_GO_GRPC_VERSION)
 PROTOBUF_BUILD_ARGS ?=
 
-.PHONY: all clean test e2e release release-binary release-cli protobuf-image protos protos-local check-protos tidy vendor fmt vet help
+.PHONY: all clean test e2e e2e-v2 release release-binary release-cli protobuf-image protos protos-local check-protos tidy vendor fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
@@ -82,6 +82,9 @@ test: ## run tests
 
 e2e: ## run unit tests and the privileged runsc e2e flow
 	@bash test/e2e/run.sh
+
+e2e-v2: ## run the self-contained privileged cgroup v2 Docker E2E flow
+	@bash test/e2e/run-v2.sh
 
 FORCE:
 

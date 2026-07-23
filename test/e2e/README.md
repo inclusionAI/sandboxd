@@ -31,3 +31,26 @@ Requirements:
 
 Set `RUN_UNIT_TESTS=0` to skip the unit-test step when rerunning only the
 privileged scenario.
+
+## Experimental self-contained cgroup v2 flow
+
+The cgroup v2 flow is intended for modern Linux hosts and the Linux VM used by
+Docker Desktop or OrbStack on macOS. It downloads and verifies the pinned
+runsc release while building the image, so the host does not need runsc or Go.
+
+```bash
+make e2e-v2
+```
+
+The runner uses `docker build` and `docker run` directly, with the host cgroup
+namespace and a read-write cgroup mount inside a privileged container; Docker
+Compose is not required. Docker Desktop Enhanced Container Isolation must be
+disabled for this test. The flow verifies lifecycle, bind
+mounts, networking, resource files, stats, OOM reporting, crash recovery, and
+cleanup. It also verifies that sandboxd does not modify the delegated parent's
+`cgroup.subtree_control`. The existing `make e2e` cgroup v1 flow is unchanged.
+
+This flow is WIP and does not make cgroup v2 production-ready. Current local
+evidence covers OrbStack on macOS/arm64. Before marking the feature ready for
+review, repeat the privileged lifecycle on amd64 Linux and Docker Desktop, and
+run the existing `make e2e` on a real cgroup v1 host.

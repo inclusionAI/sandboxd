@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/akernel-dev/sandboxd/pkg/cgroupmanager"
 	"github.com/akernel-dev/sandboxd/pkg/sandbox"
 	"github.com/sirupsen/logrus"
 )
@@ -98,6 +99,14 @@ func NewModule(sockPath string) (*Module, error) {
 func (m *Module) SetSandboxMetricsSource(source SandboxMetricsSource) {
 	if m.collector != nil {
 		m.collector.SetSandboxMetricsSource(source)
+	}
+}
+
+// SetCgroupManager routes per-sandbox metrics through the selected cgroup
+// driver instead of assuming the legacy v1 hierarchy.
+func (m *Module) SetCgroupManager(manager *cgroupmanager.CgroupManager) {
+	if m.collector != nil {
+		m.collector.SetCgroupManager(manager)
 	}
 }
 

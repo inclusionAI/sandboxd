@@ -16,11 +16,15 @@ package networkmanager
 
 import (
 	"fmt"
+	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 
+	cgroups "github.com/containerd/cgroups/v3"
+	cgroup2 "github.com/containerd/cgroups/v3/cgroup2"
 	"github.com/sirupsen/logrus"
 )
 
@@ -37,6 +41,16 @@ func getLocalCpuNum() (int, error) {
 		return cpuNum, nil
 	}
 	fetchCpu.Do(func() {
+		if cgroups.Mode() == cgroups.Unified {
+			group, err := cgroup2.PidGroupPath(os.Getpid())
+			if err != nil {
+				cpuError = fmt.Errorf("resolve current cgroup v2 path: %w", err)
+				return
+			}
+			cpuNum, cpuError = getLocalCPUCountV2(filepath.Join("/sys/fs/cgroup", group))
+			return
+		}
+
 		quota, err := os.ReadFile("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
 		if err != nil {
 			cpuError = fmt.Errorf("read /sys/fs/cgroup/cpu/cpu.cfs_quota_us failed: %v", err)
@@ -62,14 +76,51 @@ func getLocalCpuNum() (int, error) {
 }
 
 func getCpuCountFromCpuset() (int, error) {
-	data, err := os.ReadFile("/sys/fs/cgroup/cpuset/cpuset.cpus")
+	return getCPUCountFromFile("/sys/fs/cgroup/cpuset/cpuset.cpus")
+}
+
+func getLocalCPUCountV2(groupPath string) (int, error) {
+	data, err := os.ReadFile(filepath.Join(groupPath, "cpu.max"))
 	if err != nil {
-		return 0, fmt.Errorf("read /sys/fs/cgroup/cpuset/cpuset.cpus failed: %v", err)
+		return 0, fmt.Errorf("read cgroup v2 cpu.max: %w", err)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 2 {
+		return 0, fmt.Errorf("invalid cgroup v2 cpu.max value %q", strings.TrimSpace(string(data)))
+	}
+	if fields[0] == "max" {
+		return getCPUCountFromFile(filepath.Join(groupPath, "cpuset.cpus.effective"))
+	}
+	quota, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse cgroup v2 CPU quota %q: %w", fields[0], err)
+	}
+	period, err := strconv.ParseFloat(fields[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse cgroup v2 CPU period %q: %w", fields[1], err)
+	}
+	if period <= 0 {
+		return 0, fmt.Errorf("cgroup v2 CPU period must be positive, got %q", fields[1])
+	}
+	count := int(math.Ceil(quota / period))
+	if count < 1 {
+		count = 1
+	}
+	if cpusetCount, cpusetErr := getCPUCountFromFile(filepath.Join(groupPath, "cpuset.cpus.effective")); cpusetErr == nil && cpusetCount < count {
+		count = cpusetCount
+	}
+	return count, nil
+}
+
+func getCPUCountFromFile(filename string) (int, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return 0, fmt.Errorf("read cpuset file %s: %w", filename, err)
 	}
 
 	cpus := strings.Trim(string(data), "\n")
 	if cpus == "" {
-		return 0, fmt.Errorf("cpuset.cpus is empty")
+		return 0, fmt.Errorf("cpuset file %s is empty", filename)
 	}
 
 	count := 0
@@ -92,6 +143,9 @@ func getCpuCountFromCpuset() (int, error) {
 		} else if _, err := strconv.Atoi(r); err == nil {
 			count++
 		}
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("cpuset file %s contains no valid CPUs", filename)
 	}
 	return count, nil
 }

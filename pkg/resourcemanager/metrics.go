@@ -24,7 +24,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/internal/cgroupops"
+	"github.com/akernel-dev/sandboxd/pkg/cgroupmanager"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -34,7 +34,6 @@ import (
 
 	"github.com/akernel-dev/sandboxd/pkg/resourcemanager/cgroupv1"
 	"github.com/akernel-dev/sandboxd/pkg/sandbox"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 )
 
 const (
@@ -61,6 +60,40 @@ var prometheusLabelName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 // data" and skip.
 type CapacityProvider interface {
 	Capacity() (int64, int64)
+}
+
+// SetCgroupManager makes sandbox metric collection cgroup-version-neutral.
+func (c *Collector) SetCgroupManager(manager *cgroupmanager.CgroupManager) {
+	if manager == nil {
+		return
+	}
+	reader := func(path string) (sandboxStats, error) {
+		stats, err := manager.Stats(path)
+		if err != nil {
+			return sandboxStats{}, err
+		}
+		return sandboxStats{
+			CPUUsageNS:     stats.CPUUsageNS,
+			MemoryUsage:    stats.MemoryUsageBytes,
+			MemoryLimit:    stats.MemoryLimitBytes,
+			HasCPUUsage:    true,
+			HasMemoryUsage: true,
+		}, nil
+	}
+	c.setSandboxStatsReader(reader)
+}
+
+func (c *Collector) setSandboxStatsReader(reader func(string) (sandboxStats, error)) {
+	c.sandboxStatsMu.Lock()
+	c.sandboxStats = reader
+	c.sandboxStatsMu.Unlock()
+}
+
+func (c *Collector) readSandboxStats(path string) (sandboxStats, error) {
+	c.sandboxStatsMu.RLock()
+	reader := c.sandboxStats
+	c.sandboxStatsMu.RUnlock()
+	return reader(path)
 }
 
 // SandboxMetricsSource supplies immutable snapshots of running sandboxes.
@@ -118,6 +151,7 @@ type Collector struct {
 	sandboxStateMu  sync.Mutex
 	prevSandboxCPU  map[string]sandboxCPUSample
 	sandboxStopped  map[string]sandboxTombstone
+	sandboxStatsMu  sync.RWMutex
 	sandboxStats    func(string) (sandboxStats, error)
 	now             func() time.Time
 
@@ -155,8 +189,10 @@ func NewCollector(ctx context.Context, capacity CapacityProvider) (*Collector, e
 		capacity:       capacity,
 		prevSandboxCPU: make(map[string]sandboxCPUSample),
 		sandboxStopped: make(map[string]sandboxTombstone),
-		sandboxStats:   readSandboxStats,
-		now:            time.Now,
+		sandboxStats: func(path string) (sandboxStats, error) {
+			return sandboxStats{}, fmt.Errorf("cgroup stats reader is not configured for %s", path)
+		},
+		now: time.Now,
 	}
 
 	meter := provider.Meter("resource-manager")
@@ -331,30 +367,6 @@ func (c *Collector) registerMetrics(meter metric.Meter) error {
 	return nil
 }
 
-func readSandboxStats(cgroupPath string) (sandboxStats, error) {
-	handler := &cgroupops.CgroupHandlerImpl{}
-	group, err := handler.Load(cg.StaticPath(cgroupPath), cg.WithHiearchy(cg.Default))
-	if err != nil {
-		return sandboxStats{}, fmt.Errorf("load cgroup %s: %w", cgroupPath, err)
-	}
-	stats, err := group.Stat()
-	if err != nil {
-		return sandboxStats{}, fmt.Errorf("stat cgroup %s: %w", cgroupPath, err)
-	}
-
-	result := sandboxStats{}
-	if stats.CPU != nil && stats.CPU.Usage != nil {
-		result.CPUUsageNS = stats.CPU.Usage.Total
-		result.HasCPUUsage = true
-	}
-	if stats.Memory != nil && stats.Memory.Usage != nil {
-		result.MemoryUsage = stats.Memory.Usage.Usage
-		result.MemoryLimit = stats.Memory.Usage.Limit
-		result.HasMemoryUsage = true
-	}
-	return result, nil
-}
-
 func (c *Collector) getSandboxSource() SandboxMetricsSource {
 	c.sandboxSourceMu.RLock()
 	defer c.sandboxSourceMu.RUnlock()
@@ -389,7 +401,7 @@ func (c *Collector) collectSandboxObservations(now time.Time) []sandboxObservati
 		}
 		active[target.SandboxID] = struct{}{}
 		observation := sandboxObservation{target: target, running: 1}
-		stats, err := c.sandboxStats(target.CgroupPath)
+		stats, err := c.readSandboxStats(target.CgroupPath)
 		if err != nil {
 			logrus.Debugf("metrics: failed to collect sandbox %s cgroup %s: %v", target.SandboxID, target.CgroupPath, err)
 			observations = append(observations, observation)

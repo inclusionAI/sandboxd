@@ -475,11 +475,13 @@ func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan st
 	go func() {
 		var oomFlag atomic.Bool
 		stopOOM := m.startOOMWatcher(metaData.ID, &oomFlag)
-		defer stopOOM()
 
 		exit, err := handler.Wait(ctx, svc.HandlerOptions{
 			SandboxID: metaData.ID,
 		})
+		// Stop synchronously reconciles a final kernel OOM notification before
+		// we snapshot oomFlag, avoiding a Wait/inotify scheduling race.
+		stopOOM()
 		// If context was cancelled (monitor stopped), don't send exit event.
 		if ctx.Err() != nil {
 			return

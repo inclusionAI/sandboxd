@@ -63,6 +63,7 @@ func newApp() *cli.App {
 		StartCmd,
 		ListCmd,
 		InspectCmd,
+		WaitCmd,
 		DeleteCmd,
 		ExecCmd,
 		StatsCmd,

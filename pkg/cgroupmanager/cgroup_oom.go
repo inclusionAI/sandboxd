@@ -39,11 +39,11 @@ import (
 // the *os.File, which unblocks the read with an *PathError wrapping
 // ErrClosed. Callers MUST call stop in a defer regardless of whether OOM
 // fires, otherwise the goroutine leaks.
-func (c *CgroupManager) WatchOOM(name string, onOOM func()) (func(), error) {
+func (d *v1Driver) WatchOOM(name string, onOOM func()) (func(), error) {
 	if onOOM == nil {
 		return nil, errors.New("WatchOOM: onOOM callback must not be nil")
 	}
-	cgroup, err := c.cgroupHandler.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
+	cgroup, err := d.handler.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
 	if err != nil {
 		return nil, fmt.Errorf("load cgroup %s: %w", name, err)
 	}
@@ -74,15 +74,24 @@ func (c *CgroupManager) WatchOOM(name string, onOOM func()) (func(), error) {
 		closeOnce sync.Once
 		fired     sync.Once
 	)
+	done := make(chan struct{})
 	stop := func() {
 		closeOnce.Do(func() {
+			// Reconcile a pending event synchronously. Wait may return before
+			// the netpoll goroutine gets scheduled to consume the eventfd.
+			buf := make([]byte, 8)
+			if n, readErr := syscall.Read(int(fdU), buf); readErr == nil && n > 0 {
+				fired.Do(onOOM)
+			}
 			if err := f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 				logrus.Warnf("close oom eventfd for %s: %v", name, err)
 			}
 		})
+		<-done
 	}
 
 	go func() {
+		defer close(done)
 		buf := make([]byte, 8)
 		for {
 			n, err := f.Read(buf)

@@ -47,4 +47,7 @@ func TestPublicSampleConfigIsComplete(t *testing.T) {
 	if cfg.CgroupCacheSize <= 0 || cfg.InterfaceCacheSize <= 0 || cfg.MaxInstanceNum <= 0 {
 		t.Fatal("sample config must enable bounded cgroup and interface pools")
 	}
+	if cfg.CgroupVersion != CgroupVersionV1 {
+		t.Fatalf("sample config cgroup_version = %q, want %q", cfg.CgroupVersion, CgroupVersionV1)
+	}
 }

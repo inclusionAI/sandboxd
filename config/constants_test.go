@@ -16,6 +16,73 @@ package config
 
 import "testing"
 
+func TestNormalizeCgroupVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "missing preserves v1", input: "", want: CgroupVersionV1},
+		{name: "explicit v1", input: "v1", want: CgroupVersionV1},
+		{name: "explicit v2", input: "v2", want: CgroupVersionV2},
+		{name: "case and whitespace", input: " V2 ", want: CgroupVersionV2},
+		{name: "invalid", input: "auto", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := NormalizeCgroupVersion(test.input)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("NormalizeCgroupVersion(%q) unexpectedly succeeded", test.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NormalizeCgroupVersion(%q): %v", test.input, err)
+			}
+			if got != test.want {
+				t.Fatalf("NormalizeCgroupVersion(%q) = %q, want %q", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeCgroupParent(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		parent  string
+		want    string
+		wantErr bool
+	}{
+		{name: "v1 ignores missing parent", version: CgroupVersionV1},
+		{name: "v1 ignores configured parent", version: CgroupVersionV1, parent: "/ignored"},
+		{name: "v2 root parent", version: CgroupVersionV2, parent: "/", want: "/"},
+		{name: "v2 delegated parent", version: CgroupVersionV2, parent: "/system.slice/sandboxd.service", want: "/system.slice/sandboxd.service"},
+		{name: "v2 requires parent", version: CgroupVersionV2, wantErr: true},
+		{name: "v2 rejects relative parent", version: CgroupVersionV2, parent: "system.slice", wantErr: true},
+		{name: "v2 rejects unclean parent", version: CgroupVersionV2, parent: "/system.slice/../other", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := NormalizeCgroupParent(test.version, test.parent)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("NormalizeCgroupParent(%q, %q) unexpectedly succeeded", test.version, test.parent)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("NormalizeCgroupParent(%q, %q) = %q, want %q", test.version, test.parent, got, test.want)
+			}
+		})
+	}
+}
+
 func TestIsValidSandboxID(t *testing.T) {
 	tests := []struct {
 		id    string

@@ -20,6 +20,7 @@ ip_range = "10.88.0.1/24"
 nat_backend = "iptables"
 
 [plugin.resource]
+cgroup_version = "v1"
 cgroup_cache_size = 1
 # Maximum processes per sandbox. Omit or set to 0 for unlimited.
 # pids_max = 4096

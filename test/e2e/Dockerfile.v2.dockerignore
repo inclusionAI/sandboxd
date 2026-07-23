@@ -1,0 +1,9 @@
+.git
+.cache
+.idea
+.vscode
+local
+output
+coverage.log
+coverage.html
+go-test-stdout.log

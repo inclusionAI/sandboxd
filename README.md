@@ -6,7 +6,7 @@
 
 - Start, wait for, inspect, measure, and delete sandboxes.
 - Prepare local, OCI, Nydus, and S3-backed rootfs and mounts.
-- Allocate cgroups (currently v1 only) and veth interfaces and configure iptables for NAT.
+- Allocate cgroups (v1 by default, with experimental v2 support) and veth interfaces and configure iptables for NAT.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ gRPC service
 sandbox lifecycle manager
     ├── sandbox runtime adapter ──> gVisor
     ├── image manager ────────────> distill-fs / OCI
-    └── resource managers ────────> cgroup v1 / veth / iptables
+    └── resource managers ────────> cgroup v1/v2 / veth / iptables
 ```
 
 ## API / CLI
@@ -37,6 +37,9 @@ The privileged E2E suite requires Docker, cgroup v1, iptables, and the tested ru
 
 ```bash
 RUNSC_BINARY=/usr/local/bin/runsc make e2e
+
+# Experimental self-contained cgroup v2 E2E (Docker Desktop/OrbStack/Linux).
+make e2e-v2
 ```
 
 See [test/e2e/README.md](test/e2e/README.md) for the developer test environment. AKernel integration is validated through the all-in-one node image and standalone deployment in the AKernel repository.
@@ -64,14 +67,24 @@ internal/server/     gRPC service and daemon orchestration
 pkg/runtime/         sandbox runtime abstraction and gVisor adapter
 pkg/imagemanager/    rootfs and mount integration
 pkg/networkmanager/  veth and iptables integration
-pkg/cgroupmanager/   cgroup v1 integration
+pkg/cgroupmanager/   cgroup v1 and experimental v2 integration
 test/e2e/            privileged runsc E2E
 tools/               pinned protobuf code-generation image
 ```
 
+## Cgroup mode
+
+The production default remains cgroup v1 for compatibility. Unified cgroup v2
+support is experimental and must be enabled explicitly with
+`cgroup_version = "v2"` and an already-delegated `cgroup_parent` in
+`[plugin.resource]`; the selected mode must match the host hierarchy. cgroup
+v2 is currently intended for development and WIP validation, not production
+deployment.
+
 ## Known limitations
 
-- Only gVisor, cgroup v1, netstack sandbox networking, and iptables are supported in `v0.1.0`.
+- cgroup v1 remains the production-supported mode; cgroup v2 is experimental.
+- Only gVisor, netstack sandbox networking, and iptables are supported in `v0.1.0`.
 - The direct OCI registry client currently skips TLS certificate verification and should only be used with trusted registries.
 
 ## License

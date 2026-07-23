@@ -1,0 +1,62 @@
+# Copyright (c) 2026 Ant Group Corporation.
+# Licensed under the Apache License, Version 2.0.
+
+FROM golang:1.25.5-bookworm AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN GOWORK=off CGO_ENABLED=0 go build -tags "seccomp apparmor" -o /out/sandboxd ./cmd/sandboxd && \
+    GOWORK=off CGO_ENABLED=0 go build -o /out/sbox ./cmd/sbox && \
+    GOWORK=off CGO_ENABLED=0 go build -o /out/e2e-oom-trigger ./test/e2e/oom-trigger
+
+FROM ubuntu:24.04 AS runsc
+
+ARG TARGETARCH
+ARG RUNSC_RELEASE=20260706.0
+ARG RUNSC_SHA512_AMD64=73938c145ebe554cf61a01da455688f4b732eebdf7b1b635bdef5b195868b363d8cb400e3d92ed1f377b78996805556c247a4849583910cb04e92b156053033e
+ARG RUNSC_SHA512_ARM64=a4962fe56ee62c841c270443a3617b6626db3fb282e65793f6762df78b3209304dfe2e094e524b3d2b4c781c05b1b95744ce9fe50b49edee43090b27c2956c4b
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* && \
+    case "${TARGETARCH}" in \
+      amd64) gvisor_arch=x86_64; expected="${RUNSC_SHA512_AMD64}" ;; \
+      arm64) gvisor_arch=aarch64; expected="${RUNSC_SHA512_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/${RUNSC_RELEASE}/${gvisor_arch}/runsc" -o /runsc && \
+    echo "${expected}  /runsc" | sha512sum -c - && \
+    chmod 0755 /runsc
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        busybox-static \
+        ca-certificates \
+        iproute2 \
+        iptables \
+        iputils-ping \
+        jq \
+        kmod \
+        mount \
+        netcat-openbsd \
+        procps && \
+    rm -rf /var/lib/apt/lists/* && \
+    if [ -x /usr/sbin/iptables-legacy ]; then \
+        update-alternatives --set iptables /usr/sbin/iptables-legacy; \
+        update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy; \
+    fi
+
+COPY --from=build /out/sandboxd /usr/local/bin/sandboxd
+COPY --from=build /out/sbox /usr/local/bin/sbox
+COPY --from=build /out/e2e-oom-trigger /usr/local/bin/e2e-oom-trigger
+COPY --from=runsc /runsc /usr/local/bin/runsc
+COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
+
+RUN chmod 0755 /usr/local/bin/sandboxd /usr/local/bin/sbox /usr/local/bin/e2e-oom-trigger /usr/local/bin/runsc /usr/local/bin/sandboxd-e2e-run
+
+ENV E2E_CGROUP_VERSION=v2
+ENTRYPOINT ["/usr/local/bin/sandboxd-e2e-run"]

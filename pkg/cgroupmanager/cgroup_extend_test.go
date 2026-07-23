@@ -99,11 +99,11 @@ func TestSubystemsCpuMemory(t *testing.T) {
 func TestDoCreateSetsPidsMax(t *testing.T) {
 	handler := &FakeCgroupHandler{}
 	manager := &CgroupManager{
-		pidsMax:       4096,
-		cgroups:       cmap.New[struct{}](),
-		generator:     util.NewFixedLengthIDGenerator(12, nil, util.PrefixID("/sandbox/")),
-		storeMark:     atomic.Bool{},
-		cgroupHandler: handler,
+		pidsMax:   4096,
+		cgroups:   cmap.New[struct{}](),
+		generator: util.NewFixedLengthIDGenerator(12, nil, util.PrefixID("/sandbox/")),
+		storeMark: atomic.Bool{},
+		driver:    &v1Driver{handler: handler},
 	}
 
 	id, err := manager.doCreate()
@@ -115,8 +115,10 @@ func TestDoCreateSetsPidsMax(t *testing.T) {
 }
 
 func TestCgroupResourcesDefaultsToUnlimitedPids(t *testing.T) {
-	manager := &CgroupManager{}
-	assert.Nil(t, manager.cgroupResources().Pids)
+	handler := &FakeCgroupHandler{}
+	driver := &v1Driver{handler: handler}
+	assert.NoError(t, driver.Create("/sandbox/test", 0))
+	assert.Nil(t, handler.resources.Pids)
 }
 
 func TestNewCgroupManagerRejectsNegativePidsMax(t *testing.T) {

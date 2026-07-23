@@ -16,24 +16,19 @@ package cgroupmanager
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
 	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/internal/cgroupops"
 	"github.com/akernel-dev/sandboxd/internal/metrics"
 	"github.com/akernel-dev/sandboxd/internal/util"
 	"github.com/akernel-dev/sandboxd/pkg/errord"
 	"github.com/akernel-dev/sandboxd/pkg/store"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
-	"github.com/opencontainers/runtime-spec/specs-go"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/sirupsen/logrus"
 )
@@ -74,8 +69,8 @@ type CgroupManager struct {
 
 	gcQueue *util.Queue[string]
 
-	// cgroupHandler is used to handle cgroup. It's used to mock cgroup
-	cgroupHandler cgroupops.CgroupHandler
+	// driver owns all cgroup-version-specific kernel operations.
+	driver driver
 }
 
 const RetryGenIdTimes = 100
@@ -115,7 +110,7 @@ func (c *CgroupManager) gc() {
 		}
 		if c.removeCgroupFromSystem(cg) != nil {
 			logrus.Debugf("delete cgroup %v from gc queue failed, put it back to queue", cg)
-			util.KillCgroupProcesses(cg)
+			_ = c.driver.Kill(cg)
 			c.gcQueue.Push(cg)
 		} else {
 			logrus.Debugf("delete cgroup %v from gc queue success", cg)
@@ -135,6 +130,18 @@ func (c *CgroupManager) Status() ([]string, []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.usingID.Keys(), c.idleID.List()
+}
+
+func (c *CgroupManager) Update(name string, resources *runtime.LinuxSandboxResources) error {
+	return c.driver.Update(name, resources)
+}
+
+func (c *CgroupManager) Stats(name string) (Stats, error) {
+	return c.driver.Stats(name)
+}
+
+func (c *CgroupManager) WatchOOM(name string, onOOM func()) (func(), error) {
+	return c.driver.WatchOOM(name, onOOM)
 }
 
 func (c *CgroupManager) Recycle(id string) error {
@@ -276,21 +283,13 @@ func (c *CgroupManager) doCreate() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err = c.cgroupHandler.Create(cg.StaticPath(newID), c.cgroupResources(), cg.WithHiearchy(cg.Default)); err != nil {
+	if err = c.driver.Create(newID, c.pidsMax); err != nil {
 		c.generator.Release(newID)
 		return "", err
 	}
 	c.cgroups.Set(newID, struct{}{})
 	c.storeMark.Store(true)
 	return newID, nil
-}
-
-func (c *CgroupManager) cgroupResources() *specs.LinuxResources {
-	resources := &specs.LinuxResources{}
-	if c.pidsMax > 0 {
-		resources.Pids = &specs.LinuxPids{Limit: c.pidsMax}
-	}
-	return resources
 }
 
 func (c *CgroupManager) deleteCgroup(id string) {
@@ -317,10 +316,18 @@ func NewCgroupManager(
 		return nil, fmt.Errorf("pids_max must be non-negative")
 	}
 
-	rootName := cfg.CgroupRootName
-	if rootName == "" {
-		rootName = config.DefaultCgroupRoot
+	rootName, err := resolvedCgroupRoot(cfg)
+	if err != nil {
+		return nil, err
 	}
+	drv, err := newDriver(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err = drv.PrepareRoot(rootName); err != nil {
+		return nil, err
+	}
+	normalizedVersion, _ := config.NormalizeCgroupVersion(cfg.CgroupVersion)
 	// load using id from db
 	idData, err := db.LoadRaw(config.CgroupBucket)
 	if err != nil && !errord.IsNotFound(err) {
@@ -335,10 +342,14 @@ func NewCgroupManager(
 		}
 	}
 
-	// load all cgroup under rootName
-	cgs, err := loadAllCgroups(rootName)
+	// Load all cgroups under rootName through the selected kernel driver.
+	groups, err := drv.List(rootName)
 	if err != nil {
 		return nil, err
+	}
+	cgs := cmap.New[struct{}]()
+	for _, group := range groups {
+		cgs.Set(group, struct{}{})
 	}
 	if cgs.Count() > 0 {
 		logrus.Infof("load existsing cgroup num: %v", cgs.Count())
@@ -346,6 +357,10 @@ func NewCgroupManager(
 	idleIDs := util.New[string]("")
 	usingIDs := cmap.New[struct{}]()
 	for _, id := range usingID.Items {
+		if normalizedVersion == config.CgroupVersionV2 && !cgs.Has(id) {
+			logrus.Warnf("ignore stale persisted cgroup v2 id %s because it does not exist", id)
+			continue
+		}
 		usingIDs.Set(id, struct{}{})
 	}
 
@@ -363,7 +378,7 @@ func NewCgroupManager(
 		cgroups:              cgs,
 		storeMark:            atomic.Bool{},
 		enableDestroyRecycle: cfg.RecyclePolicy == config.RecyclePolicyDestroy,
-		cgroupHandler:        &cgroupops.CgroupHandlerImpl{},
+		driver:               drv,
 	}
 
 	// Adopt existing non-using cgroups into the idle pool (up to cacheSize) so a
@@ -416,52 +431,6 @@ func (c *CgroupManager) store() {
 	}
 }
 
-// load all cgroup under rootName from blkio subsystem
-func loadAllCgroups(rootName string) (cmap.ConcurrentMap[string, struct{}], error) {
-	groupDirs, err := os.ReadDir(path.Join("/sys/fs/cgroup/memory", rootName))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return cmap.New[struct{}](), nil
-		}
-		return cmap.New[struct{}](), err
-	}
-	cgroups := cmap.New[struct{}]()
-	for _, dir := range groupDirs {
-		if !dir.IsDir() {
-			continue
-		}
-		cgroups.Set(filepath.Join("/", rootName, dir.Name()), struct{}{})
-	}
-	return cgroups, nil
-}
-
 func (c *CgroupManager) removeCgroupFromSystem(name string) error {
-	cgroup, err := c.cgroupHandler.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
-	if errors.Is(err, cg.ErrCgroupDeleted) {
-		return nil
-	}
-	if err = cgroup.Delete(); err != nil {
-		if !os.IsNotExist(err) {
-			logrus.Warningf("delete cgroup %s directly failed: %v", name, err)
-			return err
-		}
-	} else {
-		return nil
-	}
-
-	subSystems, err := cg.Default()
-	if err != nil {
-		return err
-	}
-
-	errors := make([]string, 0)
-	for _, subSystem := range subSystems {
-		if err = os.RemoveAll(path.Join("/sys/fs/cgroup/", string(subSystem.Name()), name)); err != nil && !os.IsNotExist(err) {
-			errors = append(errors, err.Error())
-		}
-	}
-	if len(errors) > 0 {
-		return fmt.Errorf("delete cgroup %s failed: %v", name, errors)
-	}
-	return nil
+	return c.driver.Delete(name)
 }

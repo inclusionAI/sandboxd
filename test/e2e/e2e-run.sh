@@ -26,6 +26,7 @@ ROOTFS="${E2E_ROOTFS:-/e2e/rootfs}"
 HOST_MOUNT="${E2E_HOST_MOUNT:-/e2e/host-mount}"
 WWW_ROOT="${E2E_WWW_ROOT:-/e2e/www}"
 CGROUP_ROOT="${E2E_CGROUP_ROOT:-sandboxd-e2e}"
+CGROUP_VERSION="${E2E_CGROUP_VERSION:-v1}"
 NETWORK_CIDR="${E2E_NETWORK_CIDR:-10.88.0.1/16}"
 GATEWAY_IP="${E2E_GATEWAY_IP:-10.88.0.1}"
 HTTP_PORT="${E2E_HTTP_PORT:-18080}"
@@ -34,6 +35,10 @@ BRIDGE_NAME="${E2E_BRIDGE_NAME:-sandbox0}"
 SANDBOXD_PID=""
 HTTPD_PID=""
 SANDBOX_ID=""
+V2_PARENT_SUBTREE_BEFORE=""
+V2_CGROUP_ROOT_OWNED=0
+V2_NETWORK_RESERVED=0
+DISTILLFS_CGROUP_OWNED=0
 
 log() {
     printf '[e2e] %s\n' "$*"
@@ -44,7 +49,27 @@ fail() {
     exit 1
 }
 
+report_error() {
+    local status=$?
+    printf '[e2e][error] command failed with exit %d at line %s: %s\n' \
+        "${status}" "${BASH_LINENO[0]}" "${BASH_COMMAND}" >&2
+    return "${status}"
+}
+trap report_error ERR
+
 cleanup_cgroups() {
+	if [ "${CGROUP_VERSION}" = "v2" ]; then
+		if [ "${V2_CGROUP_ROOT_OWNED}" -ne 1 ]; then
+			return
+		fi
+		local root="/sys/fs/cgroup/${CGROUP_ROOT}"
+		if [ -d "${root}" ]; then
+			find "${root}" -depth -type f -name cgroup.kill -exec sh -c 'echo 1 > "$1"' _ {} \; 2>/dev/null || true
+			find "${root}" -depth -type d -exec rmdir {} \; 2>/dev/null || true
+		fi
+		return
+	fi
+
     local subsystem
     for subsystem in /sys/fs/cgroup/*; do
         if [ -d "${subsystem}/${CGROUP_ROOT}" ]; then
@@ -55,8 +80,23 @@ cleanup_cgroups() {
     done
 }
 
+cleanup_distillfs_cgroup() {
+    if [ "${DISTILLFS_CGROUP_OWNED}" -ne 1 ] || [ ! -d /sys/fs/cgroup/distillfs ]; then
+        return 0
+    fi
+    if [ -n "$(cat /sys/fs/cgroup/distillfs/cgroup.procs 2>/dev/null)" ]; then
+        printf '[e2e][error] processes leaked in owned cgroup: /sys/fs/cgroup/distillfs\n' >&2
+        return 1
+    fi
+    if ! rmdir /sys/fs/cgroup/distillfs; then
+        printf '[e2e][error] could not remove owned cgroup: /sys/fs/cgroup/distillfs\n' >&2
+        return 1
+    fi
+}
+
 cleanup() {
     local status=$?
+    trap - ERR
     set +e
 
     if [ -n "${SANDBOX_ID}" ]; then
@@ -70,12 +110,42 @@ cleanup() {
         kill "${SANDBOXD_PID}" >/dev/null 2>&1
         wait "${SANDBOXD_PID}" >/dev/null 2>&1
     fi
+    cleanup_distillfs_cgroup || status=1
     cleanup_cgroups
+
+    if [ "${CGROUP_VERSION}" = "v2" ]; then
+        if [ "${V2_NETWORK_RESERVED}" -eq 1 ]; then
+            iptables -t nat -D POSTROUTING -s "${NETWORK_CIDR}" -j MASQUERADE >/dev/null 2>&1 || true
+            ip link delete "${BRIDGE_NAME}" >/dev/null 2>&1 || true
+        fi
+        if [ -d "/sys/fs/cgroup/${CGROUP_ROOT}" ]; then
+            printf '[e2e][error] cgroup root leaked: /sys/fs/cgroup/%s\n' "${CGROUP_ROOT}" >&2
+            status=1
+        fi
+        if ip link show "${BRIDGE_NAME}" >/dev/null 2>&1; then
+            printf '[e2e][error] network bridge leaked: %s\n' "${BRIDGE_NAME}" >&2
+            status=1
+        fi
+        if iptables -t nat -C POSTROUTING -s "${NETWORK_CIDR}" -j MASQUERADE >/dev/null 2>&1; then
+            printf '[e2e][error] iptables MASQUERADE rule leaked for %s\n' "${NETWORK_CIDR}" >&2
+            status=1
+        fi
+        local parent_subtree_after
+        parent_subtree_after="$(cat /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null)"
+        if [ -n "${V2_PARENT_SUBTREE_BEFORE}" ] && [ "${parent_subtree_after}" != "${V2_PARENT_SUBTREE_BEFORE}" ]; then
+            printf '[e2e][error] delegated parent subtree_control changed: before=%q after=%q\n' \
+                "${V2_PARENT_SUBTREE_BEFORE}" "${parent_subtree_after}" >&2
+            status=1
+        fi
+    fi
 
     if [ "${status}" -ne 0 ] && [ -f "${LOG_FILE}" ]; then
         log "sandboxd log tail"
         tail -200 "${LOG_FILE}" >&2
     fi
+
+    trap - EXIT
+    exit "${status}"
 }
 trap cleanup EXIT
 
@@ -87,16 +157,47 @@ preflight() {
         command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
     done
 
-    [ -d /sys/fs/cgroup/memory ] || fail "cgroup v1 memory hierarchy is required at /sys/fs/cgroup/memory"
-    local probe="/sys/fs/cgroup/memory/${CGROUP_ROOT}-probe-$$"
-    mkdir "${probe}" || fail "cannot create memory cgroup; run container with --privileged --cgroupns=host"
-    rmdir "${probe}" || true
+    if [ "${CGROUP_VERSION}" = "v2" ]; then
+        [ "$(stat -fc %T /sys/fs/cgroup)" = "cgroup2fs" ] || fail "cgroup v2 unified hierarchy is required"
+        local controllers
+        controllers="$(cat /sys/fs/cgroup/cgroup.controllers)"
+        for controller in cpu cpuset memory pids; do
+            echo " ${controllers} " | grep -q " ${controller} " || fail "missing cgroup v2 controller: ${controller}"
+        done
+        V2_PARENT_SUBTREE_BEFORE="$(cat /sys/fs/cgroup/cgroup.subtree_control)"
+        for controller in cpu cpuset memory pids; do
+            echo " ${V2_PARENT_SUBTREE_BEFORE} " | grep -q " ${controller} " || fail "cgroup v2 controller is not delegated by parent: ${controller}"
+        done
+        [ ! -e "/sys/fs/cgroup/${CGROUP_ROOT}" ] || fail "/sys/fs/cgroup/${CGROUP_ROOT} already exists; refusing to reuse an unknown cgroup root"
+        V2_CGROUP_ROOT_OWNED=1
+        [ ! -e /sys/fs/cgroup/distillfs ] || fail "/sys/fs/cgroup/distillfs already exists; refusing to reuse an unknown cgroup"
+        DISTILLFS_CGROUP_OWNED=1
+        if ip link show "${BRIDGE_NAME}" >/dev/null 2>&1; then
+            fail "network bridge ${BRIDGE_NAME} already exists; refusing to reuse an unknown bridge"
+        fi
+        if iptables -t nat -C POSTROUTING -s "${NETWORK_CIDR}" -j MASQUERADE >/dev/null 2>&1; then
+            fail "iptables MASQUERADE rule already exists for ${NETWORK_CIDR}; refusing to reuse an unknown rule"
+        fi
+        V2_NETWORK_RESERVED=1
+        local probe="/sys/fs/cgroup/${CGROUP_ROOT}-probe-$$"
+        mkdir "${probe}" || fail "cannot create cgroup v2 probe; disable enhanced container isolation and use privileged host cgroup namespace"
+        rmdir "${probe}" || true
+    else
+        [ -d /sys/fs/cgroup/memory ] || fail "cgroup v1 memory hierarchy is required at /sys/fs/cgroup/memory"
+        local probe="/sys/fs/cgroup/memory/${CGROUP_ROOT}-probe-$$"
+        mkdir "${probe}" || fail "cannot create memory cgroup; run container with --privileged --cgroupns=host"
+        rmdir "${probe}" || true
+    fi
 
     iptables -t nat -L >/dev/null || fail "iptables nat table is not usable"
 }
 
 write_config() {
     mkdir -p "${CONFIG_DIR}" "${SANDBOXD_ROOT}" "${SANDBOXD_STORE}" "$(dirname "${SOCKET}")" "$(dirname "${LOG_FILE}")"
+    local cgroup_v2_config=""
+    if [ "${CGROUP_VERSION}" = "v2" ]; then
+        cgroup_v2_config=$'cgroup_parent = "/"\npids_max = 256'
+    fi
 
     cat > "${CONFIG_DIR}/oss.json" <<'EOF'
 {
@@ -160,9 +261,11 @@ ip_range = "${NETWORK_CIDR}"
 nat_backend = "iptables"
 
 [plugin.resource]
+cgroup_version = "${CGROUP_VERSION}"
 cgroup_cache_size = 1
 interface_cache_size = 1
 cgroup_root_name = "/${CGROUP_ROOT}"
+${cgroup_v2_config}
 max_instance_num = 8
 recycle_policy = "destroy"
 
@@ -205,6 +308,10 @@ prepare_rootfs() {
     chmod 1777 "${ROOTFS}/tmp"
 
     cp /bin/busybox "${ROOTFS}/bin/busybox"
+    if [ "${CGROUP_VERSION}" = "v2" ]; then
+        [ -x /usr/local/bin/e2e-oom-trigger ] || fail "missing executable: /usr/local/bin/e2e-oom-trigger"
+        cp /usr/local/bin/e2e-oom-trigger "${ROOTFS}/bin/e2e-oom-trigger"
+    fi
     while read -r applet; do
         if [ "${applet}" = "busybox" ]; then
             continue
@@ -246,6 +353,47 @@ start_sandboxd() {
         sleep 1
     done
     fail "sandboxd did not become ready"
+}
+
+restart_sandboxd_after_crash() {
+    log "crash-stopping sandboxd to verify recovery"
+    sleep 6
+    kill -KILL "${SANDBOXD_PID}"
+    wait "${SANDBOXD_PID}" >/dev/null 2>&1 || true
+    SANDBOXD_PID=""
+    start_sandboxd
+}
+
+v2_cgroup_path() {
+    find "/sys/fs/cgroup/${CGROUP_ROOT}" -mindepth 1 -maxdepth 1 -type d | head -1
+}
+
+check_v2_resources() {
+    local group
+    group="$(v2_cgroup_path)"
+    [ -n "${group}" ] || fail "sandbox cgroup v2 directory was not created"
+    [ "$(cat "${group}/memory.max")" = "134217728" ] || fail "unexpected memory.max: $(cat "${group}/memory.max")"
+    [ "$(cat "${group}/pids.max")" = "256" ] || fail "unexpected pids.max: $(cat "${group}/pids.max")"
+    [ "$(cat "${group}/cpu.weight")" != "100" ] || fail "cpu.weight was not updated"
+}
+
+run_v2_oom_check() {
+    log "starting memory-limited sandbox to verify cgroup v2 OOM reporting"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime runsc \
+        --sandbox-id sbox-e2e-oom \
+        --rootfs "${ROOTFS}" \
+        --cwd / \
+        --memory-mb 32 \
+        /bin/e2e-oom-trigger)"
+    [ -n "${SANDBOX_ID}" ] || fail "OOM sandbox start returned empty id"
+
+    local wait_output
+    wait_output="$(/usr/local/bin/sbox --address "${SOCKET}" --timeout 120s wait "${SANDBOX_ID}")"
+    echo "${wait_output}" | grep -q "oom-killed" || fail "Wait did not report OOM kill: ${wait_output}"
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
 }
 
 start_gateway_httpd() {
@@ -295,6 +443,8 @@ run_checks() {
     list_line="$(sbox_cmd list | grep "${SANDBOX_ID}")" || fail "sandbox not found in list"
     echo "${list_line}" | grep -q "SANDBOX_STATE_RUNNING" || fail "sandbox is not running: ${list_line}"
 
+    sbox_cmd inspect "${SANDBOX_ID}" | grep -q "${SANDBOX_ID}" || fail "inspect did not return the sandbox"
+
     local got
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /tmp/start-env)"
     assert_eq "${got}" "start-env-ok" "start env"
@@ -314,13 +464,43 @@ run_checks() {
 
     sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" || fail "stats output missing memory usage"
 
+    if [ "${CGROUP_VERSION}" = "v2" ]; then
+        check_v2_resources
+        restart_sandboxd_after_crash
+        got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /tmp/start-env)"
+        assert_eq "${got}" "start-env-ok" "exec after sandboxd recovery"
+        sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Limit:  134217728 bytes" || fail "stats after recovery has wrong memory limit"
+    fi
+
     log "deleting sandbox"
     sbox_cmd delete "${SANDBOX_ID}"
     local deleted_id="${SANDBOX_ID}"
     SANDBOX_ID=""
-    if sbox_cmd inspect "${deleted_id}" >/tmp/sbox-inspect-after-delete.log 2>&1; then
-        cat /tmp/sbox-inspect-after-delete.log >&2
-        fail "sandbox still inspectable after delete"
+    local list_after_delete
+    list_after_delete="$(sbox_cmd list)" || fail "sandbox list failed after delete"
+    if echo "${list_after_delete}" | grep -q "${deleted_id}"; then
+        echo "${list_after_delete}" >&2
+        fail "sandbox still present after delete"
+    fi
+
+    local runsc_after_delete
+    runsc_after_delete="$(runsc --root "${SANDBOXD_ROOT}/runsc" list)" || fail "runsc list failed after sandbox delete"
+    if echo "${runsc_after_delete}" | grep -q "${deleted_id}"; then
+        echo "${runsc_after_delete}" >&2
+        fail "runsc state still contains deleted sandbox"
+    fi
+
+    if [ "${CGROUP_VERSION}" = "v2" ]; then
+        run_v2_oom_check
+        if grep -q "/sys/fs/cgroup/cpu/cpu.cfs_quota_us" "${LOG_FILE}"; then
+            fail "cgroup v2 run attempted to read the legacy v1 CPU quota path"
+        fi
+        local i
+        for i in $(seq 1 20); do
+            [ -z "$(find "/sys/fs/cgroup/${CGROUP_ROOT}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ] && break
+            sleep 1
+        done
+        [ -z "$(find "/sys/fs/cgroup/${CGROUP_ROOT}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ] || fail "sandbox cgroups leaked after delete"
     fi
 }
 
