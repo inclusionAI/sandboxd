@@ -40,13 +40,13 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	// The side-effect import registers the public NAT backend before
 	// InterfaceManager initialization while avoiding an import cycle.
+	cg "github.com/containerd/cgroups/v3/cgroup1"
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/pelletier/go-toml"
 	"github.com/sirupsen/logrus"

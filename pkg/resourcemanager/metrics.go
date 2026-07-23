@@ -32,9 +32,9 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 
+	cg "github.com/containerd/cgroups/v3/cgroup1"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager/cgroupv1"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 )
 
 const (

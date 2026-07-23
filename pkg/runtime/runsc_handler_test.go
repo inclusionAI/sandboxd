@@ -19,11 +19,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	cg "github.com/containerd/cgroups/v3/cgroup1"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	runscapi "github.com/inclusionAI/sandboxd/pkg/runtime/runsc"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 )

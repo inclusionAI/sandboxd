@@ -21,10 +21,10 @@ import (
 	"testing"
 
 	gomonkey "github.com/agiledragon/gomonkey/v2"
+	cg "github.com/containerd/cgroups/v3/cgroup1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	"github.com/inclusionAI/sandboxd/internal/util"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/stretchr/testify/assert"

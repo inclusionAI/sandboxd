@@ -50,7 +50,7 @@ PROTOBUF_BUILD_IMAGE ?= golang:1.25.5-bookworm
 PROTOBUF_TOOL_IMAGE ?= sandboxd-protobuf:$(PROTOC_VERSION)-go-$(PROTOC_GEN_GO_VERSION)-grpc-$(PROTOC_GEN_GO_GRPC_VERSION)
 PROTOBUF_BUILD_ARGS ?=
 
-.PHONY: all clean test e2e release release-binary release-cli protobuf-image protos protos-local check-protos tidy vendor fmt vet help
+.PHONY: all clean test e2e release release-binary release-cli protobuf-image protos protos-local check-protos tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
@@ -120,6 +120,10 @@ vendor: ## sync vendor/ from go.mod (requires network)
 
 fmt: ## format Go code
 	go fmt ./...
+
+check-fmt: ## verify Go code is gofmt-clean
+	@files="$$(gofmt -l .)" || exit $$?; \
+	test -z "$$files" || { printf '%s\n' "$$files" >&2; exit 1; }
 
 vet: ## run go vet
 	go vet ./...

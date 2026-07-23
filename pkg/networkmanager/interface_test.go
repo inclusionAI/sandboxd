@@ -72,10 +72,14 @@ func TestInterfaceCleanup_IgnoresResourceWithoutInterface(t *testing.T) {
 
 func TestCalcluteCacheSize(t *testing.T) {
 	rawCacheSize := 10000
-	cacheSize := calcluteCacheSize(rawCacheSize)
-	assert.True(t, cacheSize < rawCacheSize)
-
 	getLocalCpuNumPatches := gomonkey.ApplyFunc(getLocalCpuNum, func() (int, error) {
+		return 2, nil
+	})
+	cacheSize := calcluteCacheSize(rawCacheSize)
+	getLocalCpuNumPatches.Reset()
+	assert.Equal(t, 4, cacheSize)
+
+	getLocalCpuNumPatches = gomonkey.ApplyFunc(getLocalCpuNum, func() (int, error) {
 		return 1, errors.New("fake error for getLocalCpuNum")
 	})
 	defer getLocalCpuNumPatches.Reset()

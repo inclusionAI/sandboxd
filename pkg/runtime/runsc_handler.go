@@ -27,11 +27,11 @@ import (
 	"github.com/inclusionAI/sandboxd/internal/util"
 	runscapi "github.com/inclusionAI/sandboxd/pkg/runtime/runsc"
 
+	cg "github.com/containerd/cgroups/v3/cgroup1"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )

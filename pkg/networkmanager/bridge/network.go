@@ -19,9 +19,9 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
-	"github.com/coreos/go-iptables/iptables"
 )
 
 type BridgeNetworkManager struct{}

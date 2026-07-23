@@ -23,9 +23,9 @@ import (
 	"time"
 
 	gomonkey "github.com/agiledragon/gomonkey/v2"
+	cg "github.com/containerd/cgroups/v3/cgroup1"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/internal/cgroupops"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 )
