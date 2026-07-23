@@ -17,7 +17,7 @@ package main
 import (
 	"fmt"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/urfave/cli"
 )
 

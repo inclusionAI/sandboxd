@@ -1969,7 +1969,7 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x04Wait\x12\x17.runtime.v1.WaitRequest\x1a\x18.runtime.v1.WaitResponse\"\x00\x12M\n" +
 	"\x04List\x12 .runtime.v1.ListSandboxesRequest\x1a!.runtime.v1.ListSandboxesResponse\"\x00\x12>\n" +
 	"\x05Stats\x12\x18.runtime.v1.StatsRequest\x1a\x19.runtime.v1.StatsResponse\"\x00\x12n\n" +
-	"\x15ListAvailableRuntimes\x12(.runtime.v1.ListAvailableRuntimesRequest\x1a).runtime.v1.ListAvailableRuntimesResponse\"\x00B3Z1github.com/akernel-dev/sandboxd/api/runtime/v1;v1b\x06proto3"
+	"\x15ListAvailableRuntimes\x12(.runtime.v1.ListAvailableRuntimesRequest\x1a).runtime.v1.ListAvailableRuntimesResponse\"\x00B3Z1github.com/inclusionAI/sandboxd/api/runtime/v1;v1b\x06proto3"
 
 var (
 	file_api_runtime_v1_sandbox_api_proto_rawDescOnce sync.Once

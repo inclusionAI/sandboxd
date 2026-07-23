@@ -26,7 +26,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/embedded"
 
-	"github.com/akernel-dev/sandboxd/pkg/sandbox"
+	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 )
 
 func TestDiskStatfs(t *testing.T) {

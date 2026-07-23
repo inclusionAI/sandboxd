@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/version"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/version"
 
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"

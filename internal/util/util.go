@@ -23,8 +23,8 @@ import (
 	"syscall"
 	"time"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/internal/cgroupops"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	cg "github.com/containerd/cgroups/v3/cgroup1"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 )

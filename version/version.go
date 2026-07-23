@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	Package = "github.com/akernel-dev/sandboxd"
+	Package = "github.com/inclusionAI/sandboxd"
 
 	// RunscPkgVersion describes the external runsc integration boundary.
 	RunscPkgVersion = "external-runsc"

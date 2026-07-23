@@ -33,9 +33,9 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/distillfs"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/nydus"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/oci"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/nydus"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/oci"
 )
 
 const DefaultHttpSockPath = "/var/run/image_mgr.sock"

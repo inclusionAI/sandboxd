@@ -18,7 +18,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/akernel-dev/sandboxd/pkg/errord"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/types/known/anypb"
 )

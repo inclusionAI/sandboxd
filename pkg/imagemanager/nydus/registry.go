@@ -28,7 +28,7 @@ import (
 	remoteTransport "github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/sirupsen/logrus"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/imageregistry"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageregistry"
 )
 
 const nydusFetchRetryAttempts = 3

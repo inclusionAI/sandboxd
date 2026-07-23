@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	api "github.com/akernel-dev/sandboxd/api/runtime/v1"
+	api "github.com/inclusionAI/sandboxd/api/runtime/v1"
 )
 
 // mockMounter is a test ImageMounter that returns a fake path and tracks calls.

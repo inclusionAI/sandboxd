@@ -15,8 +15,8 @@
 package server
 
 import (
-	"github.com/akernel-dev/sandboxd/config"
-	svc "github.com/akernel-dev/sandboxd/pkg/runtime"
+	"github.com/inclusionAI/sandboxd/config"
+	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"testing"
 )

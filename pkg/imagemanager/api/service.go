@@ -15,8 +15,8 @@
 package api
 
 import (
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/distillfs"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/oci"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/oci"
 )
 
 // Service is the in-process image and mount facade consumed by sandboxd. A

@@ -19,7 +19,7 @@ import (
 	"sort"
 	"testing"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 )
 
 func Test_combineEnvs(t *testing.T) {

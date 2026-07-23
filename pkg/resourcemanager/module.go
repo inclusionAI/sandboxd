@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/pkg/sandbox"
+	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/sirupsen/logrus"
 )
 

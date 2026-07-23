@@ -20,8 +20,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/pkg/networkmanager"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	"github.com/sirupsen/logrus"
 )
 

@@ -21,7 +21,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/akernel-dev/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/config"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 

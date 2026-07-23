@@ -19,12 +19,12 @@ import (
 	"sync"
 	"testing"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
-	imageapi "github.com/akernel-dev/sandboxd/pkg/imagemanager/api"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/distillfs"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/oci"
-	"github.com/akernel-dev/sandboxd/pkg/store"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	imageapi "github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/oci"
+	"github.com/inclusionAI/sandboxd/pkg/store"
 )
 
 type fsTestImageService struct {

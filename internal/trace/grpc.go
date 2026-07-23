@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/internal/metrics"
+	"github.com/inclusionAI/sandboxd/internal/metrics"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )

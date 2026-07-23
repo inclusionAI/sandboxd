@@ -20,7 +20,7 @@ import (
 	"testing"
 
 	gomonkey "github.com/agiledragon/gomonkey/v2"
-	"github.com/akernel-dev/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/vishvananda/netlink"
 )

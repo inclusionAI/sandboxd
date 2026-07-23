@@ -19,9 +19,9 @@ import (
 	"fmt"
 	"time"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/pkg/errord"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )

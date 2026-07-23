@@ -30,9 +30,9 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/sirupsen/logrus"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/diskusage"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/imgcgroup"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/registryauth"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/diskusage"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imgcgroup"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/registryauth"
 )
 
 type DaemonCreateOpt struct {

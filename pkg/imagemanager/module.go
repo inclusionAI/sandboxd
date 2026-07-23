@@ -27,11 +27,11 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/api"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/distillfs"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/imageregistry"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/nydus"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/oci"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageregistry"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/nydus"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/oci"
 )
 
 // Config corresponds to the [plugin.image] sandboxd configuration section.

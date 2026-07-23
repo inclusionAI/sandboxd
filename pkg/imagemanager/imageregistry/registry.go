@@ -35,7 +35,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/registryauth"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/registryauth"
 )
 
 // RegistryAuthEntry represents authentication credentials for a registry.

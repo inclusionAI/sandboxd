@@ -19,8 +19,8 @@ import (
 	"strings"
 	"sync"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	imgApi "github.com/akernel-dev/sandboxd/pkg/imagemanager/api"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	imgApi "github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
 	"github.com/sirupsen/logrus"
 )
 

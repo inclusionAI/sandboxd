@@ -27,10 +27,10 @@ import (
 
 	cmap "github.com/orcaman/concurrent-map/v2"
 
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/internal/util"
-	"github.com/akernel-dev/sandboxd/pkg/errord"
-	"github.com/akernel-dev/sandboxd/pkg/store"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
+	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"k8s.io/apimachinery/pkg/util/sets"

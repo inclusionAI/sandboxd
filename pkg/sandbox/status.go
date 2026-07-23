@@ -23,10 +23,10 @@ import (
 	"sync"
 	"time"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/internal/util"
-	svc "github.com/akernel-dev/sandboxd/pkg/runtime"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/util"
+	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/sirupsen/logrus"
 )
 

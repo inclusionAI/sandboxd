@@ -26,15 +26,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/internal/metrics"
-	"github.com/akernel-dev/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/internal/metrics"
+	"github.com/inclusionAI/sandboxd/internal/util"
 	cmap "github.com/orcaman/concurrent-map/v2"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/pkg/cgroupmanager"
-	"github.com/akernel-dev/sandboxd/pkg/errord"
-	svc "github.com/akernel-dev/sandboxd/pkg/runtime"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
+	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 
 	"github.com/golang/protobuf/proto"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
