@@ -26,7 +26,7 @@ import (
 const (
 	defaultIpRange = "10.88.0.1/16"
 
-	bridgeName        = "sandbox0"
+	BridgeName        = "sandbox0"
 	containerEthName  = "eth0"
 	ContainerLoopName = "lo"
 	bridgeMac         = "02:3f:e1:bd:13:b8"

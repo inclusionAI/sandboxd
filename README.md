@@ -1,6 +1,6 @@
 # sandboxd
 
-**sandboxd** is the Linux sandbox lifecycle service used by [AKernel](https://github.com/akernel-dev/akernel). It exposes a small gRPC API, manages sandbox resources, and currently runs sandboxes with [gVisor](https://github.com/google/gvisor). Kata Containers support will be open-sourced soon.
+**sandboxd** is the Linux sandbox lifecycle service used by [AKernel](https://github.com/akernel-dev/akernel). It exposes a small gRPC API, manages sandbox resources, and runs sandboxes with [gVisor](https://github.com/google/gvisor) or [Kata Containers](https://github.com/kata-containers/kata-containers).
 
 ## Responsibilities
 
@@ -14,7 +14,7 @@
 gRPC service
     |
 sandbox lifecycle manager
-    ├── sandbox runtime adapter ──> gVisor
+    ├── sandbox runtime adapter ──> gVisor / Kata Containers
     ├── image manager ────────────> distill-fs / OCI
     └── resource managers ────────> cgroup v1 / veth / iptables
 ```
@@ -61,7 +61,7 @@ cmd/sbox/            administrative CLI
 config/              configuration types and defaults
 configs/             AKernel integration configuration templates
 internal/server/     gRPC service and daemon orchestration
-pkg/runtime/         sandbox runtime abstraction and gVisor adapter
+pkg/runtime/         sandbox runtime abstraction and runtime adapters
 pkg/imagemanager/    rootfs and mount integration
 pkg/networkmanager/  veth and iptables integration
 pkg/cgroupmanager/   cgroup v1 integration
@@ -71,7 +71,8 @@ tools/               pinned protobuf code-generation image
 
 ## Known limitations
 
-- Only gVisor, cgroup v1, netstack sandbox networking, and iptables are supported in `v0.1.0`.
+- Kata Containers requires a usable `/dev/kvm` device; nodes without KVM continue to support gVisor.
+- Only cgroup v1, netstack sandbox networking, and iptables are supported in `v0.1.0`.
 - The direct OCI registry client currently skips TLS certificate verification and should only be used with trusted registries.
 
 ## License

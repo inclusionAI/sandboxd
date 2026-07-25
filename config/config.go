@@ -62,6 +62,10 @@ type NodeResourceConfig struct {
 type RuntimeConfig struct {
 	RuntimeBinary map[string]string `toml:"runtime_binary" json:"runtimeBinary"`
 
+	// Kata configures the optional Kata Containers runtime adapter. Kata is
+	// loaded only when runtime_binary contains a "kata" entry.
+	Kata KataConfig `toml:"kata" json:"kata"`
+
 	// BasicSpec is the basic spec file for different runtime type.
 	BasicSpec map[string]string `toml:"basic_spec" json:"basicSpec"`
 
@@ -83,6 +87,14 @@ type RuntimeConfig struct {
 	// OverlayTmpfsSize specifies the size limit for the overlay tmpfs upper
 	// layer (e.g. "256M", "1G"). When empty, no size limit is applied.
 	OverlayTmpfsSize string `toml:"overlay_tmpfs_size" json:"overlayTmpfsSize"`
+}
+
+// KataConfig contains the host paths and storage settings used by Kata.
+type KataConfig struct {
+	ConfigPath   string `toml:"config_path" json:"configPath"`
+	KVMDevice    string `toml:"kvm_device" json:"kvmDevice"`
+	DANConfigDir string `toml:"dan_config_dir" json:"danConfigDir"`
+	LoggerBinary string `toml:"logger_binary" json:"loggerBinary"`
 }
 
 type ResourceConfig struct {

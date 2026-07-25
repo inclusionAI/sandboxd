@@ -431,7 +431,7 @@ func NewInterfaceManager(db store.DbStore, ipRange string, size int, cacheSize i
 
 	bridgeFound, err := bridgeExists()
 	if err != nil {
-		return nil, fmt.Errorf("query bridge %s: %w", bridgeName, err)
+		return nil, fmt.Errorf("query bridge %s: %w", BridgeName, err)
 	}
 	if !bridgeFound {
 		if err := checkIPRangeAvailable(ipRange); err != nil {
@@ -446,7 +446,7 @@ func NewInterfaceManager(db store.DbStore, ipRange string, size int, cacheSize i
 		return nil, err
 	}
 
-	bridgeLink, err := netlink.LinkByName(bridgeName)
+	bridgeLink, err := netlink.LinkByName(BridgeName)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +601,7 @@ func checkIPRangeAvailable(ipRange string) error {
 }
 
 func bridgeExists() (bool, error) {
-	if _, err := netlink.LinkByName(bridgeName); err != nil {
+	if _, err := netlink.LinkByName(BridgeName); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return false, nil
 		}
@@ -615,13 +615,13 @@ func initBridge(ipRange string, natBackend string) error {
 	// check if bridge exists.
 	bridgeFound, err := bridgeExists()
 	if err != nil {
-		logrus.Warnf("check bridge %s exists failed: %v", bridgeName, err)
+		logrus.Warnf("check bridge %s exists failed: %v", BridgeName, err)
 		return err
 	}
 	if !bridgeFound {
 		// create bridge.
-		logrus.Infof("bridge %s not exists, create it", bridgeName)
-		if err = netlink.LinkAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: bridgeName}}); err != nil {
+		logrus.Infof("bridge %s not exists, create it", BridgeName)
+		if err = netlink.LinkAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName}}); err != nil {
 			return err
 		}
 		// add address.
@@ -629,17 +629,17 @@ func initBridge(ipRange string, natBackend string) error {
 		if err != nil {
 			return err
 		}
-		if err = netlink.AddrAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: bridgeName}}, addr); err != nil {
+		if err = netlink.AddrAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName}}, addr); err != nil {
 			return err
 		}
 		// set address and up.
-		if err = netlink.LinkSetUp(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: bridgeName}}); err != nil {
+		if err = netlink.LinkSetUp(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName}}); err != nil {
 			return err
 		}
 	}
 
 	// get link by name again and set mac address.
-	bridgeLink, err := netlink.LinkByName(bridgeName)
+	bridgeLink, err := netlink.LinkByName(BridgeName)
 	if err != nil {
 		return err
 	}
@@ -662,7 +662,7 @@ func initBridge(ipRange string, natBackend string) error {
 // cleanBridge is used to clean bridge and iptable rule after init failed.
 func cleanBridge(natBackend string) error {
 	// clean bridge if exists.
-	if bridge, err := netlink.LinkByName(bridgeName); err != nil {
+	if bridge, err := netlink.LinkByName(BridgeName); err != nil {
 		if !strings.Contains(err.Error(), "not found") {
 			return nil
 		}

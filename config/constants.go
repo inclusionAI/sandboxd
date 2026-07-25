@@ -24,6 +24,7 @@ import (
 // Runtime names supported by sandboxd.
 const (
 	RuntimeNameRunsc = "runsc"
+	RuntimeNameKata  = "kata"
 )
 
 // Sandbox service related constants.
@@ -76,6 +77,7 @@ const (
 // allocations.
 var RuntimeResources = map[string][]string{
 	RuntimeNameRunsc: {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameKata:  {ResourceNameCgroup, ResourceNameInterface},
 }
 
 const (

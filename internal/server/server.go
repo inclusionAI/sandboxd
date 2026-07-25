@@ -113,8 +113,15 @@ func (h *sandboxService) loadRuntimeHandlers() {
 			}
 			handler, err := svc.NewHandler(h.config, runtimeBin, runtimeName)
 			if err != nil {
-				logrus.Warnf("load runtime %v handler failed: %v", runtimeName, err)
-				allLoaded = false
+				if runtimeName == config.RuntimeNameRunsc {
+					logrus.Warnf("load required runtime %v handler failed: %v", runtimeName, err)
+					allLoaded = false
+				} else {
+					// Optional runtimes are node capabilities. A node that does
+					// not meet their host requirements remains ready and omits
+					// them from ListAvailableRuntimes.
+					logrus.Warnf("optional runtime %v is unavailable: %v", runtimeName, err)
+				}
 				continue
 			}
 			logrus.Infof("loaded runtime handler for %v", runtimeName)

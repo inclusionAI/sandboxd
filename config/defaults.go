@@ -38,5 +38,11 @@ const (
 
 	DefaultIPRange = "10.88.0.1/16"
 
-	DefaultRunscBinary = "/usr/local/bin/runsc"
+	DefaultRunscBinary   = "/usr/local/bin/runsc"
+	DefaultKataBinary    = "/opt/kata/runtime-rs/bin/containerd-shim-kata-v2"
+	DefaultKataConfig    = "/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml"
+	DefaultSandboxLogger = "/usr/local/bin/sandbox-logger"
+	DefaultKVMDevice     = "/dev/kvm"
+
+	DefaultKataDANConfigDir = "/run/kata-containers/dans"
 )

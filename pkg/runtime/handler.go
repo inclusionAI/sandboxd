@@ -66,6 +66,12 @@ func NewHandler(cfg config.Config, bin, runtimeName string) (Handler, error) {
 			return nil, err
 		}
 		return NewRunscHandler(cfg, bin, loader)
+	case config.RuntimeNameKata:
+		loader, err := NewBundleLoader("", sandboxRoot)
+		if err != nil {
+			return nil, err
+		}
+		return NewKataHandler(cfg, bin, loader)
 	default:
 		return nil, errord.ErrNotImplemented
 	}

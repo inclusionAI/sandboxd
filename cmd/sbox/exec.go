@@ -42,6 +42,11 @@ var defaultRunscRootDir = filepath.Join(
 	config.RuntimeNameRunsc,
 )
 
+var defaultContainersRoot = filepath.Join(
+	config.DefaultSandboxRootDir,
+	"containers",
+)
+
 var ExecCmd = cli.Command{
 	Name:  "exec",
 	Usage: "execute a command in a running sandbox",
@@ -73,6 +78,12 @@ var ExecCmd = cli.Command{
 			Usage:  "Root directory for runsc state",
 			Value:  defaultRunscRootDir,
 			EnvVar: "RUNSC_ROOT",
+		},
+		cli.StringFlag{
+			Name:   "containers-root",
+			Usage:  "Root directory for sandboxd runtime state",
+			Value:  defaultContainersRoot,
+			EnvVar: "SANDBOXD_CONTAINERS_ROOT",
 		},
 	},
 	Action: func(context *cli.Context) error {
@@ -138,6 +149,10 @@ func newExecRunner(runtimeName string, context *cli.Context) (execRunner, error)
 		return &runscExecRunner{
 			binary: context.String("runtime-binary"),
 			root:   context.String("runtime-root"),
+		}, nil
+	case config.RuntimeNameKata:
+		return &kataExecRunner{
+			containersRoot: context.String("containers-root"),
 		}, nil
 	default:
 		return nil, fmt.Errorf("runtime %q does not support sbox exec", runtimeName)

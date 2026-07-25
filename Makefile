@@ -25,10 +25,10 @@ ROOTDIR=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 PACKAGE_VERSION=$(shell sed -n '1p' version/VERSION)
 
-GOOS ?= $(shell $(GO) env GOOS)
-GOARCH ?= $(shell $(GO) env GOARCH)
+RELEASE_GOOS=linux
+RELEASE_GOARCH=amd64
 
-RELEASE=sandboxd-$(PACKAGE_VERSION:v%=%)-${GOOS}-${GOARCH}
+RELEASE=sandboxd-$(PACKAGE_VERSION:v%=%)-$(RELEASE_GOOS)-$(RELEASE_GOARCH)
 
 GO_BUILDTAGS ?=
 GO_BUILDTAGS += urfave_cli_no_docs
@@ -50,31 +50,25 @@ PROTOBUF_BUILD_IMAGE ?= golang:1.25.5-bookworm
 PROTOBUF_TOOL_IMAGE ?= sandboxd-protobuf:$(PROTOC_VERSION)-go-$(PROTOC_GEN_GO_VERSION)-grpc-$(PROTOC_GEN_GO_GRPC_VERSION)
 PROTOBUF_BUILD_ARGS ?=
 
-.PHONY: all clean test e2e release release-binary release-cli protobuf-image protos protos-local check-protos tidy vendor fmt check-fmt vet help
+.PHONY: all clean test e2e release release-binary release-cli sandbox-logger protobuf-image protos protos-local check-protos tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
 
-release: release-binary release-cli
+release: release-binary release-cli sandbox-logger
 	@echo "Built $(RELEASE)."
 
 release-binary:
 	@echo "Building output/sandboxd"
-ifeq ($(GOOS),linux)
-	@$(GO) build -o output/sandboxd -tags "seccomp apparmor" ./cmd/sandboxd
-else
-	@echo "cross-platform build binary at $(GOOS)"
-	@CGO_ENABLED=1 GOOS=linux GOARCH=amd64 $(GO) build -o output/sandboxd -tags "seccomp apparmor" ./cmd/sandboxd
-endif
+	@CGO_ENABLED=1 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) $(GO) build -o output/sandboxd -tags "seccomp apparmor" ./cmd/sandboxd
 
 release-cli:
 	@echo "Building output/sbox"
-ifeq ($(GOOS),linux)
-	@$(GO) build -o output/sbox ./cmd/sbox
-else
-	@echo "cross-platform build client at $(GOOS)"
-	@CGO_ENABLED=1 GOOS=linux GOARCH=amd64 $(GO) build -o output/sbox ./cmd/sbox
-endif
+	@CGO_ENABLED=1 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) $(GO) build -o output/sbox ./cmd/sbox
+
+sandbox-logger:
+	@echo "Building output/sandbox-logger"
+	@CGO_ENABLED=0 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) $(GO) build -o output/sandbox-logger ./cmd/sandbox-logger
 
 test: ## run tests
 	@$(GO) clean -testcache

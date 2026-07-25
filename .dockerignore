@@ -6,4 +6,5 @@ local
 output/*
 !output/sandboxd
 !output/sbox
+!output/sandbox-logger
 !output/runsc
