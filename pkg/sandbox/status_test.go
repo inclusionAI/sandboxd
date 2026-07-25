@@ -26,7 +26,7 @@ import (
 
 func TestGenerateStatusFromState(t *testing.T) {
 	type args struct {
-		state *svc.UnionSandboxState
+		state *svc.State
 		path  string
 	}
 	tests := []struct {
@@ -37,11 +37,10 @@ func TestGenerateStatusFromState(t *testing.T) {
 		{
 			name: "test",
 			args: args{
-				state: &svc.UnionSandboxState{
+				state: &svc.State{
 					ID:             "",
 					InitProcessPid: 100,
 					Status:         "running",
-					Bundle:         "",
 					Created:        "2023-08-28 16:34:07.878055688 +0800 CST m=+0.008551102",
 				},
 				path: "/tmp",

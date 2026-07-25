@@ -28,10 +28,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestNewRunscServiceHandlerUsesSharedLogFile(t *testing.T) {
+func TestNewRunscHandlerUsesSharedLogFile(t *testing.T) {
 	baseDir := t.TempDir()
 	rootDir := filepath.Join(baseDir, "sandboxd", "root")
-	handler, err := NewRunscServiceHandler(config.Config{RootDir: rootDir}, "/usr/local/bin/runsc", nil, nil)
+	handler, err := NewRunscHandler(config.Config{RootDir: rootDir}, "/usr/local/bin/runsc", nil)
 	assert.NoError(t, err)
 
 	client, ok := handler.runsc.(*runscapi.Client)

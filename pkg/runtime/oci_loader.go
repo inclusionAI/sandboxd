@@ -40,25 +40,19 @@ const (
 	gvisorRootfsOverlayMemory    = "memory"
 )
 
-// OciLoader is the interface to load an OCI bundle.
 type OciLoader interface {
-	// GenerateOci loads an OCI bundle from the given path (basePath + "config.json") and returns the file path.
 	GenerateOci(options OciLoadOptions) (string, *Spec, error)
 }
 
 type OciLoadOptions struct {
-	// will generate config.json into RootPath/SandboxID/config.json
 	SandboxID string
-	Request   *StartSandboxRequest
+	Config    StartConfig
 
-	CgroupPath       string
-	NetworkNameSpace string
-	// if set, will generate config.json into OverrideBundleDir instead of RootPath/SandboxID/config.json
+	CgroupPath        string
+	NetworkNameSpace  string
 	OverrideBundleDir string
 
 	OverrideRootPath string
-
-	AdditionalAnnotations map[string]string
 
 	UseGVisorRootfsImageAnnotations bool
 	RootfsOverlayTmpfsSize          string
@@ -98,7 +92,7 @@ func NewBundleLoader(baseFile, bundleDir string) (*BundleLoader, error) {
 
 func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error) {
 	ociSpec := r.baseSpec.DeepCopy()
-	if options.OverrideBundleDir == "" && (options.Request == nil || options.CgroupPath == "") {
+	if options.OverrideBundleDir == "" && (options.SandboxID == "" || options.CgroupPath == "") {
 		logrus.Debugf("invalid options, cg: %v", options.CgroupPath)
 		return "", ociSpec, errord.ErrInvalidArgument
 	}
@@ -110,21 +104,19 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 	}
 	ociSpec.Linux.CgroupsPath = options.CgroupPath
 
-	if options.Request.Cwd != "" {
-		ociSpec.Process.Cwd = options.Request.Cwd
+	if options.Config.Cwd != "" {
+		ociSpec.Process.Cwd = options.Config.Cwd
 	}
 
-	// set args
-	if len(options.Request.Command) > 0 {
-		ociSpec.Process.Args = options.Request.Command
+	if len(options.Config.Command) > 0 {
+		ociSpec.Process.Args = options.Config.Command
 	}
 
-	// set envs
-	if len(options.Request.Envs) > 0 {
-		ociSpec.Process.Env = combineEnvs(ociSpec.Process.Env, options.Request)
+	if len(options.Config.Envs) > 0 {
+		ociSpec.Process.Env = combineEnvs(ociSpec.Process.Env, options.Config.Envs)
 	}
 
-	for _, mnt := range options.Request.Mounts {
+	for _, mnt := range options.Config.Mounts {
 		ociSpec.Mounts = append(ociSpec.Mounts, Mount{
 			Destination: mnt.GetTarget(),
 			Type:        mnt.GetType(),
@@ -136,20 +128,16 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 	if ociSpec.Root == nil {
 		ociSpec.Root = &Root{}
 	}
-	ociSpec.Root.Path = filepath.Join(options.Request.Rootfs.RootDir)
+	ociSpec.Root.Path = options.Config.Rootfs
 
-	// set annotations
-	ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, options.Request.Labels)
-	ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, options.AdditionalAnnotations)
+	ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, options.Config.Annotations)
 
 	bundleDir, err := util.JoinWithinRoot(r.bundleParentDir, options.SandboxID)
 	if err != nil {
 		return "", ociSpec, fmt.Errorf("resolve sandbox bundle: %w", err)
 	}
 
-	// set resource.
-	setSpecResource(ociSpec, options.Request.Resource)
-	// set resource.
+	setSpecResource(ociSpec, options.Config.Resources)
 	if _, ok := ociSpec.Annotations[IgnoreResourceFieldAnnoKey]; ok {
 		logrus.Debugf("ignore resource field for %v", options.SandboxID)
 		ociSpec.Linux.Resources = nil
@@ -383,9 +371,7 @@ func combineAnnotations(annotations map[string]string, annoToAdd map[string]stri
 	return annotations
 }
 
-// combineEnvs will combine envs from request and spec.
-func combineEnvs(envs []string, request *StartSandboxRequest) []string {
-	//envs to map
+func combineEnvs(envs []string, overrides []*runtime.KeyValue) []string {
 	envMap := map[string]string{}
 	for _, env := range envs {
 		kv := strings.Split(env, "=")
@@ -393,12 +379,9 @@ func combineEnvs(envs []string, request *StartSandboxRequest) []string {
 			envMap[kv[0]] = kv[1]
 		}
 	}
-	if request != nil && request.Envs != nil {
-		for _, env := range request.Envs {
-			envMap[env.Key] = env.Value
-		}
+	for _, env := range overrides {
+		envMap[env.Key] = env.Value
 	}
-	// envMap to envs
 	envs = []string{}
 	for k, v := range envMap {
 		envs = append(envs, fmt.Sprintf("%s=%s", k, v))

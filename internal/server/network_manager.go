@@ -43,7 +43,7 @@ type networkManager struct {
 
 type preparedNetwork struct {
 	resource string
-	ip       string
+	config   *networkmanager.NetResource
 }
 
 func resolveNATBackend(name string) (string, error) {
@@ -79,7 +79,10 @@ func (m *networkManager) Prepare() (*preparedNetwork, error) {
 		}
 		return nil, fmt.Errorf("parse net device(%s) failed, err: %v", resource, err)
 	}
-	return &preparedNetwork{resource: resource, ip: netResource.Ip.String()}, nil
+	return &preparedNetwork{
+		resource: resource,
+		config:   netResource,
+	}, nil
 }
 
 func (m *networkManager) Release(resource string) error {

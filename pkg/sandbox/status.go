@@ -195,7 +195,7 @@ func LoadStatus(sandboxRoot string) (StatusStorage, error) {
 	}, nil
 }
 
-func GenerateStatusFromState(state *svc.UnionSandboxState, path string) StatusStorage {
+func GenerateStatusFromState(state *svc.State, path string) StatusStorage {
 	s := &statusStorage{
 		status: Status{
 			Pid:        state.InitProcessPid,
@@ -215,7 +215,7 @@ func GenerateStatusFromState(state *svc.UnionSandboxState, path string) StatusSt
 	return s
 }
 
-func UpdateStatusByState(state *svc.UnionSandboxState, status Status) Status {
+func UpdateStatusByState(state *svc.State, status Status) Status {
 	if state == nil {
 		return status
 	}

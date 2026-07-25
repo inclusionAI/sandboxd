@@ -157,16 +157,22 @@ func (m *fsManager) Prepare(request *runtime.StartRequest) (_ *preparedFS, retEr
 	return prepared, nil
 }
 
-func (m *fsManager) Commit(sandboxID string, prepared *preparedFS) {
+func (m *fsManager) Commit(sandboxID string, prepared *preparedFS) error {
 	if sandboxID == "" || prepared == nil {
-		return
+		return fmt.Errorf("sandbox filesystem commit requires an ID and prepared state")
 	}
 	state, err := stateFromPrepared(prepared)
 	if err != nil {
-		logrus.Errorf("failed to encode filesystem state for sandbox %s: %v", sandboxID, err)
-		return
+		return fmt.Errorf("encode filesystem state for sandbox %s: %w", sandboxID, err)
 	}
+
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
 	m.mu.Lock()
+	if _, exists := m.sandboxState[sandboxID]; exists {
+		m.mu.Unlock()
+		return fmt.Errorf("filesystem state for sandbox %s already exists", sandboxID)
+	}
 	m.sandboxRootfs[sandboxID] = prepared.rootfs
 	if len(prepared.s3) > 0 {
 		m.sandboxS3Mount[sandboxID] = append([]*runtime.S3Config(nil), prepared.s3...)
@@ -176,11 +182,20 @@ func (m *fsManager) Commit(sandboxID string, prepared *preparedFS) {
 	}
 	m.sandboxState[sandboxID] = state
 	m.mu.Unlock()
-	m.persistState()
+	if err := m.persistCurrentState(); err != nil {
+		m.mu.Lock()
+		delete(m.sandboxRootfs, sandboxID)
+		delete(m.sandboxS3Mount, sandboxID)
+		delete(m.sandboxOCIMount, sandboxID)
+		delete(m.sandboxState, sandboxID)
+		m.mu.Unlock()
+		return fmt.Errorf("persist filesystem state for sandbox %s: %w", sandboxID, err)
+	}
+	return nil
 }
 
-func (m *fsManager) Release(sandboxID string) {
-	m.release(sandboxID, true)
+func (m *fsManager) Release(sandboxID string) error {
+	return m.release(sandboxID, true)
 }
 
 func (m *fsManager) Shutdown() {
@@ -202,7 +217,9 @@ func (m *fsManager) Shutdown() {
 	}
 	m.s3.cleanupAllS3Unmounts()
 	m.oci.cleanupAllOciUnmounts()
-	m.persistState()
+	if err := m.persistState(); err != nil {
+		logrus.Warnf("persist filesystem shutdown state: %v", err)
+	}
 }
 
 func stateFromPrepared(prepared *preparedFS) (sandboxFSState, error) {
@@ -240,12 +257,19 @@ func cloneFSState(state sandboxFSState) sandboxFSState {
 	}
 }
 
-func (m *fsManager) persistState() {
+func (m *fsManager) persistState() error {
 	if m.store == nil {
-		return
+		return nil
 	}
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
+	return m.persistCurrentState()
+}
+
+func (m *fsManager) persistCurrentState() error {
+	if m.store == nil {
+		return nil
+	}
 	m.mu.Lock()
 	items := make(map[string]sandboxFSState, len(m.sandboxState))
 	for sandboxID, state := range m.sandboxState {
@@ -255,12 +279,12 @@ func (m *fsManager) persistState() {
 
 	data, err := json.Marshal(storedSandboxFSStates{Items: items})
 	if err != nil {
-		logrus.Warnf("failed to encode sandbox filesystem state: %v", err)
-		return
+		return fmt.Errorf("encode sandbox filesystem state: %w", err)
 	}
 	if err := m.store.StoreRaw(config.SandboxFSStateBucket, data); err != nil {
-		logrus.Warnf("failed to persist sandbox filesystem state: %v", err)
+		return fmt.Errorf("store sandbox filesystem state: %w", err)
 	}
+	return nil
 }
 
 // Restore rebuilds rootfs and additional-mount references after sandboxd
@@ -296,14 +320,13 @@ func (m *fsManager) Restore(sandboxExists func(string) bool) error {
 			continue
 		}
 		if sandboxExists != nil && !sandboxExists(sandboxID) {
-			m.release(sandboxID, false)
+			_ = m.release(sandboxID, false)
 		}
 	}
 	if len(restoreErrors) > 0 {
 		return errors.Join(restoreErrors...)
 	}
-	m.persistState()
-	return nil
+	return m.persistState()
 }
 
 func (m *fsManager) restoreSandbox(sandboxID string, state sandboxFSState) (retErr error) {
@@ -351,19 +374,43 @@ func (m *fsManager) restoreSandbox(sandboxID string, state sandboxFSState) (retE
 	return nil
 }
 
-func (m *fsManager) release(sandboxID string, persist bool) {
+func (m *fsManager) release(sandboxID string, persist bool) error {
 	if sandboxID == "" {
-		return
+		return nil
 	}
+
+	m.persistMu.Lock()
 	m.mu.Lock()
 	rootfs := m.sandboxRootfs[sandboxID]
 	s3Configs := append([]*runtime.S3Config(nil), m.sandboxS3Mount[sandboxID]...)
 	ociURLs := append([]string(nil), m.sandboxOCIMount[sandboxID]...)
+	state, stateExists := m.sandboxState[sandboxID]
 	delete(m.sandboxRootfs, sandboxID)
 	delete(m.sandboxS3Mount, sandboxID)
 	delete(m.sandboxOCIMount, sandboxID)
 	delete(m.sandboxState, sandboxID)
 	m.mu.Unlock()
+	if persist {
+		if err := m.persistCurrentState(); err != nil {
+			m.mu.Lock()
+			if rootfs != nil {
+				m.sandboxRootfs[sandboxID] = rootfs
+			}
+			if len(s3Configs) > 0 {
+				m.sandboxS3Mount[sandboxID] = s3Configs
+			}
+			if len(ociURLs) > 0 {
+				m.sandboxOCIMount[sandboxID] = ociURLs
+			}
+			if stateExists {
+				m.sandboxState[sandboxID] = state
+			}
+			m.mu.Unlock()
+			m.persistMu.Unlock()
+			return fmt.Errorf("persist released filesystem state for sandbox %s: %w", sandboxID, err)
+		}
+	}
+	m.persistMu.Unlock()
 
 	if rootfs != nil {
 		rootfs.DecRef()
@@ -378,9 +425,7 @@ func (m *fsManager) release(sandboxID string, persist bool) {
 			logrus.Warnf("failed to unmount OCI image for sandbox %s: %v", sandboxID, err)
 		}
 	}
-	if persist {
-		m.persistState()
-	}
+	return nil
 }
 
 func (p *preparedFS) RootfsPath() string {

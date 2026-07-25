@@ -96,7 +96,7 @@ type ServiceOptions func(*sandboxService)
 func buildServiceWithOptions(opts ...ServiceOptions) *sandboxService {
 	svc := &sandboxService{
 		config:         config.Config{},
-		serviceHandler: cmap.New[svc.RealRuntimeHandler](),
+		serviceHandler: cmap.New[svc.Handler](),
 	}
 	for _, opt := range opts {
 		opt(svc)
@@ -110,7 +110,7 @@ func SetPluginConfig(runtimeConfig config.RuntimeConfig) ServiceOptions {
 	}
 }
 
-func AddHandler(runtime string, handler svc.RealRuntimeHandler) ServiceOptions {
+func AddHandler(runtime string, handler svc.Handler) ServiceOptions {
 	return func(service *sandboxService) {
 		service.serviceHandler.Set(runtime, handler)
 	}

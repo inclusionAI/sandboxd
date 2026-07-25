@@ -24,33 +24,25 @@ import (
 
 	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	"github.com/inclusionAI/sandboxd/internal/trace"
-	"github.com/inclusionAI/sandboxd/internal/util"
 	runscapi "github.com/inclusionAI/sandboxd/pkg/runtime/runsc"
 
 	cg "github.com/containerd/cgroups/v3/cgroup1"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
-	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
-	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
 
-var _ RealRuntimeHandler = &RunscServiceHandler{}
+var _ Handler = &RunscHandler{}
 
 const (
 	ImageName      = "rootfs.img"
 	SplitSeparator = "__.__"
 )
 
-type RunscServiceHandler struct {
-	binary   string
-	executor util.CmdExecutor
-	runsc    runscClient
-	// root path of sandboxd, this is used to store runtime logs if the user doesn't specify the log path
-	SandboxRoot string
-	RunscRoot   string
-	ociLoader   OciLoader
+type RunscHandler struct {
+	runsc     runscClient
+	ociLoader OciLoader
 
 	rootfsOverlayTmpfsSize string
 }
@@ -103,17 +95,7 @@ func updateCgroup(cgroupPath string, resource *runtime.LinuxSandboxResources) er
 	return cgroup.Update(&cgroupResource)
 }
 
-// CleanupXFSMount is re-exported from pkg/volumemanager for backwards
-// compatibility with anything that imported it from pkg/runtime; new code
-// should call volumemanager.CleanupXFSMount directly.
-func CleanupXFSMount(filestoreDir string) error {
-	return volumemanager.CleanupXFSMount(filestoreDir)
-}
-
-// NewRunscServiceHandler constructs the runsc-backed runtime handler.
-func NewRunscServiceHandler(cfg config.Config, bin string, loader OciLoader, volMod *volumemanager.Module) (*RunscServiceHandler, error) {
-	_ = volMod
-
+func NewRunscHandler(cfg config.Config, bin string, loader OciLoader) (*RunscHandler, error) {
 	root := cfg.RootDir
 	runscRoot := filepath.Join(root, config.RuntimeNameRunsc)
 	if err := os.MkdirAll(runscRoot, 0711); err != nil {
@@ -125,117 +107,75 @@ func NewRunscServiceHandler(cfg config.Config, bin string, loader OciLoader, vol
 	}
 	runscLogPath := filepath.Join(runscLogDir, "runsc.log")
 
-	rsh := &RunscServiceHandler{
-		binary:   bin,
-		executor: &util.SystemCmdExecutor{},
+	return &RunscHandler{
 		runsc: runscapi.NewClientWithOptions(bin, runscRoot, runscapi.Options{
 			FilestoreDir:     cfg.RuntimeConfig.FilestoreDir,
 			OverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
 			DebugLogPath:     runscLogPath,
 		}),
 		ociLoader:              loader,
-		SandboxRoot:            filepath.Join(root, "containers"),
-		RunscRoot:              runscRoot,
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
-	}
-	return rsh, nil
+	}, nil
 }
 
-func (r *RunscServiceHandler) StartSandbox(
-	ctx context.Context,
-	request *StartSandboxRequest,
-	options HandlerOptions,
-) (*runtime.SandboxMetadata, error) {
-	// Apply cgroup resource limits before starting the container
-	if request.Resource != nil && options.CgroupPath != "" {
-		if err := updateCgroup(options.CgroupPath, request.Resource); err != nil {
-			return nil, fmt.Errorf("set cgroup resource limits on %s failed: %v", options.CgroupPath, err)
+func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
+	traceID, _ := trace.GetContextID(ctx)
+	if config.Resources != nil && config.CgroupPath != "" {
+		if err := updateCgroup(config.CgroupPath, config.Resources); err != nil {
+			return fmt.Errorf("update cgroup %s: %w", config.CgroupPath, err)
 		}
 	}
-
-	// Get Network Info from options
-	device, ok := options.AdditionalAnnotations[config.ResourceAnnotationKeyPrefix+config.ResourceNameInterface]
-	if !ok {
-		return nil, fmt.Errorf("interface not found in options")
-	}
-	netDevice := &networkmanager.NetResource{}
-	if err := netDevice.FromString(device); err != nil {
-		return nil, fmt.Errorf("parse net device(%s) failed, err: %v", device, err)
+	if config.Network == nil {
+		return fmt.Errorf("network is required")
 	}
 
-	bundlePath, specConf, err := r.ociLoader.GenerateOci(OciLoadOptions{
-		SandboxID: options.SandboxID,
-		Request:   request,
-
-		CgroupPath:                      options.CgroupPath,
-		AdditionalAnnotations:           options.AdditionalAnnotations,
+	bundlePath, _, err := r.ociLoader.GenerateOci(OciLoadOptions{
+		SandboxID:                       config.ID,
+		Config:                          config,
+		CgroupPath:                      config.CgroupPath,
 		UseGVisorRootfsImageAnnotations: true,
 		RootfsOverlayTmpfsSize:          r.rootfsOverlayTmpfsSize,
 	})
 	if err != nil {
-		logrus.WithField(trace.ContextKeyTraceId, options.TraceID).Debugf("generate oci failed, err: %v", err)
-		return nil, fmt.Errorf("generate oci failed because %v", err)
-	}
-
-	if request.Stderr == "" {
-		request.Stderr = filepath.Join(r.SandboxRoot, options.SandboxID, "stderr.log")
-	}
-	if request.Stdout == "" {
-		request.Stdout = filepath.Join(r.SandboxRoot, options.SandboxID, "stdout.log")
-	}
-
-	metaData := &runtime.SandboxMetadata{
-		ID:             options.SandboxID,
-		RuntimeHandler: config.RuntimeNameRunsc,
-		Labels:         specConf.Annotations,
-		MetricLabels:   request.MetricLabels,
-		Stdout:         request.Stdout,
-		Stderr:         request.Stderr,
-	}
-
-	if options.NetworkStack != "" && options.NetworkStack != "netstack" {
-		return nil, fmt.Errorf("unsupported runsc network stack %q (only netstack is supported in the open-source adapter)", options.NetworkStack)
+		return fmt.Errorf("generate OCI bundle: %w", err)
 	}
 
 	startArgs := runscapi.StartArgs{
-		ID:         options.SandboxID,
+		ID:         config.ID,
 		BundleDir:  bundlePath,
-		UserStdout: request.Stdout,
-		UserStderr: request.Stderr,
+		UserStdout: config.Stdout,
+		UserStderr: config.Stderr,
 		Network: runscapi.NetworkConfig{
-			Interface: netDevice.Interface,
-			IP:        netDevice.Ip,
-			Mask:      netDevice.Mask,
-			Gateway:   netDevice.Gateway,
+			Interface: config.Network.Interface,
+			IP:        config.Network.Ip,
+			Mask:      config.Network.Mask,
+			Gateway:   config.Network.Gateway,
 		},
 	}
 	start := time.Now()
 	if err := r.runsc.Create(ctx, startArgs); err != nil {
-		return metaData, err
+		return err
 	}
 	if err := r.runsc.Start(ctx, startArgs); err != nil {
-		r.cleanupOnFailure(ctx, options.TraceID, options.SandboxID, fmt.Sprintf("start failed: %v, try to delete.", err))
-		return metaData, err
+		r.cleanupOnFailure(ctx, traceID.String(), config.ID, "runsc start failed")
+		return err
 	}
-	logrus.WithField(trace.ContextKeyTraceId, options.TraceID).Debugf("call runsc create/start, args: %+v, cost: %v", startArgs, time.Since(start))
-	return metaData, nil
+	logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf("call runsc create/start, args: %+v, cost: %v", startArgs, time.Since(start))
+	return nil
 }
 
-func (r *RunscServiceHandler) DeleteSandbox(
-	ctx context.Context,
-	request *DeleteSandboxRequest,
-	options HandlerOptions) (*DeleteSandboxResponse, error) {
-
+func (r *RunscHandler) Delete(ctx context.Context, sandboxID string) error {
+	traceID, _ := trace.GetContextID(ctx)
 	start := time.Now()
-	err := r.runsc.Delete(ctx, options.SandboxID, true)
+	err := r.runsc.Delete(ctx, sandboxID, true)
 	if err == nil {
-		logrus.WithField(trace.ContextKeyTraceId, options.TraceID).Debugf("call runsc delete, cost: %v", time.Since(start))
+		logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf("call runsc delete, cost: %v", time.Since(start))
 	}
-	return &DeleteSandboxResponse{}, err
+	return err
 }
 
-func (r *RunscServiceHandler) ListSandboxes(ctx context.Context, options HandlerOptions) ([]*UnionSandboxState, error) {
-	containers := make([]*UnionSandboxState, 0)
+func (r *RunscHandler) List(ctx context.Context) ([]*State, error) {
+	containers := make([]*State, 0)
 	output, err := r.runsc.ListJSON(ctx)
 	if err != nil {
 		return containers, err
@@ -244,21 +184,15 @@ func (r *RunscServiceHandler) ListSandboxes(ctx context.Context, options Handler
 	return containers, err
 }
 
-func (r *RunscServiceHandler) SandboxSpec(ctx context.Context, options HandlerOptions) (*spec.Spec, error) {
-	return nil, fmt.Errorf("runsc SandboxSpec is not implemented")
-}
-
-func (r *RunscServiceHandler) Wait(ctx context.Context, options HandlerOptions) (Exit, error) {
-	status, err := r.runsc.Wait(ctx, options.SandboxID)
+func (r *RunscHandler) Wait(ctx context.Context, sandboxID string) (Exit, error) {
+	status, err := r.runsc.Wait(ctx, sandboxID)
 	return Exit{
-		Timestamp: time.Now(),
-		Status:    status,
+		ExitedAt: time.Now(),
+		ExitCode: status,
 	}, err
 }
 
-func (r *RunscServiceHandler) ShutDown() {}
-
-func (r *RunscServiceHandler) cleanupOnFailure(ctx context.Context, traceID, sandboxID, msg string) {
+func (r *RunscHandler) cleanupOnFailure(ctx context.Context, traceID, sandboxID, msg string) {
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf("%s", msg)
 	if err := r.runsc.Delete(ctx, sandboxID, true); err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Warnf(

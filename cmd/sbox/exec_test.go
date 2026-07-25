@@ -31,3 +31,41 @@ func TestCommandExitCode(t *testing.T) {
 	assert.Equal(t, 7, commandExitCode(cli.NewExitError("", 7)))
 	assert.Equal(t, 1, commandExitCode(assert.AnError))
 }
+
+func TestRunscExecCommand(t *testing.T) {
+	runner := &runscExecRunner{
+		binary: "/usr/local/bin/runsc",
+		root:   "/run/runsc",
+	}
+	command := runner.command(
+		execRequest{
+			sandboxID: "sbox-test",
+			command:   "/bin/sh",
+			args:      []string{"-c", "echo ok"},
+			user:      "1000:1000",
+			env:       []string{"LANG=C"},
+			cwd:       "/tmp",
+		},
+		"--console-socket",
+		"/tmp/console.sock",
+	)
+
+	assert.Equal(t, []string{
+		"/usr/local/bin/runsc",
+		"--root",
+		"/run/runsc",
+		"exec",
+		"--console-socket",
+		"/tmp/console.sock",
+		"--user",
+		"1000:1000",
+		"--cwd",
+		"/tmp",
+		"--env",
+		"LANG=C",
+		"sbox-test",
+		"/bin/sh",
+		"-c",
+		"echo ok",
+	}, command.Args)
+}

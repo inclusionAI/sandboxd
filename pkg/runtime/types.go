@@ -14,28 +14,13 @@
 
 package runtime
 
-import (
-	"time"
-)
+import "time"
 
-const (
-	defaultRunscRoot = "/run/containerd/runsc/default"
-)
-
-// UnionSandboxState is the state of a container returned by the list command
-type UnionSandboxState struct {
-	// ID is the container ID
-	ID string `json:"id"`
-	// InitProcessPid is the init process id in the parent namespace
-	InitProcessPid int `json:"pid"`
-	// Status is the current status of the container
-	Status SandboxStatus `json:"status"`
-	// Bundle is the path on the filesystem to the bundle
-	Bundle string `json:"bundle"`
-	// Created is the unix timestamp for the creation time of the container in UTC
-	Created string `json:"created"`
-
-	updateTime *time.Time
+type State struct {
+	ID             string        `json:"id"`
+	InitProcessPid int           `json:"pid"`
+	Status         SandboxStatus `json:"status"`
+	Created        string        `json:"created"`
 }
 
 type SandboxStatus string
@@ -52,6 +37,6 @@ const (
 )
 
 type Exit struct {
-	Timestamp time.Time
-	Status    int
+	ExitedAt time.Time
+	ExitCode int
 }

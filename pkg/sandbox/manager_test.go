@@ -25,6 +25,7 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
@@ -35,7 +36,7 @@ import (
 )
 
 func TestNewManager(t *testing.T) {
-	handlers := cmap.New[svc.RealRuntimeHandler]()
+	handlers := cmap.New[svc.Handler]()
 	healthChan := make(chan bool)
 	cgMgr, err := cgroupmanager.NewCgroupManager(store.NewMockStore(), config.ResourceConfig{
 		MaxInstanceNum:  10,
@@ -232,6 +233,7 @@ func TestReserveIDValidatesCustomID(t *testing.T) {
 	m := &Manager{
 		sandboxes:     cmap.New[*Sandbox](),
 		maxSandboxNum: 10,
+		idGenerator:   util.NewUUIDGenerator(config.SandboxPrefix, nil),
 	}
 
 	id, err := m.ReserveID("sbox-custom")
@@ -242,6 +244,39 @@ func TestReserveIDValidatesCustomID(t *testing.T) {
 		_, err := m.ReserveID(invalidID)
 		assert.ErrorIs(t, err, errord.ErrInvalidArgument, invalidID)
 	}
+}
+
+func TestReserveIDIsAtomicForCustomID(t *testing.T) {
+	m := &Manager{
+		sandboxes:     cmap.New[*Sandbox](),
+		maxSandboxNum: 10,
+		idGenerator:   util.NewUUIDGenerator(config.SandboxPrefix, nil),
+	}
+
+	const callers = 16
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	successes := make(chan string, callers)
+	for range callers {
+		go func() {
+			defer wait.Done()
+			if id, err := m.ReserveID("sbox-concurrent"); err == nil {
+				successes <- id
+			}
+		}()
+	}
+	wait.Wait()
+	close(successes)
+
+	assert.Equal(t, []string{"sbox-concurrent"}, collectStrings(successes))
+}
+
+func collectStrings(values <-chan string) []string {
+	var result []string
+	for value := range values {
+		result = append(result, value)
+	}
+	return result
 }
 
 func TestStoreMetadata(t *testing.T) {
@@ -256,10 +291,28 @@ func TestStoreMetadata(t *testing.T) {
 		RuntimeHandler: "runsc",
 	}
 
-	m.StoreMetadata(metadata.ID, metadata)
+	assert.NoError(t, m.StoreMetadata(metadata.ID, metadata))
 
 	assert.Equal(t, 1, m.sandboxes.Count())
 	assert.True(t, m.sandboxes.Has(metadata.ID))
+}
+
+func TestStoreMetadataReturnsPersistenceFailure(t *testing.T) {
+	root := t.TempDir()
+	m := &Manager{
+		root:        root,
+		recyclePath: t.TempDir(),
+		sandboxes:   cmap.New[*Sandbox](),
+	}
+	assert.NoError(t, os.RemoveAll(root))
+	assert.NoError(t, os.WriteFile(root, []byte("not a directory"), 0600))
+
+	metadata := &runtime.SandboxMetadata{
+		ID:             "sbox-store-failure",
+		RuntimeHandler: "runsc",
+	}
+	assert.Error(t, m.StoreMetadata(metadata.ID, metadata))
+	assert.False(t, m.sandboxes.Has(metadata.ID))
 }
 
 func TestLoadSandbox(t *testing.T) {
@@ -293,7 +346,7 @@ func TestStartMonitorGoroutine(t *testing.T) {
 	}
 	sandboxes.Set(id, sb)
 
-	serviceHandler := cmap.New[svc.RealRuntimeHandler]()
+	serviceHandler := cmap.New[svc.Handler]()
 	r := svc.NewFakeRuntimeHandler()
 	serviceHandler.Set("runsc", r)
 
@@ -326,7 +379,7 @@ func TestHousekeeping(t *testing.T) {
 		root:            t.TempDir(),
 		recyclePath:     t.TempDir(),
 		sandboxes:       cmap.New[*Sandbox](),
-		serviceHandler:  cmap.New[svc.RealRuntimeHandler](),
+		serviceHandler:  cmap.New[svc.Handler](),
 		monitorStopChan: cmap.New[chan struct{}](),
 		healthChan:      healthChan,
 	}

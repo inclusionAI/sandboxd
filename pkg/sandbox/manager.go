@@ -47,7 +47,7 @@ type Manager struct {
 	recyclePath string
 
 	sandboxes      cmap.ConcurrentMap[string, *Sandbox]
-	serviceHandler cmap.ConcurrentMap[string, svc.RealRuntimeHandler]
+	serviceHandler cmap.ConcurrentMap[string, svc.Handler]
 	// cgroupMgr is used only by the OOM watcher. The server owns resource
 	// allocation/release and manager shutdown.
 	cgroupMgr *cgroupmanager.CgroupManager
@@ -95,7 +95,7 @@ func (n *exitNotifier) close() {
 
 func NewManager(
 	root string,
-	handlers cmap.ConcurrentMap[string, svc.RealRuntimeHandler],
+	handlers cmap.ConcurrentMap[string, svc.Handler],
 	healthChan chan bool,
 	cgroupMgr *cgroupmanager.CgroupManager,
 	maxSandboxNum int,
@@ -128,6 +128,9 @@ func NewManager(
 	if err := m.loadSandboxes(); err != nil {
 		return nil, err
 	}
+	for sandboxID := range m.sandboxes.Items() {
+		m.idGenerator.Reserve(sandboxID)
+	}
 
 	// Start monitors for recovered sandboxes immediately (don't wait for housekeeping).
 	for item := range m.sandboxes.IterBuffered() {
@@ -159,14 +162,6 @@ func (m *Manager) Stop() {
 
 }
 
-func (m *Manager) Handlers() []svc.RealRuntimeHandler {
-	handlers := make([]svc.RealRuntimeHandler, 0, m.serviceHandler.Count())
-	for item := range m.serviceHandler.IterBuffered() {
-		handlers = append(handlers, item.Val)
-	}
-	return handlers
-}
-
 // loop receive sandbox event from runtime handler or runtime lifecycle.
 func (m *Manager) loop() {
 	housekeepingTicker := time.NewTicker(35 * time.Second)
@@ -183,7 +178,7 @@ func (m *Manager) loop() {
 			}
 			return
 		case event := <-m.syncEventChan:
-			go m.syncEvent(event)
+			m.syncEvent(event)
 		}
 	}
 }
@@ -212,42 +207,37 @@ func (m *Manager) syncEvent(event Event) {
 }
 
 // StoreMetadata store all sandbox metadata to disk.
-func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) {
-	var err error
+func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error {
+	if data == nil || data.ID != id {
+		return fmt.Errorf("sandbox metadata ID does not match %q", id)
+	}
 	sandboxRoot, err := util.JoinWithinRoot(m.root, id)
 	if err != nil {
-		logrus.Errorf("resolve sandbox %q root failed: %v", id, err)
-		return
+		return fmt.Errorf("resolve sandbox %q root: %w", id, err)
 	}
 	start := time.Now()
-	defer func() {
-		if err == nil && !m.sandboxes.Has(data.ID) {
-			if c, err := m.loadSandbox(sandboxRoot); err != nil {
-				logrus.Warnf("init loading sandbox %s failed: %v, try later when housekeeping", data.ID, err)
-			} else {
-				m.sandboxes.Set(data.ID, c)
-			}
-		}
-	}()
 
-	if _, err = os.Stat(sandboxRoot); os.IsNotExist(err) {
-		if err = os.MkdirAll(sandboxRoot, 0755); err != nil {
-			logrus.Errorf("create sandbox root %s failed: %v", sandboxRoot, err)
-			return
+	if _, err := os.Stat(sandboxRoot); os.IsNotExist(err) {
+		if err := os.MkdirAll(sandboxRoot, 0755); err != nil {
+			return fmt.Errorf("create sandbox root %s: %w", sandboxRoot, err)
 		}
 	}
 	dataFile := filepath.Join(sandboxRoot, config.SandboxMetaFile)
 	bytes, err := proto.Marshal(data)
 	if err != nil {
-		logrus.Errorf("marshal %s sandbox metadata when store failed: %v", data.ID, err)
-		return
+		return fmt.Errorf("marshal sandbox metadata %s: %w", data.ID, err)
 	}
 
-	if err = util.AtomicWriteFile(dataFile, bytes, 0600); err != nil {
-		logrus.Errorf("save %s sandbox metadata failed: %v", data.ID, err)
-		return
+	if err := util.AtomicWriteFile(dataFile, bytes, 0600); err != nil {
+		return fmt.Errorf("save sandbox metadata %s: %w", data.ID, err)
 	}
+	stored, err := m.loadSandbox(sandboxRoot)
+	if err != nil {
+		return fmt.Errorf("load stored sandbox metadata %s: %w", data.ID, err)
+	}
+	m.sandboxes.Set(data.ID, stored)
 	logrus.Debugf("store sandbox %s metadata success, cost %v", data.ID, time.Since(start).String())
+	return nil
 }
 
 func (m *Manager) housekeeping() {
@@ -276,10 +266,10 @@ func (m *Manager) housekeeping() {
 	// 2. Maintain m.sandboxes
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cstates := make(map[string]*svc.UnionSandboxState)
+	cstates := make(map[string]*svc.State)
 
 	for r, handler := range m.serviceHandler.Items() {
-		states, err := handler.ListSandboxes(ctx, svc.HandlerOptions{})
+		states, err := handler.List(ctx)
 		if err != nil {
 			logrus.Errorf("list %s sandboxes failed: %v", r, err)
 			continue
@@ -461,7 +451,7 @@ func (m *Manager) startMonitorGoroutine(metaData *runtime.SandboxMetadata, stop 
 }
 
 // startMonitor monitors a running sandbox for exit events.
-func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan struct{}, handler svc.RealRuntimeHandler) {
+func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan struct{}, handler svc.Handler) {
 	logrus.Infof("start monitor sandbox %s", metaData.ID)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -477,9 +467,7 @@ func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan st
 		stopOOM := m.startOOMWatcher(metaData.ID, &oomFlag)
 		defer stopOOM()
 
-		exit, err := handler.Wait(ctx, svc.HandlerOptions{
-			SandboxID: metaData.ID,
-		})
+		exit, err := handler.Wait(ctx, metaData.ID)
 		// If context was cancelled (monitor stopped), don't send exit event.
 		if ctx.Err() != nil {
 			return
@@ -504,8 +492,8 @@ func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan st
 			Type:      EventTypeExit,
 			SandboxID: metaData.ID,
 			Pid:       -1,
-			ExitCode:  int32(exit.Status),
-			ExitedAt:  exit.Timestamp,
+			ExitCode:  int32(exit.ExitCode),
+			ExitedAt:  exit.ExitedAt,
 			OOMKilled: oom,
 		})
 	}()
@@ -575,8 +563,7 @@ func (m *Manager) UpdateLabels(id string, labels map[string]string) error {
 	if !needUpdate {
 		return nil
 	}
-	m.StoreMetadata(id, c.Metadata)
-	return nil
+	return m.StoreMetadata(id, c.Metadata)
 }
 
 func (m *Manager) List(option ...ListOption) []*Sandbox {
@@ -724,7 +711,7 @@ func ListFilterByLabels(labels map[string]string) ListOption {
 }
 
 func (m *Manager) ReserveID(requestedID string) (string, error) {
-	if m.sandboxes.Count() >= m.maxSandboxNum {
+	if m.idGenerator.Len() >= m.maxSandboxNum {
 		return "", errord.ErrSandboxNumExceed
 	}
 	if requestedID != "" {
@@ -734,7 +721,7 @@ func (m *Manager) ReserveID(requestedID string) (string, error) {
 				requestedID, config.SandboxIDPrefix, errord.ErrInvalidArgument,
 			)
 		}
-		if m.sandboxes.Has(requestedID) {
+		if !m.idGenerator.Reserve(requestedID) {
 			return "", fmt.Errorf("sandbox %s: %w", requestedID, errord.ErrAlreadyExists)
 		}
 		return requestedID, nil
@@ -844,8 +831,8 @@ func (m *Manager) ReceiveEvent(event Event) {
 	select {
 	case m.syncEventChan <- event:
 		logrus.Debugf("receive event: %+v", event)
-	default:
-		logrus.Warnf("event channel full, dropping event: %+v", event)
+	case <-m.stopChan:
+		logrus.Debugf("ignore event after sandbox manager shutdown: %+v", event)
 	}
 }
 

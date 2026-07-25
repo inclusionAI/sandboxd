@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -56,13 +55,8 @@ import (
 
 type SandboxService interface {
 	runtime.SandboxServiceServer
-	// Closer is used by containerd to gracefully stop sandbox service.
-	io.Closer
-
 	Run() error
-
-	ShutDown()
-
+	Shutdown()
 	Ready() bool
 	RegisterServer(*grpc.Server)
 }
@@ -73,7 +67,7 @@ var _ SandboxService = &sandboxService{}
 type sandboxService struct {
 	// config is the sandbox service config
 	config         config.Config
-	serviceHandler cmap.ConcurrentMap[string, svc.RealRuntimeHandler]
+	serviceHandler cmap.ConcurrentMap[string, svc.Handler]
 
 	sandboxManager *sandbox.Manager
 
@@ -117,7 +111,7 @@ func (h *sandboxService) loadRuntimeHandlers() {
 			if h.serviceHandler.Has(runtimeName) {
 				continue
 			}
-			handler, err := svc.GetRuntimeHandler(h.config, runtimeBin, runtimeName, h.volumeMgr)
+			handler, err := svc.NewHandler(h.config, runtimeBin, runtimeName)
 			if err != nil {
 				logrus.Warnf("load runtime %v handler failed: %v", runtimeName, err)
 				allLoaded = false
@@ -156,123 +150,86 @@ func copyStringMap(in map[string]string) map[string]string {
 	return out
 }
 
-func (h *sandboxService) startSandboxRuntime(ctx context.Context, request *svc.StartSandboxRequest, networkStack string, resources *preparedStartResources) (*svc.StartSandboxResponse, error) {
+func (h *sandboxService) startSandboxRuntime(
+	ctx context.Context,
+	runtimeName string,
+	startConfig svc.StartConfig,
+) (err error) {
 	traceID, spanID := trace.GetContextID(ctx)
-	response := new(svc.StartSandboxResponse)
 	start := time.Now()
-	var err error
 	defer func() {
 		if err != nil {
 			logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("StartSandbox failed, traceID: %v, spanId: %v, err: %v", traceID, spanID, err)
 		}
 	}()
 
-	if err = h.checkRuntime(request.Runtime); err != nil {
+	if err = h.checkRuntime(runtimeName); err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("check runtime failed: %v", err)
-		return response, fmt.Errorf("runtime %q is not available: %w", request.Runtime, err)
+		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
 	}
 
-	handler, ok := h.serviceHandler.Get(request.Runtime)
+	handler, ok := h.serviceHandler.Get(runtimeName)
 	if !ok {
-		return response, errord.ToGRPC(errord.ErrNotImplemented)
+		return errord.ToGRPC(errord.ErrNotImplemented)
 	}
 
-	metaData, err := handler.StartSandbox(ctx, request, svc.HandlerOptions{
-		TraceID:   traceID.String(),
-		SpanID:    spanID.String(),
-		SandboxID: resources.ID,
-
-		CgroupPath:            resources.Resources[config.ResourceNameCgroup],
-		AdditionalAnnotations: resources.ToLabels(),
-		NetworkStack:          networkStack,
-	})
-	if err != nil {
+	if err = handler.Start(ctx, startConfig); err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
-		h.sandboxManager.CleanSandboxRoot(resources.ID)
-		// clean std file
-		if metaData != nil {
-			if err := os.RemoveAll(metaData.Stderr); err != nil {
-				logrus.WithField(trace.ContextKeyTraceId, traceID).Warnf("clean std file failed: %v", err)
-			}
-			if err := os.RemoveAll(metaData.Stdout); err != nil {
-				logrus.WithField(trace.ContextKeyTraceId, traceID).Warnf("clean std file failed: %v", err)
-			}
-		}
-		return response, errord.ToGRPC(err)
+		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
+		return errord.ToGRPC(err)
 	}
 
-	response.ID = resources.ID
-
-	h.sandboxManager.StoreMetadata(resources.ID, metaData)
-	logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("StartSandbox %s success, traceID: %v, spanId: %v, cost: %v", resources.ID, traceID, spanID, time.Since(start).String())
-
-	go h.sandboxManager.ReceiveEvent(sandbox.Event{
-		Type:      sandbox.EventTypeCreate,
-		MetaData:  metaData,
-		SandboxID: resources.ID,
-	})
-
-	return response, nil
+	logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("StartSandbox %s success, traceID: %v, spanId: %v, cost: %v", startConfig.ID, traceID, spanID, time.Since(start).String())
+	return nil
 }
 
-func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, request *svc.DeleteSandboxRequest) (response *svc.DeleteSandboxResponse, err error) {
+func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string) (err error) {
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("DeleteSandbox %s failed, traceID: %v, spanId: %v, err: %v", request.ID, traceID, spanID, err)
+			logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("DeleteSandbox %s failed, traceID: %v, spanId: %v, err: %v", sandboxID, traceID, spanID, err)
 		} else {
-			logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("DeleteSandbox %s success, traceID: %v, spanId: %v, cost: %v", request.ID, traceID, spanID, time.Since(start).String())
+			logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("DeleteSandbox %s success, traceID: %v, spanId: %v, cost: %v", sandboxID, traceID, spanID, time.Since(start).String())
 		}
 	}()
 
-	c, err := h.sandboxManager.Get(request.ID)
+	c, err := h.sandboxManager.Get(sandboxID)
 	if err != nil {
-		return response, errord.ToGRPC(err)
+		return errord.ToGRPC(err)
 	}
 
 	if h.checkRuntime(c.Metadata.RuntimeHandler) != nil {
-		return response, errord.ToGRPC(errord.ErrNotImplemented)
+		return errord.ToGRPC(errord.ErrNotImplemented)
 	}
 
 	handler, ok := h.serviceHandler.Get(c.Metadata.RuntimeHandler)
 	if !ok {
-		return response, errord.ToGRPC(errord.ErrNotImplemented)
+		return errord.ToGRPC(errord.ErrNotImplemented)
 	}
 
-	resource, err := h.sandboxManager.CollectResourceByID(request.ID)
+	resource, err := h.sandboxManager.CollectResourceByID(sandboxID)
 	if err != nil {
-		return response, err
+		return err
 	}
 
-	// TODO: implement graceful deletion using request.Timeout. The v0.1.0
-	// contract is force-only, so timeout is intentionally ignored.
-	response, err = handler.DeleteSandbox(ctx, request, svc.HandlerOptions{
-		TraceID:               traceID.String(),
-		SpanID:                spanID.String(),
-		SandboxID:             request.ID,
-		ForceDelete:           true,
-		AdditionalAnnotations: c.Spec.Annotations,
-	})
+	err = handler.Delete(ctx, sandboxID)
 	if err != nil && !errors.Is(err, errord.ErrNotFound) {
 		metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler force delete sandbox failed: %v", err)
-		return response, errord.ToGRPC(err)
+		return errord.ToGRPC(err)
 	}
 	metrics.RecordRuntimeCallResult("delete", "success", c.Metadata.RuntimeHandler)
 
+	if err := h.fsMgr.Release(sandboxID); err != nil {
+		return err
+	}
 	if err := h.releaseStartResources(resource); err != nil {
-		return response, err
+		return err
 	}
 
-	h.sandboxManager.Delete(request.ID)
-	// clean c in goroutine.
-	go h.sandboxManager.ReceiveEvent(sandbox.Event{
-		Type:      sandbox.EventTypeDelete,
-		SandboxID: request.ID,
-	})
-
-	return response, nil
+	h.sandboxManager.Delete(sandboxID)
+	return nil
 }
 
 func (h *sandboxService) List(ctx context.Context, request *runtime.ListSandboxesRequest) (*runtime.ListSandboxesResponse, error) {
@@ -369,25 +326,13 @@ func (h *sandboxService) ListAvailableRuntimes(
 	}, nil
 }
 
-func (h *sandboxService) Close() (err error) {
-	defer func() {
-		if err != nil {
-			logrus.Errorf("close sandbox service failed: %v", err)
-		} else {
-			logrus.Info("close sandbox service success")
-		}
-	}()
-	h.sandboxManager.Stop()
-	return nil
-}
-
 func (h *sandboxService) Run() error {
 	logrus.Infof("sandbox service run at %s", h.config.RootDir)
 	h.sandboxManager.Start()
 	return nil
 }
 
-func (h *sandboxService) ShutDown() {
+func (h *sandboxService) Shutdown() {
 	logrus.Info("sandbox service shutting down: cleaning up sandboxes")
 
 	// 1. Force-delete all running sandboxes with per-sandbox timeout.
@@ -398,26 +343,19 @@ func (h *sandboxService) ShutDown() {
 		}
 		id := c.Metadata.ID
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if _, err := h.deleteSandboxRuntime(ctx, &svc.DeleteSandboxRequest{ID: id}); err != nil {
+		if err := h.deleteSandboxRuntime(ctx, id); err != nil {
 			logrus.Warnf("shutdown: failed to delete sandbox %s: %v", id, err)
 		}
 		cancel()
 
-		h.fsMgr.Release(id)
 	}
 
 	h.fsMgr.Shutdown()
 
-	// 2. Shut down all runtime handlers. Must happen after sandboxes are
-	// gone but before resource managers and XFS are torn down.
-	for _, handler := range h.sandboxManager.Handlers() {
-		handler.ShutDown()
-	}
-
-	// 3. Stop sandbox manager (stops event loop + monitors).
+	// 2. Stop sandbox manager (stops event loop + monitors).
 	h.sandboxManager.Stop()
 
-	// 4. Stop resource managers owned by the server.
+	// 3. Stop resource managers owned by the server.
 	if h.cgroupMgr != nil {
 		if err := h.cgroupMgr.ShutDown(); err != nil {
 			logrus.Warnf("shutdown: failed to stop cgroup manager: %v", err)
@@ -631,7 +569,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}
 	// On any subsequent init failure, roll infrastructure modules back in
 	// reverse construction order. defer-LIFO gives the reverse-order
-	// shutdown that mirrors ShutDown() without duplicating its body.
+	// Clean up initialized modules if construction fails.
 	// Without these, Restart=always would loop with leaked distillfs
 	// goroutines / bbolt handles, an XFS mount still attached, and
 	// resource-manager's OTel collector still pushing metrics.
@@ -647,7 +585,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		config:                            cfg,
 		store:                             stateStore,
 		UnimplementedSandboxServiceServer: runtime.UnimplementedSandboxServiceServer{},
-		serviceHandler:                    cmap.New[svc.RealRuntimeHandler](),
+		serviceHandler:                    cmap.New[svc.Handler](),
 		fsMgr:                             newFSManager(imgSvc, stateStore),
 		imageMod:                          imgMod,
 		resourceMod:                       nodeResMod,
@@ -750,17 +688,7 @@ func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequ
 	// Clean up DNAT rules before deleting sandbox
 	h.networkMgr.cleanupDnatRules(request.ID)
 
-	deleteSandboxRequest := &svc.DeleteSandboxRequest{
-		ID:      request.ID,
-		Timeout: request.Timeout,
-	}
-
-	_, err = h.deleteSandboxRuntime(ctx, deleteSandboxRequest)
-
-	if err == nil {
-		h.fsMgr.Release(request.ID)
-	}
-
+	err = h.deleteSandboxRuntime(ctx, request.ID)
 	return response, err
 }
 
@@ -840,6 +768,21 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	if startReq.Network == "" {
 		startReq.Network = "sandbox"
 	}
+	if startReq.ExtraConfig != "" {
+		var extraConfig ExtraConfig
+		if err := json.Unmarshal([]byte(startReq.ExtraConfig), &extraConfig); err != nil {
+			return &runtime.StartResponse{
+				Code:    -1,
+				Message: fmt.Sprintf("invalid extra config: %v", err),
+			}, errord.ToGRPC(errord.ErrInvalidArgument)
+		}
+		if extraConfig.NetworkStack != "" && extraConfig.NetworkStack != "netstack" {
+			return &runtime.StartResponse{
+				Code:    -1,
+				Message: fmt.Sprintf("unsupported network stack %q", extraConfig.NetworkStack),
+			}, errord.ToGRPC(errord.ErrInvalidArgument)
+		}
+	}
 
 	if err := h.checkRuntime(startReq.Runtime); err != nil {
 		return &runtime.StartResponse{
@@ -856,11 +799,43 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}, errord.ToGRPC(err)
 	}
 	startReq.SandboxID = sandboxID
-	idCommitted := false
+	startSucceeded := false
+	var preparedFilesystem *preparedFS
+	var preparedResources *preparedStartResources
+	var filesystemCommitted bool
+	var runtimeStarted bool
+	var dnatConfigured bool
 	defer func() {
-		if !idCommitted {
-			h.sandboxManager.ReleaseID(sandboxID)
+		if startSucceeded {
+			return
 		}
+		if runtimeStarted {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
+				if err := handler.Delete(cleanupCtx, sandboxID); err != nil {
+					logrus.Warnf("rollback runtime for sandbox %s: %v", sandboxID, err)
+				} else {
+					h.sandboxManager.CleanSandboxRoot(sandboxID)
+				}
+			}
+			cancel()
+		}
+		if dnatConfigured {
+			h.networkMgr.cleanupDnatRules(sandboxID)
+		}
+		if filesystemCommitted {
+			if err := h.fsMgr.Release(sandboxID); err != nil {
+				logrus.Warnf("rollback filesystem state for sandbox %s: %v", sandboxID, err)
+			}
+		} else if preparedFilesystem != nil {
+			preparedFilesystem.Rollback()
+		}
+		if preparedResources != nil {
+			if err := h.releaseStartResources(preparedResources.OccupiedResource); err != nil {
+				logrus.Warnf("rollback resources for sandbox %s: %v", sandboxID, err)
+			}
+		}
+		h.sandboxManager.ReleaseID(sandboxID)
 	}()
 
 	fsCh := make(chan fsPrepareResult, 1)
@@ -876,23 +851,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 
 	fsResult := <-fsCh
 	resourceResult := <-resourceCh
-	preparedFS := fsResult.fs
-	preparedResources := resourceResult.resources
-
-	fsCommitted := false
-	defer func() {
-		if !fsCommitted && preparedFS != nil {
-			preparedFS.Rollback()
-		}
-	}()
-	resourcesCommitted := false
-	defer func() {
-		if !resourcesCommitted && preparedResources != nil {
-			if err := h.releaseStartResources(preparedResources.OccupiedResource); err != nil {
-				logrus.Warnf("rollback resources for sandbox %s failed: %v", sandboxID, err)
-			}
-		}
-	}()
+	preparedFilesystem = fsResult.fs
+	preparedResources = resourceResult.resources
 	if fsResult.err != nil || resourceResult.err != nil {
 		err := errors.Join(fsResult.err, resourceResult.err)
 		return &runtime.StartResponse{
@@ -905,7 +865,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	// Rootfs env (from image mount) goes first with lowest priority; request
 	// envs follow and override on key conflict because combineEnvs uses a map
 	// where later entries win.
-	rootfsEnvs := preparedFS.rootfs.RootFS.Env()
+	rootfsEnvs := preparedFilesystem.rootfs.RootFS.Env()
 	env := make([]*runtime.KeyValue, 0, len(rootfsEnvs)+len(startReq.Envs))
 	for _, e := range rootfsEnvs {
 		if parts := strings.SplitN(e, "=", 2); len(parts) == 2 {
@@ -922,78 +882,85 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		})
 	}
 
-	var networkStack string
-	if startReq.ExtraConfig != "" {
-		var extraConfig ExtraConfig
-		err := json.Unmarshal([]byte(startReq.ExtraConfig), &extraConfig)
-		if err != nil {
-			logrus.Errorf("unmarshal extra config failed: %v, extra_config: %v", err, startReq.ExtraConfig)
-		} else {
-			logrus.Infof("unmarshal extra config success: %v, original extra_config: %v", extraConfig, startReq.ExtraConfig)
-			networkStack = extraConfig.NetworkStack
-		}
+	annotations := copyStringMap(startReq.Labels)
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	for key, value := range preparedResources.ToLabels() {
+		annotations[key] = value
 	}
 
-	startSandboxRequest := &svc.StartSandboxRequest{
-		Runtime: startReq.Runtime,
-		Command: startReq.Command,
-		Rootfs: &svc.Rootfs{
-			Type:     "none",
-			LowerDir: "",
-			RootDir:  preparedFS.RootfsPath(),
-		},
-		Resource:     resourcesToLinux(startReq.Resources),
-		Mounts:       preparedFS.Mounts(),
-		Envs:         env,
-		Network:      startReq.Network,
-		Labels:       copyStringMap(startReq.Labels),
-		MetricLabels: copyStringMap(startReq.MetricLabels),
-		Stdout:       startReq.Stdout,
-		Stderr:       startReq.Stderr,
-		Cwd:          startReq.Cwd,
+	runtimeConfig := svc.StartConfig{
+		ID:          sandboxID,
+		Command:     startReq.Command,
+		Rootfs:      preparedFilesystem.RootfsPath(),
+		Resources:   resourcesToLinux(startReq.Resources),
+		Mounts:      preparedFilesystem.Mounts(),
+		Envs:        env,
+		Stdout:      startReq.Stdout,
+		Stderr:      startReq.Stderr,
+		Cwd:         startReq.Cwd,
+		CgroupPath:  preparedResources.Resources[config.ResourceNameCgroup],
+		Annotations: annotations,
+		Network:     preparedResources.network,
 	}
-	startSandboxResponse, err := h.startSandboxRuntime(ctx, startSandboxRequest, networkStack, preparedResources)
-	if err != nil {
+	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
 			Message: fmt.Sprintf("Failed to start: %v", err),
 			ID:      "",
 		}, err
 	}
-	resourcesCommitted = true
-	idCommitted = true
+	runtimeStarted = true
 
 	// If Ports are specified, set up DNAT rules using sandbox IP from startSandboxRuntime.
 	if len(startReq.Ports) > 0 {
 		if preparedResources.sandboxIP == "" {
-			h.deleteSandboxRuntime(ctx, &svc.DeleteSandboxRequest{
-				ID:      startSandboxResponse.ID,
-				Timeout: 0,
-			})
 			return &runtime.StartResponse{
 				Code:    -1,
 				Message: "Failed to get sandbox IP for DNAT",
 			}, errors.New("sandbox IP not available")
 		}
-		if err := h.networkMgr.setupDnatRules(startSandboxResponse.ID, startReq.Ports, preparedResources.sandboxIP); err != nil {
-			h.networkMgr.cleanupDnatRules(startSandboxResponse.ID)
-			h.deleteSandboxRuntime(ctx, &svc.DeleteSandboxRequest{
-				ID:      startSandboxResponse.ID,
-				Timeout: 0,
-			})
+		if err := h.networkMgr.setupDnatRules(sandboxID, startReq.Ports, preparedResources.sandboxIP); err != nil {
 			return &runtime.StartResponse{
 				Code:    -1,
 				Message: fmt.Sprintf("Failed to setup DNAT rules: %v", err),
 			}, err
 		}
+		dnatConfigured = true
 	}
 
-	h.fsMgr.Commit(startSandboxResponse.ID, preparedFS)
-	fsCommitted = true
+	if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
+		return &runtime.StartResponse{
+			Code:    -1,
+			Message: fmt.Sprintf("Failed to commit filesystem state: %v", err),
+		}, err
+	}
+	filesystemCommitted = true
+	metadata := &runtime.SandboxMetadata{
+		ID:             sandboxID,
+		RuntimeHandler: startReq.Runtime,
+		Labels:         copyStringMap(startReq.Labels),
+		MetricLabels:   copyStringMap(startReq.MetricLabels),
+		Stdout:         startReq.Stdout,
+		Stderr:         startReq.Stderr,
+	}
+	if err := h.sandboxManager.StoreMetadata(sandboxID, metadata); err != nil {
+		return &runtime.StartResponse{
+			Code:    -1,
+			Message: fmt.Sprintf("Failed to persist sandbox metadata: %v", err),
+		}, err
+	}
+	h.sandboxManager.ReceiveEvent(sandbox.Event{
+		Type:      sandbox.EventTypeCreate,
+		MetaData:  metadata,
+		SandboxID: sandboxID,
+	})
+	startSucceeded = true
 	return &runtime.StartResponse{
 		Code:    0,
 		Message: "Succeed",
-		ID:      startSandboxResponse.ID,
+		ID:      sandboxID,
 	}, nil
 }
 

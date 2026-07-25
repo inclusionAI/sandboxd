@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/sirupsen/logrus"
 )
@@ -26,6 +27,7 @@ import (
 type preparedStartResources struct {
 	sandbox.OccupiedResource
 	sandboxIP string
+	network   *networkmanager.NetResource
 }
 
 func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*preparedStartResources, error) {
@@ -38,8 +40,8 @@ func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*
 	for _, name := range required {
 		name := name
 		go func() {
-			value, ip, err := h.allocateStartResource(name)
-			resultCh <- resourceResult{name: name, value: value, sandboxIP: ip, err: err}
+			value, network, err := h.allocateStartResource(name)
+			resultCh <- resourceResult{name: name, value: value, network: network, err: err}
 		}()
 	}
 
@@ -60,8 +62,9 @@ func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*
 			continue
 		}
 		resources.Resources[result.name] = result.value
-		if result.sandboxIP != "" {
-			resources.sandboxIP = result.sandboxIP
+		if result.network != nil {
+			resources.network = result.network
+			resources.sandboxIP = result.network.Ip.String()
 		}
 	}
 	if firstErr != nil {
@@ -74,31 +77,31 @@ func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*
 }
 
 type resourceResult struct {
-	name      string
-	value     string
-	sandboxIP string
-	err       error
+	name    string
+	value   string
+	network *networkmanager.NetResource
+	err     error
 }
 
-func (h *sandboxService) allocateStartResource(name string) (value string, sandboxIP string, err error) {
+func (h *sandboxService) allocateStartResource(name string) (string, *networkmanager.NetResource, error) {
 	switch name {
 	case config.ResourceNameCgroup:
 		if h.cgroupMgr == nil {
-			return "", "", fmt.Errorf("cgroup manager not configured")
+			return "", nil, fmt.Errorf("cgroup manager not configured")
 		}
 		value, err := h.cgroupMgr.Allocate()
-		return value, "", err
+		return value, nil, err
 	case config.ResourceNameInterface:
 		if h.networkMgr == nil {
-			return "", "", fmt.Errorf("network manager not configured")
+			return "", nil, fmt.Errorf("network manager not configured")
 		}
 		network, err := h.networkMgr.Prepare()
 		if err != nil {
-			return "", "", err
+			return "", nil, err
 		}
-		return network.resource, network.ip, nil
+		return network.resource, network.config, nil
 	default:
-		return "", "", fmt.Errorf("resource %s is not registered", name)
+		return "", nil, fmt.Errorf("resource %s is not registered", name)
 	}
 }
 

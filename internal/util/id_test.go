@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestUUIDGenerator(t *testing.T) {
@@ -40,6 +41,16 @@ func TestUUIDGenerator(t *testing.T) {
 	if generator.Len() != 0 {
 		t.Fatalf("generator length after release = %d, want 0", generator.Len())
 	}
+}
+
+func TestUniqueIDGeneratorReserve(t *testing.T) {
+	generator := NewUUIDGenerator("sbox", nil)
+	assert.True(t, generator.Reserve("sbox-explicit"))
+	assert.False(t, generator.Reserve("sbox-explicit"))
+	assert.Equal(t, 1, generator.Len())
+
+	generator.Release("sbox-explicit")
+	assert.True(t, generator.Reserve("sbox-explicit"))
 }
 
 func TestFixedLengthIDGenerator(t *testing.T) {

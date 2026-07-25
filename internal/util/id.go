@@ -31,6 +31,7 @@ const (
 // released yet.
 type UniqueIDGenerator interface {
 	Next() (string, error)
+	Reserve(id string) bool
 	Release(id string)
 	Len() int
 }
@@ -92,6 +93,18 @@ func (g *uniqueIDGenerator) Next() (string, error) {
 		g.mu.Unlock()
 	}
 	return "", fmt.Errorf("failed to generate a unique ID after %d attempts", maxIDGenerationAttempts)
+}
+
+// Reserve marks a caller-provided ID as in use. It returns false when the ID
+// was already reserved.
+func (g *uniqueIDGenerator) Reserve(id string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, exists := g.ids[id]; exists {
+		return false
+	}
+	g.ids[id] = struct{}{}
+	return true
 }
 
 func (g *uniqueIDGenerator) Release(id string) {

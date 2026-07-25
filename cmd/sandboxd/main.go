@@ -124,7 +124,7 @@ func main() {
 	}()
 
 	shutDownFunc := make([]func(), 0)
-	shutDownFunc = append(shutDownFunc, sandboxService.ShutDown)
+	shutDownFunc = append(shutDownFunc, sandboxService.Shutdown)
 	serveGrpc(ctx, rpc, shutDownFunc)
 }
 

@@ -24,8 +24,8 @@ import (
 
 func Test_combineEnvs(t *testing.T) {
 	type args struct {
-		envs    []string
-		request *StartSandboxRequest
+		envs      []string
+		overrides []*runtime.KeyValue
 	}
 	tests := []struct {
 		name string
@@ -36,12 +36,10 @@ func Test_combineEnvs(t *testing.T) {
 			name: "combineEnvs",
 			args: args{
 				envs: []string{"a=1", "b=2"},
-				request: &StartSandboxRequest{
-					Envs: []*runtime.KeyValue{
-						{
-							Key:   "c",
-							Value: "3",
-						},
+				overrides: []*runtime.KeyValue{
+					{
+						Key:   "c",
+						Value: "3",
 					},
 				},
 			},
@@ -51,12 +49,10 @@ func Test_combineEnvs(t *testing.T) {
 			name: "combineEnvs-0",
 			args: args{
 				envs: []string{"a=1", "b=2"},
-				request: &StartSandboxRequest{
-					Envs: []*runtime.KeyValue{
-						{
-							Key:   "a",
-							Value: "3",
-						},
+				overrides: []*runtime.KeyValue{
+					{
+						Key:   "a",
+						Value: "3",
 					},
 				},
 			},
@@ -65,7 +61,7 @@ func Test_combineEnvs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := combineEnvs(tt.args.envs, tt.args.request)
+			got := combineEnvs(tt.args.envs, tt.args.overrides)
 			sort.Strings(got)
 			sort.Strings(tt.want)
 			if !reflect.DeepEqual(got, tt.want) {
@@ -88,10 +84,10 @@ func TestGenerateOciPreservesEntrypoint(t *testing.T) {
 	_, spec, err := loader.GenerateOci(OciLoadOptions{
 		SandboxID:  "sandbox-id",
 		CgroupPath: "/sandbox/test",
-		Request: &StartSandboxRequest{
-			Rootfs:   &Rootfs{RootDir: t.TempDir()},
-			Command:  command,
-			Resource: &runtime.LinuxSandboxResources{},
+		Config: StartConfig{
+			Rootfs:    t.TempDir(),
+			Command:   command,
+			Resources: &runtime.LinuxSandboxResources{},
 			Mounts: []*runtime.Mount{{
 				Target: "/opt/runtime",
 				Type:   "erofs",
@@ -115,8 +111,8 @@ func TestGenerateOciRejectsEscapingSandboxID(t *testing.T) {
 	_, _, err = loader.GenerateOci(OciLoadOptions{
 		SandboxID:  "../outside",
 		CgroupPath: "/sandbox/test",
-		Request: &StartSandboxRequest{
-			Rootfs:  &Rootfs{RootDir: t.TempDir()},
+		Config: StartConfig{
+			Rootfs:  t.TempDir(),
 			Command: []string{"/bin/true"},
 		},
 	})

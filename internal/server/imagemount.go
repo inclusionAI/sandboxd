@@ -178,7 +178,7 @@ func (m *s3MountManager) unmountS3(cfg *runtime.S3Config) error {
 }
 
 // cleanupAllS3Unmounts unmounts all remaining S3 mounts.
-// Called during ShutDown.
+// Called during shutdown.
 func (m *s3MountManager) cleanupAllS3Unmounts() {
 	m.mu.Lock()
 	entries := make(map[string]*imageMountEntry, len(m.entries))
@@ -306,7 +306,7 @@ func (m *ociMountManager) unmountOCI(imageURL string) error {
 }
 
 // cleanupAllOciUnmounts unmounts all remaining OCI image mounts.
-// Called during ShutDown.
+// Called during shutdown.
 func (m *ociMountManager) cleanupAllOciUnmounts() {
 	m.mu.Lock()
 	entries := make(map[string]*imageMountEntry, len(m.entries))

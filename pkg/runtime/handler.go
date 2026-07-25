@@ -24,85 +24,39 @@ import (
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
-	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
-
-	spec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 )
 
-// RealRuntimeHandler is the interface implemented by runtime adapters.
-type RealRuntimeHandler interface {
-	StartSandbox(context.Context, *StartSandboxRequest, HandlerOptions) (*runtime.SandboxMetadata, error)
-	DeleteSandbox(context.Context, *DeleteSandboxRequest, HandlerOptions) (*DeleteSandboxResponse, error)
-	ListSandboxes(context.Context, HandlerOptions) ([]*UnionSandboxState, error)
-	SandboxSpec(context.Context, HandlerOptions) (*spec.Spec, error)
-
-	Wait(context.Context, HandlerOptions) (Exit, error)
-
-	// ShutDown cleans up all runtime resources before the daemon exits.
-	ShutDown()
+// Handler is the lifecycle boundary implemented by sandbox runtimes.
+type Handler interface {
+	Start(context.Context, StartConfig) error
+	Delete(context.Context, string) error
+	List(context.Context) ([]*State, error)
+	Wait(context.Context, string) (Exit, error)
 }
 
-type HandlerOptions struct {
-	TraceID   string
-	SpanID    string
-	SandboxID string
-
-	// For delete
-	ForceDelete bool
-	// For resource
-	CgroupPath string
-
-	AdditionalAnnotations map[string]string
-
-	// NetworkStack selects the in-sandbox network stack for runsc-backed
-	// containers. The open-source adapter supports gVisor netstack only; empty
-	// is treated as netstack for compatibility with older requests.
-	NetworkStack string
+type StartConfig struct {
+	ID          string
+	Command     []string
+	Mounts      []*runtime.Mount
+	Rootfs      string
+	Resources   *runtime.LinuxSandboxResources
+	Envs        []*runtime.KeyValue
+	Stdout      string
+	Stderr      string
+	Cwd         string
+	CgroupPath  string
+	Annotations map[string]string
+	Network     *networkmanager.NetResource
 }
 
-type Rootfs struct {
-	Type     string
-	LowerDir string
-	RootDir  string
-}
-
-type StartSandboxRequest struct {
-	Runtime      string
-	Command      []string
-	Mounts       []*runtime.Mount
-	Rootfs       *Rootfs
-	Resource     *runtime.LinuxSandboxResources
-	Envs         []*runtime.KeyValue
-	Stdout       string
-	Stderr       string
-	Network      string
-	Labels       map[string]string
-	MetricLabels map[string]string
-	Cwd          string
-}
-
-type StartSandboxResponse struct {
-	ID string
-}
-
-type DeleteSandboxRequest struct {
-	ID      string
-	Timeout int64
-}
-
-type DeleteSandboxResponse struct{}
-
-// GetRuntimeHandler constructs the per-runtime handler for sandboxd. The
-// VolumeManager is required so the runsc handler knows whether to advertise
-// fork (ficlone) support; pass nil for tests/probes that don't need fork.
-func GetRuntimeHandler(cfg config.Config, bin, runtime string, volMod *volumemanager.Module) (RealRuntimeHandler, error) {
-	// check if the binary is existed
+func NewHandler(cfg config.Config, bin, runtimeName string) (Handler, error) {
 	if _, err := os.Stat(bin); err != nil {
 		return nil, err
 	}
 
 	sandboxRoot := filepath.Join(cfg.RootDir, "containers")
-	switch runtime {
+	switch runtimeName {
 	case config.RuntimeNameRunsc:
 		if cfg.RuntimeConfig.BasicSpec == nil {
 			cfg.RuntimeConfig.BasicSpec = make(map[string]string)
@@ -111,7 +65,7 @@ func GetRuntimeHandler(cfg config.Config, bin, runtime string, volMod *volumeman
 		if err != nil {
 			return nil, err
 		}
-		return NewRunscServiceHandler(cfg, bin, loader, volMod)
+		return NewRunscHandler(cfg, bin, loader)
 	default:
 		return nil, errord.ErrNotImplemented
 	}
@@ -123,40 +77,24 @@ func NewFakeRuntimeHandler() *FakeRuntimeHandler {
 
 type FakeRuntimeHandler struct{}
 
-func (f *FakeRuntimeHandler) StartSandbox(
-	ctx context.Context,
-	request *StartSandboxRequest,
-	options HandlerOptions,
-) (*runtime.SandboxMetadata, error) {
-
-	return &runtime.SandboxMetadata{}, getErrorFromContext(ctx)
+func (f *FakeRuntimeHandler) Start(ctx context.Context, _ StartConfig) error {
+	return getErrorFromContext(ctx)
 }
 
-func (f *FakeRuntimeHandler) DeleteSandbox(
-	ctx context.Context,
-	request *DeleteSandboxRequest,
-	options HandlerOptions,
-) (*DeleteSandboxResponse, error) {
-
-	return &DeleteSandboxResponse{}, getErrorFromContext(ctx)
+func (f *FakeRuntimeHandler) Delete(ctx context.Context, _ string) error {
+	return getErrorFromContext(ctx)
 }
 
-func (f *FakeRuntimeHandler) ListSandboxes(ctx context.Context, options HandlerOptions) ([]*UnionSandboxState, error) {
-	return []*UnionSandboxState{}, getErrorFromContext(ctx)
+func (f *FakeRuntimeHandler) List(ctx context.Context) ([]*State, error) {
+	return []*State{}, getErrorFromContext(ctx)
 }
 
-func (f *FakeRuntimeHandler) SandboxSpec(ctx context.Context, options HandlerOptions) (*spec.Spec, error) {
-	return &spec.Spec{}, getErrorFromContext(ctx)
-}
-
-func (f *FakeRuntimeHandler) Wait(ctx context.Context, options HandlerOptions) (Exit, error) {
+func (f *FakeRuntimeHandler) Wait(ctx context.Context, _ string) (Exit, error) {
 	return Exit{
-		Timestamp: time.Time{},
-		Status:    0,
+		ExitedAt: time.Time{},
+		ExitCode: 0,
 	}, getErrorFromContext(ctx)
 }
-
-func (r *FakeRuntimeHandler) ShutDown() {}
 
 func getErrorFromContext(ctx context.Context) error {
 	if errStr, ok := ctx.Value("ERROR").(string); ok {
@@ -165,4 +103,4 @@ func getErrorFromContext(ctx context.Context) error {
 	return nil
 }
 
-var _ RealRuntimeHandler = &FakeRuntimeHandler{}
+var _ Handler = &FakeRuntimeHandler{}

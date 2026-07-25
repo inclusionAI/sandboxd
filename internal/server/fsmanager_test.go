@@ -113,7 +113,26 @@ func prepareAndCommitFS(t *testing.T, manager *fsManager, sandboxID string) {
 	if err != nil {
 		t.Fatalf("Prepare(%s) failed: %v", sandboxID, err)
 	}
-	manager.Commit(sandboxID, prepared)
+	if err := manager.Commit(sandboxID, prepared); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+}
+
+func TestFSManagerCommitRollsBackFailedPersistence(t *testing.T) {
+	stateStore := store.NewMockStore()
+	manager := newFSManager(newFSTestImageService(), stateStore)
+	prepared, err := manager.Prepare(fsTestStartRequest("sbox-failed"))
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	defer prepared.Rollback()
+
+	if err := manager.Commit("sbox-failed", prepared); err == nil {
+		t.Fatal("Commit() error = nil, want persistence failure")
+	}
+	if _, exists := manager.sandboxState["sbox-failed"]; exists {
+		t.Fatal("failed filesystem commit remained in manager state")
+	}
 }
 
 func TestFSManagerRestoresSharedRootfsAndMountReferences(t *testing.T) {

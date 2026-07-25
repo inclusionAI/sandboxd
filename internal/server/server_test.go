@@ -36,12 +36,12 @@ import (
 )
 
 // newTestService creates an sandboxService with a real sandbox.Manager backed by a temp dir.
-func newTestService(t *testing.T, handlers map[string]svc.RealRuntimeHandler) *sandboxService {
+func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxService {
 	t.Helper()
 
 	tmpDir := t.TempDir()
 
-	handlerMap := cmap.New[svc.RealRuntimeHandler]()
+	handlerMap := cmap.New[svc.Handler]()
 	runtimeBinary := make(map[string]string)
 	for name, h := range handlers {
 		handlerMap.Set(name, h)
@@ -88,7 +88,7 @@ func newTestService(t *testing.T, handlers map[string]svc.RealRuntimeHandler) *s
 }
 
 func TestWait(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 
@@ -96,10 +96,10 @@ func TestWait(t *testing.T) {
 	// Wait now reads the terminal state maintained by the sandbox
 	// manager rather than calling runtime.Wait directly. Stage a sandbox
 	// that has already exited so the RPC can resolve via the fast path.
-	s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
+	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
 		ID:             id,
 		RuntimeHandler: "runsc",
-	})
+	}))
 	assert.NoError(t, s.sandboxManager.SetExit(id, 0, time.Now().Format(time.RFC3339Nano), false))
 
 	resp, err := s.Wait(context.Background(), &runtime.WaitRequest{ID: id})
@@ -108,7 +108,7 @@ func TestWait(t *testing.T) {
 }
 
 func TestWait_NotFound(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 
@@ -138,7 +138,7 @@ func TestResetMetadataIfResourceStateIncompatible_KeepsJSONResourceState(t *test
 }
 
 func TestList_Empty(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 
@@ -148,9 +148,9 @@ func TestList_Empty(t *testing.T) {
 }
 
 func TestListAvailableRuntimes(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
+		"other": svc.NewFakeRuntimeHandler(),
 		"runsc": svc.NewFakeRuntimeHandler(),
-		"kata":  svc.NewFakeRuntimeHandler(),
 	})
 	s.config.PluginConfig.RuntimeConfig.RuntimeBinary["unavailable"] = "/fake/unavailable"
 
@@ -159,11 +159,11 @@ func TestListAvailableRuntimes(t *testing.T) {
 		&runtime.ListAvailableRuntimesRequest{},
 	)
 	assert.NoError(t, err)
-	assert.Equal(t, []string{"kata", "runsc"}, resp.RuntimeClasses)
+	assert.Equal(t, []string{"other", "runsc"}, resp.RuntimeClasses)
 }
 
 func TestList_ById_NotFound(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 
@@ -174,7 +174,7 @@ func TestList_ById_NotFound(t *testing.T) {
 }
 
 func TestList_WithStoredContainer(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 
@@ -187,7 +187,7 @@ func TestList_WithStoredContainer(t *testing.T) {
 		Stderr:         "/tmp/stderr.log",
 	}
 
-	s.sandboxManager.StoreMetadata(sandboxID, meta)
+	assert.NoError(t, s.sandboxManager.StoreMetadata(sandboxID, meta))
 	time.Sleep(200 * time.Millisecond)
 
 	resp, err := s.List(context.Background(), &runtime.ListSandboxesRequest{})
@@ -206,7 +206,7 @@ func TestList_WithStoredContainer(t *testing.T) {
 }
 
 func TestList_ByLabel(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 
@@ -216,7 +216,7 @@ func TestList_ByLabel(t *testing.T) {
 		RuntimeHandler: "runsc",
 		Labels:         map[string]string{"app": "myapp"},
 	}
-	s.sandboxManager.StoreMetadata(sandboxID, meta)
+	assert.NoError(t, s.sandboxManager.StoreMetadata(sandboxID, meta))
 	time.Sleep(200 * time.Millisecond)
 
 	// Match label
@@ -243,7 +243,7 @@ func TestList_ByLabel(t *testing.T) {
 }
 
 func TestDelete_NotFound(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 
@@ -255,25 +255,22 @@ func TestDelete_NotFound(t *testing.T) {
 
 type recordingDeleteHandler struct {
 	*svc.FakeRuntimeHandler
-	calls   int
-	request *svc.DeleteSandboxRequest
-	options svc.HandlerOptions
+	calls     int
+	sandboxID string
 }
 
-func (h *recordingDeleteHandler) DeleteSandbox(
+func (h *recordingDeleteHandler) Delete(
 	_ context.Context,
-	request *svc.DeleteSandboxRequest,
-	options svc.HandlerOptions,
-) (*svc.DeleteSandboxResponse, error) {
+	sandboxID string,
+) error {
 	h.calls++
-	h.request = request
-	h.options = options
-	return &svc.DeleteSandboxResponse{}, nil
+	h.sandboxID = sandboxID
+	return nil
 }
 
-func TestDeleteAlwaysForcesAndIgnoresTimeout(t *testing.T) {
+func TestDeleteRoutesSandboxIDToRuntime(t *testing.T) {
 	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{"runsc": handler})
+	s := newTestService(t, map[string]svc.Handler{"runsc": handler})
 
 	const id = "sbox-force-delete"
 	bundleDir := filepath.Join(s.config.RootDir, "containers", id)
@@ -283,22 +280,21 @@ func TestDeleteAlwaysForcesAndIgnoresTimeout(t *testing.T) {
 		[]byte(`{"ociVersion":"1.0.2","process":{"cwd":"/"},"root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
 		0600,
 	))
-	s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
+	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
 		ID:             id,
 		RuntimeHandler: "runsc",
-	})
+	}))
 	_, err := s.sandboxManager.Get(id)
 	assert.NoError(t, err)
 
 	_, err = s.Delete(context.Background(), &runtime.DeleteRequest{ID: id, Timeout: 30})
 	assert.NoError(t, err)
 	assert.Equal(t, 1, handler.calls)
-	assert.Equal(t, int64(30), handler.request.Timeout)
-	assert.True(t, handler.options.ForceDelete)
+	assert.Equal(t, id, handler.sandboxID)
 }
 
 func TestStart_And_Delete(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 
@@ -414,7 +410,7 @@ func newDnatTestService(t *testing.T, fake *fakeNetworkManager) *sandboxService 
 		delete(networkmanager.NetworkManagers, testNetworkType)
 	})
 
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 	s.config.NatBackend = testNetworkType
@@ -482,7 +478,7 @@ func TestSetupDnatRules_NetworkManagerError(t *testing.T) {
 }
 
 func TestSetupDnatRules_NoNetworkManager(t *testing.T) {
-	s := newTestService(t, map[string]svc.RealRuntimeHandler{
+	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
 	})
 	s.config.NatBackend = "nonexistent-type"
