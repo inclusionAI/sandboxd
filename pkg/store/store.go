@@ -20,7 +20,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/akernel-dev/sandboxd/pkg/errord"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/containerd/typeurl/v2"
 	"github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/proto"

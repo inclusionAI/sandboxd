@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"sync"
 
-	api "github.com/akernel-dev/sandboxd/api/runtime/v1"
+	api "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/sirupsen/logrus"
 )
 

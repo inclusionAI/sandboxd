@@ -19,8 +19,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/akernel-dev/sandboxd/config"
-	svc "github.com/akernel-dev/sandboxd/pkg/runtime"
+	"github.com/inclusionAI/sandboxd/config"
+	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/stretchr/testify/assert"
 )
 

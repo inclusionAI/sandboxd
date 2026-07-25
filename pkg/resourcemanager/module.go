@@ -24,8 +24,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/pkg/cgroupmanager"
-	"github.com/akernel-dev/sandboxd/pkg/sandbox"
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
+	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/sirupsen/logrus"
 )
 

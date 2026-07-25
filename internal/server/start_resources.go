@@ -18,8 +18,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/pkg/sandbox"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/sirupsen/logrus"
 )
 

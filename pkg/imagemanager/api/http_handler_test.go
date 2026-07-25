@@ -25,9 +25,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/distillfs"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/nydus"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/oci"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/nydus"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/oci"
 )
 
 // mustNewHttpWorker creates an HttpWorker for testing, failing the test on error.

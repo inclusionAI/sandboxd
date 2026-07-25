@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
 	cgroups "github.com/containerd/cgroups/v3"
 	cgstats "github.com/containerd/cgroups/v3/cgroup2/stats"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"golang.org/x/sys/unix"
 )
 

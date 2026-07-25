@@ -22,14 +22,14 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/internal/trace"
-	"github.com/akernel-dev/sandboxd/internal/util"
-	runscapi "github.com/akernel-dev/sandboxd/pkg/runtime/runsc"
+	"github.com/inclusionAI/sandboxd/internal/trace"
+	"github.com/inclusionAI/sandboxd/internal/util"
+	runscapi "github.com/inclusionAI/sandboxd/pkg/runtime/runsc"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/pkg/networkmanager"
-	"github.com/akernel-dev/sandboxd/pkg/volumemanager"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
+	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )

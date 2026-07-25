@@ -18,7 +18,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/timedtrace"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/timedtrace"
 
 	"go.opentelemetry.io/otel/attribute"
 )

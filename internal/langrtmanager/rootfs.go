@@ -19,8 +19,8 @@ import (
 	"os"
 	"sync"
 
-	runtime_api "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/api"
+	runtime_api "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
 	"github.com/sirupsen/logrus"
 )
 

@@ -38,8 +38,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/diskusage"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/imageregistry"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/diskusage"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageregistry"
 )
 
 const (

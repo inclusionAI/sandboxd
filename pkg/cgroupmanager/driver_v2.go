@@ -24,9 +24,9 @@ import (
 	"strings"
 	"sync"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
 	cg "github.com/containerd/cgroups/v3/cgroup2"
 	cgstats "github.com/containerd/cgroups/v3/cgroup2/stats"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"golang.org/x/sys/unix"
 )
 

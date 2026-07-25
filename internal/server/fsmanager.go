@@ -21,12 +21,12 @@ import (
 	"sort"
 	"sync"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/internal/langrtmanager"
-	"github.com/akernel-dev/sandboxd/pkg/errord"
-	imageapi "github.com/akernel-dev/sandboxd/pkg/imagemanager/api"
-	"github.com/akernel-dev/sandboxd/pkg/store"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/langrtmanager"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
+	imageapi "github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
+	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )

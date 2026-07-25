@@ -18,8 +18,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/akernel-dev/sandboxd/config"
-	runscapi "github.com/akernel-dev/sandboxd/pkg/runtime/runsc"
+	"github.com/inclusionAI/sandboxd/config"
+	runscapi "github.com/inclusionAI/sandboxd/pkg/runtime/runsc"
 	"github.com/stretchr/testify/assert"
 )
 

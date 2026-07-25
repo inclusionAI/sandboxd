@@ -15,7 +15,7 @@
 package util
 
 import (
-	"github.com/akernel-dev/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/config"
 	"net"
 	"testing"
 )

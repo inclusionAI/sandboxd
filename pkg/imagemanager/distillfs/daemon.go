@@ -32,8 +32,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/imgcgroup"
-	"github.com/akernel-dev/sandboxd/pkg/imagemanager/registryauth"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imgcgroup"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/registryauth"
 )
 
 const (

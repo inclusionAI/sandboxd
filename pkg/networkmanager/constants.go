@@ -17,7 +17,7 @@ package networkmanager
 import (
 	"time"
 
-	"github.com/akernel-dev/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/config"
 )
 
 // Pool-local constants previously living in pkg/resourcemanager/types.go.

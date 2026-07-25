@@ -21,8 +21,8 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/internal/util"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )

@@ -28,7 +28,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/akernel-dev/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )

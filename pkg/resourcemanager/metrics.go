@@ -24,7 +24,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/akernel-dev/sandboxd/pkg/cgroupmanager"
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -32,8 +32,8 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 
-	"github.com/akernel-dev/sandboxd/pkg/resourcemanager/cgroupv1"
-	"github.com/akernel-dev/sandboxd/pkg/sandbox"
+	"github.com/inclusionAI/sandboxd/pkg/resourcemanager/cgroupv1"
+	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 )
 
 const (

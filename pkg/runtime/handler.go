@@ -21,10 +21,10 @@ import (
 	"path/filepath"
 	"time"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/pkg/errord"
-	"github.com/akernel-dev/sandboxd/pkg/volumemanager"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
+	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
 
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 )

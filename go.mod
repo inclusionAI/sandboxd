@@ -1,4 +1,4 @@
-module github.com/akernel-dev/sandboxd
+module github.com/inclusionAI/sandboxd
 
 go 1.25.5
 

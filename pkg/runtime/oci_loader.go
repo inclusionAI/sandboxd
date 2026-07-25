@@ -21,10 +21,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	runtime "github.com/akernel-dev/sandboxd/api/runtime/v1"
-	"github.com/akernel-dev/sandboxd/config"
-	"github.com/akernel-dev/sandboxd/internal/util"
-	"github.com/akernel-dev/sandboxd/pkg/errord"
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/sirupsen/logrus"
 )
 

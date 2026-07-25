@@ -16,7 +16,7 @@ syntax = "proto3";
 
 package runtime.v1;
 
-option go_package = "github.com/akernel-dev/sandboxd/api/runtime/v1;v1";
+option go_package = "github.com/inclusionAI/sandboxd/api/runtime/v1;v1";
 
 // SandboxService manages sandbox lifecycle and inspection operations.
 service SandboxService {
