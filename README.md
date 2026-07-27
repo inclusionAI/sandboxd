@@ -6,7 +6,7 @@
 
 - Start, wait for, inspect, measure, and delete sandboxes.
 - Prepare local, OCI, Nydus, and S3-backed rootfs and mounts.
-- Allocate cgroups (currently v1 only) and veth interfaces and configure iptables for NAT.
+- Allocate cgroups and veth interfaces and configure iptables for NAT.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ gRPC service
 sandbox lifecycle manager
     ├── sandbox runtime adapter ──> gVisor / Kata Containers
     ├── image manager ────────────> distill-fs / OCI
-    └── resource managers ────────> cgroup v1 / veth / iptables
+    └── resource managers ────────> cgroup v1 or v2 / veth / iptables
 ```
 
 ## API / CLI
@@ -33,7 +33,7 @@ make test
 make vet
 ```
 
-The privileged E2E suite requires Docker, cgroup v1, iptables, and the tested runsc release:
+The privileged E2E suite requires Docker, iptables, a writable cgroup v1 or v2 hierarchy, and the tested runsc release:
 
 ```bash
 RUNSC_BINARY=/usr/local/bin/runsc make e2e
@@ -64,7 +64,7 @@ internal/server/     gRPC service and daemon orchestration
 pkg/runtime/         sandbox runtime abstraction and runtime adapters
 pkg/imagemanager/    rootfs and mount integration
 pkg/networkmanager/  veth and iptables integration
-pkg/cgroupmanager/   cgroup v1 integration
+pkg/cgroupmanager/   transparent cgroup v1/v2 integration and cache
 test/e2e/            privileged runsc E2E
 tools/               pinned protobuf code-generation image
 ```
@@ -72,7 +72,8 @@ tools/               pinned protobuf code-generation image
 ## Known limitations
 
 - Kata Containers requires a usable `/dev/kvm` device; nodes without KVM continue to support gVisor.
-- Only cgroup v1, netstack sandbox networking, and iptables are supported in `v0.1.0`.
+- sandboxd detects the local cgroup mode at startup. Legacy and hybrid hosts use cgroup v1; unified hosts use cgroup v2. The gRPC API and resource-cache behavior are identical in both modes.
+- To minimize sandbox startup latency, sandboxd caches and reuses physical cgroups across sandbox leases. Cumulative CPU accounting and peak-memory statistics therefore cover the physical cgroup lifetime, and reclaimable charges such as page cache may remain until kernel pressure reclaims them; CPU utilization calculated from sampling deltas and configured resource limits remain correct for the active sandbox.
 - The direct OCI registry client currently skips TLS certificate verification and should only be used with trusted registries.
 
 ## License
