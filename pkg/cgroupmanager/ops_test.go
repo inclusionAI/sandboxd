@@ -482,6 +482,27 @@ func TestV1OOMWatcherMultiplexesEventFDs(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestV1OOMKilledDrainsPendingEventFD(t *testing.T) {
+	const name = "/sandbox/lease"
+	fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	require.NoError(t, err)
+	defer unix.Close(fd)
+
+	entry := &v1OOMEntry{name: name, fd: fd}
+	watcher := &v1OOMWatcher{
+		byName: map[string]*v1OOMEntry{name: entry},
+	}
+	wakeEventFD(fd)
+
+	killed, err := watcher.OOMKilled(name)
+	require.NoError(t, err)
+	assert.True(t, killed)
+
+	killed, err = watcher.OOMKilled(name)
+	require.NoError(t, err)
+	assert.True(t, killed, "OOM flag must remain set after the eventfd is drained")
+}
+
 func TestNewCgroupManagerRejectsNegativePidsMax(t *testing.T) {
 	_, err := NewCgroupManager(nil, config.ResourceConfig{PidsMax: -1}, 1)
 	assert.EqualError(t, err, "pids_max must be non-negative")

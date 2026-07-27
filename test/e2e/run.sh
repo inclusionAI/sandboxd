@@ -23,6 +23,8 @@ IMAGE="${SANDBOXD_E2E_IMAGE:-sandboxd-e2e:local}"
 CONTAINER="${SANDBOXD_E2E_CONTAINER:-sandboxd-e2e}"
 RUN_UNIT_TESTS="${RUN_UNIT_TESTS:-1}"
 RUNSC_BINARY="${RUNSC_BINARY:-}"
+E2E_STRESS_ROUNDS="${E2E_STRESS_ROUNDS:-0}"
+E2E_STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
 
 log() {
     printf '[e2e-run] %s\n' "$*"
@@ -61,6 +63,8 @@ fi
 
 log "building sandboxd and sbox"
 GOWORK=off GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-official GOTOOLCHAIN=auto make release
+CGO_ENABLED=0 GOWORK=off GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-official \
+    GOTOOLCHAIN=auto go build -o output/oom-hog ./test/e2e/oom-hog
 
 log "copying runsc from ${RUNSC_BINARY}"
 cp "${RUNSC_BINARY}" output/runsc
@@ -78,6 +82,8 @@ set +e
     --privileged \
     --cgroupns=host \
     --net bridge \
+    -e "E2E_STRESS_ROUNDS=${E2E_STRESS_ROUNDS}" \
+    -e "E2E_STRESS_CONCURRENCY=${E2E_STRESS_CONCURRENCY}" \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     "${IMAGE}"
 status=$?
