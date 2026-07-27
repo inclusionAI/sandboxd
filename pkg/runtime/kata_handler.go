@@ -126,12 +126,6 @@ func (k *KataHandler) Start(ctx context.Context, startConfig StartConfig) error 
 	if err != nil {
 		return err
 	}
-	if startConfig.Resources != nil && startConfig.CgroupPath != "" {
-		if err := updateCgroup(startConfig.CgroupPath, kataHostResources(startConfig.Resources)); err != nil {
-			return fmt.Errorf("update cgroup: %w", err)
-		}
-	}
-
 	kataConfig := cloneKataStartConfig(startConfig)
 	cleanupMounts, err := prepareKataMounts(bundlePath, &kataConfig)
 	if err != nil {

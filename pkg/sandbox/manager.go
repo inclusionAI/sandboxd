@@ -43,16 +43,22 @@ import (
 
 type Manager struct {
 	// sandbox root directory
-	root        string
+	root string
+	// recyclePath receives incomplete on-disk sandbox directories. Housekeeping
+	// removes them after recovery no longer needs their contents.
 	recyclePath string
 
-	sandboxes      cmap.ConcurrentMap[string, *Sandbox]
+	sandboxes cmap.ConcurrentMap[string, *Sandbox]
+	// serviceHandler maps a configured runtime name to its runsc or Kata
+	// implementation. Handlers are loaded before Manager is constructed.
 	serviceHandler cmap.ConcurrentMap[string, svc.Handler]
-	// cgroupMgr is used only by the OOM watcher. The server owns resource
-	// allocation/release and manager shutdown.
+
+	// cgroupMgr is used only to consume the manager-level OOM flag. The server
+	// owns resource allocation/release and manager shutdown.
 	cgroupMgr *cgroupmanager.CgroupManager
 
 	monitorStopChan cmap.ConcurrentMap[string, chan struct{}]
+
 	// exitNotifiers fan-out exit notifications to any number of WaitForExit
 	// callers. Created when monitor starts; closed once after SetExit has
 	// persisted the terminal status, or on Delete/Stop.
@@ -75,6 +81,8 @@ type Manager struct {
 	// Implementations must not perform network I/O on this lifecycle path.
 	OnSandboxStopped func(MetricsTarget)
 
+	// isHousekeepingRunning prevents overlapping runtime/disk reconciliation
+	// passes when one pass lasts longer than the periodic interval.
 	isHousekeepingRunning atomic.Bool
 }
 
@@ -455,25 +463,18 @@ func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan st
 	logrus.Infof("start monitor sandbox %s", metaData.ID)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	cgroupName := m.oomCgroupName(metaData.ID)
 
-	// collect exit info. The OOM watcher's lifetime is bound to this Wait
-	// call (not to the surrounding monitor): once handler.Wait returns the
-	// sandbox's processes are gone, so the kernel will not emit further
-	// OOM events and the watcher fd/goroutine can be released immediately.
-	// Binding it to the monitor instead would leak the watcher whenever the
-	// upper layer never sends Delete after exit.
+	// Collect exit information asynchronously. The kernel OOM subscription
+	// follows the cached cgroup lifetime inside CgroupManager.
 	go func() {
-		var oomFlag atomic.Bool
-		stopOOM := m.startOOMWatcher(metaData.ID, &oomFlag)
-		defer stopOOM()
-
 		exit, err := handler.Wait(ctx, metaData.ID)
 		// If context was cancelled (monitor stopped), don't send exit event.
 		if ctx.Err() != nil {
 			return
 		}
 
-		oom := oomFlag.Load()
+		oom := m.oomKilled(metaData.ID, cgroupName)
 		logrus.Infof("wait sandbox %s finished, err: %v, exit: %+v, oom: %v",
 			metaData.ID, err, exit, oom)
 
@@ -502,37 +503,40 @@ func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan st
 	logrus.Infof("stop monitor sandbox %s", metaData.ID)
 }
 
-// startOOMWatcher spins up a memory cgroup OOM eventfd subscription for the
-// sandbox, returning a stop function that is always safe to call. When
-// the cgroup cannot be located (e.g. legacy sandboxes without the resource
-// annotation), startOOMWatcher logs and returns a no-op stop so the monitor
-// continues to function with OOMKilled defaulting to false.
-func (m *Manager) startOOMWatcher(sandboxID string, flag *atomic.Bool) func() {
-	noop := func() {}
-
+// oomCgroupName resolves the cgroup before waiting so a concurrent Delete may
+// remove sandbox metadata without invalidating the runtime wait goroutine.
+func (m *Manager) oomCgroupName(sandboxID string) string {
 	if m.cgroupMgr == nil {
-		return noop
+		return ""
 	}
 	resource, err := m.CollectResourceByID(sandboxID)
 	if err != nil {
-		logrus.Warnf("oom watcher: collect resource for %s failed: %v", sandboxID, err)
-		return noop
+		logrus.Warnf("oom monitor: collect resource for %s failed: %v", sandboxID, err)
+		return ""
 	}
 	cgroupName, ok := resource.Resources[config.ResourceNameCgroup]
 	if !ok || cgroupName == "" {
-		logrus.Warnf("oom watcher: cgroup name missing for %s, skipping", sandboxID)
-		return noop
+		logrus.Warnf("oom monitor: cgroup name missing for %s, skipping", sandboxID)
+		return ""
 	}
+	return cgroupName
+}
 
-	stop, err := m.cgroupMgr.WatchOOM(cgroupName, func() {
-		flag.Store(true)
-		logrus.Infof("oom watcher: sandbox %s observed OOM kill", sandboxID)
-	})
-	if err != nil {
-		logrus.Warnf("oom watcher: WatchOOM(%s) failed for %s: %v", cgroupName, sandboxID, err)
-		return noop
+func (m *Manager) oomKilled(sandboxID, cgroupName string) bool {
+	if m.cgroupMgr == nil || cgroupName == "" {
+		return false
 	}
-	return stop
+	killed, err := m.cgroupMgr.OOMKilled(cgroupName)
+	if err != nil {
+		logrus.Warnf(
+			"oom monitor: read cgroup %s flag for %s failed: %v",
+			cgroupName,
+			sandboxID,
+			err,
+		)
+		return false
+	}
+	return killed
 }
 
 func (m *Manager) Get(id string) (*Sandbox, error) {

@@ -16,6 +16,7 @@ package resourcemanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -24,7 +25,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -32,15 +32,11 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 
-	cg "github.com/containerd/cgroups/v3/cgroup1"
-	"github.com/inclusionAI/sandboxd/pkg/resourcemanager/cgroupv1"
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 )
 
 const (
-	defaultCpuacctPath = "/sys/fs/cgroup/cpuacct"
-	defaultMemPath     = "/sys/fs/cgroup/memory"
-
 	collectorEndpoint = "127.0.0.1:4318"
 	collectInterval   = 5 * time.Second
 
@@ -104,8 +100,8 @@ type sandboxObservation struct {
 type Collector struct {
 	provider *sdkmetric.MeterProvider
 
-	cpuacctPath string
-	memPath     string
+	cgroupStatsMu sync.RWMutex
+	cgroupStats   func(string) (cgroupmanager.Stats, error)
 
 	capacity CapacityProvider
 
@@ -150,14 +146,12 @@ func NewCollector(ctx context.Context, capacity CapacityProvider) (*Collector, e
 
 	c := &Collector{
 		provider:       provider,
-		cpuacctPath:    defaultCpuacctPath,
-		memPath:        defaultMemPath,
 		capacity:       capacity,
 		prevSandboxCPU: make(map[string]sandboxCPUSample),
 		sandboxStopped: make(map[string]sandboxTombstone),
-		sandboxStats:   readSandboxStats,
 		now:            time.Now,
 	}
+	c.sandboxStats = c.readSandboxStats
 
 	meter := provider.Meter("resource-manager")
 	if err := c.registerMetrics(meter); err != nil {
@@ -203,6 +197,17 @@ func (c *Collector) SetSandboxMetricsSource(source SandboxMetricsSource) {
 	c.sandboxSourceMu.Unlock()
 }
 
+// SetCgroupStatsReader connects the collector to the already-selected
+// CgroupManager backend. This keeps node, sandbox, and gRPC stats on the same
+// detected cgroup version.
+func (c *Collector) SetCgroupStatsReader(
+	reader func(string) (cgroupmanager.Stats, error),
+) {
+	c.cgroupStatsMu.Lock()
+	c.cgroupStats = reader
+	c.cgroupStatsMu.Unlock()
+}
+
 // MarkSandboxStopped records an explicit terminal value without performing
 // network I/O. The regular metrics callback exports running=0 for several
 // collection cycles and then discards the copied labels.
@@ -228,7 +233,7 @@ func (c *Collector) MarkSandboxStopped(target sandbox.MetricsTarget) {
 func (c *Collector) registerMetrics(meter metric.Meter) error {
 	if _, err := meter.Float64ObservableGauge("node.cpu.usage",
 		metric.WithUnit("{cores}"),
-		metric.WithDescription("CPU cores in use (cpuacct.usage delta / wall time)"),
+		metric.WithDescription("CPU cores in use (normalized cgroup usage delta / wall time)"),
 		metric.WithFloat64Callback(c.cpuUsageCallback),
 	); err != nil {
 		return err
@@ -331,28 +336,37 @@ func (c *Collector) registerMetrics(meter metric.Meter) error {
 	return nil
 }
 
-func readSandboxStats(cgroupPath string) (sandboxStats, error) {
-	handler := &cgroupops.CgroupHandlerImpl{}
-	group, err := handler.Load(cg.StaticPath(cgroupPath), cg.WithHiearchy(cg.Default))
-	if err != nil {
-		return sandboxStats{}, fmt.Errorf("load cgroup %s: %w", cgroupPath, err)
+func (c *Collector) readSandboxStats(cgroupPath string) (sandboxStats, error) {
+	reader := c.getCgroupStatsReader()
+	if reader == nil {
+		return sandboxStats{}, errors.New("cgroup stats reader is not configured")
 	}
-	stats, err := group.Stat()
+	stats, err := reader(cgroupPath)
 	if err != nil {
 		return sandboxStats{}, fmt.Errorf("stat cgroup %s: %w", cgroupPath, err)
 	}
 
-	result := sandboxStats{}
-	if stats.CPU != nil && stats.CPU.Usage != nil {
-		result.CPUUsageNS = stats.CPU.Usage.Total
-		result.HasCPUUsage = true
+	return sandboxStats{
+		CPUUsageNS:     stats.CPUUsageNanos,
+		MemoryUsage:    stats.MemoryUsageBytes,
+		MemoryLimit:    stats.MemoryLimitBytes,
+		HasCPUUsage:    true,
+		HasMemoryUsage: true,
+	}, nil
+}
+
+func (c *Collector) getCgroupStatsReader() func(string) (cgroupmanager.Stats, error) {
+	c.cgroupStatsMu.RLock()
+	defer c.cgroupStatsMu.RUnlock()
+	return c.cgroupStats
+}
+
+func (c *Collector) rootCgroupStats() (cgroupmanager.Stats, error) {
+	reader := c.getCgroupStatsReader()
+	if reader == nil {
+		return cgroupmanager.Stats{}, errors.New("cgroup stats reader is not configured")
 	}
-	if stats.Memory != nil && stats.Memory.Usage != nil {
-		result.MemoryUsage = stats.Memory.Usage.Usage
-		result.MemoryLimit = stats.Memory.Usage.Limit
-		result.HasMemoryUsage = true
-	}
-	return result, nil
+	return reader("/")
 }
 
 func (c *Collector) getSandboxSource() SandboxMetricsSource {
@@ -502,13 +516,14 @@ func (c *Collector) sandboxMetricsCallback(_ context.Context, observer metric.Ob
 	return nil
 }
 
-// cpuUsageCallback computes CPU utilization from cpuacct.usage deltas.
+// cpuUsageCallback computes CPU utilization from normalized cgroup CPU deltas.
 func (c *Collector) cpuUsageCallback(_ context.Context, o metric.Float64Observer) error {
-	usage, err := cgroupv1.ReadUsage(c.cpuacctPath, "cpuacct.usage")
+	stats, err := c.rootCgroupStats()
 	if err != nil {
-		logrus.Debugf("metrics: failed to read cpuacct.usage: %v", err)
+		logrus.Debugf("metrics: failed to read root cgroup CPU stats: %v", err)
 		return nil
 	}
+	usage := uint64ToInt64(stats.CPUUsageNanos)
 
 	now := time.Now()
 	if c.prevCPUUsage != 0 {
@@ -546,15 +561,16 @@ func (c *Collector) cpuLimitCallback(_ context.Context, o metric.Float64Observer
 	return nil
 }
 
-// memUsageCallback reports node memory usage from cgroupv1.
+// memUsageCallback reports memory usage from the current cgroup namespace root.
 func (c *Collector) memUsageCallback(_ context.Context, o metric.Int64Observer) error {
-	mem, err := cgroupv1.ReadMemcgV1(c.memPath, "")
+	stats, err := c.rootCgroupStats()
 	if err != nil {
 		logrus.Debugf("metrics: failed to read memory cgroup: %v", err)
 		return nil
 	}
-	o.Observe(int64(mem.Usage))
-	logrus.Infof("metrics: node.memory.usage=%d bytes (%.2f MiB)", mem.Usage, float64(mem.Usage)/(1024*1024))
+	usage := uint64ToInt64(stats.MemoryUsageBytes)
+	o.Observe(usage)
+	logrus.Infof("metrics: node.memory.usage=%d bytes (%.2f MiB)", usage, float64(usage)/(1024*1024))
 	return nil
 }
 

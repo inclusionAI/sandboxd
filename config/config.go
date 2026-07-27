@@ -109,19 +109,7 @@ type ResourceConfig struct {
 	PidsMax int64 `toml:"pids_max" json:"pidsMax"`
 	// InterfaceCacheSize is the size of interface cache. Default is same as max_instance_num.
 	InterfaceCacheSize int `toml:"interface_cache_size" json:"interfaceCacheSize"`
-	ResourceAdvanceConfig
 }
-
-// ResourceAdvanceConfig will override the resource config
-type ResourceAdvanceConfig struct {
-	// RecyclePolicy is the policy of recycle cgroup. Default is reuse.
-	RecyclePolicy string `toml:"recycle_policy" json:"recyclePolicy"`
-}
-
-const (
-	RecyclePolicyReuse   = "reuse"
-	RecyclePolicyDestroy = "destroy"
-)
 
 // NetworkConfig contains network-related configuration for sandboxd.
 type NetworkConfig struct {

@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/embedded"
 
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 )
 
@@ -77,6 +78,15 @@ type recordObserver struct {
 	values []float64
 }
 
+type recordIntObserver struct {
+	embedded.Int64Observer
+	values []int64
+}
+
+func (r *recordIntObserver) Observe(v int64, _ ...metric.ObserveOption) {
+	r.values = append(r.values, v)
+}
+
 func (r *recordObserver) Observe(v float64, _ ...metric.ObserveOption) {
 	r.values = append(r.values, v)
 }
@@ -103,6 +113,42 @@ func TestCPULimitCallback(t *testing.T) {
 		require.NoError(t, c.cpuLimitCallback(context.Background(), obs))
 		assert.Empty(t, obs.values, "zero (no refresh yet) should not observe 0")
 	})
+}
+
+func TestCollectorUsesSharedCgroupStatsReader(t *testing.T) {
+	c := &Collector{}
+	c.SetCgroupStatsReader(func(path string) (cgroupmanager.Stats, error) {
+		switch path {
+		case "/":
+			return cgroupmanager.Stats{
+				CPUUsageNanos:    2_000_000_000,
+				MemoryUsageBytes: 512 << 20,
+			}, nil
+		case "/sandbox/one":
+			return cgroupmanager.Stats{
+				CPUUsageNanos:    123_000,
+				MemoryUsageBytes: 32 << 20,
+				MemoryLimitBytes: 64 << 20,
+			}, nil
+		default:
+			return cgroupmanager.Stats{}, assert.AnError
+		}
+	})
+
+	memObserver := &recordIntObserver{}
+	require.NoError(t, c.memUsageCallback(context.Background(), memObserver))
+	require.Equal(t, []int64{512 << 20}, memObserver.values)
+
+	require.NoError(t, c.cpuUsageCallback(context.Background(), &recordObserver{}))
+	assert.Equal(t, int64(2_000_000_000), c.prevCPUUsage)
+
+	stats, err := c.readSandboxStats("/sandbox/one")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(123_000), stats.CPUUsageNS)
+	assert.Equal(t, uint64(32<<20), stats.MemoryUsage)
+	assert.Equal(t, uint64(64<<20), stats.MemoryLimit)
+	assert.True(t, stats.HasCPUUsage)
+	assert.True(t, stats.HasMemoryUsage)
 }
 
 type fakeSandboxMetricsSource struct {

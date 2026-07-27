@@ -26,7 +26,6 @@ cgroup_cache_size = 1
 interface_cache_size = 1
 cgroup_root_name = "/sandboxd"
 max_instance_num = 32
-recycle_policy = "destroy"
 
 [plugin.runtime]
 # Retained for configuration compatibility; the current runtime does not read it.

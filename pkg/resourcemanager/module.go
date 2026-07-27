@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/sirupsen/logrus"
 )
@@ -98,6 +99,16 @@ func NewModule(sockPath string) (*Module, error) {
 func (m *Module) SetSandboxMetricsSource(source SandboxMetricsSource) {
 	if m.collector != nil {
 		m.collector.SetSandboxMetricsSource(source)
+	}
+}
+
+// SetCgroupStatsReader routes all cgroup-backed OTel metrics through the
+// CgroupManager's auto-selected v1/v2 implementation.
+func (m *Module) SetCgroupStatsReader(
+	reader func(string) (cgroupmanager.Stats, error),
+) {
+	if m.collector != nil {
+		m.collector.SetCgroupStatsReader(reader)
 	}
 }
 

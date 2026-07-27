@@ -40,11 +40,8 @@ func TestNewManager(t *testing.T) {
 	healthChan := make(chan bool)
 	cgMgr, err := cgroupmanager.NewCgroupManager(store.NewMockStore(), config.ResourceConfig{
 		MaxInstanceNum:  10,
-		CgroupRootName:  "huse",
+		CgroupRootName:  "sandbox-test",
 		CgroupCacheSize: 8,
-		ResourceAdvanceConfig: config.ResourceAdvanceConfig{
-			RecyclePolicy: config.RecyclePolicyDestroy,
-		},
 	}, 10)
 	assert.NotNil(t, cgMgr)
 	assert.Nil(t, err)

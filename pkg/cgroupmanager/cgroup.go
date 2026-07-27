@@ -18,17 +18,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	"github.com/inclusionAI/sandboxd/config"
-	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	"github.com/inclusionAI/sandboxd/internal/metrics"
 	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
@@ -37,6 +32,14 @@ import (
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/sirupsen/logrus"
 )
+
+const (
+	storeInterval    = 5 * time.Second
+	gcInitialBackoff = 100 * time.Millisecond
+	gcMaxBackoff     = 10 * time.Second
+)
+
+var errCgroupManagerStopped = errors.New("cgroup manager is stopped")
 
 type CgroupManager struct {
 	// max is the pool ceiling: using + idle + in-flight creates never exceed it.
@@ -48,47 +51,35 @@ type CgroupManager struct {
 	usingID cmap.ConcurrentMap[string, struct{}]
 	idleID  *util.Queue[string]
 
-	// It maintains all cgroups under /huse before sandboxd starts and all cgroups created by sandboxd
-	// All used/reused cgroups must be in this list.
+	// cgroups contains every physical child owned by this manager, including
+	// active and cached cgroups.
 	cgroups   cmap.ConcurrentMap[string, struct{}]
 	generator util.UniqueIDGenerator
-	// if enableDestroyRecycle is true, the cgroup will be destroyed when be recycled.
-	enableDestroyRecycle bool
 
-	// mu guards total and the slow-path pool decisions (reserve / fill /
-	// shrink). The fast paths (Allocate hit, Recycle) only touch the
-	// self-locking idleID queue and usingID map and do not take mu.
+	// mu guards total and cache admission decisions.
 	mu sync.Mutex
-	// total = usingID.Count() + idleID.Length() + in-flight creates. It is the
-	// authoritative count checked against max. Guarded by mu.
+	// total = using + idle + in-flight creates. It does not include
+	// cgroups already handed to the asynchronous deletion worker.
 	total int
-	// createReqs delivers on-demand create requests to the single maintenance
-	// goroutine. Buffered to max so a reserved Allocate never blocks on submit.
+
 	createReqs chan *createRequest
 
-	db store.DbStore
-
-	// storeMark is used to mark whether the cgroup id need to be stored.
-	// If it's true, manager should not exit.
-	storeMark atomic.Bool
+	db         store.DbStore
+	storeDirty atomic.Bool
 
 	gcQueue *util.Queue[string]
+	gcWake  chan struct{}
 
-	// cgroupHandler is used to handle cgroup. It's used to mock cgroup
-	cgroupHandler cgroupops.CgroupHandler
+	ops cgroupOps
+	oom oomWatcher
+
+	stopCh       chan struct{}
+	stopped      atomic.Bool
+	shutdownOnce sync.Once
+	shutdownErr  error
+	wg           sync.WaitGroup
 }
 
-const RetryGenIdTimes = 100
-
-// shrinkInterval is how often the maintenance goroutine checks whether the pool
-// holds more idle cgroups than cacheSize and trims the excess. The periodic
-// timer ONLY shrinks — growth is demand-driven (init fill + on-demand create),
-// never timer-driven.
-const shrinkInterval = 30 * time.Second
-
-// createRequest is submitted by Allocate when the idle pool is empty but the
-// pool is still below max. It asks the single maintenance goroutine to create
-// one cgroup on demand; the result is delivered back on result.
 type createRequest struct {
 	result chan createResult
 }
@@ -106,29 +97,88 @@ type storedCgroupIDs struct {
 func (c *CgroupManager) CacheSizeLimit() int { return c.cacheSize }
 
 func (c *CgroupManager) gc() {
+	defer c.wg.Done()
+	attempts := make(map[string]int)
 	for {
-		metrics.RecordGcQueueLength(config.ResourceNameCgroup, float64(c.gcQueue.Length()))
-		cg := c.gcQueue.Pop()
-		if cg == "" {
-			time.Sleep(1 * time.Second)
-			continue
+		select {
+		case <-c.stopCh:
+			return
+		case <-c.gcWake:
 		}
-		if c.removeCgroupFromSystem(cg) != nil {
-			logrus.Debugf("delete cgroup %v from gc queue failed, put it back to queue", cg)
-			util.KillCgroupProcesses(cg)
-			c.gcQueue.Push(cg)
-		} else {
-			logrus.Debugf("delete cgroup %v from gc queue success", cg)
-			c.generator.Release(cg)
+
+		for {
+			name := c.gcQueue.Pop()
+			metrics.RecordGcQueueLength(
+				config.ResourceNameCgroup,
+				float64(c.gcQueue.Length()),
+			)
+			if name == "" {
+				break
+			}
+			if err := c.removeCgroupFromSystem(name); err == nil {
+				delete(attempts, name)
+				c.generator.Release(name)
+				logrus.Debugf("delete cgroup %s from gc queue success", name)
+				continue
+			} else {
+				attempts[name]++
+				delay := gcBackoff(attempts[name])
+				logrus.Warnf(
+					"delete cgroup %s failed (attempt %d), retry in %s: %v",
+					name,
+					attempts[name],
+					delay,
+					err,
+				)
+				if killErr := c.ops.kill(name); killErr != nil {
+					logrus.Warnf(
+						"kill processes in cgroup %s before retry failed: %v",
+						name,
+						killErr,
+					)
+				}
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+					c.gcQueue.Push(name)
+				case <-c.stopCh:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				}
+			}
 		}
 	}
 }
 
-func (c *CgroupManager) ShutDown() error {
-	if c.storeMark.Load() {
-		c.store()
+func gcBackoff(attempt int) time.Duration {
+	delay := gcInitialBackoff
+	for i := 1; i < attempt && delay < gcMaxBackoff; i++ {
+		delay *= 2
 	}
-	return nil
+	if delay > gcMaxBackoff {
+		return gcMaxBackoff
+	}
+	return delay
+}
+
+func (c *CgroupManager) ShutDown() error {
+	c.shutdownOnce.Do(func() {
+		c.stopped.Store(true)
+		close(c.stopCh)
+		c.wg.Wait()
+		if err := c.oom.Close(); err != nil {
+			c.shutdownErr = err
+		}
+		if c.storeDirty.Swap(false) {
+			if err := c.store(); err != nil {
+				c.storeDirty.Store(true)
+				c.shutdownErr = errors.Join(c.shutdownErr, err)
+			}
+		}
+	})
+	return c.shutdownErr
 }
 
 func (c *CgroupManager) Status() ([]string, []string) {
@@ -137,44 +187,65 @@ func (c *CgroupManager) Status() ([]string, []string) {
 	return c.usingID.Keys(), c.idleID.List()
 }
 
+// Recycle synchronously returns an active cgroup to the clean idle cache.
+// Runtime teardown has already run, so draining and restoring the small set of
+// controls managed by sandboxd belongs on this release path, not Start.
 func (c *CgroupManager) Recycle(id string) error {
-	c.usingID.Remove(id)
-	defer c.storeMark.Store(true)
-	if c.enableDestroyRecycle {
-		// The cgroup is torn down on recycle, so it leaves the pool entirely.
-		if c.cgroups.Has(id) {
-			c.mu.Lock()
-			c.total--
-			c.mu.Unlock()
-		}
+	if _, active := c.usingID.Pop(id); !active {
+		return nil
+	}
+	c.storeDirty.Store(true)
+
+	if !c.cgroups.Has(id) {
+		c.mu.Lock()
+		c.total--
+		c.mu.Unlock()
+		return nil
+	}
+
+	if err := c.cleanForReuse(id); err != nil {
+		logrus.Warnf("clean cgroup %s for reuse failed; destroy it: %v", id, err)
+		c.mu.Lock()
+		c.total--
+		c.mu.Unlock()
 		c.deleteCgroup(id)
 		return nil
 	}
-	return c.recycleWithReuse(id)
-}
 
-func (c *CgroupManager) recycleWithReuse(id string) error {
-	// Never recycle cgroups which aren't in c.cgroups. Such ids were never
-	// counted in total either, so leave total untouched.
-	if !c.cgroups.Has(id) {
+	c.mu.Lock()
+	if c.idleID.Length() < c.cacheSize {
+		c.idleID.Push(id)
+		c.mu.Unlock()
 		return nil
 	}
-	// using -> idle, total unchanged.
-	c.idleID.Push(id)
+	c.total--
+	c.mu.Unlock()
+	c.deleteCgroup(id)
 	return nil
 }
 
-// Allocate hands out an idle cgroup name (e.g. "/sandbox/<id>"). The caller
-// is expected to bake the result into the sandbox's OCI Linux.CgroupsPath.
-//
-// Fast path: pop the idle queue. On a miss it either reserves a slot and waits
-// for the maintenance goroutine to create one on demand (when below max), or
-// fails fast with ErrResourceExhausted (at max, no blocking, no timeout).
+func (c *CgroupManager) cleanForReuse(name string) error {
+	if err := c.ops.kill(name); err != nil {
+		return fmt.Errorf("drain cgroup: %w", err)
+	}
+	if err := c.ops.reset(name); err != nil {
+		return fmt.Errorf("reset managed controls: %w", err)
+	}
+	if err := c.oom.Reset(name); err != nil {
+		return fmt.Errorf("reset OOM state: %w", err)
+	}
+	return nil
+}
+
+// Allocate hands out an idle cgroup name (e.g. "/sandbox/<id>"). On a cache
+// miss, creation remains serialized by the maintenance goroutine.
 func (c *CgroupManager) Allocate() (string, error) {
+	if c.stopped.Load() {
+		return "", errCgroupManagerStopped
+	}
 	if id := c.idleID.Pop(); id != "" {
-		// idle -> using, total unchanged.
 		c.usingID.Set(id, struct{}{})
-		c.storeMark.Store(true)
+		c.storeDirty.Store(true)
 		return id, nil
 	}
 
@@ -183,53 +254,56 @@ func (c *CgroupManager) Allocate() (string, error) {
 		c.mu.Unlock()
 		return "", errord.ErrResourceExhausted
 	}
-	c.total++ // reserve a slot for the about-to-be-created cgroup
+	c.total++
 	c.mu.Unlock()
 
 	req := &createRequest{result: make(chan createResult, 1)}
-	c.createReqs <- req
-	res := <-req.result
-	if res.err != nil {
-		// total was already decremented by the maintenance goroutine.
-		return "", res.err
+	select {
+	case c.createReqs <- req:
+	case <-c.stopCh:
+		c.mu.Lock()
+		c.total--
+		c.mu.Unlock()
+		return "", errCgroupManagerStopped
 	}
-	c.usingID.Set(res.id, struct{}{})
-	c.storeMark.Store(true)
-	return res.id, nil
+
+	select {
+	case res := <-req.result:
+		if res.err != nil {
+			return "", res.err
+		}
+		c.usingID.Set(res.id, struct{}{})
+		c.storeDirty.Store(true)
+		return res.id, nil
+	case <-c.stopCh:
+		return "", errCgroupManagerStopped
+	}
 }
 
-// run is the single maintenance goroutine: it performs all create/destroy
-// serially. It fills the idle pool to cacheSize once at startup, then serves
-// on-demand create requests and periodically shrinks excess idle back to
-// cacheSize.
 func (c *CgroupManager) run() {
+	defer c.wg.Done()
 	c.fillToCacheSize()
-	ticker := time.NewTicker(shrinkInterval)
-	defer ticker.Stop()
 	for {
 		select {
+		case <-c.stopCh:
+			return
 		case req := <-c.createReqs:
 			id, err := c.doCreate()
 			if err != nil {
 				logrus.Errorf("create cgroup on demand failed: %v", err)
 				c.mu.Lock()
-				c.total-- // release the reservation
+				c.total--
 				c.mu.Unlock()
 				req.result <- createResult{err: err}
 				continue
 			}
-			// Hand the new cgroup straight to the waiting Allocate; it goes to
-			// using (the reservation already accounts for it in total).
 			req.result <- createResult{id: id}
-		case <-ticker.C:
-			c.shrink()
 		}
 	}
 }
 
-// fillToCacheSize creates idle cgroups until idle reaches cacheSize (or max).
 func (c *CgroupManager) fillToCacheSize() {
-	for {
+	for !c.stopped.Load() {
 		c.mu.Lock()
 		if c.idleID.Length() >= c.cacheSize || c.total >= c.max {
 			c.mu.Unlock()
@@ -250,38 +324,27 @@ func (c *CgroupManager) fillToCacheSize() {
 	}
 }
 
-// shrink trims idle cgroups down to cacheSize. cgroup teardown is cheap (it is
-// enqueued to the async gc queue), so no pacing is needed.
-func (c *CgroupManager) shrink() {
-	for {
-		c.mu.Lock()
-		if c.idleID.Length() <= c.cacheSize {
-			c.mu.Unlock()
-			return
-		}
-		id := c.idleID.Pop()
-		if id == "" {
-			c.mu.Unlock()
-			return
-		}
-		c.total--
-		c.mu.Unlock()
-		c.deleteCgroup(id)
-	}
-}
-
-// doCreate creates one cgroup and returns its id. Called only by run().
 func (c *CgroupManager) doCreate() (string, error) {
 	newID, err := c.generator.Next()
 	if err != nil {
 		return "", err
 	}
-	if _, err = c.cgroupHandler.Create(cg.StaticPath(newID), c.cgroupResources(), cg.WithHiearchy(cg.Default)); err != nil {
+	if err = c.ops.create(newID, c.cgroupResources()); err != nil {
 		c.generator.Release(newID)
 		return "", err
 	}
+	if err = c.oom.Add(newID); err != nil {
+		if deleteErr := c.ops.delete(newID); deleteErr != nil {
+			logrus.Warnf(
+				"delete cgroup %s after OOM watcher setup failed: %v",
+				newID,
+				deleteErr,
+			)
+		}
+		c.generator.Release(newID)
+		return "", fmt.Errorf("register OOM watcher for cgroup %s: %w", newID, err)
+	}
 	c.cgroups.Set(newID, struct{}{})
-	c.storeMark.Store(true)
 	return newID, nil
 }
 
@@ -294,18 +357,27 @@ func (c *CgroupManager) cgroupResources() *specs.LinuxResources {
 }
 
 func (c *CgroupManager) deleteCgroup(id string) {
-	if !strings.Contains(id, c.rootName) {
-		logrus.Debugf("cgroup %s is legal, does not belong to %s", id, c.rootName)
+	if !belongsToRoot(id, c.rootName) {
+		logrus.Warnf(
+			"refusing to delete cgroup %s outside owned root %s",
+			id,
+			c.rootName,
+		)
 		return
 	}
-
-	c.cgroups.Remove(id)
+	if _, exists := c.cgroups.Pop(id); !exists {
+		return
+	}
+	c.oom.Remove(id)
 	c.gcQueue.Push(id)
-	c.storeMark.Store(true)
-}
-
-func (c *CgroupManager) cacheNum() int {
-	return c.idleID.Length()
+	metrics.RecordGcQueueLength(
+		config.ResourceNameCgroup,
+		float64(c.gcQueue.Length()),
+	)
+	select {
+	case c.gcWake <- struct{}{}:
+	default:
+	}
 }
 
 func NewCgroupManager(
@@ -317,151 +389,190 @@ func NewCgroupManager(
 		return nil, fmt.Errorf("pids_max must be non-negative")
 	}
 
-	rootName := cfg.CgroupRootName
-	if rootName == "" {
-		rootName = config.DefaultCgroupRoot
+	configuredRoot := cfg.CgroupRootName
+	if configuredRoot == "" {
+		configuredRoot = config.DefaultCgroupRoot
 	}
-	// load using id from db
+	rootName, err := normalizeCgroupRoot(configuredRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	ops, err := newCgroupOps()
+	if err != nil {
+		return nil, err
+	}
+	if err := ops.prepareRoot(rootName, cfg.PidsMax); err != nil {
+		return nil, err
+	}
+	oom, err := ops.newOOMWatcher()
+	if err != nil {
+		return nil, err
+	}
+	closeOOMOnError := true
+	defer func() {
+		if closeOOMOnError {
+			_ = oom.Close()
+		}
+	}()
+
+	logrus.Infof(
+		"detected cgroup mode %s; using transparent cgroup v%d operations under %s",
+		cgroupModeName(ops.mode()),
+		cgroupVersion(ops.mode()),
+		rootName,
+	)
+
 	idData, err := db.LoadRaw(config.CgroupBucket)
 	if err != nil && !errord.IsNotFound(err) {
 		return nil, err
 	}
-	var usingID storedCgroupIDs
+	var persisted storedCgroupIDs
 	if idData != nil {
-		if err = json.Unmarshal(idData, &usingID); err != nil {
+		if err = json.Unmarshal(idData, &persisted); err != nil {
 			return nil, err
-		} else {
-			logrus.Infof("load cgroup using id num: %v", len(usingID.Items))
 		}
+		logrus.Infof("load cgroup using id num: %d", len(persisted.Items))
 	}
 
-	// load all cgroup under rootName
-	cgs, err := loadAllCgroups(rootName)
+	cgroups, err := loadAllCgroups(ops, rootName)
 	if err != nil {
 		return nil, err
 	}
-	if cgs.Count() > 0 {
-		logrus.Infof("load existsing cgroup num: %v", cgs.Count())
+	if cgroups.Count() > 0 {
+		logrus.Infof("load existing cgroup num: %d", cgroups.Count())
 	}
-	idleIDs := util.New[string]("")
+
 	usingIDs := cmap.New[struct{}]()
-	for _, id := range usingID.Items {
+	recoveryDirty := false
+	for _, id := range persisted.Items {
+		if !belongsToRoot(id, rootName) || !cgroups.Has(id) {
+			logrus.Warnf("drop stale persisted cgroup id %s during recovery", id)
+			recoveryDirty = true
+			continue
+		}
 		usingIDs.Set(id, struct{}{})
 	}
 
 	c := &CgroupManager{
-		max:                  max,
-		cacheSize:            cfg.CgroupCacheSize,
-		rootName:             rootName,
-		pidsMax:              cfg.PidsMax,
-		usingID:              usingIDs,
-		idleID:               idleIDs,
-		createReqs:           make(chan *createRequest, max),
-		gcQueue:              util.New[string](""),
-		generator:            util.NewFixedLengthIDGenerator(12, cgs.Keys(), util.PrefixID(filepath.Join("/", rootName)+"/")),
-		db:                   db,
-		cgroups:              cgs,
-		storeMark:            atomic.Bool{},
-		enableDestroyRecycle: cfg.RecyclePolicy == config.RecyclePolicyDestroy,
-		cgroupHandler:        &cgroupops.CgroupHandlerImpl{},
+		max:        max,
+		cacheSize:  cfg.CgroupCacheSize,
+		rootName:   rootName,
+		pidsMax:    cfg.PidsMax,
+		usingID:    usingIDs,
+		idleID:     util.New(""),
+		cgroups:    cgroups,
+		generator:  util.NewFixedLengthIDGenerator(12, cgroups.Keys(), util.PrefixID(filepath.Join("/", rootName)+"/")),
+		createReqs: make(chan *createRequest, max),
+		db:         db,
+		gcQueue:    util.New(""),
+		gcWake:     make(chan struct{}, 1),
+		ops:        ops,
+		oom:        oom,
+		stopCh:     make(chan struct{}),
 	}
 
-	// Adopt existing non-using cgroups into the idle pool (up to cacheSize) so a
-	// restart reuses them instead of destroying then recreating; delete the
-	// excess. The maintenance goroutine then tops idle up to cacheSize.
-	for id := range cgs.Items() {
+	for id := range cgroups.Items() {
+		if err := ops.setPidsLimit(id, cfg.PidsMax); err != nil {
+			return nil, fmt.Errorf("restore pids limit for cgroup %s: %w", id, err)
+		}
+		if err := oom.Add(id); err != nil {
+			return nil, fmt.Errorf("restore OOM watcher for cgroup %s: %w", id, err)
+		}
+	}
+
+	for id := range cgroups.Items() {
 		if usingIDs.Has(id) {
 			continue
 		}
-		if !c.enableDestroyRecycle && c.idleID.Length() < c.cacheSize {
-			c.idleID.Push(id)
-		} else {
-			c.deleteCgroup(id)
+		if c.idleID.Length() < c.cacheSize {
+			if err := c.cleanForReuse(id); err == nil {
+				c.idleID.Push(id)
+				continue
+			} else {
+				logrus.Warnf(
+					"clean recovered cgroup %s failed; destroy it: %v",
+					id,
+					err,
+				)
+			}
 		}
+		c.deleteCgroup(id)
 	}
 	c.total = c.usingID.Count() + c.idleID.Length()
-	c.keepStoring()
+	c.storeDirty.Store(recoveryDirty)
+
+	c.wg.Add(3)
 	go c.run()
 	go c.gc()
-
+	go c.keepStoring()
+	closeOOMOnError = false
 	return c, nil
 }
 
 func (c *CgroupManager) keepStoring() {
-	go func() {
-		for {
-			select {
-			case <-time.After(5 * time.Second):
-				if c.storeMark.Load() {
-					c.storeMark.Store(false)
-					c.store()
-				}
+	defer c.wg.Done()
+	ticker := time.NewTicker(storeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			if !c.storeDirty.Swap(false) {
+				continue
+			}
+			if err := c.store(); err != nil {
+				c.storeDirty.Store(true)
+				logrus.Warnf("store cgroup using IDs failed: %v", err)
 			}
 		}
-	}()
+	}
 }
 
-func (c *CgroupManager) store() {
+func (c *CgroupManager) store() error {
 	start := time.Now()
 	defer func() {
-		logrus.Debugf("store cgroup %v using id cost: %v ms", c.usingID.Count(), time.Since(start).Milliseconds())
+		logrus.Debugf(
+			"store cgroup %d using ids cost: %d ms",
+			c.usingID.Count(),
+			time.Since(start).Milliseconds(),
+		)
 	}()
-	dataToStore, err := json.Marshal(storedCgroupIDs{Items: c.usingID.Keys()})
+	data, err := json.Marshal(storedCgroupIDs{Items: c.usingID.Keys()})
 	if err != nil {
-		logrus.Warnf("encode cgroup using id failed: %v", err)
-		return
+		return fmt.Errorf("encode cgroup using IDs: %w", err)
 	}
-	if err := c.db.StoreRaw(config.CgroupBucket, dataToStore); err != nil {
-		logrus.Warnf("store cgroup using id failed: %v", err)
+	if err := c.db.StoreRaw(config.CgroupBucket, data); err != nil {
+		return fmt.Errorf("store cgroup using IDs: %w", err)
 	}
+	return nil
 }
 
-// load all cgroup under rootName from blkio subsystem
-func loadAllCgroups(rootName string) (cmap.ConcurrentMap[string, struct{}], error) {
-	groupDirs, err := os.ReadDir(path.Join("/sys/fs/cgroup/memory", rootName))
+func loadAllCgroups(
+	ops cgroupOps,
+	rootName string,
+) (cmap.ConcurrentMap[string, struct{}], error) {
+	groupDirs, err := ops.list(rootName)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return cmap.New[struct{}](), nil
-		}
 		return cmap.New[struct{}](), err
 	}
 	cgroups := cmap.New[struct{}]()
-	for _, dir := range groupDirs {
-		if !dir.IsDir() {
-			continue
+	for _, name := range groupDirs {
+		if belongsToRoot(name, rootName) {
+			cgroups.Set(name, struct{}{})
 		}
-		cgroups.Set(filepath.Join("/", rootName, dir.Name()), struct{}{})
 	}
 	return cgroups, nil
 }
 
 func (c *CgroupManager) removeCgroupFromSystem(name string) error {
-	cgroup, err := c.cgroupHandler.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
-	if errors.Is(err, cg.ErrCgroupDeleted) {
-		return nil
+	if !belongsToRoot(name, c.rootName) {
+		return fmt.Errorf(
+			"refusing to remove cgroup %s outside owned root %s",
+			name,
+			c.rootName,
+		)
 	}
-	if err = cgroup.Delete(); err != nil {
-		if !os.IsNotExist(err) {
-			logrus.Warningf("delete cgroup %s directly failed: %v", name, err)
-			return err
-		}
-	} else {
-		return nil
-	}
-
-	subSystems, err := cg.Default()
-	if err != nil {
-		return err
-	}
-
-	errors := make([]string, 0)
-	for _, subSystem := range subSystems {
-		if err = os.RemoveAll(path.Join("/sys/fs/cgroup/", string(subSystem.Name()), name)); err != nil && !os.IsNotExist(err) {
-			errors = append(errors, err.Error())
-		}
-	}
-	if len(errors) > 0 {
-		return fmt.Errorf("delete cgroup %s failed: %v", name, errors)
-	}
-	return nil
+	return c.ops.delete(name)
 }

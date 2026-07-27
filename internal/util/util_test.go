@@ -17,16 +17,12 @@ package util
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"syscall"
 	"testing"
 	"time"
 
 	gomonkey "github.com/agiledragon/gomonkey/v2"
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
-	"github.com/inclusionAI/sandboxd/internal/cgroupops"
-	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -112,62 +108,6 @@ func TestEnvValue(t *testing.T) {
 			assert.Equalf(t, tt.want, EnvValue(tt.args.envs, tt.args.key), "EnvValue(%v, %v)", tt.args.envs, tt.args.key)
 		})
 	}
-}
-
-func subystemsExecptMemory() ([]cg.Subsystem, error) {
-	var enabled = []cg.Subsystem{
-		cg.NewCpuset("/sys/fs/cgroup"),
-	}
-
-	return enabled, nil
-}
-
-func TestKillCgroupProcesses(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("Requires root to create cgroups")
-	}
-	// OK case
-	const cgroupPath = "test-kill-sandbox"
-	cgroupHandler := &cgroupops.CgroupHandlerImpl{}
-	cgroup, err := cgroupHandler.Create(cg.StaticPath(cgroupPath), &specs.LinuxResources{}, cg.WithHiearchy(cg.Default))
-	assert.NoError(t, err)
-
-	cmd := exec.Command("sleep", "666")
-	err = cmd.Start()
-	assert.NoError(t, err)
-
-	err = cgroup.AddProc(uint64(cmd.Process.Pid))
-	assert.NoError(t, err)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
-	err = KillCgroupProcesses(cgroupPath)
-	assert.NoError(t, err)
-
-	select {
-	case <-time.After(1 * time.Second):
-		assert.Fail(t, "timeout")
-	case err := <-done:
-		assert.ErrorContains(t, err, "signal: killed")
-	}
-
-	// Fail case 1
-	// Use non-exist cgroup-path
-	err = KillCgroupProcesses("/non-exist-test-cgroup-path")
-	assert.ErrorContains(t, err, "getting cgroup failed")
-
-	// Fail case 2
-	// Use no memory subsystem cgroup
-	const cgroupPathEmpty = "test-kill-sandbox-no-memory"
-	_, err = cgroupHandler.Create(cg.StaticPath(cgroupPathEmpty), &specs.LinuxResources{}, cg.WithHiearchy(subystemsExecptMemory))
-	assert.NoError(t, err)
-
-	err = KillCgroupProcesses(cgroupPathEmpty)
-	assert.ErrorContains(t, err, "getting processes failed")
-
 }
 
 // type fakeFileStat interface {

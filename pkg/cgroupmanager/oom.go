@@ -12,27 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cgroupv1
+package cgroupmanager
 
-import (
-	"testing"
-
-	"github.com/stretchr/testify/assert"
-)
-
-func TestReadCfsInfo(t *testing.T) {
-	cfsInfo, err := ReadCfsInfo("", "testdata")
-	assert.NoError(t, err)
-	assert.Equal(t, int64(1024), cfsInfo.Shares)
-	assert.Equal(t, int64(100000), cfsInfo.Period)
-	assert.Equal(t, int64(100000), cfsInfo.Quota)
-
-	_, err = ReadCfsInfo("", "xxx")
-	assert.Error(t, err)
-
-	_, err = ReadCfsInfo("testdata", "a")
-	assert.Error(t, err)
-
-	_, err = ReadCfsInfo("testdata", "b")
-	assert.Error(t, err)
+// oomWatcher owns the kernel subscriptions for every cgroup managed by one
+// CgroupManager. Add and Remove follow the physical cgroup lifetime, while
+// Reset clears the observation when a cgroup is returned to the idle cache.
+type oomWatcher interface {
+	Add(name string) error
+	Remove(name string)
+	Reset(name string) error
+	OOMKilled(name string) (bool, error)
+	Close() error
 }

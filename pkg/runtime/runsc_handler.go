@@ -22,14 +22,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	"github.com/inclusionAI/sandboxd/internal/trace"
 	runscapi "github.com/inclusionAI/sandboxd/pkg/runtime/runsc"
 
-	cg "github.com/containerd/cgroups/v3/cgroup1"
-	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
-	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -53,46 +49,6 @@ type runscClient interface {
 	Wait(context.Context, string) (int, error)
 	Delete(context.Context, string, bool) error
 	ListJSON(context.Context) ([]byte, error)
-}
-
-func updateCgroup(cgroupPath string, resource *runtime.LinuxSandboxResources) error {
-	if resource == nil {
-		return nil
-	}
-
-	cgroupHandler := &cgroupops.CgroupHandlerImpl{}
-	cgroup, err := cgroupHandler.Load(cg.StaticPath(cgroupPath), cg.WithHiearchy(cg.Default))
-	if err != nil {
-		return err
-	}
-
-	var cpu spec.LinuxCPU
-	if resource.CpuShares > 0 {
-		cpu.Shares = &resource.CpuShares
-	}
-	if resource.CpuQuota > 0 {
-		cpu.Quota = &resource.CpuQuota
-	}
-	if resource.CpuPeriod > 0 {
-		cpu.Period = &resource.CpuPeriod
-	}
-	if resource.CpusetCpus != "" {
-		cpu.Cpus = resource.CpusetCpus
-	}
-	if resource.CpusetMems != "" {
-		cpu.Mems = resource.CpusetMems
-	}
-	var mem spec.LinuxMemory
-	if resource.MemoryLimitInBytes > 0 {
-		mem.Limit = &resource.MemoryLimitInBytes
-	}
-
-	cgroupResource := spec.LinuxResources{
-		CPU:    &cpu,
-		Memory: &mem,
-	}
-
-	return cgroup.Update(&cgroupResource)
 }
 
 func NewRunscHandler(cfg config.Config, bin string, loader OciLoader) (*RunscHandler, error) {
@@ -120,11 +76,6 @@ func NewRunscHandler(cfg config.Config, bin string, loader OciLoader) (*RunscHan
 
 func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 	traceID, _ := trace.GetContextID(ctx)
-	if config.Resources != nil && config.CgroupPath != "" {
-		if err := updateCgroup(config.CgroupPath, config.Resources); err != nil {
-			return fmt.Errorf("update cgroup %s: %w", config.CgroupPath, err)
-		}
-	}
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
 	}

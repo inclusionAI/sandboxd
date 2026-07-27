@@ -29,7 +29,6 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
-	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	"github.com/inclusionAI/sandboxd/internal/metrics"
 	"github.com/inclusionAI/sandboxd/internal/trace"
 	"github.com/inclusionAI/sandboxd/internal/util"
@@ -39,7 +38,6 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	// The side-effect import registers the public NAT backend before
 	// InterfaceManager initialization while avoiding an import cycle.
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
@@ -180,6 +178,16 @@ func (h *sandboxService) startSandboxRuntime(
 		return errord.ToGRPC(errord.ErrNotImplemented)
 	}
 
+	if startConfig.CgroupPath != "" {
+		if h.cgroupMgr == nil {
+			return errors.New("cgroup manager is not configured")
+		}
+		hostResources := svc.HostCgroupResources(runtimeName, startConfig.Resources)
+		if err = h.cgroupMgr.Prepare(startConfig.CgroupPath, hostResources); err != nil {
+			return fmt.Errorf("prepare cgroup %s: %w", startConfig.CgroupPath, err)
+		}
+	}
+
 	if err = handler.Start(ctx, startConfig); err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
 		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
@@ -293,29 +301,22 @@ func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsReques
 		return nil, errord.ToGRPC(fmt.Errorf("cgroup path not found for sandbox %s", request.ID))
 	}
 
-	cgroupHandler := &cgroupops.CgroupHandlerImpl{}
-	cgroup, err := cgroupHandler.Load(cg.StaticPath(cgroupPath), cg.WithHiearchy(cg.Default))
-	if err != nil {
-		return nil, errord.ToGRPC(fmt.Errorf("load cgroup %s failed: %v", cgroupPath, err))
+	if h.cgroupMgr == nil {
+		return nil, errord.ToGRPC(errors.New("cgroup manager is not configured"))
 	}
-
-	metrics, err := cgroup.Stat()
+	cgroupStats, err := h.cgroupMgr.Stats(cgroupPath)
 	if err != nil {
 		return nil, errord.ToGRPC(fmt.Errorf("stat cgroup %s failed: %v", cgroupPath, err))
 	}
 
-	resp := &runtime.StatsResponse{}
-	if metrics.CPU != nil && metrics.CPU.Usage != nil {
-		resp.CpuUsageNs = metrics.CPU.Usage.Total
-		resp.CpuKernelNs = metrics.CPU.Usage.Kernel
-		resp.CpuUserNs = metrics.CPU.Usage.User
-	}
-	if metrics.Memory != nil && metrics.Memory.Usage != nil {
-		resp.MemoryUsageBytes = metrics.Memory.Usage.Usage
-		resp.MemoryLimitBytes = metrics.Memory.Usage.Limit
-		resp.MemoryMaxUsageBytes = metrics.Memory.Usage.Max
-	}
-	return resp, nil
+	return &runtime.StatsResponse{
+		CpuUsageNs:          cgroupStats.CPUUsageNanos,
+		CpuKernelNs:         cgroupStats.CPUKernelNanos,
+		CpuUserNs:           cgroupStats.CPUUserNanos,
+		MemoryUsageBytes:    cgroupStats.MemoryUsageBytes,
+		MemoryLimitBytes:    cgroupStats.MemoryLimitBytes,
+		MemoryMaxUsageBytes: cgroupStats.MemoryMaxUsageBytes,
+	}, nil
 }
 
 // ListAvailableRuntimes returns a stable snapshot of runtime classes whose
@@ -628,6 +629,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		}
 		s.cgroupMgr = cgroupMgr
 		metrics.RecordResourceGauge("cgroup", float64(cgroupMgr.CacheSizeLimit()))
+		if nodeResMod != nil {
+			nodeResMod.SetCgroupStatsReader(cgroupMgr.Stats)
+		}
 		defer func() {
 			if retErr != nil {
 				_ = cgroupMgr.ShutDown()

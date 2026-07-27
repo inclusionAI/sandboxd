@@ -23,9 +23,7 @@ import (
 	"syscall"
 	"time"
 
-	cg "github.com/containerd/cgroups/v3/cgroup1"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
-	"github.com/inclusionAI/sandboxd/internal/cgroupops"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -117,27 +115,6 @@ func EnvValue(envs []*runtime.KeyValue, key string) string {
 		}
 	}
 	return ""
-}
-
-func KillCgroupProcesses(cgroupPath string) error {
-	// Kill all processes still attached to the sandbox cgroup.
-	cgroupHandler := &cgroupops.CgroupHandlerImpl{}
-	cgroup, err := cgroupHandler.Load(cg.StaticPath(cgroupPath), cg.WithHiearchy(cg.Default))
-	if err != nil {
-		return fmt.Errorf("getting cgroup failed: %v", err)
-	}
-
-	processes, err := cgroup.Processes(cg.Memory, true)
-	if err != nil {
-		return fmt.Errorf("getting processes failed: %v", err)
-	}
-
-	for _, process := range processes {
-		// Kill process with SIGKILL never failed
-		_ = syscall.Kill(process.Pid, syscall.SIGKILL)
-	}
-
-	return nil
 }
 
 func IsMountpoint(target string) (bool, error) {

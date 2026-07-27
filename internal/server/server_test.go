@@ -54,9 +54,6 @@ func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxServi
 		MaxInstanceNum:  10,
 		CgroupRootName:  "sandbox-test",
 		CgroupCacheSize: 4,
-		ResourceAdvanceConfig: config.ResourceAdvanceConfig{
-			RecyclePolicy: config.RecyclePolicyDestroy,
-		},
 	}, 10)
 	if !assert.NoError(t, err) {
 		t.FailNow()

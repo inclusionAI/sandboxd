@@ -1,9 +1,0 @@
-total_pgpgin 8295298214 xxx
-total_pgpgout 8288060810
-total_pgfault 12113682850
-total_pgmajfault 22632910
-total_inactive_anon xxxx730976256
-total_active_anon 3723264
-total_inactive_file 14042796032
-total_active_file 14957842432
-total_unevictable 50012160
