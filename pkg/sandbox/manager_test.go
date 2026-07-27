@@ -26,10 +26,8 @@ import (
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/util"
-	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
-	"github.com/inclusionAI/sandboxd/pkg/store"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/stretchr/testify/assert"
@@ -38,15 +36,7 @@ import (
 func TestNewManager(t *testing.T) {
 	handlers := cmap.New[svc.Handler]()
 	healthChan := make(chan bool)
-	cgMgr, err := cgroupmanager.NewCgroupManager(store.NewMockStore(), config.ResourceConfig{
-		MaxInstanceNum:  10,
-		CgroupRootName:  "sandbox-test",
-		CgroupCacheSize: 8,
-	}, 10)
-	assert.NotNil(t, cgMgr)
-	assert.Nil(t, err)
-
-	mgr, err := NewManager("/tmp/mock", handlers, healthChan, cgMgr, 10)
+	mgr, err := NewManager("/tmp/mock", handlers, healthChan, nil, 10)
 	assert.NotNil(t, mgr)
 	assert.Nil(t, err)
 

@@ -26,7 +26,6 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
-	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
@@ -50,16 +49,7 @@ func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxServi
 
 	healthChan := make(chan bool, 10)
 
-	cgMgr, err := cgroupmanager.NewCgroupManager(store.NewMockStore(), config.ResourceConfig{
-		MaxInstanceNum:  10,
-		CgroupRootName:  "sandbox-test",
-		CgroupCacheSize: 4,
-	}, 10)
-	if !assert.NoError(t, err) {
-		t.FailNow()
-	}
-
-	cm, err := sandbox.NewManager(tmpDir, handlerMap, healthChan, cgMgr, 1000)
+	cm, err := sandbox.NewManager(tmpDir, handlerMap, healthChan, nil, 1000)
 	if !assert.NoError(t, err) {
 		t.FailNow()
 	}
