@@ -71,6 +71,7 @@ func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxServi
 		networkMgr:                        newNetworkManager(nil, ""),
 	}
 	s.ready.Store(true)
+	s.recoveryReady.Store(true)
 	return s
 }
 
@@ -147,6 +148,22 @@ func TestListAvailableRuntimes(t *testing.T) {
 	)
 	assert.NoError(t, err)
 	assert.Equal(t, []string{"other", "runsc"}, resp.RuntimeClasses)
+}
+
+func TestDistillFSRecoveryGatesNewSandboxTraffic(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		"runsc": svc.NewFakeRuntimeHandler(),
+	})
+	s.recoveryReady.Store(false)
+
+	assert.False(t, s.Healthy())
+	_, err := s.ListAvailableRuntimes(
+		context.Background(),
+		&runtime.ListAvailableRuntimesRequest{},
+	)
+	assert.Error(t, err)
+	_, err = s.Start(context.Background(), &runtime.StartRequest{})
+	assert.Error(t, err)
 }
 
 func TestList_ById_NotFound(t *testing.T) {

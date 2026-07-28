@@ -190,19 +190,20 @@ func TestFSManagerRestoreCleansOrphanState(t *testing.T) {
 	stateStore := store.NewMockStore()
 	service := newFSTestImageService()
 	beforeCrash := newFSManager(service, stateStore)
-	prepareAndCommitFS(t, beforeCrash, "orphan")
+	prepareAndCommitFS(t, beforeCrash, "a-orphan")
+	prepareAndCommitFS(t, beforeCrash, "z-live")
 
 	afterCrash := newFSManager(service, stateStore)
-	if err := afterCrash.Restore(func(string) bool { return false }); err != nil {
+	if err := afterCrash.Restore(func(id string) bool { return id == "z-live" }); err != nil {
 		t.Fatalf("Restore() failed: %v", err)
 	}
-	if len(afterCrash.sandboxState) != 0 {
-		t.Fatalf("orphan state was retained: %+v", afterCrash.sandboxState)
+	if len(afterCrash.sandboxState) != 1 || afterCrash.sandboxState["z-live"].Rootfs == nil {
+		t.Fatalf("restored filesystem state = %+v, want only z-live", afterCrash.sandboxState)
 	}
-	if got := service.umountCalls("registry.example/rootfs:latest"); got != 1 {
-		t.Fatalf("orphan rootfs unmount calls = %d, want 1", got)
+	if got := service.umountCalls("registry.example/rootfs:latest"); got != 0 {
+		t.Fatalf("shared live rootfs was unmounted during restore: calls=%d", got)
 	}
-	if got := service.umountCalls("registry.example/data:latest"); got != 1 {
-		t.Fatalf("orphan additional unmount calls = %d, want 1", got)
+	if got := service.umountCalls("registry.example/data:latest"); got != 0 {
+		t.Fatalf("shared live mount was unmounted during restore: calls=%d", got)
 	}
 }

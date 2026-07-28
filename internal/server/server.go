@@ -85,7 +85,8 @@ type sandboxService struct {
 
 	fsMgr *fsManager
 
-	ready atomic.Bool
+	ready         atomic.Bool
+	recoveryReady atomic.Bool
 }
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
@@ -326,6 +327,9 @@ func (h *sandboxService) ListAvailableRuntimes(
 	_ context.Context,
 	_ *runtime.ListAvailableRuntimesRequest,
 ) (*runtime.ListAvailableRuntimesResponse, error) {
+	if !h.Healthy() {
+		return nil, errord.ToGRPCf(errord.ErrUnavailable, "sandbox service is not ready")
+	}
 	runtimeClasses := h.serviceHandler.Keys()
 	sort.Strings(runtimeClasses)
 
@@ -336,6 +340,15 @@ func (h *sandboxService) ListAvailableRuntimes(
 
 func (h *sandboxService) Run() error {
 	logrus.Infof("sandbox service run at %s", h.config.RootDir)
+	for {
+		if err := h.imageMod.ReconcileRecoveredDaemons(); err != nil {
+			logrus.WithError(err).Warn("distillfs recovery is incomplete; retrying")
+			time.Sleep(time.Second)
+			continue
+		}
+		break
+	}
+	h.recoveryReady.Store(true)
 	h.sandboxManager.Start()
 	return nil
 }
@@ -401,7 +414,7 @@ func (h *sandboxService) Shutdown() {
 // been constructed (e.g. legacy code path) is treated as not unhealthy:
 // only an explicit false from a live module flips the result.
 func (h *sandboxService) Healthy() bool {
-	if !h.ready.Load() {
+	if !h.recoveryReady.Load() || !h.ready.Load() {
 		return false
 	}
 	if h.resourceMod != nil && !h.resourceMod.Healthy() {
@@ -755,6 +768,10 @@ type resourcePrepareResult struct {
 func (h *sandboxService) Start(ctx context.Context, request *runtime.StartRequest) (*runtime.StartResponse, error) {
 	if request == nil {
 		err := fmt.Errorf("start request is nil")
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+	}
+	if !h.recoveryReady.Load() {
+		err := errord.ToGRPCf(errord.ErrUnavailable, "distillfs recovery is incomplete")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)

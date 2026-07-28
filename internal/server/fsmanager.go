@@ -307,10 +307,20 @@ func (m *fsManager) Restore(sandboxExists func(string) bool) error {
 		return fmt.Errorf("decode sandbox filesystem state: %w", err)
 	}
 	ids := make([]string, 0, len(stored.Items))
+	orphaned := make(map[string]bool, len(stored.Items))
 	for sandboxID := range stored.Items {
 		ids = append(ids, sandboxID)
+		orphaned[sandboxID] = sandboxExists != nil && !sandboxExists(sandboxID)
 	}
-	sort.Strings(ids)
+	// Restore live sandboxes first so shared mount references exist before
+	// orphan state is reacquired and released. Otherwise an orphan sorted first
+	// could unmount a daemon that a recovered sandbox still uses.
+	sort.Slice(ids, func(i, j int) bool {
+		if orphaned[ids[i]] != orphaned[ids[j]] {
+			return !orphaned[ids[i]]
+		}
+		return ids[i] < ids[j]
+	})
 
 	var restoreErrors []error
 	for _, sandboxID := range ids {
@@ -319,7 +329,7 @@ func (m *fsManager) Restore(sandboxExists func(string) bool) error {
 			restoreErrors = append(restoreErrors, fmt.Errorf("sandbox %s: %w", sandboxID, err))
 			continue
 		}
-		if sandboxExists != nil && !sandboxExists(sandboxID) {
+		if orphaned[sandboxID] {
 			_ = m.release(sandboxID, false)
 		}
 	}

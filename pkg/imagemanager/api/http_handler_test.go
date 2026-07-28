@@ -132,6 +132,11 @@ func (m *mockManager) ListDaemons() []distillfs.DaemonInfo {
 	return []distillfs.DaemonInfo{}
 }
 
+func (m *mockManager) SetDaemonReferenced(string, bool) {}
+func (m *mockManager) ReconcileRecoveredDaemons() error {
+	return nil
+}
+
 func TestHttpWorker_MountOSS_Validation(t *testing.T) {
 	tests := []struct {
 		name    string

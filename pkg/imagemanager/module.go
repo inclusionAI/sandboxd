@@ -141,6 +141,12 @@ func (m *Module) Service() api.Service { return m.worker }
 // their background goroutines during NewModule.
 func (m *Module) Start() error { return nil }
 
+// ReconcileRecoveredDaemons removes distillfs daemons that were not claimed
+// while sandbox filesystem state was restored.
+func (m *Module) ReconcileRecoveredDaemons() error {
+	return m.mgr.ReconcileRecoveredDaemons()
+}
+
 // Stop closes the worker (drains in-flight requests, persists mount state
 // to mount_records.db) and the OCI manager (releases overlay mounts). It
 // is safe to call multiple times; only the first call performs work.

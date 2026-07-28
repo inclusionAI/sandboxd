@@ -82,6 +82,58 @@ func createTestRegistryAuthsFile(t *testing.T, dir string) string {
 	return authsPath
 }
 
+func TestReconcileRecoveredDaemonsRetriesUntilOrphanIsClean(t *testing.T) {
+	root := t.TempDir()
+	alive := true
+	orphan := &Daemon{
+		ctx: context.Background(),
+		meta: DaemonMeta{
+			ID:          "orphan",
+			MountPoint:  filepath.Join(root, "mnt", "orphan"),
+			PidFilePath: filepath.Join(root, "orphan.pid"),
+		},
+		isAliveFunc: func() bool { return alive },
+	}
+	orphan.setState(DaemonStateStopped)
+	live := &Daemon{
+		ctx:  context.Background(),
+		meta: DaemonMeta{ID: "live"},
+	}
+
+	mgr := &manager{
+		root: root,
+		daemons: map[string]*Daemon{
+			"live":   live,
+			"orphan": orphan,
+		},
+		recovered: map[string]bool{
+			"live":   true,
+			"orphan": false,
+		},
+	}
+
+	if err := mgr.ReconcileRecoveredDaemons(); err == nil {
+		t.Fatal("reconciliation succeeded while orphan process was alive")
+	}
+	if mgr.daemons["orphan"] == nil {
+		t.Fatal("failed orphan was removed instead of retained for retry")
+	}
+
+	alive = false
+	if err := mgr.ReconcileRecoveredDaemons(); err != nil {
+		t.Fatalf("reconciliation retry failed: %v", err)
+	}
+	if mgr.daemons["orphan"] != nil {
+		t.Fatal("clean orphan was not removed")
+	}
+	if mgr.daemons["live"] == nil {
+		t.Fatal("referenced daemon was removed")
+	}
+	if mgr.recovered != nil {
+		t.Fatal("recovery state remained after reconciliation")
+	}
+}
+
 func createTestDockerFormatRegistryAuthsFile(t *testing.T, dir string) string {
 	t.Helper()
 	authsPath := filepath.Join(dir, "registry_auths_docker.json")

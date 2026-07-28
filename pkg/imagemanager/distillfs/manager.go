@@ -60,6 +60,8 @@ type Manager interface {
 	GetDaemon(id string) *Daemon
 	CleanupDaemon(daemonID string) error
 	ListDaemons() []DaemonInfo
+	SetDaemonReferenced(daemonID string, referenced bool)
+	ReconcileRecoveredDaemons() error
 }
 
 type manager struct {
@@ -75,6 +77,11 @@ type manager struct {
 	ossAuths         OSSAuthsConfig        // OSS authentication credentials
 	registryAuths    RegistryAuthsConfig   // Registry authentication credentials
 	cgroupCtrl       *imgcgroup.Controller // Memory cgroup for daemon processes (nil = disabled)
+
+	// recovered tracks daemons loaded from disk and whether restored sandbox
+	// filesystem state still references them. A nil map means reconciliation
+	// has completed.
+	recovered map[string]bool
 }
 
 // NydusClient interface for fetching Nydus images and extracting bootstrap.
@@ -137,6 +144,7 @@ func NewManager(config *ManagerConfig) (Manager, error) {
 		ossCfgTemplate:   BackendConfig{},
 		nydusCfgTemplate: BackendConfig{},
 		daemons:          map[string]*Daemon{},
+		recovered:        map[string]bool{},
 		nydusClient:      config.NydusClient,
 		cgroupCtrl:       imgcgroup.NewController(config.CgroupMemoryLimit),
 	}
@@ -197,6 +205,7 @@ func (mgr *manager) loadExistedDaemons() error {
 		}
 		d.savedPath = filepath.Join(daemonConfigDir, d.meta.ID+".json")
 		mgr.daemons[d.meta.ID] = d
+		mgr.recovered[d.meta.ID] = false
 	}
 	return nil
 }
@@ -721,8 +730,12 @@ func (mgr *manager) gcWorker() {
 	for range gcTicker.C {
 		mgr.mu.RLock()
 		total := len(mgr.daemons)
+		recovering := mgr.recovered != nil
 		mgr.mu.RUnlock()
 		logrus.Infof("try gc daemons, total daemons number: %d", total)
+		if recovering {
+			continue
+		}
 
 		// First check if disk pressure requires urgent cleanup
 		mgr.gcDaemonsByDiskPressure()
@@ -751,8 +764,79 @@ func (mgr *manager) CleanupDaemon(daemonID string) error {
 
 	mgr.cleanupDaemonResources(d)
 	delete(mgr.daemons, d.meta.ID)
+	delete(mgr.recovered, daemonID)
 	logrus.WithFields(d.daemonLogFields()).Info("successfully cleaned daemon")
 
+	return nil
+}
+
+// SetDaemonReferenced updates whether restored sandbox filesystem state uses a
+// daemon loaded during this restart.
+func (mgr *manager) SetDaemonReferenced(daemonID string, referenced bool) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if _, ok := mgr.recovered[daemonID]; ok {
+		mgr.recovered[daemonID] = referenced
+	}
+}
+
+// ReconcileRecoveredDaemons removes daemons that are not referenced by any
+// recovered sandbox. Failed cleanups remain candidates for the next call.
+func (mgr *manager) ReconcileRecoveredDaemons() error {
+	mgr.mu.RLock()
+	candidates := make(map[string]*Daemon)
+	for id, referenced := range mgr.recovered {
+		if !referenced {
+			candidates[id] = mgr.daemons[id]
+		}
+	}
+	mgr.mu.RUnlock()
+
+	var retErr error
+	for id, daemon := range candidates {
+		if daemon == nil {
+			continue
+		}
+		if err := daemon.Unmount(); err != nil {
+			retErr = fmt.Errorf("unmount recovered daemon %s: %w", id, err)
+			continue
+		}
+		if daemon.IsAlive() {
+			retErr = fmt.Errorf("recovered daemon %s is still running", id)
+			continue
+		}
+		mounted, err := isMountPoint(daemon.MountPoint())
+		if err != nil {
+			retErr = fmt.Errorf("check recovered daemon %s mount: %w", id, err)
+			continue
+		}
+		if mounted {
+			retErr = fmt.Errorf("recovered daemon %s is still mounted", id)
+			continue
+		}
+		if err := mgr.CleanupDaemon(id); err != nil {
+			retErr = fmt.Errorf("cleanup recovered daemon %s: %w", id, err)
+		}
+	}
+
+	mgr.mu.Lock()
+	pending := 0
+	for _, referenced := range mgr.recovered {
+		if !referenced {
+			pending++
+		}
+	}
+	if pending == 0 {
+		mgr.recovered = nil
+	}
+	mgr.mu.Unlock()
+
+	if retErr != nil {
+		return retErr
+	}
+	if pending > 0 {
+		return fmt.Errorf("%d recovered distillfs daemons still need cleanup", pending)
+	}
 	return nil
 }
 

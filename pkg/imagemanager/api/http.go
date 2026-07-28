@@ -205,6 +205,7 @@ func (w *HttpWorker) MountOSS(req *OSSMountRequest) (*MountInfo, error) {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to mount %s: %w", opts.ID, err)
 	}
+	w.mgr.SetDaemonReferenced(opts.ID, true)
 	logrus.WithFields(logrus.Fields{
 		"daemon_id":   opts.ID,
 		"mount_point": d.MountPoint(),
@@ -232,6 +233,7 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 		timing.Fail(err)
 		return nil, err
 	}
+	defer w.mgr.SetDaemonReferenced(id, false)
 	timing.Stage("get_daemon", time.Since(stageStart))
 
 	// Stage 2: Unmount daemon (this will have its own detailed timing)
@@ -297,6 +299,7 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 			timing.Fail(err)
 			return nil, fmt.Errorf("failed to mount existing daemon %s: %w", id, err)
 		}
+		w.mgr.SetDaemonReferenced(id, true)
 		timing.Stage("mount_existing_daemon", time.Since(stageStart))
 
 		return info, nil
@@ -356,6 +359,7 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to mount %s: %w", opts.ID, err)
 	}
+	w.mgr.SetDaemonReferenced(opts.ID, true)
 	info.Env = d.Env()
 	logrus.WithFields(logrus.Fields{
 		"daemon_id":   opts.ID,
@@ -393,6 +397,7 @@ func (w *HttpWorker) UnmountNydus(req *NydusUmountRequest) (*MountInfo, error) {
 		timing.Fail(err)
 		return nil, err
 	}
+	defer w.mgr.SetDaemonReferenced(id, false)
 	timing.Stage("get_daemon", time.Since(stageStart))
 
 	// Stage 3: Unmount daemon
@@ -605,6 +610,7 @@ func (w *HttpWorker) unmountOCILegacy(req *OCIUmountRequest) error {
 		nydusID := generateNydusID(req.ImageURL)
 		if d := w.mgr.GetDaemon(nydusID); d != nil {
 			logrus.Infof("legacy: image %s was mounted as Nydus, unmounting via Nydus", req.ImageURL)
+			defer w.mgr.SetDaemonReferenced(nydusID, false)
 			return d.Unmount()
 		}
 
@@ -614,6 +620,7 @@ func (w *HttpWorker) unmountOCILegacy(req *OCIUmountRequest) error {
 			nydusIDWithSuffix := generateNydusID(imageWithSuffix)
 			if d := w.mgr.GetDaemon(nydusIDWithSuffix); d != nil {
 				logrus.Infof("legacy: image %s (with suffix) was mounted as Nydus, unmounting via Nydus", imageWithSuffix)
+				defer w.mgr.SetDaemonReferenced(nydusIDWithSuffix, false)
 				return d.Unmount()
 			}
 		}
