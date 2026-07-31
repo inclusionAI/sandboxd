@@ -35,6 +35,11 @@ max_instance_num = 32
 # Retained for configuration compatibility; the current runtime does not read it.
 image_lib_dir = "/var/lib/sandboxd/images"
 overlay_tmpfs_size = "256M"
+# Extra memory in the host cgroup that contains the complete runsc sandbox.
+# This increases the effective and reported sandbox memory limit; include the
+# same amount in scheduler and node-capacity accounting. Empty or zero disables
+# the overhead.
+runsc_host_cgroup_memory_overhead = "0"
 
 [plugin.runtime.basic_spec]
 # Empty uses sandboxd's built-in OCI base specification.

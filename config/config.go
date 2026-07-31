@@ -87,6 +87,12 @@ type RuntimeConfig struct {
 	// OverlayTmpfsSize specifies the size limit for the overlay tmpfs upper
 	// layer (e.g. "256M", "1G"). When empty, no size limit is applied.
 	OverlayTmpfsSize string `toml:"overlay_tmpfs_size" json:"overlayTmpfsSize"`
+
+	// RunscHostCgroupMemoryOverhead adds runtime overhead to the host cgroup
+	// enclosing runsc. Runsc derives its reported total memory and effective
+	// sandbox memory boundary from that cgroup, so an orchestrator must include
+	// the same overhead in scheduling and capacity accounting.
+	RunscHostCgroupMemoryOverhead string `toml:"runsc_host_cgroup_memory_overhead" json:"runscHostCgroupMemoryOverhead"`
 }
 
 // KataConfig contains the host paths and storage settings used by Kata.

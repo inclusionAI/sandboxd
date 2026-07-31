@@ -84,6 +84,12 @@ tools/               pinned protobuf code-generation image
   advertised. Do not use this mode when per-sandbox resource isolation is
   required.
 - To minimize sandbox startup latency, sandboxd caches and reuses physical cgroups across sandbox leases. Cumulative CPU accounting and peak-memory statistics therefore cover the physical cgroup lifetime, and reclaimable charges such as page cache may remain until kernel pressure reclaims them; CPU utilization calculated from sampling deltas and configured resource limits remain correct for the active sandbox.
+- gVisor charges application memory, the Sentry, gofers, and host-side page
+  cache to the host cgroup containing runsc. Operators can configure
+  `runsc_host_cgroup_memory_overhead` when the requested limit is not a
+  sufficient total sandbox budget. The overhead increases the effective limit
+  reported by `Stats` and observed inside the sandbox; orchestrators must add
+  the same amount to scheduling and node-capacity accounting.
 - The direct OCI registry client currently skips TLS certificate verification and should only be used with trusted registries.
 
 ## License

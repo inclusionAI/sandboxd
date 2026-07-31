@@ -22,7 +22,6 @@ import (
 	"strconv"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
-	"github.com/inclusionAI/sandboxd/config"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -42,19 +41,6 @@ func kataHostResources(
 	result.CpuQuota = 0
 	result.CpuPeriod = 0
 	return result
-}
-
-// HostCgroupResources maps sandbox resources to the host cgroup enclosing a
-// runtime. Kata keeps CPU quota/period inside its VM topology, while runsc uses
-// the request unchanged.
-func HostCgroupResources(
-	runtimeName string,
-	resource *runtime.LinuxSandboxResources,
-) *runtime.LinuxSandboxResources {
-	if runtimeName == config.RuntimeNameKata {
-		return kataHostResources(resource)
-	}
-	return resource
 }
 
 // prepareKataResourceSpec gives the VM an explicit topology while keeping the
