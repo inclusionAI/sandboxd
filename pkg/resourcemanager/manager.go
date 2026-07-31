@@ -26,6 +26,9 @@ import (
 const (
 	tokenPath = "/etc/k8s_secrets/token"
 	caPath    = "/etc/k8s_secrets/ca.crt"
+
+	ProviderKubernetes = "kubernetes"
+	ProviderCgroup     = "cgroup"
 )
 
 type NodeResourceManager interface {
@@ -85,10 +88,38 @@ func newNodeK8sClient() (*nodeClient, error) {
 	return &nodeClient{client: clientset, localNodeName: nodeName}, nil
 }
 
-// NewNodeResourceManager creates the portable Kubernetes resource provider.
-// It reports the node's allocatable CPU and memory after subtracting requests
-// from non-terminal Pods assigned to the same node.
-func NewNodeResourceManager() (NodeResourceManager, error) {
+func normalizeProvider(provider string) (string, error) {
+	switch normalized := strings.ToLower(strings.TrimSpace(provider)); normalized {
+	case "", ProviderKubernetes:
+		return ProviderKubernetes, nil
+	case ProviderCgroup:
+		return ProviderCgroup, nil
+	default:
+		return "", fmt.Errorf(
+			"unsupported node-resource provider %q (supported: %s, %s)",
+			provider,
+			ProviderKubernetes,
+			ProviderCgroup,
+		)
+	}
+}
+
+// NewNodeResourceManager constructs the configured CPU and memory capacity
+// source. Kubernetes remains the default for backward compatibility; cgroup
+// is the read-only provider used by standalone deployments.
+func NewNodeResourceManager(provider string) (NodeResourceManager, error) {
+	normalized, err := normalizeProvider(provider)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == ProviderCgroup {
+		mgr, cgroupErr := newCgroupResourceManager()
+		if cgroupErr != nil {
+			return nil, fmt.Errorf("failed to create cgroup resource manager: %w", cgroupErr)
+		}
+		return mgr, nil
+	}
+
 	mgr, err := newK8sWatchResourceManager()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Kubernetes resource manager: %w", err)

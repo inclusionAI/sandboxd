@@ -71,10 +71,10 @@ type xpuProvider interface {
 	Resources() []xpumanager.Resource
 }
 
-// NewModule constructs the Kubernetes-backed node-resource module. sockPath
-// is the Unix socket exposed to the external collector.
-func NewModule(sockPath string) (*Module, error) {
-	nrm, err := NewNodeResourceManager()
+// NewModule constructs the configured node-resource module. sockPath is the
+// Unix socket exposed to the external collector.
+func NewModule(sockPath, provider string) (*Module, error) {
+	nrm, err := NewNodeResourceManager(provider)
 	if err != nil {
 		return nil, err
 	}
@@ -194,9 +194,8 @@ func (m *Module) Stop() {
 	m.wg.Wait()
 }
 
-// Healthy reports whether the latest refresh was within the staleness
-// window. ResourceManager's freshness is a leading indicator that the
-// Kubernetes watch is alive.
+// Healthy reports whether the latest provider refresh was within the
+// staleness window.
 func (m *Module) Healthy() bool {
 	ts := m.lastRefresh.Load()
 	if ts == 0 {

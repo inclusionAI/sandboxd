@@ -47,6 +47,19 @@ inventory:
 {"cpu":32,"mem":68719476736,"xpu":[{"type":"gpu","product_model":"l20","device_ids":[0,1]}]}
 ```
 
+Kubernetes remains the default CPU and memory provider. A standalone process
+can report the effective limits of its own cgroup without Kubernetes access:
+
+```toml
+[plugin.node_resource]
+provider = "cgroup"
+sock_path = "/run/sandboxd/resource.sock"
+```
+
+The cgroup provider is read-only and works with both cgroup v1 and v2. It does
+not enable controllers or create child cgroups, including when experimental
+cgroup-disabled execution is selected.
+
 See [test/e2e/README.md](test/e2e/README.md#gpu-debug-image) for the validated
 GPU debug image and manual CUDA test.
 

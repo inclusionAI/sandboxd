@@ -51,10 +51,12 @@ type ImageManagerConfig struct {
 	CgroupMemoryLimit string `toml:"cgroup_memory_limit" json:"cgroupMemoryLimit"`
 }
 
-// NodeResourceConfig configures optional Kubernetes node-resource reporting.
-// SockPath exposes the node's remaining allocatable capacity over a Unix
+// NodeResourceConfig configures optional node-resource reporting. Provider
+// selects the CPU and memory capacity source; an empty value preserves the
+// historical Kubernetes behavior. SockPath exposes that capacity over a Unix
 // socket for an external scheduler or resource collector.
 type NodeResourceConfig struct {
+	Provider string `toml:"provider" json:"provider"`
 	SockPath string `toml:"sock_path" json:"sockPath"`
 }
 

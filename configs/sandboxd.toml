@@ -54,6 +54,8 @@ registry_auths_path = "/etc/sandboxd/registry_auths.json"
 cgroup_memory_limit = "0"
 
 # The optional node-resource integration is intended for an AKernel node.
-# Omit this section for a standalone sandboxd process.
+# Kubernetes is the backward-compatible default. Standalone deployments can
+# select the read-only cgroup provider instead.
 # [plugin.node_resource]
+# provider = "kubernetes" # or "cgroup"
 # sock_path = "/run/sandboxd/resource.sock"

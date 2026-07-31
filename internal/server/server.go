@@ -572,15 +572,17 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	)
 
 	// The optional node-resource module comes up first so its external resource
-	// socket is visible before image, volume, and sandbox initialization. Gated on
-	// [plugin.node_resource]: deployments that don't report node resources
-	// (e.g. standalone) omit the section and the module is skipped; when it is
-	// configured, init/bind failure is fatal and lets systemd restart sandboxd.
+	// socket is visible before image, volume, and sandbox initialization. Gated
+	// on [plugin.node_resource]: deployments that don't report node resources
+	// omit the section, Kubernetes deployments use the default provider, and
+	// standalone deployments can explicitly select the read-only cgroup
+	// provider. A configured provider's init/bind failure is fatal and lets
+	// systemd restart sandboxd.
 	// Held in a local because s.resourceMod is back-filled once s exists below.
 	var nodeResMod *resourcemanager.Module
 	if cfg.SockPath != "" {
 		sockPath := cfg.SockPath
-		mod, merr := resourcemanager.NewModule(sockPath)
+		mod, merr := resourcemanager.NewModule(sockPath, cfg.NodeResourceConfig.Provider)
 		if merr != nil {
 			return nil, fmt.Errorf("node-resource module init: %w", merr)
 		}
@@ -593,7 +595,11 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			return nil, fmt.Errorf("node-resource module start: %w", serr)
 		}
 		nodeResMod = mod
-		logrus.Infof("node-resource module ready, sock=%s", sockPath)
+		provider := cfg.NodeResourceConfig.Provider
+		if provider == "" {
+			provider = resourcemanager.ProviderKubernetes
+		}
+		logrus.Infof("node-resource module ready, provider=%s sock=%s", provider, sockPath)
 		defer func() {
 			if retErr != nil {
 				mod.Stop()
