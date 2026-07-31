@@ -38,6 +38,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/diskusage"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageregistry"
 )
@@ -402,7 +403,14 @@ func (m *Manager) MountImageWithContext(ctx context.Context, imageURL string) (m
 	reservedChainIDs = append(reservedChainIDs, chainIDs...)
 
 	lowerDirs := reverseCopy(chainPaths)
-	mountPath = filepath.Join(m.mountsDir, mountID, "merged")
+	mountRoot := filepath.Join(m.mountsDir, mountID)
+	runtimeDefaults, err := prepareRuntimeDefaultsLowerDir(mountRoot, chainPaths)
+	if err != nil {
+		timing.RecordError(err)
+		return "", nil, err
+	}
+	lowerDirs = append([]string{runtimeDefaults}, lowerDirs...)
+	mountPath = filepath.Join(mountRoot, "merged")
 	txn = &OciMountTxnRecord{
 		ImageURL:      imageURL,
 		MountID:       mountID,
@@ -1423,6 +1431,48 @@ func reverseCopy(items []string) []string {
 		out[i], out[j] = out[j], out[i]
 	}
 	return out
+}
+
+const runtimeTmpSentinel = ".akernel-keep-rootfs"
+
+func prepareRuntimeDefaultsLowerDir(mountRoot string, imageLowerDirs []string) (string, error) {
+	lowerDir := filepath.Join(mountRoot, "runtime-defaults")
+	// The runtime-defaults lowerdir sits above the image layers. Only inject a
+	// default /etc/hosts when no image layer provides one, so image-provided
+	// entries stay authoritative and the file is only a mount-target fallback.
+	if !imageProvidesHostsFile(imageLowerDirs) {
+		etcDir := filepath.Join(lowerDir, "etc")
+		if err := os.MkdirAll(etcDir, 0755); err != nil {
+			return "", fmt.Errorf("failed to create OCI runtime defaults directory: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(etcDir, "hosts"), []byte(config.LocalhostHostsFileContent), 0644); err != nil {
+			return "", fmt.Errorf("failed to write OCI runtime hosts file: %w", err)
+		}
+	}
+
+	// runsc mounts an internal tmpfs over an empty /tmp. Keep the directory
+	// non-empty so /tmp remains part of the writable root overlay, matching OCI
+	// runtimes where rename(2) between the image filesystem and /tmp is atomic.
+	tmpDir := filepath.Join(lowerDir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0777|os.ModeSticky); err != nil {
+		return "", fmt.Errorf("failed to create OCI runtime tmp directory: %w", err)
+	}
+	if err := os.Chmod(tmpDir, 0777|os.ModeSticky); err != nil {
+		return "", fmt.Errorf("failed to set OCI runtime tmp permissions: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, runtimeTmpSentinel), nil, 0644); err != nil {
+		return "", fmt.Errorf("failed to write OCI runtime tmp sentinel: %w", err)
+	}
+	return lowerDir, nil
+}
+
+func imageProvidesHostsFile(imageLowerDirs []string) bool {
+	for _, dir := range imageLowerDirs {
+		if _, err := os.Lstat(filepath.Join(dir, "etc", "hosts")); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultOverlayMount(target string, lowerDirs []string) error {

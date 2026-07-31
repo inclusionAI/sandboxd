@@ -148,6 +148,9 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 	}
 
 	if options.UseGVisorRootfsImageAnnotations && options.OverrideRootPath == "" {
+		if err := prepareRunscHostsMount(ociSpec, bundleDir); err != nil {
+			return "", ociSpec, err
+		}
 		if err := applyGVisorRootfsImageAnnotations(ociSpec, bundleDir, options.RootfsOverlayTmpfsSize); err != nil {
 			return "", ociSpec, err
 		}
@@ -166,6 +169,29 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 	buf, _ := util.UnescapedMarshal(ociSpec)
 	logrus.Debugf("write spec to %v, content: %v", ociFile, string(buf))
 	return bundleDir, ociSpec, os.WriteFile(ociFile, buf, 0644)
+}
+
+func prepareRunscHostsMount(spec *Spec, bundleDir string) error {
+	for _, mount := range spec.Mounts {
+		if filepath.Clean(mount.Destination) == "/etc/hosts" {
+			return nil
+		}
+	}
+
+	if err := os.MkdirAll(bundleDir, 0755); err != nil {
+		return fmt.Errorf("create runsc bundle for hosts file: %w", err)
+	}
+	hostsPath := filepath.Join(bundleDir, "hosts")
+	if err := os.WriteFile(hostsPath, []byte(config.LocalhostHostsFileContent), 0644); err != nil {
+		return fmt.Errorf("write runsc hosts file: %w", err)
+	}
+	spec.Mounts = append(spec.Mounts, Mount{
+		Destination: "/etc/hosts",
+		Type:        "bind",
+		Source:      hostsPath,
+		Options:     []string{"bind", "ro"},
+	})
+	return nil
 }
 
 func applyGVisorRootfsImageAnnotations(spec *Spec, bundleDir, overlayTmpfsSize string) error {

@@ -112,7 +112,7 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 	if c.Options.DebugLogPath != "" {
 		cmdArgs = append(cmdArgs, "-debug-log="+c.Options.DebugLogPath)
 	}
-	cmdArgs = append(cmdArgs, "--overlay2="+rootMemoryOverlay(c.Options.OverlayTmpfsSize))
+	cmdArgs = append(cmdArgs, "--overlay2="+rootOverlay(c.Options.FilestoreDir, c.Options.OverlayTmpfsSize))
 	cmdArgs = append(cmdArgs, "create")
 	cmdArgs = append(cmdArgs,
 		"--bundle", args.BundleDir,
@@ -138,11 +138,14 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 	return nil
 }
 
-func rootMemoryOverlay(size string) string {
-	if size == "" {
+func rootOverlay(filestoreDir, memorySize string) string {
+	if filestoreDir != "" {
+		return "root:dir=" + filestoreDir
+	}
+	if memorySize == "" {
 		return "root:memory"
 	}
-	return "root:memory,size=" + size
+	return "root:memory,size=" + memorySize
 }
 
 func openOutputFile(path string) (*os.File, error) {

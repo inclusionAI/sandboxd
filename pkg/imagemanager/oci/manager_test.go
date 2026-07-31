@@ -31,6 +31,8 @@ import (
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+
+	"github.com/inclusionAI/sandboxd/config"
 )
 
 type panicUncompressedLayer struct {
@@ -1647,6 +1649,58 @@ func TestBuildOverlayMountData(t *testing.T) {
 				t.Fatalf("buildOverlayMountData() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPrepareRuntimeDefaultsLowerDir(t *testing.T) {
+	mountRoot := filepath.Join(t.TempDir(), "mount")
+
+	lowerDir, err := prepareRuntimeDefaultsLowerDir(mountRoot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lowerDir != filepath.Join(mountRoot, "runtime-defaults") {
+		t.Fatalf("lower dir = %q", lowerDir)
+	}
+	data, err := os.ReadFile(filepath.Join(lowerDir, "etc", "hosts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != config.LocalhostHostsFileContent {
+		t.Fatalf("hosts content = %q", data)
+	}
+	tmpDir := filepath.Join(lowerDir, "tmp")
+	tmpInfo, err := os.Stat(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tmpInfo.Mode().Perm(); got != 0777 || tmpInfo.Mode()&os.ModeSticky == 0 {
+		t.Fatalf("tmp mode = %v, want 01777", tmpInfo.Mode())
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, runtimeTmpSentinel)); err != nil {
+		t.Fatalf("runtime tmp sentinel: %v", err)
+	}
+}
+
+func TestPrepareRuntimeDefaultsLowerDirKeepsImageHosts(t *testing.T) {
+	mountRoot := filepath.Join(t.TempDir(), "mount")
+	imageLower := filepath.Join(t.TempDir(), "lower")
+	if err := os.MkdirAll(filepath.Join(imageLower, "etc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(imageLower, "etc", "hosts"), []byte("10.0.0.1 custom\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lowerDir, err := prepareRuntimeDefaultsLowerDir(mountRoot, []string{imageLower})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(lowerDir, "etc", "hosts")); !os.IsNotExist(err) {
+		t.Fatalf("default hosts should be skipped when the image provides one, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(lowerDir, "tmp", runtimeTmpSentinel)); err != nil {
+		t.Fatalf("runtime tmp sentinel: %v", err)
 	}
 }
 

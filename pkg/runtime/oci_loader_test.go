@@ -15,11 +15,14 @@
 package runtime
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"testing"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 )
 
 func Test_combineEnvs(t *testing.T) {
@@ -118,5 +121,45 @@ func TestGenerateOciRejectsEscapingSandboxID(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("GenerateOci accepted a sandbox ID that escapes the bundle root")
+	}
+}
+
+func TestPrepareRunscHostsMount(t *testing.T) {
+	bundleDir := t.TempDir()
+	spec := &Spec{}
+
+	if err := prepareRunscHostsMount(spec, bundleDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(spec.Mounts) != 1 {
+		t.Fatalf("mount count = %d, want 1", len(spec.Mounts))
+	}
+	mount := spec.Mounts[0]
+	if mount.Destination != "/etc/hosts" || mount.Type != "bind" {
+		t.Fatalf("hosts mount = %+v", mount)
+	}
+	if !reflect.DeepEqual(mount.Options, []string{"bind", "ro"}) {
+		t.Fatalf("hosts mount options = %v", mount.Options)
+	}
+	data, err := os.ReadFile(filepath.Join(bundleDir, "hosts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != config.LocalhostHostsFileContent {
+		t.Fatalf("hosts content = %q", data)
+	}
+}
+
+func TestPrepareRunscHostsMountPreservesExplicitMount(t *testing.T) {
+	explicit := Mount{Destination: "/etc/hosts", Source: "/custom/hosts"}
+	spec := &Spec{Mounts: []Mount{explicit}}
+
+	if err := prepareRunscHostsMount(spec, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(spec.Mounts, []Mount{explicit}) {
+		t.Fatalf("mounts = %+v, want explicit hosts mount", spec.Mounts)
 	}
 }

@@ -19,14 +19,12 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"regexp"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageregistry"
@@ -76,7 +74,7 @@ func NewModule(cfg Config) (*Module, error) {
 		cfg.DistillFsBin = "/usr/local/bin/distill_fs"
 	}
 
-	cgroupMemoryLimit, err := parseMemorySize(cfg.CgroupMemoryLimit)
+	cgroupMemoryLimit, err := config.ParseMemorySize(cfg.CgroupMemoryLimit)
 	if err != nil {
 		return nil, fmt.Errorf("imagemanager: parse cgroup_memory_limit %q: %w", cfg.CgroupMemoryLimit, err)
 	}
@@ -167,46 +165,3 @@ func (m *Module) Stop() {
 // is left to a later iteration since Stop is the only well-defined unhealthy
 // transition right now.
 func (m *Module) Healthy() bool { return m.healthy.Load() }
-
-// parseMemorySize mirrors the helper in the standalone main.go so that the
-// flag's accepted values ("512MiB", "2GiB", "1024", "") behave identically.
-func parseMemorySize(s string) (int64, error) {
-	s = strings.TrimSpace(s)
-	if s == "" || s == "0" {
-		return 0, nil
-	}
-	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return n, nil
-	}
-	re := regexp.MustCompile(`(?i)^(\d+(?:\.\d+)?)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)$`)
-	m := re.FindStringSubmatch(s)
-	if m == nil {
-		return 0, fmt.Errorf("unsupported format, use e.g. 512MiB, 2GiB, or plain bytes")
-	}
-	val, err := strconv.ParseFloat(m[1], 64)
-	if err != nil {
-		return 0, err
-	}
-	var multiplier float64
-	switch strings.ToUpper(m[2]) {
-	case "B":
-		multiplier = 1
-	case "KIB":
-		multiplier = 1024
-	case "MIB":
-		multiplier = 1024 * 1024
-	case "GIB":
-		multiplier = 1024 * 1024 * 1024
-	case "TIB":
-		multiplier = 1024 * 1024 * 1024 * 1024
-	case "KB":
-		multiplier = 1000
-	case "MB":
-		multiplier = 1000 * 1000
-	case "GB":
-		multiplier = 1000 * 1000 * 1000
-	case "TB":
-		multiplier = 1000 * 1000 * 1000 * 1000
-	}
-	return int64(val * multiplier), nil
-}

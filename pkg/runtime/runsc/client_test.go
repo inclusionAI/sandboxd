@@ -22,6 +22,29 @@ import (
 	"testing"
 )
 
+func TestRootOverlayUsesFilestoreWhenConfigured(t *testing.T) {
+	if got := rootOverlay("/var/lib/sandboxd/filestore", "10G"); got != "root:dir=/var/lib/sandboxd/filestore" {
+		t.Fatalf("rootOverlay() = %q", got)
+	}
+}
+
+func TestRootOverlayFallsBackToMemory(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		size string
+		want string
+	}{
+		{name: "unlimited", want: "root:memory"},
+		{name: "limited", size: "256M", want: "root:memory,size=256M"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := rootOverlay("", test.size); got != test.want {
+				t.Fatalf("rootOverlay() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestCreateUsesExactDebugLogPath(t *testing.T) {
 	tempDir := t.TempDir()
 	argsFile := filepath.Join(tempDir, "args")
