@@ -159,6 +159,21 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		}
 	}
 
+	// Provider-owned fields are applied last so request labels, image
+	// metadata, and the base spec cannot override device authorization.
+	if updates := options.Config.SpecUpdates; updates != nil {
+		if len(updates.Envs) > 0 {
+			ociSpec.Process.Env = combineEnvs(ociSpec.Process.Env, updates.Envs)
+		}
+		if len(updates.Prestart) > 0 {
+			if ociSpec.Hooks == nil {
+				ociSpec.Hooks = &Hooks{}
+			}
+			ociSpec.Hooks.Prestart = append(ociSpec.Hooks.Prestart, updates.Prestart...)
+		}
+		ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, updates.Annotations)
+	}
+
 	ociFile := filepath.Join(bundleDir, config.SandboxSpecFile)
 
 	// create target path r.TargetDir/SandboxID is not exist

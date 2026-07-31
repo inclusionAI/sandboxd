@@ -84,6 +84,15 @@ message Mount {
   }
 }
 
+// XpuAllocation describes concrete accelerator devices assigned by the
+// scheduler on the selected node.
+message XpuAllocation {
+  // Type is the normalized accelerator type, such as gpu.
+  string type = 1;
+  // DeviceIDs contains node-local physical device IDs selected by the scheduler.
+  repeated uint32 device_ids = 2;
+}
+
 // StartRequest describes a sandbox start request.
 message StartRequest {
   // SandboxID is an optional caller-provided sandbox ID. sandboxd generates one when empty.
@@ -123,6 +132,8 @@ message StartRequest {
   map<string, string> labels = 16;
   // MetricLabels contains sandbox metadata intended for metric dimensions.
   map<string, string> metric_labels = 17;
+  // XpuAllocations contains concrete accelerator devices assigned to the sandbox.
+  repeated XpuAllocation xpu_allocations = 18;
 }
 
 // StartResponse is returned after sandbox start.

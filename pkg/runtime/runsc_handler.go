@@ -17,12 +17,14 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/internal/trace"
+	"github.com/inclusionAI/sandboxd/internal/util"
 	runscapi "github.com/inclusionAI/sandboxd/pkg/runtime/runsc"
 
 	"github.com/inclusionAI/sandboxd/config"
@@ -41,6 +43,7 @@ type RunscHandler struct {
 	ociLoader OciLoader
 
 	rootfsOverlayTmpfsSize string
+	sandboxRoot            string
 }
 
 type runscClient interface {
@@ -72,6 +75,7 @@ func NewRunscHandler(cfg config.Config, bin string, loader OciLoader) (*RunscHan
 		}),
 		ociLoader:              loader,
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
+		sandboxRoot:            filepath.Join(root, "containers"),
 	}, nil
 }
 
@@ -81,7 +85,7 @@ func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 		return fmt.Errorf("network is required")
 	}
 
-	bundlePath, _, err := r.ociLoader.GenerateOci(OciLoadOptions{
+	bundlePath, ociSpec, err := r.ociLoader.GenerateOci(OciLoadOptions{
 		SandboxID:                       config.ID,
 		Config:                          config,
 		CgroupPath:                      config.CgroupPath,
@@ -90,6 +94,13 @@ func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 	})
 	if err != nil {
 		return fmt.Errorf("generate OCI bundle: %w", err)
+	}
+	var cleanupNVProxyRootfs func() error
+	if config.SpecUpdates != nil {
+		cleanupNVProxyRootfs, err = prepareRunscNVProxyRootfs(bundlePath, ociSpec)
+		if err != nil {
+			return fmt.Errorf("prepare writable nvproxy rootfs: %w", err)
+		}
 	}
 
 	startArgs := runscapi.StartArgs{
@@ -106,10 +117,16 @@ func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 	}
 	start := time.Now()
 	if err := r.runsc.Create(ctx, startArgs); err != nil {
+		if cleanupNVProxyRootfs != nil {
+			return errors.Join(err, cleanupNVProxyRootfs())
+		}
 		return err
 	}
 	if err := r.runsc.Start(ctx, startArgs); err != nil {
 		r.cleanupOnFailure(ctx, traceID.String(), config.ID, "runsc start failed")
+		if cleanupNVProxyRootfs != nil {
+			return errors.Join(err, cleanupNVProxyRootfs())
+		}
 		return err
 	}
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf("call runsc create/start, args: %+v, cost: %v", startArgs, time.Since(start))
@@ -119,11 +136,18 @@ func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 func (r *RunscHandler) Delete(ctx context.Context, sandboxID string) error {
 	traceID, _ := trace.GetContextID(ctx)
 	start := time.Now()
-	err := r.runsc.Delete(ctx, sandboxID, true)
-	if err == nil {
-		logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf("call runsc delete, cost: %v", time.Since(start))
+	if err := r.runsc.Delete(ctx, sandboxID, true); err != nil {
+		return err
 	}
-	return err
+	bundlePath, err := util.JoinWithinRoot(r.sandboxRoot, sandboxID)
+	if err != nil {
+		return fmt.Errorf("resolve runsc sandbox bundle: %w", err)
+	}
+	if err := cleanupRunscNVProxyRootfs(bundlePath); err != nil {
+		return err
+	}
+	logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf("call runsc delete, cost: %v", time.Since(start))
+	return nil
 }
 
 func (r *RunscHandler) List(ctx context.Context) ([]*State, error) {

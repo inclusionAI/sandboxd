@@ -655,7 +655,7 @@ run_cgroup_disabled_checks() {
     SANDBOX_ID=""
 }
 
-main() {
+run_e2e() {
     preflight
     cleanup_cgroups
     write_config
@@ -670,4 +670,29 @@ main() {
     log "e2e passed"
 }
 
-main "$@"
+serve_sandboxd() {
+    preflight
+    cleanup_cgroups
+    write_config
+    mkdir -p "$(dirname "${LOG_FILE}")"
+    log "starting sandboxd in manual debug mode"
+    exec /usr/local/bin/sandboxd \
+        --root "${SANDBOXD_HOME}" \
+        --config "${CONFIG_FILE}" \
+        --socket "${SOCKET}" \
+        --log-level debug \
+        --log-file "${LOG_FILE}" \
+        --http-address "0.0.0.0:23001"
+}
+
+case "${1:-e2e}" in
+    e2e)
+        run_e2e
+        ;;
+    serve)
+        serve_sandboxd
+        ;;
+    *)
+        fail "unknown mode $1; expected e2e or serve"
+        ;;
+esac

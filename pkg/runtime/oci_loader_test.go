@@ -103,6 +103,54 @@ func TestGenerateOciPreservesEntrypoint(t *testing.T) {
 	}
 }
 
+func TestGenerateOciAppliesProviderUpdatesLast(t *testing.T) {
+	loader, err := NewBundleLoader("", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, spec, err := loader.GenerateOci(OciLoadOptions{
+		SandboxID:  "sandbox-gpu",
+		CgroupPath: "/sandbox/gpu",
+		Config: StartConfig{
+			Rootfs:    t.TempDir(),
+			Resources: &runtime.LinuxSandboxResources{},
+			Envs: []*runtime.KeyValue{{
+				Key:   "NVIDIA_VISIBLE_DEVICES",
+				Value: "caller-value",
+			}},
+			Annotations: map[string]string{
+				"sandbox.akernel.dev/xpu-allocation": "caller-value",
+			},
+			SpecUpdates: &SpecUpdates{
+				Envs: []*runtime.KeyValue{{
+					Key:   "NVIDIA_VISIBLE_DEVICES",
+					Value: "GPU-uuid-0,GPU-uuid-2",
+				}},
+				Prestart: []Hook{{
+					Path: "/usr/bin/nvidia-container-runtime-hook",
+					Args: []string{"nvidia-container-runtime-hook", "prestart"},
+				}},
+				Annotations: map[string]string{
+					"sandbox.akernel.dev/xpu-allocation": "sandboxd-value",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(spec.Process.Env, "NVIDIA_VISIBLE_DEVICES=GPU-uuid-0,GPU-uuid-2") {
+		t.Fatalf("provider environment missing from %v", spec.Process.Env)
+	}
+	if len(spec.Hooks.Prestart) != 1 ||
+		spec.Hooks.Prestart[0].Path != "/usr/bin/nvidia-container-runtime-hook" {
+		t.Fatalf("provider hook missing from %+v", spec.Hooks)
+	}
+	if got := spec.Annotations["sandbox.akernel.dev/xpu-allocation"]; got != "sandboxd-value" {
+		t.Fatalf("provider annotation = %q, want sandboxd-value", got)
+	}
+}
+
 func TestGenerateOciWithoutCgroup(t *testing.T) {
 	loader, err := NewBundleLoader("", t.TempDir())
 	if err != nil {
@@ -148,4 +196,13 @@ func TestGenerateOciRejectsEscapingSandboxID(t *testing.T) {
 	if err == nil {
 		t.Fatal("GenerateOci accepted a sandbox ID that escapes the bundle root")
 	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

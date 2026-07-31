@@ -49,6 +49,16 @@ type StartConfig struct {
 	Annotations   map[string]string
 	Network       *networkmanager.NetResource
 	DisableCgroup bool
+	SpecUpdates   *SpecUpdates
+}
+
+// SpecUpdates contains provider-resolved OCI changes. Device providers use
+// this boundary so vendor-specific discovery and authorization do not leak
+// into the runsc client.
+type SpecUpdates struct {
+	Envs        []*runtime.KeyValue
+	Prestart    []Hook
+	Annotations map[string]string
 }
 
 func NewHandler(cfg config.Config, bin, runtimeName string) (Handler, error) {

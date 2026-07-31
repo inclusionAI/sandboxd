@@ -7,6 +7,7 @@
 - Start, wait for, inspect, measure, and delete sandboxes.
 - Prepare local, OCI, Nydus, and S3-backed rootfs and mounts.
 - Allocate cgroups and veth interfaces and configure iptables for NAT.
+- Discover, validate, and lease scheduler-selected accelerator devices.
 
 ## Architecture
 
@@ -24,6 +25,30 @@ sandbox lifecycle manager
 The public protobuf contract is [api/runtime/v1/sandbox-api.proto](api/runtime/v1/sandbox-api.proto).
 
 The `sbox` binary is an administrative CLI for managing sandboxes.
+
+### NVIDIA GPU sandboxes
+
+GPU support is experimental and currently uses gVisor runsc with nvproxy. The
+scheduler passes concrete node-local device IDs through
+`StartRequest.xpu_allocations`; sandboxd resolves them to NVIDIA UUIDs and
+maintains a local exclusive lease:
+
+```bash
+sbox start \
+  --rootfs /path/to/directory-rootfs \
+  --xpu-allocation gpu:0,2 \
+  /bin/sleep 300
+```
+
+When `[plugin.node_resource]` is enabled, `/resource` includes the stable XPU
+inventory:
+
+```json
+{"cpu":32,"mem":68719476736,"xpu":[{"type":"gpu","product_model":"l20","device_ids":[0,1]}]}
+```
+
+See [test/e2e/README.md](test/e2e/README.md#gpu-debug-image) for the validated
+GPU debug image and manual CUDA test.
 
 ## Build and test
 
@@ -67,6 +92,7 @@ pkg/runtime/         sandbox runtime abstraction and runtime adapters
 pkg/imagemanager/    rootfs and mount integration
 pkg/networkmanager/  veth and iptables integration
 pkg/cgroupmanager/   transparent cgroup v1/v2 integration and cache
+pkg/xpumanager/      accelerator discovery, inventory, and local leases
 test/e2e/            privileged runsc E2E
 tools/               pinned protobuf code-generation image
 ```
@@ -74,6 +100,10 @@ tools/               pinned protobuf code-generation image
 ## Known limitations
 
 - Kata Containers requires a usable `/dev/kvm` device; nodes without KVM continue to support gVisor.
+- NVIDIA GPU sandboxes require runsc, a directory/lisafs-backed rootfs,
+  `nvidia-container-cli`, accessible NVIDIA devices and userspace driver
+  libraries, and a host driver supported by the pinned runsc nvproxy. Kata,
+  MIG, fractional GPUs, and regular-file/EROFS rootfs are not supported.
 - sandboxd detects the local cgroup mode at startup. Legacy and hybrid hosts use cgroup v1; unified hosts use cgroup v2. The gRPC API and resource-cache behavior are identical in both modes.
 - `[plugin.resource].disable_cgroup = true` enables an experimental/debug
   compatibility mode for environments where sandboxd cannot write the

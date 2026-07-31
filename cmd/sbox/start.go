@@ -16,6 +16,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
@@ -78,6 +79,10 @@ var StartCmd = cli.Command{
 			Name:  "port",
 			Usage: "DNAT rule, formatted as protocol:dstPort:targetPort",
 		},
+		cli.StringSliceFlag{
+			Name:  "xpu-allocation",
+			Usage: "accelerator allocation, formatted as type:id[,id...]",
+		},
 		cli.BoolFlag{
 			Name:  "quiet,q",
 			Usage: "print only the sandbox id",
@@ -108,6 +113,10 @@ var StartCmd = cli.Command{
 		if err != nil {
 			return err
 		}
+		xpuAllocations, err := parseXPUAllocationFlags(context.StringSlice("xpu-allocation"))
+		if err != nil {
+			return err
+		}
 
 		resources := make(map[string]float64)
 		if cpu := context.Float64("cpu-millicores"); cpu > 0 {
@@ -133,15 +142,16 @@ var StartCmd = cli.Command{
 					Path: context.String("rootfs"),
 				},
 			},
-			Command:   command,
-			Cwd:       context.String("cwd"),
-			Envs:      envs,
-			Mounts:    mounts,
-			Resources: resources,
-			Stdout:    context.String("stdout"),
-			Stderr:    context.String("stderr"),
-			Network:   "sandbox",
-			Ports:     context.StringSlice("port"),
+			Command:        command,
+			Cwd:            context.String("cwd"),
+			Envs:           envs,
+			Mounts:         mounts,
+			Resources:      resources,
+			Stdout:         context.String("stdout"),
+			Stderr:         context.String("stderr"),
+			Network:        "sandbox",
+			Ports:          context.StringSlice("port"),
+			XpuAllocations: xpuAllocations,
 		})
 		if err != nil {
 			return err
@@ -157,6 +167,43 @@ var StartCmd = cli.Command{
 		fmt.Printf("Started sandbox %s\n", resp.ID)
 		return nil
 	},
+}
+
+func parseXPUAllocationFlags(flags []string) ([]*runtime.XpuAllocation, error) {
+	if len(flags) > 1 {
+		return nil, fmt.Errorf("exactly one XPU allocation is supported")
+	}
+	allocations := make([]*runtime.XpuAllocation, 0, len(flags))
+	for _, flag := range flags {
+		xpuType, rawIDs, ok := strings.Cut(flag, ":")
+		xpuType = strings.ToLower(strings.TrimSpace(xpuType))
+		if !ok || xpuType == "" || rawIDs == "" {
+			return nil, fmt.Errorf(
+				"invalid XPU allocation %q, expected type:id[,id...]",
+				flag,
+			)
+		}
+		idParts := strings.Split(rawIDs, ",")
+		deviceIDs := make([]uint32, 0, len(idParts))
+		seen := make(map[uint32]struct{}, len(idParts))
+		for _, rawID := range idParts {
+			parsed, err := strconv.ParseUint(strings.TrimSpace(rawID), 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("invalid XPU device ID %q: %w", rawID, err)
+			}
+			id := uint32(parsed)
+			if _, duplicate := seen[id]; duplicate {
+				return nil, fmt.Errorf("duplicate XPU device ID %d in %q", id, flag)
+			}
+			seen[id] = struct{}{}
+			deviceIDs = append(deviceIDs, id)
+		}
+		allocations = append(allocations, &runtime.XpuAllocation{
+			Type:      xpuType,
+			DeviceIds: deviceIDs,
+		})
+	}
+	return allocations, nil
 }
 
 func parseEnvFlags(flags []string) (map[string]string, error) {

@@ -46,6 +46,41 @@ bind-mounts the hierarchy read-only.
 Set `RUN_UNIT_TESTS=0` to skip the unit-test step when rerunning only the
 privileged scenario.
 
+## GPU debug image
+
+`gpu.Dockerfile` builds a standalone debug image with sandboxd, sbox, the
+checksum-verified gVisor runsc release, `nvidia-container-cli` 1.19.1, and the
+CUDA vectorAdd sample rootfs. It starts sandboxd in the experimental
+cgroup-disabled mode:
+
+```bash
+docker build -f test/e2e/gpu.Dockerfile -t sandboxd-gpu:local .
+docker run -d --name sandboxd-gpu --privileged --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+  sandboxd-gpu:local
+
+id="$(docker exec sandboxd-gpu sbox start --quiet \
+  --rootfs /e2e/gpu-rootfs \
+  --xpu-allocation gpu:0 \
+  /bin/sleep 300)"
+docker exec sandboxd-gpu sbox exec "${id}" /cuda-samples/vectorAdd
+docker exec sandboxd-gpu sbox delete "${id}"
+```
+
+Use `--xpu-allocation gpu:0,1` to assign more than one physical GPU. sandboxd
+resolves node-local IDs to UUIDs and presents them inside the sandbox as
+contiguous CUDA device indices.
+
+For a Kubernetes Pod that shares its network namespace with other software,
+select an unused `[plugin.network].ip_range` with at least 1,000 addresses (a
+`/22` or larger range), for example:
+
+```bash
+E2E_DISABLE_CGROUP=1 \
+E2E_NETWORK_CIDR=172.30.252.1/22 \
+/usr/bin/tini -s -- /usr/local/bin/sandboxd-e2e-run serve
+```
+
 ## Shutdown cleanup
 
 Configure an unused `[plugin.network].ip_range` whenever sandboxd shares its

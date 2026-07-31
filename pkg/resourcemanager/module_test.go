@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inclusionAI/sandboxd/pkg/xpumanager"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,6 +33,14 @@ type stubNodeResourceManager struct {
 	cpu     int64
 	mem     int64
 	stopped atomic.Bool
+}
+
+type stubXPUProvider struct {
+	resources []xpumanager.Resource
+}
+
+func (s stubXPUProvider) Resources() []xpumanager.Resource {
+	return s.resources
 }
 
 func (s *stubNodeResourceManager) GetAvailableResource() (int64, int64, error) {
@@ -68,6 +77,11 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 		nodeResource: resourceManager,
 		sockPath:     sockPath,
 		stopCh:       make(chan struct{}),
+		xpu: stubXPUProvider{resources: []xpumanager.Resource{{
+			Type:         "gpu",
+			ProductModel: "l20",
+			DeviceIDs:    []uint32{0, 2},
+		}}},
 	}
 	require.NoError(t, m.Start())
 
@@ -86,7 +100,12 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 		if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 			return false
 		}
-		return info.Cpu == 2 && info.Mem == 5<<30
+		return info.Cpu == 2 && info.Mem == 5<<30 &&
+			assert.Equal(t, []xpumanager.Resource{{
+				Type:         "gpu",
+				ProductModel: "l20",
+				DeviceIDs:    []uint32{0, 2},
+			}}, info.Xpu)
 	}, time.Second, 10*time.Millisecond)
 
 	m.Stop()

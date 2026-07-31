@@ -26,6 +26,7 @@ import (
 
 	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
+	"github.com/inclusionAI/sandboxd/pkg/xpumanager"
 	"github.com/sirupsen/logrus"
 )
 
@@ -46,6 +47,7 @@ type Module struct {
 	mu       sync.RWMutex
 	availCpu int64
 	availMem int64
+	xpu      xpuProvider
 
 	lastRefresh atomic.Int64 // unix-nano of most recent successful refresh
 	listener    net.Listener
@@ -60,8 +62,13 @@ type Module struct {
 // resourceInfo is the JSON payload served by the /resource endpoint. CPU is
 // reported in cores; memory is reported in bytes.
 type resourceInfo struct {
-	Cpu int64 `json:"cpu"`
-	Mem int64 `json:"mem"`
+	Cpu int64                 `json:"cpu"`
+	Mem int64                 `json:"mem"`
+	Xpu []xpumanager.Resource `json:"xpu"`
+}
+
+type xpuProvider interface {
+	Resources() []xpumanager.Resource
 }
 
 // NewModule constructs the Kubernetes-backed node-resource module. sockPath
@@ -102,6 +109,13 @@ func (m *Module) SetSandboxMetricsSource(source SandboxMetricsSource) {
 	}
 }
 
+// SetXPUProvider adds the node-local accelerator inventory to /resource.
+func (m *Module) SetXPUProvider(provider xpuProvider) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.xpu = provider
+}
+
 // SetCgroupStatsReader routes all cgroup-backed OTel metrics through the
 // CgroupManager's auto-selected v1/v2 implementation.
 func (m *Module) SetCgroupStatsReader(
@@ -134,7 +148,14 @@ func (m *Module) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.RLock()
-		info := resourceInfo{Cpu: m.availCpu, Mem: m.availMem}
+		info := resourceInfo{
+			Cpu: m.availCpu,
+			Mem: m.availMem,
+			Xpu: []xpumanager.Resource{},
+		}
+		if m.xpu != nil {
+			info.Xpu = m.xpu.Resources()
+		}
 		m.mu.RUnlock()
 		body, _ := json.Marshal(info)
 		w.WriteHeader(http.StatusOK)
