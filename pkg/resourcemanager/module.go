@@ -82,6 +82,7 @@ type ephemeralStorageProvider interface {
 }
 
 const storageQuotaFeature = "storage-quota-v1"
+
 // NewModule constructs the configured node-resource module. sockPath is the
 // Unix socket exposed to the external collector.
 func NewModule(sockPath, provider string) (*Module, error) {
