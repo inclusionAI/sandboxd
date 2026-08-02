@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 )
 
 func Test_combineEnvs(t *testing.T) {
@@ -236,6 +237,12 @@ func TestGenerateOciUsesDiskBackedRootfsImageOverlay(t *testing.T) {
 	if spec.Root.Path != "rootfs" {
 		t.Fatalf("root path = %q, want placeholder rootfs", spec.Root.Path)
 	}
+	if _, err := os.Stat(filepath.Join(bundleRoot, "sandbox-storage", "rootfs", "etc", "hosts")); err != nil {
+		t.Fatalf("placeholder hosts mount target: %v", err)
+	}
+	if !hasMountDestination(spec.Mounts, "/etc/hosts") {
+		t.Fatalf("hosts mount missing from %+v", spec.Mounts)
+	}
 }
 
 func TestGenerateOciRejectsMemoryBackedRootfsImageOverlay(t *testing.T) {
@@ -262,9 +269,107 @@ func TestGenerateOciRejectsMemoryBackedRootfsImageOverlay(t *testing.T) {
 	}
 }
 
+func TestPrepareRunscHostsMount(t *testing.T) {
+	bundleDir := t.TempDir()
+	spec := &Spec{}
+
+	if err := prepareRunscHostsMount(spec, bundleDir); err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Mounts) != 1 {
+		t.Fatalf("mount count = %d, want 1", len(spec.Mounts))
+	}
+	mount := spec.Mounts[0]
+	if mount.Destination != "/etc/hosts" || mount.Type != "bind" {
+		t.Fatalf("hosts mount = %+v", mount)
+	}
+	if !reflect.DeepEqual(mount.Options, []string{"bind", "ro"}) {
+		t.Fatalf("hosts mount options = %v", mount.Options)
+	}
+	data, err := os.ReadFile(filepath.Join(bundleDir, "hosts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != config.LocalhostHostsFileContent {
+		t.Fatalf("hosts content = %q", data)
+	}
+}
+
+func TestPrepareRunscHostsMountPreservesExplicitMount(t *testing.T) {
+	explicit := Mount{Destination: "/etc/hosts", Source: "/custom/hosts"}
+	spec := &Spec{Mounts: []Mount{explicit}}
+	bundleDir := t.TempDir()
+
+	if err := prepareRunscHostsMount(spec, bundleDir); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(spec.Mounts, []Mount{explicit}) {
+		t.Fatalf("mounts = %+v, want explicit hosts mount", spec.Mounts)
+	}
+	if _, err := os.Stat(filepath.Join(bundleDir, "hosts")); !os.IsNotExist(err) {
+		t.Fatalf("generated hosts file should be absent, err=%v", err)
+	}
+}
+
+func TestPrepareRunscHostsMountPreservesExplicitParentMount(t *testing.T) {
+	explicit := Mount{Destination: "/etc", Source: "/custom/etc"}
+	spec := &Spec{Mounts: []Mount{explicit}}
+	bundleDir := t.TempDir()
+
+	if err := prepareRunscHostsMount(spec, bundleDir); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(spec.Mounts, []Mount{explicit}) {
+		t.Fatalf("mounts = %+v, want explicit /etc mount", spec.Mounts)
+	}
+	if _, err := os.Stat(filepath.Join(bundleDir, "hosts")); !os.IsNotExist(err) {
+		t.Fatalf("generated hosts file should be absent, err=%v", err)
+	}
+}
+
+func TestPrepareRunscHostsMountReplacesStaleHostsFileAtomically(t *testing.T) {
+	bundleDir := t.TempDir()
+	hostsPath := filepath.Join(bundleDir, "hosts")
+	staleTarget := filepath.Join(bundleDir, "stale")
+	if err := os.WriteFile(staleTarget, []byte("do not replace\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(staleTarget, hostsPath); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := &Spec{}
+	if err := prepareRunscHostsMount(spec, bundleDir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(hostsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0644 {
+		t.Fatalf("hosts mode = %v, want regular 0644", info.Mode())
+	}
+	data, err := os.ReadFile(staleTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "do not replace\n" {
+		t.Fatalf("stale symlink target changed: %q", data)
+	}
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMountDestination(mounts []Mount, destination string) bool {
+	for _, mount := range mounts {
+		if mount.Destination == destination {
 			return true
 		}
 	}

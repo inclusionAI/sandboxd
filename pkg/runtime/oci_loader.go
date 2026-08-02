@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -162,6 +163,9 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 	}
 
 	if options.UseGVisorRootfsImageAnnotations && options.OverrideRootPath == "" {
+		if err := prepareRunscHostsMount(ociSpec, bundleDir); err != nil {
+			return "", ociSpec, err
+		}
 		if err := applyGVisorRootfsImageAnnotations(
 			ociSpec,
 			bundleDir,
@@ -200,6 +204,63 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 	buf, _ := util.UnescapedMarshal(ociSpec)
 	logrus.Debugf("write spec to %v, content: %v", ociFile, string(buf))
 	return bundleDir, ociSpec, os.WriteFile(ociFile, buf, 0644)
+}
+
+func prepareRunscHostsMount(spec *Spec, bundleDir string) error {
+	for _, mount := range spec.Mounts {
+		if mountOwnsDestination(mount.Destination, "/etc/hosts") {
+			return nil
+		}
+	}
+
+	if err := os.MkdirAll(bundleDir, 0755); err != nil {
+		return fmt.Errorf("create runsc bundle for hosts file: %w", err)
+	}
+	hostsPath := filepath.Join(bundleDir, "hosts")
+	if err := writeRunscHostsFile(hostsPath); err != nil {
+		return fmt.Errorf("write runsc hosts file: %w", err)
+	}
+	spec.Mounts = append(spec.Mounts, Mount{
+		Destination: "/etc/hosts",
+		Type:        "bind",
+		Source:      hostsPath,
+		Options:     []string{"bind", "ro"},
+	})
+	return nil
+}
+
+func mountOwnsDestination(mountDestination, target string) bool {
+	mountDestination = path.Clean(mountDestination)
+	target = path.Clean(target)
+	return mountDestination == target ||
+		mountDestination == "/" ||
+		strings.HasPrefix(target, mountDestination+"/")
+}
+
+func writeRunscHostsFile(target string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".hosts-")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	if err := tmp.Chmod(0644); err != nil {
+		return err
+	}
+	if _, err := tmp.WriteString(config.LocalhostHostsFileContent); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		return err
+	}
+	return nil
 }
 
 func applyGVisorRootfsImageAnnotations(

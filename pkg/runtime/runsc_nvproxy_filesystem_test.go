@@ -17,6 +17,7 @@ package runtime
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,6 +231,69 @@ func TestPrepareRunscNVProxyRootfsMountsEROFSImage(t *testing.T) {
 	}
 	if err := cleanup(); err != nil {
 		t.Fatalf("cleanup nvproxy rootfs: %v", err)
+	}
+}
+
+func TestPrepareRunscNVProxyRootfsAddsOnlyRequiredHostsTarget(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		generatedMount bool
+		existingTarget bool
+		wantTarget     bool
+	}{
+		{name: "explicit etc mount remains unchanged"},
+		{name: "existing image target remains unchanged", generatedMount: true, existingTarget: true},
+		{name: "missing image target is seeded", generatedMount: true, wantTarget: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bundlePath := t.TempDir()
+			lowerDir := t.TempDir()
+			if test.existingTarget {
+				if err := os.Mkdir(filepath.Join(lowerDir, "etc"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(lowerDir, "etc", "hosts"), nil, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			originalMount := mountRunscNVProxyOverlay
+			originalUnmount := unmountRunscNVProxyPath
+			t.Cleanup(func() {
+				mountRunscNVProxyOverlay = originalMount
+				unmountRunscNVProxyPath = originalUnmount
+			})
+			mountRunscNVProxyOverlay = func(_, upper, _, _ string) error {
+				_, err := os.Lstat(filepath.Join(upper, "etc", "hosts"))
+				gotTarget := err == nil
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+				if gotTarget != test.wantTarget {
+					return fmt.Errorf("hosts target present = %v, want %v", gotTarget, test.wantTarget)
+				}
+				return nil
+			}
+			unmountRunscNVProxyPath = func(string, int) error { return syscall.EINVAL }
+
+			spec := &Spec{Root: &Root{Path: lowerDir, Readonly: true}}
+			if test.generatedMount {
+				spec.Mounts = []Mount{{
+					Destination: "/etc/hosts",
+					Type:        "bind",
+					Source:      filepath.Join(bundlePath, "hosts"),
+				}}
+			} else {
+				spec.Mounts = []Mount{{Destination: "/etc", Type: "bind", Source: "/custom/etc"}}
+			}
+			cleanup, err := prepareRunscNVProxyRootfs(bundlePath, spec)
+			if err != nil {
+				t.Fatalf("prepareRunscNVProxyRootfs() error = %v", err)
+			}
+			if err := cleanup(); err != nil {
+				t.Fatalf("cleanup NVProxy rootfs: %v", err)
+			}
+		})
 	}
 }
 

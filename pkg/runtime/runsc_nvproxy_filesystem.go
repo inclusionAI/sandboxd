@@ -101,6 +101,15 @@ func prepareRunscNVProxyRootfs(bundlePath string, spec *Spec) (func() error, err
 			return nil, errors.Join(err, cleanupRunscNVProxyRootfs(bundlePath))
 		}
 	}
+	// Reuse NVProxy's existing private upper when the generated hosts bind
+	// mount needs a target. This is a strict no-op for callers that provide
+	// /etc themselves and for images that already contain a regular target.
+	if err := prepareRunscGeneratedHostsTarget(bundlePath, spec, lowerDir, upperDir); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("prepare nvproxy hosts target: %w", err),
+			cleanupRunscNVProxyRootfs(bundlePath),
+		)
+	}
 	// Seed the mount point in the private upper directory before mounting the
 	// overlay. The image-backed lower directory is untrusted and may contain
 	// symlinks at any component of this path. Creating the directory through

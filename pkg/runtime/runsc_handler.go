@@ -106,11 +106,16 @@ func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 	if err != nil {
 		return fmt.Errorf("generate OCI bundle: %w", err)
 	}
-	var cleanupNVProxyRootfs func() error
+	var cleanupPreparedRootfs func() error
 	if config.SpecUpdates != nil && config.SpecUpdates.RequiresHostWritableRootfs {
-		cleanupNVProxyRootfs, err = prepareRunscNVProxyRootfs(bundlePath, ociSpec)
+		cleanupPreparedRootfs, err = prepareRunscNVProxyRootfs(bundlePath, ociSpec)
 		if err != nil {
 			return fmt.Errorf("prepare writable nvproxy rootfs: %w", err)
+		}
+	} else {
+		cleanupPreparedRootfs, err = prepareRunscHostsRootfs(bundlePath, ociSpec)
+		if err != nil {
+			return fmt.Errorf("prepare runsc hosts rootfs: %w", err)
 		}
 	}
 
@@ -129,15 +134,15 @@ func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 	}
 	start := time.Now()
 	if err := r.runsc.Create(ctx, startArgs); err != nil {
-		if cleanupNVProxyRootfs != nil {
-			return errors.Join(err, cleanupNVProxyRootfs())
+		if cleanupPreparedRootfs != nil {
+			return errors.Join(err, cleanupPreparedRootfs())
 		}
 		return err
 	}
 	if err := r.runsc.Start(ctx, startArgs); err != nil {
 		r.cleanupOnFailure(ctx, traceID.String(), config.ID, "runsc start failed")
-		if cleanupNVProxyRootfs != nil {
-			return errors.Join(err, cleanupNVProxyRootfs())
+		if cleanupPreparedRootfs != nil {
+			return errors.Join(err, cleanupPreparedRootfs())
 		}
 		return err
 	}
@@ -166,8 +171,16 @@ func (r *RunscHandler) Delete(ctx context.Context, sandboxID string) error {
 	if err != nil {
 		return fmt.Errorf("resolve runsc sandbox bundle: %w", err)
 	}
-	if err := cleanupRunscNVProxyRootfs(bundlePath); err != nil {
-		return err
+	nvproxyCleanupErr := cleanupRunscNVProxyRootfs(bundlePath)
+	hostsCleanupErr := cleanupRunscHostsRootfs(bundlePath)
+	if nvproxyCleanupErr != nil {
+		if hostsCleanupErr != nil {
+			return errors.Join(nvproxyCleanupErr, hostsCleanupErr)
+		}
+		return nvproxyCleanupErr
+	}
+	if hostsCleanupErr != nil {
+		return hostsCleanupErr
 	}
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf("call runsc delete, cost: %v", time.Since(start))
 	return nil
