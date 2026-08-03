@@ -94,6 +94,9 @@ func NewBundleLoader(baseFile, bundleDir string) (*BundleLoader, error) {
 
 func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error) {
 	ociSpec := r.baseSpec.DeepCopy()
+	if options.Config.Hostname != "" {
+		ociSpec.Hostname = options.Config.Hostname
+	}
 	if options.OverrideBundleDir == "" &&
 		(options.SandboxID == "" || (!options.Config.DisableCgroup && options.CgroupPath == "")) {
 		logrus.Debugf("invalid options, cg: %v", options.CgroupPath)
@@ -484,7 +487,7 @@ func defaultSandboxSpec() *Spec {
 			Path:     "rootfs",
 			Readonly: true,
 		},
-		Hostname: "runsc",
+		Hostname: DefaultSandboxHostname,
 		Mounts: []Mount{
 			{
 				Destination: "/proc",

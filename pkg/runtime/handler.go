@@ -37,6 +37,7 @@ type Handler interface {
 
 type StartConfig struct {
 	ID                      string
+	Hostname                string
 	Command                 []string
 	Mounts                  []*runtime.Mount
 	Rootfs                  string

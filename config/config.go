@@ -75,6 +75,10 @@ type NodeResourceConfig struct {
 type RuntimeConfig struct {
 	RuntimeBinary map[string]string `toml:"runtime_binary" json:"runtimeBinary"`
 
+	// ResolvConfPath is the host resolver file mounted into sandboxes when the
+	// final configuration does not already provide /etc/resolv.conf.
+	ResolvConfPath string `toml:"resolv_conf_path" json:"resolvConfPath"`
+
 	// Kata configures the optional Kata Containers runtime adapter. Kata is
 	// loaded only when runtime_binary contains a "kata" entry.
 	Kata KataConfig `toml:"kata" json:"kata"`
@@ -181,6 +185,7 @@ func DefaultConfig() Config {
 				RuntimeBinary: map[string]string{
 					RuntimeNameRunsc: DefaultRunscBinary,
 				},
+				ResolvConfPath: "/etc/resolv.conf",
 				BasicSpec: map[string]string{
 					RuntimeNameRunsc: "/home/akernel/images/config.json",
 				},

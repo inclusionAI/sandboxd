@@ -985,6 +985,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	startSucceeded := false
 	var preparedFilesystem *preparedFS
 	var preparedResources *preparedStartResources
+	var sandboxFiles *preparedSandboxFiles
 	var filesystemCommitted bool
 	var runtimeStarted bool
 	var dnatConfigured bool
@@ -1021,6 +1022,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		if xpuAcquired && h.xpuMgr != nil {
 			h.xpuMgr.Release(sandboxID)
+		}
+		if sandboxFiles != nil {
+			sandboxFiles.Rollback()
 		}
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
@@ -1105,12 +1109,31 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	if h.config.DisableCgroup {
 		sandboxResources = nil
 	}
+	defaults := svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname}
+	if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
+		if provider, ok := handler.(svc.SandboxDefaultsProvider); ok {
+			defaults = provider.SandboxDefaults()
+		}
+	}
+	sandboxFiles, err = h.prepareSandboxFiles(
+		sandboxID,
+		defaults,
+		preparedResources.network.Ip,
+		preparedFilesystem.Mounts(),
+	)
+	if err != nil {
+		return &runtime.StartResponse{
+			Code:    -1,
+			Message: fmt.Sprintf("failed to prepare sandbox files: %v", err),
+		}, err
+	}
 	runtimeConfig := svc.StartConfig{
 		ID:                      sandboxID,
+		Hostname:                defaults.Hostname,
 		Command:                 startReq.Command,
 		Rootfs:                  preparedFilesystem.RootfsPath(),
 		Resources:               sandboxResources,
-		Mounts:                  preparedFilesystem.Mounts(),
+		Mounts:                  sandboxFiles.Mounts(),
 		Envs:                    env,
 		Stdout:                  startReq.Stdout,
 		Stderr:                  startReq.Stderr,
