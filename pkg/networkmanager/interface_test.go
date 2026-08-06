@@ -17,6 +17,8 @@ package networkmanager
 import (
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -154,6 +156,27 @@ func TestDestroyDevice(t *testing.T) {
 		err := m.destroyDevice(net.Interface{Name: "eth0"})
 		assert.ErrorContains(t, err, "delete failed")
 	})
+}
+
+func TestDisablePeerForwarding(t *testing.T) {
+	root := t.TempDir()
+	peerName := config.PeerVethPrefix + "0afa01f7"
+	peerDir := filepath.Join(root, peerName)
+	require.NoError(t, os.Mkdir(peerDir, 0755))
+	forwardingPath := filepath.Join(peerDir, "forwarding")
+	require.NoError(t, os.WriteFile(forwardingPath, []byte("1\n"), 0644))
+
+	m := &InterfaceManager{sysctlRoot: root}
+	require.NoError(t, m.disablePeerForwarding(peerName))
+	value, err := os.ReadFile(forwardingPath)
+	require.NoError(t, err)
+	assert.Equal(t, "0\n", string(value))
+}
+
+func TestDisablePeerForwardingRejectsNonPeerInterface(t *testing.T) {
+	m := &InterfaceManager{sysctlRoot: t.TempDir()}
+	err := m.disablePeerForwarding(config.HostVethPrefix + "0afa01f7")
+	assert.ErrorContains(t, err, "non-peer interface")
 }
 
 type fakeLinkOperations struct {

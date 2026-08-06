@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,6 +53,7 @@ type InterfaceManager struct {
 	bridgeLink netlink.Link
 	linkOps    linkOperations
 	natBackend string
+	sysctlRoot string
 
 	mask net.IPMask
 
@@ -83,6 +86,8 @@ type InterfaceManager struct {
 	shutdownError error
 }
 
+const defaultInterfaceSysctlRoot = "/proc/sys/net/ipv4/conf"
+
 type linkOperations interface {
 	LinkByName(string) (netlink.Link, error)
 	LinkDel(netlink.Link) error
@@ -103,6 +108,25 @@ func (m *InterfaceManager) links() linkOperations {
 		return m.linkOps
 	}
 	return systemLinkOperations{}
+}
+
+// disablePeerForwarding keeps the host IP stack from routing frames that the
+// runtime reads from the peer through AF_PACKET. Without this, a reply routed
+// through the bridge can be forwarded back into the same veth pair forever
+// when reverse-path filtering is disabled.
+func (m *InterfaceManager) disablePeerForwarding(name string) error {
+	if !strings.HasPrefix(name, config.PeerVethPrefix) {
+		return fmt.Errorf("refuse to change forwarding on non-peer interface %q", name)
+	}
+	root := m.sysctlRoot
+	if root == "" {
+		root = defaultInterfaceSysctlRoot
+	}
+	path := filepath.Join(root, name, "forwarding")
+	if err := os.WriteFile(path, []byte("0\n"), 0); err != nil {
+		return fmt.Errorf("disable IPv4 forwarding on peer interface %s: %w", name, err)
+	}
+	return nil
 }
 
 // createRequest is submitted by Allocate when the idle pool is empty but the
@@ -628,6 +652,9 @@ func (m *InterfaceManager) load(ips sets.Set[string]) error {
 				logrus.Errorf("set link %v up failed: %v", devs[idx].Name, err)
 				continue
 			}
+			if err := m.disablePeerForwarding(devs[idx].Name); err != nil {
+				return err
+			}
 			ip := util.VethToIp(devs[idx].Name)
 			dev := &NetResource{
 				Interface: &devs[idx],
@@ -856,6 +883,9 @@ func (m *InterfaceManager) createDevice(ip string) (netlink.Link, error) {
 
 	if err = netlink.LinkSetUp(peerVeth); err != nil {
 		return nil, fmt.Errorf("set peer veth up failed: %v", err)
+	}
+	if err = m.disablePeerForwarding(peerVethName); err != nil {
+		return nil, err
 	}
 
 	return peerVeth, nil
