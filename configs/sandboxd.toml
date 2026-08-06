@@ -17,7 +17,12 @@ storeDir = "/var/lib/sandboxd/store"
 
 [plugin.network]
 ip_range = "10.88.0.1/24"
+# Use "bpfnat" on nodes that cannot provide iptables. The BPF object is
+# embedded in sandboxd. Host setup must set net.ipv4.ip_forward=1 and, when
+# local DNAT is enabled, net.ipv4.conf.all.rp_filter=0.
 nat_backend = "iptables"
+# Optional: override the IPv4 default-route device selected by bpfnat.
+# bpfnat_device = "eth0"
 # Enable only when a trusted frontend shares sandboxd's network namespace and
 # must reach forwarded sandbox ports through a local address.
 enable_local_dnat = false

@@ -6,7 +6,7 @@
 
 - Start, wait for, inspect, measure, and delete sandboxes.
 - Prepare local, OCI, Nydus, and S3-backed rootfs and mounts.
-- Allocate cgroups and veth interfaces and configure iptables for NAT.
+- Allocate cgroups and veth interfaces and configure iptables or eBPF for NAT.
 - Discover, validate, and lease scheduler-selected accelerator devices.
 
 ## Architecture
@@ -17,7 +17,7 @@ gRPC service
 sandbox lifecycle manager
     ├── sandbox runtime adapter ──> gVisor / Kata Containers
     ├── image manager ────────────> distill-fs / OCI
-    └── resource managers ────────> cgroup v1 or v2 / veth / iptables
+    └── resource managers ────────> cgroup v1 or v2 / veth / iptables / eBPF
 ```
 
 ## API / CLI
@@ -63,6 +63,18 @@ cgroup-disabled execution is selected.
 See [test/e2e/README.md](test/e2e/README.md#gpu-debug-image) for the validated
 GPU debug image and manual CUDA test.
 
+## Network backends
+
+Sandboxd supports two NAT backends:
+
+- `iptables` is the default backend.
+- `bpfnat` is an experimental embedded TC eBPF backend for Linux 5.10 or
+  newer.
+
+Select the backend with `plugin.network.nat_backend`. See the
+[bpfnat implementation notes](bpf/bpfnat/README.md) for its host prerequisites
+and build workflow.
+
 ## Build and test
 
 ```bash
@@ -103,7 +115,7 @@ configs/             AKernel integration configuration templates
 internal/server/     gRPC service and daemon orchestration
 pkg/runtime/         sandbox runtime abstraction and runtime adapters
 pkg/imagemanager/    rootfs and mount integration
-pkg/networkmanager/  veth and iptables integration
+pkg/networkmanager/  veth, iptables, and eBPF NAT integration
 pkg/cgroupmanager/   transparent cgroup v1/v2 integration and cache
 pkg/xpumanager/      accelerator discovery, inventory, and local leases
 test/e2e/            privileged runsc E2E

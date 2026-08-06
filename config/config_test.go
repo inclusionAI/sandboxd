@@ -62,8 +62,19 @@ func TestDefaultConfigDisablesLocalDNAT(t *testing.T) {
 
 func TestNetworkConfigEnablesLocalDNAT(t *testing.T) {
 	var cfg Config
-	if err := toml.Unmarshal([]byte("[plugin.network]\nenable_local_dnat = true\n"), &cfg); err != nil {
+	if err := toml.Unmarshal([]byte(
+		"[plugin.network]\n"+
+			"nat_backend = \"bpfnat\"\n"+
+			"bpfnat_device = \"eth0\"\n"+
+			"enable_local_dnat = true\n",
+	), &cfg); err != nil {
 		t.Fatalf("decode local DNAT config: %v", err)
+	}
+	if cfg.NatBackend != NatBackendBpfnat {
+		t.Fatalf("configured NAT backend = %q, want %q", cfg.NatBackend, NatBackendBpfnat)
+	}
+	if cfg.BpfnatDevice != "eth0" {
+		t.Fatalf("configured bpfnat device = %q, want eth0", cfg.BpfnatDevice)
 	}
 	if !cfg.EnableLocalDNAT {
 		t.Fatal("configured local DNAT is disabled, want enabled")

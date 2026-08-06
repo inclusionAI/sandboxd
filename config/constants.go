@@ -113,6 +113,7 @@ const (
 	PeerVethPrefix = "pv."
 
 	NatBackendIptables = "iptables"
+	NatBackendBpfnat   = "bpfnat"
 )
 
 const (

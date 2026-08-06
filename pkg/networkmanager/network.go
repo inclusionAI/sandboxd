@@ -14,9 +14,7 @@
 
 package networkmanager
 
-import (
-	"net"
-)
+import "net"
 
 type NetworkManager interface {
 	SetupSNATRules(ipRange string) error
@@ -38,6 +36,19 @@ type LocalDNATManager interface {
 	SetupLocalDNATRule(protocol string, dstPort uint16, targetIP string, targetPort uint16) error
 
 	CleanupLocalDNATRule(protocol string, dstPort uint16, targetIP string, targetPort uint16) error
+}
+
+// BackendConfig contains host-level settings needed before a stateful NAT
+// backend initializes its dataplane.
+type BackendConfig struct {
+	Device          string
+	EnableLocalDNAT bool
+}
+
+// ConfigurableNetworkManager is implemented by stateful backends whose
+// dataplane needs host-level configuration before it is initialized.
+type ConfigurableNetworkManager interface {
+	Configure(BackendConfig) error
 }
 
 var NetworkManagers = map[string]NetworkManager{}

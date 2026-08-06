@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/agiledragon/gomonkey/v2 v2.13.0
 	github.com/avast/retry-go/v4 v4.7.0
+	github.com/cilium/ebpf v0.9.1
 	github.com/containerd/cgroups/v3 v3.0.1
 	github.com/containerd/containerd/api v1.10.0
 	github.com/containerd/fifo v1.1.0
@@ -48,7 +49,6 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cilium/ebpf v0.9.1 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/stargz-snapshotter/estargz v0.18.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.6.0 // indirect

@@ -585,6 +585,7 @@ func TestResolveNATBackend(t *testing.T) {
 	}{
 		{name: "default", backend: "", want: config.NatBackendIptables},
 		{name: "iptables", backend: config.NatBackendIptables, want: config.NatBackendIptables},
+		{name: "bpfnat", backend: config.NatBackendBpfnat, want: config.NatBackendBpfnat},
 		{name: "unsupported", backend: "unregistered-backend", wantErr: true},
 	}
 

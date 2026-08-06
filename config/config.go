@@ -171,6 +171,10 @@ type NetworkConfig struct {
 	// sandboxd's network namespace. It is intended for standalone deployments
 	// whose frontend shares that namespace and is disabled by default.
 	EnableLocalDNAT bool `toml:"enable_local_dnat" json:"enableLocalDNAT"`
+
+	// BpfnatDevice overrides the IPv4 default-route interface selected by the
+	// bpfnat backend. It is useful on hosts with more than one default route.
+	BpfnatDevice string `toml:"bpfnat_device" json:"bpfnatDevice"`
 }
 
 // DefaultConfig returns the programmatic default sandboxd configuration.

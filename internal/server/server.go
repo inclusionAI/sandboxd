@@ -37,8 +37,9 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
-	// The side-effect import registers the public NAT backend before
+	// The side-effect imports register the available NAT backends before
 	// InterfaceManager initialization while avoiding an import cycle.
+	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bpfnat"
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
@@ -585,6 +586,14 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("network configuration: %w", err)
 	}
 	cfg.NatBackend = natBackend
+	if configurable, ok := networkmanager.NetworkManagers[natBackend].(networkmanager.ConfigurableNetworkManager); ok {
+		if err := configurable.Configure(networkmanager.BackendConfig{
+			Device:          cfg.BpfnatDevice,
+			EnableLocalDNAT: cfg.EnableLocalDNAT,
+		}); err != nil {
+			return nil, fmt.Errorf("configure NAT backend %s: %w", natBackend, err)
+		}
+	}
 
 	if err := resetStateIfPodChanged(cfg.StoreDir, cfg.RootDir, cfg.ImageManagerRoot); err != nil {
 		return nil, fmt.Errorf("reset state on pod change: %w", err)
