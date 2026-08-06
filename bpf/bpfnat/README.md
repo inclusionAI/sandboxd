@@ -73,3 +73,13 @@ image, then fails if the checked-in artifacts are stale. Generation does not
 inspect the running kernel or invoke `bpftool`. At runtime,
 `github.com/cilium/ebpf` loads the embedded object using the BPF syscall; it
 does not install or run Cilium.
+
+Run the privileged kernel regression suite after changing the dataplane,
+maps, garbage collection, or manager lifecycle:
+
+```sh
+make bpfnat-test
+```
+
+The target uses an isolated container network namespace and bpffs mount, but
+it requires a Linux host that permits privileged Docker containers.

@@ -971,8 +971,17 @@ type ipv4NATEntry struct {
 }
 
 func (m *Manager) runGC(stop <-chan struct{}, done chan<- struct{}, mappings, cfg *ebpf.Map) {
+	m.runGCWithInterval(stop, done, mappings, cfg, gcInterval)
+}
+
+func (m *Manager) runGCWithInterval(
+	stop <-chan struct{},
+	done chan<- struct{},
+	mappings, cfg *ebpf.Map,
+	interval time.Duration,
+) {
 	defer close(done)
-	ticker := time.NewTicker(gcInterval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {

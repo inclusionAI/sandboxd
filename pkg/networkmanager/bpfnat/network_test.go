@@ -16,10 +16,14 @@ package bpfnat
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -52,27 +56,75 @@ func TestSetSysctlIsIdempotent(t *testing.T) {
 	assert.Equal(t, "0\n", string(actual))
 }
 
-func TestEmbeddedObjectContainsDataplane(t *testing.T) {
-	spec, err := loadEmbeddedSpec(gcModeUserspace)
+func TestEmbeddedObjectsContainDataplane(t *testing.T) {
+	for _, mode := range []gcMode{gcModeUserspace, gcModeBPFTimer} {
+		t.Run(string(mode), func(t *testing.T) {
+			spec, err := loadEmbeddedSpec(mode)
+			require.NoError(t, err)
+			for _, name := range []string{
+				"sandboxd_egress_bpfnat",
+				"sandboxd_ingress_bpfnat",
+				"sandboxd_local_ingress_bpfnat",
+				"sandboxd_bridge_ingress_bpfnat",
+			} {
+				assert.Contains(t, spec.Programs, name)
+			}
+			for _, name := range []string{
+				"SNAT_MAPPING_IPV4",
+				"EGRESS_POLICY_MAP",
+				"DNAT_RULES_MAP",
+				"SNAT_CONFIG_MAP",
+				"POD_PORT_MAP",
+				"LOCAL_REDIRECT_MAP",
+			} {
+				assert.Contains(t, spec.Maps, name)
+			}
+		})
+	}
+}
+
+func TestEmbeddedObjectsUseDistinctMappingLayouts(t *testing.T) {
+	legacy, err := loadEmbeddedSpec(gcModeUserspace)
 	require.NoError(t, err)
-	for _, name := range []string{
-		"sandboxd_egress_bpfnat",
-		"sandboxd_ingress_bpfnat",
-		"sandboxd_local_ingress_bpfnat",
-		"sandboxd_bridge_ingress_bpfnat",
-	} {
-		assert.Contains(t, spec.Programs, name)
-	}
-	for _, name := range []string{
-		"SNAT_MAPPING_IPV4",
-		"EGRESS_POLICY_MAP",
-		"DNAT_RULES_MAP",
-		"SNAT_CONFIG_MAP",
-		"POD_PORT_MAP",
-		"LOCAL_REDIRECT_MAP",
-	} {
-		assert.Contains(t, spec.Maps, name)
-	}
+	timer, err := loadEmbeddedSpec(gcModeBPFTimer)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(binary.Size(ipv4NATEntry{})), legacy.Maps["SNAT_MAPPING_IPV4"].ValueSize)
+	assert.Greater(t, timer.Maps["SNAT_MAPPING_IPV4"].ValueSize, legacy.Maps["SNAT_MAPPING_IPV4"].ValueSize)
+	assert.NotEqual(t, pinPathForMode(gcModeUserspace), pinPathForMode(gcModeBPFTimer))
+}
+
+func TestSelectGCModePrefersBPFTimers(t *testing.T) {
+	var helpers []asm.BuiltinFunc
+	mode, err := selectGCMode(func(programType ebpf.ProgramType, helper asm.BuiltinFunc) error {
+		assert.Equal(t, ebpf.SchedCLS, programType)
+		helpers = append(helpers, helper)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, gcModeBPFTimer, mode)
+	assert.Equal(t, []asm.BuiltinFunc{asm.FnTimerInit, asm.FnTimerSetCallback, asm.FnTimerStart}, helpers)
+}
+
+func TestSelectGCModeFallsBackWhenTimerHelperIsUnavailable(t *testing.T) {
+	mode, err := selectGCMode(func(_ ebpf.ProgramType, helper asm.BuiltinFunc) error {
+		if helper == asm.FnTimerSetCallback {
+			return fmt.Errorf("timer callback: %w", ebpf.ErrNotSupported)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, gcModeUserspace, mode)
+}
+
+func TestSelectGCModeDoesNotHideProbeFailures(t *testing.T) {
+	probeErr := errors.New("permission denied")
+	mode, err := selectGCMode(func(ebpf.ProgramType, asm.BuiltinFunc) error {
+		return probeErr
+	})
+	assert.Empty(t, mode)
+	require.ErrorIs(t, err, probeErr)
+	require.ErrorContains(t, err, "probe bpfnat BPF timer helper")
 }
 
 func TestMakeEgressPolicy(t *testing.T) {

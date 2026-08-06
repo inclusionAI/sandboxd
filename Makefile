@@ -57,11 +57,13 @@ BPF_LIBBPF_PACKAGE_VERSION ?= 1:1.1.2-0+deb12u1
 BPF_LINUX_UAPI_PACKAGE_VERSION ?= 6.1.180-1
 BPF_BUILD_IMAGE ?= golang:1.25.5-bookworm@sha256:d9132cce84391efab786495288756d60e1da215b1f94e87860aeefc3d4c45b6d
 BPF_TOOL_IMAGE ?= sandboxd-bpf:clang-$(BPF_CLANG_VERSION)-bpf2go-$(BPF2GO_VERSION)
+BPF_TEST_IMAGE ?= sandboxd-bpfnat-test:clang-$(BPF_CLANG_VERSION)-bpf2go-$(BPF2GO_VERSION)
 BPF_BUILD_ARGS ?=
+BPF_TEST_BUILD_ARGS ?=
 BPF_SOURCE_DIR := bpf/bpfnat
 BPF_C_SOURCES := $(shell find $(BPF_SOURCE_DIR) -type f \( -name '*.c' -o -name '*.h' \) | sort)
 
-.PHONY: all clean test e2e release release-binary release-cli sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf tidy vendor fmt check-fmt vet help
+.PHONY: all clean test e2e release release-binary release-cli sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
@@ -161,6 +163,25 @@ check-bpf-generated: bpf ## verify generated bpfnat bindings and object are up t
 	@test -z "$$(git ls-files --others --exclude-standard -- pkg/networkmanager/bpfnat | tee /dev/stderr)"
 
 check-bpf: check-bpf-format check-bpf-generated ## verify bpfnat C formatting and generated artifacts
+
+bpfnat-test-image: bpf-image
+	$(DOCKER) build $(BPF_TEST_BUILD_ARGS) \
+		--build-arg BPF_TOOL_IMAGE=$(BPF_TOOL_IMAGE) \
+		-f tools/bpfnat-test.Dockerfile \
+		-t $(BPF_TEST_IMAGE) .
+
+bpfnat-test: bpfnat-test-image ## run privileged bpfnat dataplane and lifecycle tests
+	$(DOCKER) run --rm \
+		--privileged \
+		--network none \
+		--tmpfs /sys/fs/bpf:rw,nosuid,nodev,noexec,mode=700 \
+		--sysctl net.ipv4.ip_forward=1 \
+		--sysctl net.ipv4.conf.all.rp_filter=0 \
+		-v "$(ROOTDIR):/workspace:ro" \
+		$(BPF_TEST_IMAGE)
+
+bpfnat-test-local:
+	$(GO) test -count=1 -v -tags bpfnat_integration ./pkg/networkmanager/bpfnat
 
 tidy: ## ensure go.mod/go.sum are up-to-date
 	@GOFLAGS= $(GO) mod tidy
