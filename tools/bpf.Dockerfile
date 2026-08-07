@@ -27,6 +27,10 @@ RUN apt-get update && \
 RUN GOBIN=/usr/local/bin go install \
         "github.com/cilium/ebpf/cmd/bpf2go@${BPF2GO_VERSION}"
 
+# Generation runs as the caller's UID, which cannot write the image's /go tree.
+ENV GOCACHE=/tmp/go-build \
+    GOMODCACHE=/tmp/go-mod
+
 WORKDIR /workspace
 
 ENTRYPOINT ["make"]
