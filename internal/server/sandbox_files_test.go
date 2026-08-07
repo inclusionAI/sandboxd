@@ -61,9 +61,11 @@ func TestPrepareSandboxFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(hosts), "10.88.0.2 configured-host\n") ||
-		!strings.Contains(string(hosts), "::1 localhost ip6-localhost ip6-loopback\n") {
-		t.Fatalf("hosts = %q", hosts)
+	wantHosts := "127.0.0.1 localhost\n" +
+		"::1 localhost ip6-localhost ip6-loopback\n" +
+		"10.88.0.2 configured-host\n"
+	if string(hosts) != wantHosts {
+		t.Fatalf("hosts = %q, want %q", hosts, wantHosts)
 	}
 }
 

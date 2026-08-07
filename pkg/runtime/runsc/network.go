@@ -194,6 +194,7 @@ func BuildNetworkArgs(network NetworkConfig, rawSocket *os.File) (*createLinksAn
 				Name: containerLoName,
 				Addresses: []ipWithPrefix{
 					{Address: net.IPv4(127, 0, 0, 1), PrefixLen: 8},
+					{Address: net.IPv6loopback, PrefixLen: 128},
 				},
 			},
 		},

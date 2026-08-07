@@ -303,6 +303,7 @@ prepare_rootfs() {
 
     cat > "${ROOTFS}/etc/hosts" <<'EOF'
 127.0.0.1 localhost
+::1 localhost ip6-localhost ip6-loopback
 EOF
     cat > "${ROOTFS}/etc/resolv.conf" <<'EOF'
 nameserver 8.8.8.8
