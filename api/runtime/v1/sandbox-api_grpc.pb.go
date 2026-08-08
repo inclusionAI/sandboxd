@@ -39,6 +39,7 @@ const (
 	SandboxService_List_FullMethodName                  = "/runtime.v1.SandboxService/List"
 	SandboxService_Stats_FullMethodName                 = "/runtime.v1.SandboxService/Stats"
 	SandboxService_ListAvailableRuntimes_FullMethodName = "/runtime.v1.SandboxService/ListAvailableRuntimes"
+	SandboxService_SetNetworkPolicy_FullMethodName      = "/runtime.v1.SandboxService/SetNetworkPolicy"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
@@ -59,6 +60,8 @@ type SandboxServiceClient interface {
 	Stats(ctx context.Context, in *StatsRequest, opts ...grpc.CallOption) (*StatsResponse, error)
 	// ListAvailableRuntimes lists runtime classes whose handlers are ready.
 	ListAvailableRuntimes(ctx context.Context, in *ListAvailableRuntimesRequest, opts ...grpc.CallOption) (*ListAvailableRuntimesResponse, error)
+	// SetNetworkPolicy atomically replaces the network policy of a running sandbox.
+	SetNetworkPolicy(ctx context.Context, in *SetNetworkPolicyRequest, opts ...grpc.CallOption) (*SetNetworkPolicyResponse, error)
 }
 
 type sandboxServiceClient struct {
@@ -129,6 +132,16 @@ func (c *sandboxServiceClient) ListAvailableRuntimes(ctx context.Context, in *Li
 	return out, nil
 }
 
+func (c *sandboxServiceClient) SetNetworkPolicy(ctx context.Context, in *SetNetworkPolicyRequest, opts ...grpc.CallOption) (*SetNetworkPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetNetworkPolicyResponse)
+	err := c.cc.Invoke(ctx, SandboxService_SetNetworkPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SandboxServiceServer is the server API for SandboxService service.
 // All implementations must embed UnimplementedSandboxServiceServer
 // for forward compatibility.
@@ -147,6 +160,8 @@ type SandboxServiceServer interface {
 	Stats(context.Context, *StatsRequest) (*StatsResponse, error)
 	// ListAvailableRuntimes lists runtime classes whose handlers are ready.
 	ListAvailableRuntimes(context.Context, *ListAvailableRuntimesRequest) (*ListAvailableRuntimesResponse, error)
+	// SetNetworkPolicy atomically replaces the network policy of a running sandbox.
+	SetNetworkPolicy(context.Context, *SetNetworkPolicyRequest) (*SetNetworkPolicyResponse, error)
 	mustEmbedUnimplementedSandboxServiceServer()
 }
 
@@ -174,6 +189,9 @@ func (UnimplementedSandboxServiceServer) Stats(context.Context, *StatsRequest) (
 }
 func (UnimplementedSandboxServiceServer) ListAvailableRuntimes(context.Context, *ListAvailableRuntimesRequest) (*ListAvailableRuntimesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListAvailableRuntimes not implemented")
+}
+func (UnimplementedSandboxServiceServer) SetNetworkPolicy(context.Context, *SetNetworkPolicyRequest) (*SetNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetNetworkPolicy not implemented")
 }
 func (UnimplementedSandboxServiceServer) mustEmbedUnimplementedSandboxServiceServer() {}
 func (UnimplementedSandboxServiceServer) testEmbeddedByValue()                        {}
@@ -304,6 +322,24 @@ func _SandboxService_ListAvailableRuntimes_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_SetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetNetworkPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).SetNetworkPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_SetNetworkPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).SetNetworkPolicy(ctx, req.(*SetNetworkPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SandboxService_ServiceDesc is the grpc.ServiceDesc for SandboxService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -334,6 +370,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListAvailableRuntimes",
 			Handler:    _SandboxService_ListAvailableRuntimes_Handler,
+		},
+		{
+			MethodName: "SetNetworkPolicy",
+			Handler:    _SandboxService_SetNetworkPolicy_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

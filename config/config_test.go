@@ -55,8 +55,19 @@ func TestDefaultConfigUsesCPUQuota(t *testing.T) {
 }
 
 func TestDefaultConfigDisablesLocalDNAT(t *testing.T) {
-	if DefaultConfig().EnableLocalDNAT {
+	cfg := DefaultConfig()
+	if cfg.EnableLocalDNAT {
 		t.Fatal("DefaultConfig local DNAT is enabled, want disabled")
+	}
+	if cfg.EnableNetworkACL {
+		t.Fatal("DefaultConfig network ACL is enabled, want disabled")
+	}
+	if cfg.DNSProxyConcurrencyLimit != 256 || cfg.DNSProxyPerSandboxConcurrencyLimit != 16 {
+		t.Fatalf(
+			"DefaultConfig DNS concurrency = %d/%d, want 256/16",
+			cfg.DNSProxyConcurrencyLimit,
+			cfg.DNSProxyPerSandboxConcurrencyLimit,
+		)
 	}
 }
 
@@ -66,7 +77,10 @@ func TestNetworkConfigEnablesLocalDNAT(t *testing.T) {
 		"[plugin.network]\n"+
 			"nat_backend = \"bpfnat\"\n"+
 			"bpfnat_device = \"eth0\"\n"+
-			"enable_local_dnat = true\n",
+			"enable_local_dnat = true\n"+
+			"enable_network_acl = true\n"+
+			"dns_proxy_concurrency_limit = 128\n"+
+			"dns_proxy_per_sandbox_concurrency_limit = 8\n",
 	), &cfg); err != nil {
 		t.Fatalf("decode local DNAT config: %v", err)
 	}
@@ -78,5 +92,15 @@ func TestNetworkConfigEnablesLocalDNAT(t *testing.T) {
 	}
 	if !cfg.EnableLocalDNAT {
 		t.Fatal("configured local DNAT is disabled, want enabled")
+	}
+	if !cfg.EnableNetworkACL {
+		t.Fatal("configured network ACL is disabled, want enabled")
+	}
+	if cfg.DNSProxyConcurrencyLimit != 128 || cfg.DNSProxyPerSandboxConcurrencyLimit != 8 {
+		t.Fatalf(
+			"configured DNS concurrency = %d/%d, want 128/8",
+			cfg.DNSProxyConcurrencyLimit,
+			cfg.DNSProxyPerSandboxConcurrencyLimit,
+		)
 	}
 }

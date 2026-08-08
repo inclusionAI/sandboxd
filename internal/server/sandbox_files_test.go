@@ -23,6 +23,8 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager/networkacl"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 )
 
@@ -105,6 +107,61 @@ func TestPrepareSandboxFilesHonorsBaseResolverMount(t *testing.T) {
 	}
 	if len(prepared.Mounts()) != 2 {
 		t.Fatalf("mounts = %+v", prepared.Mounts())
+	}
+}
+
+func TestPrepareSandboxFilesUsesManagedResolverForNetworkACL(t *testing.T) {
+	root := t.TempDir()
+	resolver := filepath.Join(t.TempDir(), "resolv.conf")
+	content := "nameserver 1.1.1.1\nsearch svc.example\noptions ndots:2 timeout:1\n"
+	if err := os.WriteFile(resolver, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	service := &sandboxService{
+		config: config.Config{
+			RootDir: root,
+			PluginConfig: config.PluginConfig{RuntimeConfig: config.RuntimeConfig{
+				ResolvConfPath: resolver,
+			}},
+		},
+		aclMgr:       &networkacl.Manager{},
+		interfaceMgr: &networkmanager.InterfaceManager{BridgeIp: net.ParseIP("10.88.0.1")},
+	}
+	prepared, err := service.prepareSandboxFiles(
+		"sbox-test",
+		svc.SandboxDefaults{
+			Hostname:          svc.DefaultSandboxHostname,
+			MountDestinations: []string{"/etc/resolv.conf"},
+		},
+		net.ParseIP("10.88.0.2"),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Rollback()
+	managed, err := os.ReadFile(filepath.Join(prepared.root, "resolv.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "nameserver 10.88.0.1\nsearch svc.example\noptions ndots:2 timeout:1\n"
+	if string(managed) != want {
+		t.Fatalf("managed resolver = %q, want %q", managed, want)
+	}
+	if len(prepared.Mounts()) != 3 || prepared.Mounts()[2].GetTarget() != "/etc/resolv.conf" {
+		t.Fatalf("managed resolver mount missing: %+v", prepared.Mounts())
+	}
+}
+
+func TestValidateManagedResolverMounts(t *testing.T) {
+	for _, target := range []string{"/", "/etc", "/etc/resolv.conf"} {
+		err := validateManagedResolverMounts([]*runtime.Mount{{Target: target}})
+		if err == nil {
+			t.Fatalf("mount target %q did not conflict with managed DNS", target)
+		}
+	}
+	if err := validateManagedResolverMounts([]*runtime.Mount{{Target: "/etc/hosts"}}); err != nil {
+		t.Fatalf("unrelated mount rejected: %v", err)
 	}
 }
 

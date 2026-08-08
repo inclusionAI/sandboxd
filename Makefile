@@ -60,10 +60,10 @@ BPF_TOOL_IMAGE ?= sandboxd-bpf:clang-$(BPF_CLANG_VERSION)-bpf2go-$(BPF2GO_VERSIO
 BPF_TEST_IMAGE ?= sandboxd-bpfnat-test:clang-$(BPF_CLANG_VERSION)-bpf2go-$(BPF2GO_VERSION)
 BPF_BUILD_ARGS ?=
 BPF_TEST_BUILD_ARGS ?=
-BPF_SOURCE_DIR := bpf/bpfnat
-BPF_C_SOURCES := $(shell find $(BPF_SOURCE_DIR) -type f \( -name '*.c' -o -name '*.h' \) | sort)
+BPF_SOURCE_DIRS := bpf/bpfnat bpf/networkacl
+BPF_C_SOURCES := $(shell find $(BPF_SOURCE_DIRS) -type f \( -name '*.c' -o -name '*.h' \) | sort)
 
-.PHONY: all clean test e2e release release-binary release-cli sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local tidy vendor fmt check-fmt vet help
+.PHONY: all clean test e2e release release-binary release-cli sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
@@ -131,16 +131,16 @@ bpf-image:
 		-f tools/bpf.Dockerfile \
 		-t $(BPF_TOOL_IMAGE) .
 
-bpf: bpf-image ## regenerate the embedded bpfnat object with the pinned toolchain
+bpf: bpf-image ## regenerate embedded BPF objects with the pinned toolchain
 	$(DOCKER) run --rm \
 		--user "$(shell id -u):$(shell id -g)" \
 		-v "$(ROOTDIR):/workspace" \
 		$(BPF_TOOL_IMAGE)
 
-bpf-local: ## regenerate bpfnat with matching local bpf2go and Clang 14 tools
-	go generate ./pkg/networkmanager/bpfnat
+bpf-local: ## regenerate BPF objects with matching local bpf2go and Clang 14 tools
+	go generate ./pkg/networkmanager/bpfnat ./pkg/networkmanager/networkacl
 
-bpf-format: bpf-image ## format bpfnat C sources with the pinned toolchain
+bpf-format: bpf-image ## format BPF C sources with the pinned toolchain
 	$(DOCKER) run --rm \
 		--user "$(shell id -u):$(shell id -g)" \
 		-v "$(ROOTDIR):/workspace" \
@@ -149,7 +149,7 @@ bpf-format: bpf-image ## format bpfnat C sources with the pinned toolchain
 bpf-format-local:
 	clang-format-14 -i $(BPF_C_SOURCES)
 
-check-bpf-format: bpf-image ## verify bpfnat C sources use the pinned format
+check-bpf-format: bpf-image ## verify BPF C sources use the pinned format
 	$(DOCKER) run --rm \
 		--user "$(shell id -u):$(shell id -g)" \
 		-v "$(ROOTDIR):/workspace" \
@@ -158,11 +158,11 @@ check-bpf-format: bpf-image ## verify bpfnat C sources use the pinned format
 check-bpf-format-local:
 	clang-format-14 --dry-run --Werror $(BPF_C_SOURCES)
 
-check-bpf-generated: bpf ## verify generated bpfnat bindings and object are up to date
-	@git diff --exit-code -- pkg/networkmanager/bpfnat
-	@test -z "$$(git ls-files --others --exclude-standard -- pkg/networkmanager/bpfnat | tee /dev/stderr)"
+check-bpf-generated: bpf ## verify generated BPF bindings and objects are up to date
+	@git diff --exit-code -- pkg/networkmanager/bpfnat pkg/networkmanager/networkacl
+	@test -z "$$(git ls-files --others --exclude-standard -- pkg/networkmanager/bpfnat pkg/networkmanager/networkacl | tee /dev/stderr)"
 
-check-bpf: check-bpf-format check-bpf-generated ## verify bpfnat C formatting and generated artifacts
+check-bpf: check-bpf-format check-bpf-generated ## verify BPF C formatting and generated artifacts
 
 bpfnat-test-image: bpf-image
 	$(DOCKER) build $(BPF_TEST_BUILD_ARGS) \
@@ -182,6 +182,17 @@ bpfnat-test: bpfnat-test-image ## run privileged bpfnat dataplane and lifecycle 
 
 bpfnat-test-local:
 	$(GO) test -count=1 -v -tags bpfnat_integration ./pkg/networkmanager/bpfnat
+
+networkacl-test: bpfnat-test-image ## run privileged network ACL dataplane tests
+	$(DOCKER) run --rm \
+		--privileged \
+		--network none \
+		--tmpfs /sys/fs/bpf:rw,nosuid,nodev,noexec,mode=700 \
+		-v "$(ROOTDIR):/workspace:ro" \
+		$(BPF_TEST_IMAGE) networkacl-test-local
+
+networkacl-test-local:
+	$(GO) test -count=1 -v -tags networkacl_integration ./pkg/networkmanager/networkacl
 
 tidy: ## ensure go.mod/go.sum are up-to-date
 	@GOFLAGS= $(GO) mod tidy

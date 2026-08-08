@@ -32,7 +32,82 @@ service SandboxService {
   rpc Stats(StatsRequest) returns (StatsResponse) {}
   // ListAvailableRuntimes lists runtime classes whose handlers are ready.
   rpc ListAvailableRuntimes(ListAvailableRuntimesRequest) returns (ListAvailableRuntimesResponse) {}
+  // SetNetworkPolicy atomically replaces the network policy of a running sandbox.
+  rpc SetNetworkPolicy(SetNetworkPolicyRequest) returns (SetNetworkPolicyResponse) {}
 }
+
+// NetworkPolicyAction is the action selected by a network policy rule.
+enum NetworkPolicyAction {
+  NETWORK_POLICY_ACTION_UNSPECIFIED = 0;
+  NETWORK_POLICY_ACTION_ALLOW       = 1;
+  NETWORK_POLICY_ACTION_DENY        = 2;
+}
+
+// NetworkDirection is expressed from the sandbox's point of view.
+enum NetworkDirection {
+  NETWORK_DIRECTION_UNSPECIFIED = 0;
+  NETWORK_DIRECTION_INGRESS     = 1;
+  NETWORK_DIRECTION_EGRESS      = 2;
+  NETWORK_DIRECTION_BOTH        = 3;
+}
+
+// NetworkProtocol selects the IPv4 transport protocol matched by a rule.
+enum NetworkProtocol {
+  NETWORK_PROTOCOL_UNSPECIFIED = 0;
+  NETWORK_PROTOCOL_ANY         = 1;
+  NETWORK_PROTOCOL_TCP         = 2;
+  NETWORK_PROTOCOL_UDP         = 3;
+  NETWORK_PROTOCOL_ICMP        = 4;
+}
+
+// NetworkEndpoint identifies the remote peer matched by a traffic rule.
+message NetworkEndpoint {
+  // Address is an exact IPv4 address in v1.
+  string address = 1;
+  // Port is an exact TCP or UDP port. Zero matches any port.
+  uint32 port = 2;
+}
+
+// TrafficRule describes one ingress or egress packet rule.
+message TrafficRule {
+  NetworkPolicyAction action = 1;
+  NetworkDirection direction = 2;
+  NetworkProtocol protocol   = 3;
+  NetworkEndpoint peer       = 4;
+}
+
+// TrafficPolicy controls IPv4 packets crossing a sandbox's host veth.
+message TrafficPolicy {
+  NetworkPolicyAction default_action = 1;
+  repeated TrafficRule rules         = 2;
+}
+
+// DNSRule matches either an exact DNS name or a leading "*." suffix pattern.
+message DNSRule {
+  NetworkPolicyAction action = 1;
+  string pattern             = 2;
+}
+
+// DNSPolicy controls conventional DNS queries sent through sandboxd's proxy.
+message DNSPolicy {
+  NetworkPolicyAction default_action = 1;
+  repeated DNSRule rules             = 2;
+}
+
+// NetworkPolicy combines packet and DNS policy. Missing sections allow traffic.
+message NetworkPolicy {
+  TrafficPolicy traffic = 1;
+  DNSPolicy dns         = 2;
+}
+
+// SetNetworkPolicyRequest replaces a running sandbox's complete policy.
+message SetNetworkPolicyRequest {
+  string sandbox_id            = 1;
+  NetworkPolicy network_policy = 2;
+}
+
+// SetNetworkPolicyResponse is empty after a successful replacement.
+message SetNetworkPolicyResponse {}
 
 // RootfsSrcType identifies the root filesystem source type.
 enum RootfsSrcType {
@@ -141,6 +216,9 @@ message StartRequest {
   // WritableLayerLimitBytes is the hard quota for the writable root filesystem
   // layer. Zero preserves the node-configured default for older clients.
   uint64 writable_layer_limit_bytes = 19;
+  // NetworkPolicy is the sandbox's initial packet and DNS policy. It can be
+  // replaced while the sandbox is running with SetNetworkPolicy.
+  NetworkPolicy network_policy = 20;
 }
 
 // StartResponse is returned after sandbox start.

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +38,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
+	"github.com/inclusionAI/sandboxd/pkg/networkmanager/networkacl"
 	// The side-effect imports register the available NAT backends before
 	// InterfaceManager initialization while avoiding an import cycle.
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bpfnat"
@@ -79,6 +81,7 @@ type sandboxService struct {
 	cgroupMgr    *cgroupmanager.CgroupManager
 	interfaceMgr *networkmanager.InterfaceManager
 	networkMgr   *networkManager
+	aclMgr       *networkacl.Manager
 	resourceMod  *resourcemanager.Module
 	imageMod     *imagemanager.Module
 	volumeMgr    *volumemanager.Module
@@ -93,6 +96,7 @@ type sandboxService struct {
 	ready         atomic.Bool
 	recoveryReady atomic.Bool
 	deleteGroup   singleflight.Group
+	aclMu         sync.Mutex
 }
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
@@ -260,6 +264,14 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 	if err := h.fsMgr.Release(sandboxID); err != nil {
 		return err
 	}
+	if h.aclMgr != nil {
+		h.aclMu.Lock()
+		aclErr := h.aclMgr.Remove(sandboxID)
+		h.aclMu.Unlock()
+		if aclErr != nil {
+			return fmt.Errorf("remove network ACL for sandbox %s: %w", sandboxID, aclErr)
+		}
+	}
 	if err := h.releaseStartResources(resource); err != nil {
 		return err
 	}
@@ -426,6 +438,11 @@ func (h *sandboxService) Shutdown() {
 	if h.cgroupMgr != nil {
 		if err := h.cgroupMgr.ShutDown(); err != nil {
 			logrus.Warnf("shutdown: failed to stop cgroup manager: %v", err)
+		}
+	}
+	if h.aclMgr != nil {
+		if err := h.aclMgr.Close(); err != nil {
+			logrus.Warnf("shutdown: failed to stop network ACL manager: %v", err)
 		}
 	}
 	if h.interfaceMgr != nil {
@@ -762,6 +779,26 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	if cfg.EnableLocalDNAT {
 		logrus.Info("local DNAT forwarding enabled for callers sharing sandboxd's network namespace")
 	}
+	if cfg.EnableNetworkACL {
+		if interfaceMgr == nil {
+			return nil, errors.New("network ACL requires interface management")
+		}
+		s.aclMgr, err = networkacl.New(networkacl.Config{
+			BridgeIP:                           interfaceMgr.BridgeIp,
+			ResolverPath:                       cfg.ResolvConfPath,
+			Store:                              s.store,
+			DNSProxyConcurrencyLimit:           cfg.DNSProxyConcurrencyLimit,
+			DNSProxyPerSandboxConcurrencyLimit: cfg.DNSProxyPerSandboxConcurrencyLimit,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("initialize network ACL: %w", err)
+		}
+		defer func() {
+			if retErr != nil {
+				_ = s.aclMgr.Close()
+			}
+		}()
+	}
 	logrus.Debugf("resource modules init success with config: %v", cfg.PluginConfig.ResourceConfig)
 
 	// create root dir if not exist
@@ -790,6 +827,15 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}); err != nil {
 		return nil, fmt.Errorf("restore sandbox filesystem state: %w", err)
 	}
+	if s.aclMgr != nil {
+		bindings, bindErr := s.activeACLBindings()
+		if bindErr != nil {
+			return nil, bindErr
+		}
+		if err := s.aclMgr.Restore(bindings); err != nil {
+			return nil, fmt.Errorf("restore network ACL state: %w", err)
+		}
+	}
 
 	// health check from sandbox manager housekeeping.
 	go func() {
@@ -799,6 +845,35 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}()
 
 	return s, nil
+}
+
+func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, error) {
+	bindings := make(map[string]networkacl.Binding)
+	for _, current := range h.sandboxManager.List() {
+		if current == nil || current.Metadata == nil {
+			continue
+		}
+		sandboxID := current.Metadata.ID
+		resources, err := h.sandboxManager.CollectResourceByID(sandboxID)
+		if err != nil {
+			return nil, fmt.Errorf("collect network resource for sandbox %s: %w", sandboxID, err)
+		}
+		encoded, ok := resources.Resources[config.ResourceNameInterface]
+		if !ok {
+			return nil, fmt.Errorf("sandbox %s has no network resource", sandboxID)
+		}
+		network, err := networkmanager.NewNetResource(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode network resource for sandbox %s: %w", sandboxID, err)
+		}
+		hostVeth, _ := util.IpToVeth(network.Ip.String())
+		bindings[sandboxID] = networkacl.Binding{
+			SandboxID: sandboxID,
+			IP:        network.Ip,
+			HostVeth:  hostVeth,
+		}
+	}
+	return bindings, nil
 }
 
 func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
@@ -811,6 +886,36 @@ func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
 func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequest) (response *runtime.DeleteResponse, err error) {
 	err = h.deleteSandbox(ctx, request.ID)
 	return response, err
+}
+
+func (h *sandboxService) SetNetworkPolicy(
+	_ context.Context,
+	request *runtime.SetNetworkPolicyRequest,
+) (*runtime.SetNetworkPolicyResponse, error) {
+	if request == nil || strings.TrimSpace(request.SandboxID) == "" {
+		return nil, errord.ToGRPC(fmt.Errorf("sandbox ID is required: %w", errord.ErrInvalidArgument))
+	}
+	policy, err := networkacl.NormalizePolicy(request.NetworkPolicy)
+	if err != nil {
+		return nil, errord.ToGRPC(fmt.Errorf("invalid network policy: %v: %w", err, errord.ErrInvalidArgument))
+	}
+	if h.aclMgr == nil {
+		return nil, errord.ToGRPC(fmt.Errorf("network ACL is disabled: %w", errord.ErrFailedPrecondition))
+	}
+
+	h.aclMu.Lock()
+	defer h.aclMu.Unlock()
+	current, err := h.sandboxManager.Get(request.SandboxID)
+	if err != nil {
+		return nil, errord.ToGRPC(err)
+	}
+	if current.Status == nil || current.Status.Get().State() != runtime.SandboxState_SANDBOX_STATE_RUNNING {
+		return nil, errord.ToGRPC(fmt.Errorf("sandbox %s is not running: %w", request.SandboxID, errord.ErrFailedPrecondition))
+	}
+	if err := h.aclMgr.SetPolicy(request.SandboxID, policy); err != nil {
+		return nil, errord.ToGRPC(err)
+	}
+	return &runtime.SetNetworkPolicyResponse{}, nil
 }
 
 // resourcesToLinux converts a StartRequest.Resources map (CPU millicore, Memory MB)
@@ -887,6 +992,22 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
+	networkPolicy, err := networkacl.NormalizePolicy(startReq.NetworkPolicy)
+	if err != nil {
+		wrapped := errord.ToGRPC(fmt.Errorf("invalid network policy: %v: %w", err, errord.ErrInvalidArgument))
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, wrapped
+	}
+	if !networkPolicy.Empty() && h.aclMgr == nil {
+		err := errors.New("network ACL is disabled")
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrFailedPrecondition))
+	}
+	if h.aclMgr != nil {
+		if err := validateManagedResolverMounts(startReq.Mounts); err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
+		}
+	}
 	if startReq.Rootfs == nil {
 		err := fmt.Errorf("rootfs is required")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
@@ -1017,6 +1138,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	var filesystemCommitted bool
 	var runtimeStarted bool
 	var dnatConfigured bool
+	var aclAttempted bool
+	var aclRegistered bool
 	var xpuAcquired bool
 	defer func() {
 		if startSucceeded {
@@ -1035,6 +1158,30 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		if dnatConfigured {
 			h.networkMgr.cleanupDnatRules(sandboxID)
+		}
+		aclCleanupFailed := aclAttempted && !aclRegistered
+		if aclAttempted && h.aclMgr != nil {
+			h.aclMu.Lock()
+			if err := h.aclMgr.Remove(sandboxID); err != nil {
+				logrus.Warnf("rollback network ACL for sandbox %s: %v", sandboxID, err)
+				aclCleanupFailed = true
+			}
+			h.aclMu.Unlock()
+		}
+		if aclCleanupFailed && preparedResources != nil {
+			resource := preparedResources.Resources[config.ResourceNameInterface]
+			// Never return a veth whose ACL registration or cleanup failed
+			// to the idle pool. A successful discard destroys its TC
+			// attachments; a failed discard leaves the lease quarantined in
+			// the interface manager for restart recovery.
+			if discardErr := h.networkMgr.Discard(resource); discardErr != nil {
+				logrus.Warnf(
+					"quarantine interface after ACL rollback failure for sandbox %s: %v",
+					sandboxID,
+					discardErr,
+				)
+			}
+			delete(preparedResources.Resources, config.ResourceNameInterface)
 		}
 		if filesystemCommitted {
 			if err := h.fsMgr.Release(sandboxID); err != nil {
@@ -1142,6 +1289,23 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		if provider, ok := handler.(svc.SandboxDefaultsProvider); ok {
 			defaults = provider.SandboxDefaults()
 		}
+	}
+	if h.aclMgr != nil {
+		hostVeth, _ := util.IpToVeth(preparedResources.sandboxIP)
+		h.aclMu.Lock()
+		aclAttempted = true
+		err = h.aclMgr.Register(networkacl.Binding{
+			SandboxID: sandboxID,
+			IP:        preparedResources.network.Ip,
+			HostVeth:  hostVeth,
+		}, networkPolicy)
+		h.aclMu.Unlock()
+		if err != nil {
+			return &runtime.StartResponse{
+				Code: -1, Message: fmt.Sprintf("failed to install network ACL: %v", err),
+			}, err
+		}
+		aclRegistered = true
 	}
 	sandboxFiles, err = h.prepareSandboxFiles(
 		sandboxID,

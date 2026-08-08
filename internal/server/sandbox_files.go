@@ -82,7 +82,7 @@ func (h *sandboxService) prepareSandboxFiles(
 	}
 	needsHosts := !mountDestinationsOwn(owners, "/etc/hosts")
 	needsHostname := !mountDestinationsOwn(owners, "/etc/hostname")
-	needsResolver := !mountDestinationsOwn(owners, "/etc/resolv.conf")
+	needsResolver := h.aclMgr != nil || !mountDestinationsOwn(owners, "/etc/resolv.conf")
 	if !needsHosts && !needsHostname && !needsResolver {
 		return prepared, nil
 	}
@@ -131,10 +131,56 @@ func (h *sandboxService) prepareSandboxFiles(
 		if !info.Mode().IsRegular() {
 			return nil, fmt.Errorf("resolver source %s is not a regular file", resolver)
 		}
-		prepared.mounts = append(prepared.mounts, sandboxFileMount("/etc/resolv.conf", resolver))
+		if h.aclMgr == nil {
+			prepared.mounts = append(prepared.mounts, sandboxFileMount("/etc/resolv.conf", resolver))
+		} else {
+			if h.interfaceMgr == nil || h.interfaceMgr.BridgeIp.To4() == nil {
+				return nil, fmt.Errorf("sandbox bridge IPv4 address is required for managed DNS")
+			}
+			content, err := managedResolverContent(h.interfaceMgr.BridgeIp, resolver)
+			if err != nil {
+				return nil, err
+			}
+			source := filepath.Join(root, "resolv.conf")
+			if err := atomicWriteSandboxFile(source, content); err != nil {
+				return nil, fmt.Errorf("write managed resolver: %w", err)
+			}
+			prepared.mounts = append(prepared.mounts, sandboxFileMount("/etc/resolv.conf", source))
+		}
 	}
 	failed = false
 	return prepared, nil
+}
+
+func validateManagedResolverMounts(mounts []*runtime.Mount) error {
+	for _, mount := range mounts {
+		if mount == nil {
+			continue
+		}
+		if mountDestinationsOwn([]string{mount.GetTarget()}, "/etc/resolv.conf") {
+			return fmt.Errorf("mount target %q conflicts with managed DNS", mount.GetTarget())
+		}
+	}
+	return nil
+}
+
+func managedResolverContent(gateway net.IP, resolverPath string) ([]byte, error) {
+	data, err := os.ReadFile(resolverPath)
+	if err != nil {
+		return nil, fmt.Errorf("read resolver source %s: %w", resolverPath, err)
+	}
+	lines := []string{"nameserver " + gateway.String()}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "search", "domain", "options":
+			lines = append(lines, strings.Join(fields, " "))
+		}
+	}
+	return []byte(strings.Join(lines, "\n") + "\n"), nil
 }
 
 func validateSandboxHostname(hostname string) error {

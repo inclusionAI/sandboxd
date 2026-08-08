@@ -65,8 +65,8 @@ jobs:
       - name: Verify generated protobuf bindings
         run: make check-protos
 
-  bpfnat:
-    name: Generated bpfnat object
+  bpf:
+    name: Generated BPF objects
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -74,8 +74,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Check bpfnat C formatting
+      - name: Check BPF C formatting
         run: make check-bpf-format
 
-      - name: Verify generated bpfnat bindings and object
+      - name: Verify generated BPF bindings and objects
         run: make check-bpf-generated
+
+  networkacl:
+    name: Network ACL dataplane
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run privileged network ACL tests
+        run: make networkacl-test

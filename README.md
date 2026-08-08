@@ -75,6 +75,10 @@ Select the backend with `plugin.network.nat_backend`. See the
 [bpfnat implementation notes](bpf/bpfnat/README.md) for its host prerequisites
 and build workflow.
 
+An optional backend-neutral eBPF ACL supports dynamic per-sandbox IPv4 and DNS
+policies. See [the network ACL guide](doc/network-acl.md) for its API, host
+requirements, limitations, and recovery behavior.
+
 ## Build and test
 
 ```bash

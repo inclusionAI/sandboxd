@@ -50,4 +50,7 @@ func TestPublicSampleConfigIsComplete(t *testing.T) {
 	if cfg.CPULimitMode != CPULimitModeQuota {
 		t.Fatalf("sample cpu_limit_mode = %q, want %q", cfg.CPULimitMode, CPULimitModeQuota)
 	}
+	if cfg.DNSProxyConcurrencyLimit <= 0 || cfg.DNSProxyPerSandboxConcurrencyLimit <= 0 {
+		t.Fatal("sample config must bound global and per-sandbox DNS proxy concurrency")
+	}
 }

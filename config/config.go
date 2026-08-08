@@ -175,6 +175,19 @@ type NetworkConfig struct {
 	// BpfnatDevice overrides the IPv4 default-route interface selected by the
 	// bpfnat backend. It is useful on hosts with more than one default route.
 	BpfnatDevice string `toml:"bpfnat_device" json:"bpfnatDevice"`
+
+	// EnableNetworkACL enables per-sandbox packet ACLs and the managed DNS
+	// proxy. It is disabled by default so existing nodes keep their current
+	// networking and resolver behavior.
+	EnableNetworkACL bool `toml:"enable_network_acl" json:"enableNetworkACL"`
+
+	// DNSProxyConcurrencyLimit bounds DNS requests and TCP connections handled
+	// concurrently across all sandboxes. Zero selects the safe default.
+	DNSProxyConcurrencyLimit int `toml:"dns_proxy_concurrency_limit" json:"dnsProxyConcurrencyLimit"`
+
+	// DNSProxyPerSandboxConcurrencyLimit bounds one sandbox's share of the DNS
+	// proxy. Zero selects the safe default.
+	DNSProxyPerSandboxConcurrencyLimit int `toml:"dns_proxy_per_sandbox_concurrency_limit" json:"dnsProxyPerSandboxConcurrencyLimit"`
 }
 
 // DefaultConfig returns the programmatic default sandboxd configuration.
@@ -182,8 +195,10 @@ func DefaultConfig() Config {
 	return Config{
 		PluginConfig: PluginConfig{
 			NetworkConfig: NetworkConfig{
-				NatBackend: "iptables",
-				IPRange:    DefaultIPRange,
+				NatBackend:                         "iptables",
+				IPRange:                            DefaultIPRange,
+				DNSProxyConcurrencyLimit:           256,
+				DNSProxyPerSandboxConcurrencyLimit: 16,
 			},
 			RuntimeConfig: RuntimeConfig{
 				RuntimeBinary: map[string]string{

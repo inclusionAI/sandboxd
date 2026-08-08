@@ -64,6 +64,13 @@ type InterfaceManager struct {
 	// total = usingInterfaces.Count() + interfaces.Length() + in-flight
 	// creates. Authoritative count checked against size. Guarded by mu.
 	total int
+	// deviceMu serializes kernel veth create/destroy operations. The maintenance
+	// goroutine owns normal pool resizing, while Discard may synchronously
+	// destroy a poisoned lease from a request rollback.
+	deviceMu sync.Mutex
+	// leaseMu makes Recycle and Discard mutually exclusive for one leased
+	// resource so it can never be both cached and destroyed.
+	leaseMu sync.Mutex
 	// createReqs delivers on-demand create requests to the single maintenance
 	// goroutine. Buffered to size so a reserved Allocate never blocks on submit.
 	createReqs chan *createRequest
@@ -283,6 +290,9 @@ func (m *InterfaceManager) shrink() {
 // only by run(). It reuses the peer link looked up inside createDevice, so it
 // never calls the expensive net.Interfaces() full dump.
 func (m *InterfaceManager) doCreate() (string, error) {
+	m.deviceMu.Lock()
+	defer m.deviceMu.Unlock()
+
 	ip := m.idleIp.Pop()
 	if ip == "" {
 		return "", fmt.Errorf("no idle ip available")
@@ -311,10 +321,14 @@ func (m *InterfaceManager) doCreate() (string, error) {
 }
 
 // doDestroy tears down one veth pair and returns its ip to the idle ip pool on
-// success. Called only by run() (shrink) so it is naturally serialized. On
-// error nothing is mutated (the ip is not returned), so the caller can safely
-// roll back: the veth is still live and fully described by devStr.
+// success. deviceMu serializes calls from the maintenance goroutine and
+// synchronous Discard operations. On error nothing is mutated (the ip is not
+// returned), so the caller can safely roll back: the veth is still live and
+// fully described by devStr.
 func (m *InterfaceManager) doDestroy(devStr string) error {
+	m.deviceMu.Lock()
+	defer m.deviceMu.Unlock()
+
 	dev, err := NewNetResource(devStr)
 	if err != nil {
 		return fmt.Errorf("parse net resource %q failed: %v", devStr, err)
@@ -388,8 +402,12 @@ func (m *InterfaceManager) Recycle(id string) error {
 	if m.closed {
 		return errord.ErrUnavailable
 	}
+	m.leaseMu.Lock()
+	defer m.leaseMu.Unlock()
 
-	m.usingInterfaces.Remove(id)
+	if _, active := m.usingInterfaces.Pop(id); !active {
+		return nil
+	}
 	netResource := &NetResource{}
 	if err := netResource.FromString(id); err == nil {
 		logrus.Infof("parse interface when recycle: %s ", netResource.ToString())
@@ -398,6 +416,33 @@ func (m *InterfaceManager) Recycle(id string) error {
 	}
 	// using -> idle, total unchanged.
 	m.interfaces.Push(id)
+	m.storeMark.Store(true)
+	return nil
+}
+
+// Discard destroys an active interface instead of returning it to the idle
+// pool. It is used when ACL cleanup failed: deleting the veth removes any TC
+// attachment with it and prevents a later sandbox from inheriting that link.
+// A failed destroy leaves the resource leased and therefore quarantined.
+func (m *InterfaceManager) Discard(id string) error {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.closed {
+		return errord.ErrUnavailable
+	}
+	m.leaseMu.Lock()
+	defer m.leaseMu.Unlock()
+
+	if _, active := m.usingInterfaces.Pop(id); !active {
+		return nil
+	}
+	if err := m.doDestroy(id); err != nil {
+		m.usingInterfaces.Set(id, struct{}{})
+		return err
+	}
+	m.mu.Lock()
+	m.total--
+	m.mu.Unlock()
 	m.storeMark.Store(true)
 	return nil
 }

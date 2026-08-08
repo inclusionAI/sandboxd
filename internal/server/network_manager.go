@@ -102,6 +102,16 @@ func (m *networkManager) Release(resource string) error {
 	return m.iface.Recycle(resource)
 }
 
+func (m *networkManager) Discard(resource string) error {
+	if resource == "" {
+		return nil
+	}
+	if m.iface == nil {
+		return fmt.Errorf("interface manager not configured")
+	}
+	return m.iface.Discard(resource)
+}
+
 func (m *networkManager) setupDnatRules(sandboxID string, ports []string, targetIP string) error {
 	if len(ports) == 0 {
 		return nil

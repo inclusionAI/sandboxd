@@ -26,6 +26,14 @@ nat_backend = "iptables"
 # Enable only when a trusted frontend shares sandboxd's network namespace and
 # must reach forwarded sandbox ports through a local address.
 enable_local_dnat = false
+# Enable dynamic per-sandbox IPv4 and DNS policies. This manages sandbox
+# resolv.conf files and listens on sandbox0 TCP/UDP port 53. Drain the node
+# before changing this from false to true.
+enable_network_acl = false
+# Bound in-flight UDP requests and TCP connections before allocating handler
+# goroutines or upstream sockets. A zero value uses these defaults.
+dns_proxy_concurrency_limit = 256
+dns_proxy_per_sandbox_concurrency_limit = 16
 
 [plugin.resource]
 # EXPERIMENTAL/DEBUG ONLY. Set true when /sys/fs/cgroup is read-only.

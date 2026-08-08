@@ -398,6 +398,51 @@ func TestInterfaceShrinkRollbackOnFailure(t *testing.T) {
 	assert.Equal(t, 1, m.idleIp.Length(), "ip returned to pool on success")
 }
 
+func TestInterfaceDiscardDestroysPoisonedLease(t *testing.T) {
+	resource := (&NetResource{
+		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
+		Ip:        net.ParseIP("10.88.0.2"),
+		Type:      "bridge",
+	}).ToString()
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: config.HostVethPrefix + "0a580002"}}
+	m := &InterfaceManager{
+		interfaces:      util.New(""),
+		usingInterfaces: cmap.New[struct{}](),
+		idleIp:          util.New(""),
+		linkOps:         &fakeLinkOperations{link: link},
+		total:           1,
+	}
+	m.usingInterfaces.Set(resource, struct{}{})
+
+	require.NoError(t, m.Discard(resource))
+	assert.False(t, m.usingInterfaces.Has(resource))
+	assert.Equal(t, 0, m.interfaces.Length(), "discarded interfaces must not enter the idle cache")
+	assert.Equal(t, 0, m.total)
+	assert.Equal(t, 1, m.idleIp.Length())
+}
+
+func TestInterfaceDiscardQuarantinesLeaseWhenDestroyFails(t *testing.T) {
+	resource := (&NetResource{
+		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
+		Ip:        net.ParseIP("10.88.0.2"),
+		Type:      "bridge",
+	}).ToString()
+	m := &InterfaceManager{
+		interfaces:      util.New(""),
+		usingInterfaces: cmap.New[struct{}](),
+		idleIp:          util.New(""),
+		linkOps:         &fakeLinkOperations{lookupErr: errors.New("lookup failed")},
+		total:           1,
+	}
+	m.usingInterfaces.Set(resource, struct{}{})
+
+	require.Error(t, m.Discard(resource))
+	assert.True(t, m.usingInterfaces.Has(resource), "failed destroy must retain the lease")
+	assert.Equal(t, 0, m.interfaces.Length())
+	assert.Equal(t, 1, m.total)
+	assert.Equal(t, 0, m.idleIp.Length())
+}
+
 func TestValidateIPRangeNoOverlapRejectsExistingDeviceSubnet(t *testing.T) {
 	err := validateIPRangeNoOverlap("172.17.0.1/16", []deviceIPNet{
 		{Interface: "eth0", Network: deviceCIDR("172.17.0.2", 16)},
