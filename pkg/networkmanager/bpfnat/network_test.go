@@ -127,6 +127,47 @@ func TestSelectGCModeDoesNotHideProbeFailures(t *testing.T) {
 	require.ErrorContains(t, err, "probe bpfnat BPF timer helper")
 }
 
+func TestLoadWithGCModeFallbackRetriesUserspace(t *testing.T) {
+	timerErr := errors.New("timer object rejected by verifier")
+	var modes []gcMode
+	_, mode, err := loadWithGCModeFallback(gcModeBPFTimer, func(candidate gcMode) (bpfObjects, error) {
+		modes = append(modes, candidate)
+		if candidate == gcModeBPFTimer {
+			return bpfObjects{}, timerErr
+		}
+		return bpfObjects{}, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, gcModeUserspace, mode)
+	assert.Equal(t, []gcMode{gcModeBPFTimer, gcModeUserspace}, modes)
+}
+
+func TestLoadWithGCModeFallbackReportsBothFailures(t *testing.T) {
+	timerErr := errors.New("timer object rejected by verifier")
+	userspaceErr := errors.New("userspace object rejected by verifier")
+	_, mode, err := loadWithGCModeFallback(gcModeBPFTimer, func(candidate gcMode) (bpfObjects, error) {
+		if candidate == gcModeBPFTimer {
+			return bpfObjects{}, timerErr
+		}
+		return bpfObjects{}, userspaceErr
+	})
+	assert.Equal(t, gcModeUserspace, mode)
+	require.ErrorIs(t, err, userspaceErr)
+	require.ErrorContains(t, err, timerErr.Error())
+}
+
+func TestLoadWithGCModeFallbackDoesNotRetryUserspace(t *testing.T) {
+	loadErr := errors.New("userspace object rejected by verifier")
+	loadCount := 0
+	_, mode, err := loadWithGCModeFallback(gcModeUserspace, func(gcMode) (bpfObjects, error) {
+		loadCount++
+		return bpfObjects{}, loadErr
+	})
+	assert.Equal(t, gcModeUserspace, mode)
+	require.ErrorIs(t, err, loadErr)
+	assert.Equal(t, 1, loadCount)
+}
+
 func TestMakeEgressPolicy(t *testing.T) {
 	key, err := makeEgressPolicy("10.88.4.37/20")
 	require.NoError(t, err)

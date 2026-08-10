@@ -141,6 +141,28 @@ func selectGCMode(probe programHelperProbe) (gcMode, error) {
 	return gcModeBPFTimer, nil
 }
 
+type gcObjectLoader func(gcMode) (bpfObjects, error)
+
+func loadWithGCModeFallback(mode gcMode, load gcObjectLoader) (bpfObjects, gcMode, error) {
+	objects, err := load(mode)
+	if err == nil {
+		return objects, mode, nil
+	}
+	if mode != gcModeBPFTimer {
+		return bpfObjects{}, mode, err
+	}
+
+	timerErr := err
+	logrus.Warnf("bpfnat BPF timer object is unavailable; falling back to userspace GC: %v", timerErr)
+	objects, err = load(gcModeUserspace)
+	if err != nil {
+		return bpfObjects{}, gcModeUserspace, fmt.Errorf(
+			"load bpfnat userspace GC fallback after BPF timer failure (%v): %w",
+			timerErr, err)
+	}
+	return objects, gcModeUserspace, nil
+}
+
 func pinPathForMode(mode gcMode) string {
 	return filepath.Join(pinRoot, string(mode))
 }
@@ -261,26 +283,39 @@ func (m *Manager) SetupSNATRules(ipRange string) error {
 	if err != nil {
 		return err
 	}
-	selectedPinPath := pinPathForMode(mode)
-	if err := os.MkdirAll(selectedPinPath, 0700); err != nil {
-		return fmt.Errorf("create bpfnat pin directory: %w", err)
-	}
-
 	device, deviceIP, err := selectExternalDevice(m.config.Device)
 	if err != nil {
 		return err
 	}
 
-	spec, err := loadEmbeddedSpec(mode)
+	loadObjects := func(candidate gcMode) (bpfObjects, error) {
+		pinPath := pinPathForMode(candidate)
+		if err := os.MkdirAll(pinPath, 0700); err != nil {
+			return bpfObjects{}, fmt.Errorf("create bpfnat pin directory for gc_mode=%s: %w", candidate, err)
+		}
+		spec, err := loadEmbeddedSpec(candidate)
+		if err != nil {
+			return bpfObjects{}, fmt.Errorf("read embedded bpfnat object: %w", err)
+		}
+		var objects bpfObjects
+		if err := spec.LoadAndAssign(&objects, &ebpf.CollectionOptions{
+			Maps: ebpf.MapOptions{PinPath: pinPath},
+		}); err != nil {
+			_ = objects.close()
+			if cleanupErr := removePinDirectories(pinPath); cleanupErr != nil {
+				logrus.Warnf("cleanup failed bpfnat pins for gc_mode=%s: %v", candidate, cleanupErr)
+			}
+			return bpfObjects{}, fmt.Errorf(
+				"load embedded bpfnat object with gc_mode=%s: %w", candidate, err)
+		}
+		return objects, nil
+	}
+
+	objects, mode, err := loadWithGCModeFallback(mode, loadObjects)
 	if err != nil {
-		return fmt.Errorf("read embedded bpfnat object: %w", err)
+		return err
 	}
-	var objects bpfObjects
-	if err := spec.LoadAndAssign(&objects, &ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{PinPath: selectedPinPath},
-	}); err != nil {
-		return fmt.Errorf("load embedded bpfnat object with gc_mode=%s: %w", mode, err)
-	}
+	selectedPinPath := pinPathForMode(mode)
 
 	m.objects = objects
 	m.device = device

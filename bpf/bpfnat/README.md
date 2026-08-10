@@ -17,9 +17,10 @@ program. Unsupported kernels fail while sandboxd initializes the backend.
 
 sandboxd probes the TC program helpers available on the running kernel. It
 prefers in-kernel BPF timers for connection expiry and falls back to its
-userspace garbage collector when the timer helpers are unavailable. The
-selected `gc_mode` is recorded in the initialization log. The two modes use
-separate bpffs pin directories because their map value layouts differ.
+userspace garbage collector when the timer helpers are unavailable or the
+kernel verifier rejects the timer-enabled object. The selected `gc_mode` is
+recorded in the initialization log. The two modes use separate bpffs pin
+directories because their map value layouts differ.
 
 Select the backend with:
 
