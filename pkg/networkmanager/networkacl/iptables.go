@@ -449,17 +449,29 @@ func (b *iptablesBackend) cleanup(entry persistedEntry) error {
 		return fmt.Errorf("iptables ACL sandbox IP %q is not IPv4", entry.IP)
 	}
 	stableEgress, stableIngress, _, _ := iptablesChainNames(ip, entry.Generation)
-	if err := b.replaceStableIfExists(stableEgress, dropBarrierChain); err != nil {
+	egressExists, err := b.replaceStableIfExists(stableEgress, dropBarrierChain)
+	if err != nil {
 		return err
 	}
-	if err := b.replaceStableIfExists(stableIngress, dropBarrierChain); err != nil {
+	ingressExists, err := b.replaceStableIfExists(stableIngress, dropBarrierChain)
+	if err != nil {
 		return err
 	}
 	if err := b.deleteConntrack(ip); err != nil {
 		return err
 	}
 	var errs []error
+	existingTargets := map[string]bool{
+		stableEgress:  egressExists,
+		stableIngress: ingressExists,
+	}
 	for _, hook := range aclIPTablesHooks(ip, stableEgress, stableIngress) {
+		// iptables-nft cannot check a rule that jumps to a nonexistent
+		// chain. Such a hook cannot exist, so skip the check when cleanup
+		// is reconciling an entry that never installed a policy.
+		if !existingTargets[hook.rule[len(hook.rule)-1]] {
+			continue
+		}
 		if err := b.client.DeleteIfExists(filterTable, hook.chain, hook.rule...); err != nil {
 			errs = append(errs, err)
 		}
@@ -500,12 +512,12 @@ func (b *iptablesBackend) close() error {
 	return b.deleteChain(dropBarrierChain)
 }
 
-func (b *iptablesBackend) replaceStableIfExists(stable, target string) error {
+func (b *iptablesBackend) replaceStableIfExists(stable, target string) (bool, error) {
 	exists, err := b.client.ChainExists(filterTable, stable)
 	if err != nil || !exists {
-		return err
+		return exists, err
 	}
-	return b.replaceStable(stable, target)
+	return true, b.replaceStable(stable, target)
 }
 
 func (b *iptablesBackend) deleteChain(chain string) error {

@@ -183,9 +183,21 @@ to another sandbox.
 
 ## Verification
 
-Unit tests run with the normal test suite. The privileged dataplane, TC
-lifecycle, restart-recovery, and uncached DNS proxy tests run with:
+Unit tests run with the normal test suite. The privileged ACL target runs the
+same backend-neutral conformance scenarios through iptables and bpfnat in
+isolated network namespaces. It covers rule precedence and wildcarding,
+stateful and stateless TCP, UDP and ICMP, published sandbox ports, related
+ICMP errors, IPv4 fragments, DNS endpoint enforcement, live policy
+replacement, restart recovery, and policy removal. Backend-specific TC,
+pinned-map, failure-recovery, and uncached DNS proxy tests run in the same
+target:
 
 ```sh
 make networkacl-test
+```
+
+The independent bpfnat NAT and garbage-collection suite runs with:
+
+```sh
+make bpfnat-test
 ```

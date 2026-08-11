@@ -81,7 +81,7 @@ jobs:
         run: make check-bpf-generated
 
   networkacl:
-    name: Network ACL dataplane
+    name: Network dataplane
     runs-on: ubuntu-22.04
     timeout-minutes: 30
 
@@ -89,5 +89,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Prepare network ACL kernel prerequisites
+        run: |
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+
       - name: Run privileged network ACL tests
         run: make networkacl-test
+
+      - name: Run privileged bpfnat tests
+        run: make bpfnat-test

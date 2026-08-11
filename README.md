@@ -87,7 +87,16 @@ limitations, and recovery behavior.
 make
 make test
 make vet
+make networkacl-test
+make bpfnat-test
 ```
+
+`networkacl-test` runs one backend-neutral conformance suite against native
+iptables and TC eBPF enforcement in isolated network namespaces. It covers
+allow and deny precedence, exact and wildcard peers, peer and sandbox ports,
+stateful TCP, UDP, ICMP and related errors, IPv4 fragments, DNS redirection,
+policy replacement, restart recovery, and policy removal. `bpfnat-test` adds
+backend-specific NAT, map lifecycle, and garbage-collection coverage.
 
 The privileged E2E suite requires Docker, iptables, and the tested runsc
 release. It validates both a writable cgroup v1/v2 hierarchy and the

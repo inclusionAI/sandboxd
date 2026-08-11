@@ -188,6 +188,9 @@ networkacl-test: bpfnat-test-image ## run privileged network ACL dataplane tests
 		--privileged \
 		--network none \
 		--tmpfs /sys/fs/bpf:rw,nosuid,nodev,noexec,mode=700 \
+		--sysctl net.ipv4.ip_forward=1 \
+		--sysctl net.ipv4.conf.all.rp_filter=0 \
+		--sysctl net.ipv4.conf.default.rp_filter=0 \
 		-v "$(ROOTDIR):/workspace:ro" \
 		$(BPF_TEST_IMAGE) networkacl-test-local
 

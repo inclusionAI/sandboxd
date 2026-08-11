@@ -9,4 +9,11 @@ COPY go.mod go.sum /tmp/sandboxd-deps/
 
 RUN cd /tmp/sandboxd-deps && go mod download
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        iproute2 \
+        iptables \
+        iputils-ping && \
+    rm -rf /var/lib/apt/lists/*
+
 CMD ["bpfnat-test-local"]
