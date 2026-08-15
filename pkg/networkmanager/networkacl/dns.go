@@ -203,8 +203,8 @@ func (p *dnsProxy) serveUDP() {
 		p.wg.Add(1)
 		go func() {
 			defer p.wg.Done()
-			defer release()
 			response, err := p.handle(source.IP, request, "udp")
+			release()
 			if err == nil {
 				_, _ = p.udp.WriteToUDP(response, source)
 			}
