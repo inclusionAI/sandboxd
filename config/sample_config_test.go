@@ -38,6 +38,12 @@ func TestPublicSampleConfigIsComplete(t *testing.T) {
 	if cfg.RuntimeBinary[RuntimeNameRunsc] == "" {
 		t.Fatal("sample config must define the runsc binary")
 	}
+	if cfg.FilestoreDir == "" || cfg.FilestoreDirSize != "" {
+		t.Fatalf("sample filestore must default to an ordinary directory: %+v", cfg.RuntimeConfig)
+	}
+	if cfg.FilestoreXFSEnabled || cfg.LoopDeviceDir != DefaultLoopDeviceDir {
+		t.Fatalf("sample filestore must disable XFS and use %s: %+v", DefaultLoopDeviceDir, cfg.RuntimeConfig)
+	}
 	if cfg.ImageManagerRoot == "" || cfg.OSSTemplate == "" || cfg.NydusTemplate == "" {
 		t.Fatal("sample config must define image-manager state and templates")
 	}

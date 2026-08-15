@@ -54,6 +54,22 @@ func TestDefaultConfigUsesCPUQuota(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigUsesOrdinaryFilestore(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.FilestoreDir != DefaultFilestoreDir {
+		t.Fatalf("filestore_dir = %q, want %q", cfg.FilestoreDir, DefaultFilestoreDir)
+	}
+	if cfg.FilestoreDirSize != "" {
+		t.Fatalf("filestore_dir_size = %q, want empty", cfg.FilestoreDirSize)
+	}
+	if cfg.FilestoreXFSEnabled {
+		t.Fatal("filestore_xfs_enabled = true, want false")
+	}
+	if cfg.LoopDeviceDir != DefaultLoopDeviceDir {
+		t.Fatalf("loop_device_dir = %q, want %q", cfg.LoopDeviceDir, DefaultLoopDeviceDir)
+	}
+}
+
 func TestDefaultConfigDisablesLocalDNAT(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.EnableLocalDNAT {

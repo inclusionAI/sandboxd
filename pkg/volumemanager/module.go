@@ -20,76 +20,106 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/inclusionAI/sandboxd/pkg/loopdevice"
 	"github.com/sirupsen/logrus"
 )
 
-// Module owns the optional XFS filestore lifecycle. It exposes:
-//
-//   - Start: probes / creates the XFS image at FilestoreDir; on failure
-//     leaves the directory in place (overlay can still use it as a plain
-//     tmpfs fallback).
-//   - Stop: tears the XFS mount down via CleanupXFSMount.
-//
-// Module is safe to construct with FilestoreDir == "" — Start becomes a
-// no-op, matching the behaviour when sandboxd runs without an XFS-backed
-// filestore.
+// Module owns a shared filestore and its optional loop-backed filesystem.
+// An ordinary directory supports normal sandbox starts. A bounded ext4
+// filesystem adds an aggregate capacity limit, while XFS additionally enables
+// reflink for runtimes that implement sandbox fork.
 type Module struct {
-	FilestoreDir string
-	Size         string
+	FilestoreDir  string
+	Size          string
+	XFSEnabled    bool
+	LoopDeviceDir string
 
-	started    atomic.Bool
-	xfsMounted atomic.Bool
+	loopDevice   *loopdevice.Device
+	ensureMount  func(string, string, bool, *loopdevice.Manager) (*loopdevice.Device, error)
+	cleanupMount func(string, bool, *loopdevice.Device) error
+
+	started       atomic.Bool
+	healthy       atomic.Bool
+	forkSupported atomic.Bool
 }
 
-// NewModule constructs a Module rooted at filestoreDir. size accepts any
-// string that mkfs.xfs / truncate take (e.g. "100G").
-func NewModule(filestoreDir, size string) *Module {
-	return &Module{FilestoreDir: filestoreDir, Size: size}
+// NewModule constructs a Module rooted at filestoreDir.
+func NewModule(filestoreDir, size string, xfsEnabled bool, loopDeviceDir ...string) *Module {
+	deviceDir := "/dev"
+	if len(loopDeviceDir) > 0 && loopDeviceDir[0] != "" {
+		deviceDir = loopDeviceDir[0]
+	}
+	return &Module{
+		FilestoreDir:  filestoreDir,
+		Size:          size,
+		XFSEnabled:    xfsEnabled,
+		LoopDeviceDir: deviceDir,
+		ensureMount:   ensureFilestoreMount,
+		cleanupMount:  cleanupFilestoreMount,
+	}
 }
 
-// Start mounts the XFS filestore. When the loop device is unavailable or
-// mkfs.xfs is missing the call falls back: the directory is created plain
-// so overlay can still work.
+// Start creates an ordinary directory when size is empty. A configured size
+// selects a loop-backed ext4 or XFS filesystem and fails closed on setup errors.
 func (m *Module) Start() error {
-	m.started.Store(true)
+	m.started.Store(false)
+	m.healthy.Store(false)
+	m.forkSupported.Store(false)
 	if m.FilestoreDir == "" {
+		m.started.Store(true)
+		m.healthy.Store(true)
 		return nil
+	}
+	if err := os.MkdirAll(m.FilestoreDir, 0755); err != nil {
+		return fmt.Errorf("create filestore directory %s: %w", m.FilestoreDir, err)
 	}
 	if m.Size == "" {
-		return errMissingSize
-	}
-	if err := EnsureXFSMount(m.FilestoreDir, m.Size); err != nil {
-		logrus.Warnf("volumemanager: XFS filestore mount failed (%v); falling back to a plain directory", err)
-		// Best-effort: keep the directory so overlay can still use it as a
-		// plain mount.
-		_ = os.MkdirAll(m.FilestoreDir, 0755)
+		logrus.Infof("volumemanager: using ordinary filestore directory %s", m.FilestoreDir)
+		m.started.Store(true)
+		m.healthy.Store(true)
 		return nil
 	}
-	m.xfsMounted.Store(true)
+	manager, err := loopdevice.New(m.LoopDeviceDir)
+	if err != nil {
+		return fmt.Errorf("initialize loop manager: %w", err)
+	}
+	device, err := m.ensureMount(m.FilestoreDir, m.Size, m.XFSEnabled, manager)
+	if err != nil {
+		return fmt.Errorf("mount filestore: %w", err)
+	}
+	m.loopDevice = device
+	m.started.Store(true)
+	m.healthy.Store(true)
+	m.forkSupported.Store(m.XFSEnabled)
 	return nil
 }
 
-// Stop unmounts the filestore (best-effort). Safe to call when Start was
-// never called or when the mount never came up.
+// Stop tears down a bounded filestore. Ordinary directories are preserved.
 func (m *Module) Stop() error {
 	if !m.started.Load() {
 		return nil
 	}
-	return CleanupXFSMount(m.FilestoreDir)
-}
-
-// Healthy reports whether a started VolumeManager has its expected backing.
-// An unconfigured filestore is treated as healthy because the operator has
-// explicitly chosen not to use an XFS-backed filestore.
-func (m *Module) Healthy() bool {
-	if m.FilestoreDir == "" {
-		return true
+	m.healthy.Store(false)
+	m.forkSupported.Store(false)
+	if m.Size == "" {
+		m.started.Store(false)
+		return nil
 	}
-	return m.xfsMounted.Load()
+	err := m.cleanupMount(m.FilestoreDir, m.XFSEnabled, m.loopDevice)
+	if err == nil {
+		m.loopDevice = nil
+		m.started.Store(false)
+	}
+	return err
 }
 
-// EphemeralStorageCapacity reports the total and currently available bytes on
-// the filesystem that backs gVisor writable-layer filestores.
+// ForkSupported reports whether a reflink-capable XFS filestore is mounted.
+func (m *Module) ForkSupported() bool { return m.forkSupported.Load() }
+
+// Healthy reports whether Start established the selected filestore mode.
+func (m *Module) Healthy() bool { return m.healthy.Load() }
+
+// EphemeralStorageCapacity reports total and available bytes on the filestore.
 func (m *Module) EphemeralStorageCapacity() (uint64, uint64, error) {
 	if m.FilestoreDir == "" {
 		return 0, 0, fmt.Errorf("filestore_dir is not configured")
@@ -103,14 +133,4 @@ func (m *Module) EphemeralStorageCapacity() (uint64, uint64, error) {
 	}
 	blockSize := uint64(stat.Bsize)
 	return stat.Blocks * blockSize, stat.Bavail * blockSize, nil
-}
-
-// errMissingSize is a typed sentinel so callers / tests can distinguish a
-// config validation failure from a runtime mount failure.
-var errMissingSize = errMissingSizeT{}
-
-type errMissingSizeT struct{}
-
-func (errMissingSizeT) Error() string {
-	return "filestore_dir_size must be set when filestore_dir is configured"
 }

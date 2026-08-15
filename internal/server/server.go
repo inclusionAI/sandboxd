@@ -457,7 +457,7 @@ func (h *sandboxService) Shutdown() {
 	//   ImageManager  -> drains distillfs + persists mount_records.db
 	//   ResourceMod   -> closes /var/run/resource.sock + stops the K8s
 	//                    watcher; safe to call even when Start was a no-op
-	//   VolumeMgr     -> unmounts the XFS filestore
+	//   VolumeMgr     -> unmounts the bounded filestore
 	if h.imageMod != nil {
 		h.imageMod.Stop()
 	}
@@ -466,7 +466,7 @@ func (h *sandboxService) Shutdown() {
 	}
 	if h.volumeMgr != nil {
 		if err := h.volumeMgr.Stop(); err != nil {
-			logrus.Warnf("shutdown: failed to unmount XFS filestore: %v", err)
+			logrus.Warnf("shutdown: failed to unmount filestore: %v", err)
 		}
 	}
 	logrus.Info("sandbox service shutdown complete")
@@ -708,9 +708,14 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		xpuMgr:                            xpuMgr,
 	}
 
-	// VolumeManager comes up before runtime handlers. Failure to mount XFS is
-	// not fatal because VolumeManager.Start can use the plain directory.
-	s.volumeMgr = volumemanager.NewModule(cfg.RuntimeConfig.FilestoreDir, cfg.RuntimeConfig.FilestoreDirSize)
+	// VolumeManager comes up before runtime handlers. An ordinary directory is
+	// the default; a configured bounded filesystem must be established fully.
+	s.volumeMgr = volumemanager.NewModule(
+		cfg.RuntimeConfig.FilestoreDir,
+		cfg.RuntimeConfig.FilestoreDirSize,
+		cfg.RuntimeConfig.FilestoreXFSEnabled,
+		cfg.RuntimeConfig.LoopDeviceDir,
+	)
 	if vErr := s.volumeMgr.Start(); vErr != nil {
 		return nil, fmt.Errorf("volumemanager: %w", vErr)
 	}

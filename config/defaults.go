@@ -26,8 +26,10 @@ const (
 	DefaultSandboxRootDir = "/home/akernel/sandboxd/root"
 	DefaultStoreDir       = "/home/akernel/sandboxd/store"
 
-	DefaultLogDir      = "/var/log/sandboxd"
-	DefaultImageLibDir = "/home/akernel/images"
+	DefaultLogDir        = "/var/log/sandboxd"
+	DefaultImageLibDir   = "/home/akernel/images"
+	DefaultFilestoreDir  = "/home/akernel/filestore"
+	DefaultLoopDeviceDir = "/dev"
 
 	DefaultHttpAddress = "127.0.0.1:23001"
 

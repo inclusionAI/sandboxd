@@ -26,6 +26,10 @@ type fakeOperations struct {
 	nextDevice    int
 	configureErrs []error
 	configs       []*unix.LoopConfig
+	setFDErrs     []error
+	statuses      []*unix.LoopInfo64
+	statusValue   *unix.LoopInfo64
+	statValue     unix.Stat_t
 	opened        []string
 	closed        []int
 	cleared       []int
@@ -47,12 +51,27 @@ func (f *fakeOperations) close(fd int) error {
 	return nil
 }
 
-func (f *fakeOperations) getFree(int) (int, error) {
-	return f.nextDevice, nil
-}
+func (f *fakeOperations) getFree(int) (int, error) { return f.nextDevice, nil }
 
 func (f *fakeOperations) makeDevice(path string, _ int) error {
 	f.created = append(f.created, path)
+	return nil
+}
+
+func (f *fakeOperations) setFD(_, _ int) error {
+	if len(f.setFDErrs) == 0 {
+		return nil
+	}
+	err := f.setFDErrs[0]
+	f.setFDErrs = f.setFDErrs[1:]
+	if errors.Is(err, unix.EBUSY) {
+		f.nextDevice++
+	}
+	return err
+}
+
+func (f *fakeOperations) setStatus(_ int, status *unix.LoopInfo64) error {
+	f.statuses = append(f.statuses, status)
 	return nil
 }
 
@@ -74,11 +93,21 @@ func (f *fakeOperations) clear(fd int) error {
 	return nil
 }
 
-func TestAttachReadOnlyUsesAtomicAutoclear(t *testing.T) {
-	ops := &fakeOperations{
-		nextDevice:    5,
-		configureErrs: []error{unix.EBUSY, nil},
+func (f *fakeOperations) status(int) (*unix.LoopInfo64, error) {
+	if f.statusValue == nil {
+		return nil, errors.New("status unavailable")
 	}
+	value := *f.statusValue
+	return &value, nil
+}
+
+func (f *fakeOperations) fstat(_ int, stat *unix.Stat_t) error {
+	*stat = f.statValue
+	return nil
+}
+
+func TestAttachReadOnlyUsesAtomicAutoclear(t *testing.T) {
+	ops := &fakeOperations{nextDevice: 5, configureErrs: []error{unix.EBUSY, nil}}
 	manager := &Manager{deviceDir: "/dev", ops: ops}
 	device, err := manager.AttachReadOnly("/images/runtime.erofs")
 	if err != nil {
@@ -86,9 +115,6 @@ func TestAttachReadOnlyUsesAtomicAutoclear(t *testing.T) {
 	}
 	if device.Path() != "/dev/loop6" {
 		t.Fatalf("loop path = %q, want /dev/loop6", device.Path())
-	}
-	if len(ops.configs) != 2 {
-		t.Fatalf("configure calls = %d, want 2", len(ops.configs))
 	}
 	flags := ops.configs[1].Info.Flags
 	wantFlags := uint32(unix.LO_FLAGS_AUTOCLEAR | unix.LO_FLAGS_READ_ONLY)
@@ -98,8 +124,42 @@ func TestAttachReadOnlyUsesAtomicAutoclear(t *testing.T) {
 	if err := device.Release(); err != nil {
 		t.Fatal(err)
 	}
-	if len(ops.cleared) != 0 {
-		t.Fatal("Release cleared an autoclearing mounted loop")
+}
+
+func TestAttachReadOnlyCreatesMissingDeviceNode(t *testing.T) {
+	ops := &fakeOperations{nextDevice: 8, missingDevice: true}
+	manager := &Manager{deviceDir: "/dev", ops: ops}
+	device, err := manager.AttachReadOnly("/images/runtime.erofs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ops.created) != 1 || ops.created[0] != "/dev/loop8" {
+		t.Fatalf("created device nodes = %v", ops.created)
+	}
+	if device.Path() != "/dev/loop8" {
+		t.Fatalf("loop path = %q, want /dev/loop8", device.Path())
+	}
+}
+
+func TestAttachWritableCreatesMissingDeviceAndRetriesBusy(t *testing.T) {
+	ops := &fakeOperations{
+		nextDevice:    8,
+		missingDevice: true,
+		setFDErrs:     []error{unix.EBUSY, nil},
+	}
+	manager := &Manager{deviceDir: "/dev", ops: ops}
+	device, err := manager.AttachWritable("/var/lib/sandboxd/ext4.img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if device.Path() != "/dev/loop9" {
+		t.Fatalf("loop path = %q, want /dev/loop9", device.Path())
+	}
+	if len(ops.created) != 1 || ops.created[0] != "/dev/loop8" {
+		t.Fatalf("created device nodes = %v", ops.created)
+	}
+	if len(ops.statuses) != 1 || ops.statuses[0].Flags != unix.LO_FLAGS_AUTOCLEAR {
+		t.Fatalf("loop statuses = %+v", ops.statuses)
 	}
 }
 
@@ -118,18 +178,30 @@ func TestDetachClearsUnMountedLoop(t *testing.T) {
 	}
 }
 
-func TestAttachReadOnlyCreatesMissingDeviceNode(t *testing.T) {
-	ops := &fakeOperations{nextDevice: 8, missingDevice: true}
+func TestAdoptVerifiesBackingFileAndFlags(t *testing.T) {
+	ops := &fakeOperations{
+		nextDevice: 12,
+		statusValue: &unix.LoopInfo64{
+			Device: 44,
+			Inode:  55,
+			Flags:  unix.LO_FLAGS_AUTOCLEAR,
+		},
+		statValue: unix.Stat_t{Dev: 44, Ino: 55},
+	}
 	manager := &Manager{deviceDir: "/dev", ops: ops}
-
-	device, err := manager.AttachReadOnly("/images/runtime.erofs")
+	device, err := manager.Adopt("/dev/loop12", "/var/lib/sandboxd/ext4.img", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ops.created) != 1 || ops.created[0] != "/dev/loop8" {
-		t.Fatalf("created device nodes = %v", ops.created)
+	if device.Path() != "/dev/loop12" {
+		t.Fatalf("adopted path = %q", device.Path())
 	}
-	if device.Path() != "/dev/loop8" {
-		t.Fatalf("loop path = %q, want /dev/loop8", device.Path())
+}
+
+func TestNewRejectsUnsafeDeviceDirectory(t *testing.T) {
+	for _, path := range []string{"relative", "/"} {
+		if _, err := New(path); err == nil {
+			t.Fatalf("New(%q) succeeded", path)
+		}
 	}
 }

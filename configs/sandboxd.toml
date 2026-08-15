@@ -53,10 +53,13 @@ max_instance_num = 32
 [plugin.runtime]
 # Retained for configuration compatibility; the current runtime does not read it.
 image_lib_dir = "/var/lib/sandboxd/images"
-# Writable gVisor overlays are stored on this XFS-backed filestore instead of
-# shmem. sandboxd creates and mounts the image when needed.
+# Writable gVisor overlays are stored in this shared directory. Leaving size
+# unset uses an ordinary directory and requires no loop device. Setting a size
+# creates a bounded ext4 filestore; enable XFS only when reflink is required.
 filestore_dir = "/var/lib/sandboxd/filestore"
-filestore_dir_size = "100G"
+filestore_xfs_enabled = false
+# filestore_dir_size = "100G"
+loop_device_dir = "/dev"
 overlay_tmpfs_size = "256M"
 
 [plugin.runtime.basic_spec]

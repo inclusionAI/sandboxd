@@ -89,17 +89,21 @@ type RuntimeConfig struct {
 	// ImageLibDir is retained for configuration compatibility and is not used.
 	ImageLibDir string `toml:"image_lib_dir" json:"imageLibDir"`
 
-	// FilestoreDir specifies a directory for overlay backing files.
-	// The directory must reside on an XFS filesystem with reflink support for
-	// ficlone to work when forking sandboxes. If the directory is not yet
-	// mounted, sandboxd will create an XFS image file at
-	// <parent-of-FilestoreDir>/xfs.img and mount it automatically.
+	// FilestoreDir specifies a directory for writable overlay backing files.
+	// With no size configured, sandboxd uses it as an ordinary directory.
 	FilestoreDir string `toml:"filestore_dir" json:"filestoreDir"`
 
-	// FilestoreDirSize specifies the size of the XFS image file created for
-	// FilestoreDir (e.g. "100G", "50G"). Required when FilestoreDir is set
-	// and the mount point does not already exist as an XFS filesystem.
+	// FilestoreDirSize optionally bounds the shared filestore with a loop-backed
+	// filesystem. ext4 is used by default; XFS is selected explicitly below.
 	FilestoreDirSize string `toml:"filestore_dir_size" json:"filestoreDirSize"`
+
+	// FilestoreXFSEnabled selects XFS for a bounded filestore. XFS is only
+	// needed by consumers that require reflink, such as sandbox fork.
+	FilestoreXFSEnabled bool `toml:"filestore_xfs_enabled" json:"filestoreXFSEnabled"`
+
+	// LoopDeviceDir contains loop-control and loopN device nodes. The default
+	// is /dev; deployments may point it at another mounted device namespace.
+	LoopDeviceDir string `toml:"loop_device_dir" json:"loopDeviceDir"`
 
 	// OverlayTmpfsSize specifies the size limit for the gVisor writable overlay
 	// (e.g. "256M", "1G"). The name is retained for configuration compatibility.
@@ -208,7 +212,9 @@ func DefaultConfig() Config {
 				BasicSpec: map[string]string{
 					RuntimeNameRunsc: "/home/akernel/images/config.json",
 				},
-				ImageLibDir: DefaultImageLibDir,
+				ImageLibDir:   DefaultImageLibDir,
+				FilestoreDir:  DefaultFilestoreDir,
+				LoopDeviceDir: DefaultLoopDeviceDir,
 			},
 			ResourceConfig: ResourceConfig{
 				MaxInstanceNum:     DefaultMaxSandboxNum,
