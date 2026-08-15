@@ -106,11 +106,35 @@ func prepareKataRootfs(
 	mounts []Mount,
 	readonly bool,
 ) (*kataRootfsPlan, error) {
+	return prepareKataRootfsWithMounter(
+		bundlePath,
+		source,
+		kind,
+		mounts,
+		readonly,
+		mountKataEROFSImage,
+	)
+}
+
+func prepareKataRootfsWithMounter(
+	bundlePath string,
+	source string,
+	kind kataRootfsKind,
+	mounts []Mount,
+	readonly bool,
+	mountEROFS erofsImageMounter,
+) (*kataRootfsPlan, error) {
 	switch kind {
 	case kataRootfsDirectory:
 		return prepareKataDirectoryRootfs(bundlePath, source, mounts, readonly)
 	case kataRootfsEROFS:
-		return prepareKataEROFSRootfs(bundlePath, source, mounts, readonly)
+		return prepareKataEROFSRootfsWithMounter(
+			bundlePath,
+			source,
+			mounts,
+			readonly,
+			mountEROFS,
+		)
 	default:
 		return nil, fmt.Errorf("unsupported Kata rootfs kind %d", kind)
 	}
@@ -180,11 +204,27 @@ func prepareKataEROFSRootfs(
 	mounts []Mount,
 	readonly bool,
 ) (*kataRootfsPlan, error) {
+	return prepareKataEROFSRootfsWithMounter(
+		bundlePath,
+		source,
+		mounts,
+		readonly,
+		mountKataEROFSImage,
+	)
+}
+
+func prepareKataEROFSRootfsWithMounter(
+	bundlePath string,
+	source string,
+	mounts []Mount,
+	readonly bool,
+	mountEROFS erofsImageMounter,
+) (*kataRootfsPlan, error) {
 	if err := cleanupKataRootfs(bundlePath); err != nil {
 		return nil, fmt.Errorf("clean previous Kata rootfs: %w", err)
 	}
 	lowerDir := filepath.Join(bundlePath, kataRootfsLowerDir)
-	if err := mountKataEROFSAt(source, lowerDir); err != nil {
+	if err := mountKataEROFSAtWithMounter(source, lowerDir, mountEROFS); err != nil {
 		return nil, err
 	}
 	plan, err := prepareKataOverlayRootfs(bundlePath, lowerDir, mounts, readonly)
@@ -263,6 +303,14 @@ func cleanupKataRootfs(bundlePath string) error {
 // prepareKataMounts keeps directory-backed mounts on virtiofs and loop-mounts
 // regular EROFS files before exposing them as read-only directories.
 func prepareKataMounts(bundlePath string, config *StartConfig) (func() error, error) {
+	return prepareKataMountsWithMounter(bundlePath, config, mountKataEROFSImage)
+}
+
+func prepareKataMountsWithMounter(
+	bundlePath string,
+	config *StartConfig,
+	mountEROFS erofsImageMounter,
+) (func() error, error) {
 	if err := cleanupKataMounts(bundlePath); err != nil {
 		return nil, fmt.Errorf("clean previous Kata EROFS mounts: %w", err)
 	}
@@ -334,7 +382,7 @@ func prepareKataMounts(bundlePath string, config *StartConfig) (func() error, er
 
 		mountDir := filepath.Join(bundlePath, kataEROFSMountDir, fmt.Sprintf("%d", index))
 		lowerDir := filepath.Join(mountDir, kataEROFSLowerDir)
-		if err := mountKataEROFSAt(source, lowerDir); err != nil {
+		if err := mountKataEROFSAtWithMounter(source, lowerDir, mountEROFS); err != nil {
 			return nil, errors.Join(err, cleanup())
 		}
 		mounted = append(mounted, lowerDir)
@@ -364,6 +412,13 @@ func kataReadOnlyBindOptions(options []string) []string {
 }
 
 func mountKataEROFSAt(source, target string) error {
+	return mountKataEROFSAtWithMounter(source, target, mountKataEROFSImage)
+}
+
+func mountKataEROFSAtWithMounter(
+	source, target string,
+	mountEROFS erofsImageMounter,
+) error {
 	if err := os.RemoveAll(target); err != nil {
 		return err
 	}
@@ -372,7 +427,7 @@ func mountKataEROFSAt(source, target string) error {
 	}
 	// TODO: Remove this host loop-mount fallback once Kata Containers
 	// reliably supports EROFS rootfs images and mounts as direct volumes.
-	if err := mountKataEROFSImage(source, target); err != nil {
+	if err := mountEROFS(source, target); err != nil {
 		return errors.Join(err, os.RemoveAll(target))
 	}
 	return nil

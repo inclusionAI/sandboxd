@@ -79,6 +79,7 @@ func TestRunscHandlerDoesNotPrepareNVProxyRootfsForGenericSpecUpdates(t *testing
 		rootfsOverlayTmpfsSize: "10G",
 		filestoreDir:           t.TempDir(),
 		sandboxRoot:            bundleRoot,
+		mountEROFS:             mountRunscNVProxyEROFSImage,
 	}
 	err := handler.Start(context.Background(), StartConfig{
 		ID:          "sbox-generic-updates",
@@ -122,6 +123,7 @@ func TestRunscHandlerMountsRootfsImageForNVProxy(t *testing.T) {
 		rootfsOverlayTmpfsSize: "10G",
 		filestoreDir:           t.TempDir(),
 		sandboxRoot:            bundleRoot,
+		mountEROFS:             mountRunscNVProxyEROFSImage,
 	}
 	err = handler.Start(context.Background(), StartConfig{
 		ID:         "sbox-rootfs-image",

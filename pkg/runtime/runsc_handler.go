@@ -46,6 +46,7 @@ type RunscHandler struct {
 	rootfsOverlayTmpfsSize string
 	filestoreDir           string
 	sandboxRoot            string
+	mountEROFS             erofsImageMounter
 }
 
 type runscClient interface {
@@ -70,6 +71,10 @@ func NewRunscHandler(cfg config.Config, bin string, loader OciLoader) (*RunscHan
 		return nil, err
 	}
 	runscLogPath := filepath.Join(runscLogDir, "runsc.log")
+	mountEROFS, err := newEROFSImageMounter(cfg.RuntimeConfig.LoopDeviceDir)
+	if err != nil {
+		return nil, fmt.Errorf("initialize EROFS loop manager: %w", err)
+	}
 
 	return &RunscHandler{
 		runsc: runscapi.NewClientWithOptions(bin, runscRoot, runscapi.Options{
@@ -82,6 +87,7 @@ func NewRunscHandler(cfg config.Config, bin string, loader OciLoader) (*RunscHan
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
 		filestoreDir:           cfg.RuntimeConfig.FilestoreDir,
 		sandboxRoot:            filepath.Join(root, "containers"),
+		mountEROFS:             mountEROFS,
 	}, nil
 }
 
@@ -114,10 +120,11 @@ func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 		config.SpecUpdates.RequiresHostWritableRootfs
 	var cleanupNVProxyRootfs func() error
 	if requiresHostWritableRootfs || !mountTargetsReady {
-		cleanupNVProxyRootfs, err = prepareRunscPrivateRootfs(
+		cleanupNVProxyRootfs, err = prepareRunscPrivateRootfsWithMounter(
 			bundlePath,
 			ociSpec,
 			requiresHostWritableRootfs,
+			r.mountEROFS,
 		)
 		if err != nil {
 			return fmt.Errorf("prepare private runsc rootfs: %w", err)

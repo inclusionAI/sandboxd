@@ -61,6 +61,20 @@ func prepareRunscPrivateRootfs(
 	spec *Spec,
 	requireHostWritable bool,
 ) (func() error, error) {
+	return prepareRunscPrivateRootfsWithMounter(
+		bundlePath,
+		spec,
+		requireHostWritable,
+		mountRunscNVProxyEROFSImage,
+	)
+}
+
+func prepareRunscPrivateRootfsWithMounter(
+	bundlePath string,
+	spec *Spec,
+	requireHostWritable bool,
+	mountEROFS erofsImageMounter,
+) (func() error, error) {
 	if spec == nil || spec.Root == nil || spec.Root.Path == "" {
 		return nil, errors.New("private runsc rootfs requires a root filesystem")
 	}
@@ -78,7 +92,7 @@ func prepareRunscPrivateRootfs(
 		if err := os.MkdirAll(lowerDir, 0755); err != nil {
 			return nil, errors.Join(err, cleanupRunscNVProxyRootfs(bundlePath))
 		}
-		if err := mountRunscNVProxyEROFSImage(source, lowerDir); err != nil {
+		if err := mountEROFS(source, lowerDir); err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("mount nvproxy EROFS rootfs %s: %w", source, err),
 				cleanupRunscNVProxyRootfs(bundlePath),

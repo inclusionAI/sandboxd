@@ -19,18 +19,41 @@ import (
 	"fmt"
 	"syscall"
 
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/loopdevice"
 )
 
 const erofsMountType = "erofs"
 
+type erofsImageMounter func(source, target string) error
+
+func newEROFSImageMounter(deviceDir string) (erofsImageMounter, error) {
+	if deviceDir == "" {
+		deviceDir = config.DefaultLoopDeviceDir
+	}
+	manager, err := loopdevice.New(deviceDir)
+	if err != nil {
+		return nil, err
+	}
+	return func(source, target string) error {
+		return mountReadOnlyEROFSImageWithManager(manager, source, target)
+	}, nil
+}
+
 // mountReadOnlyEROFSImage exposes an EROFS image as a host directory. The
 // loop mapping is automatically cleared after the final mount disappears.
 func mountReadOnlyEROFSImage(source, target string) error {
-	manager, err := loopdevice.New("/dev")
+	mounter, err := newEROFSImageMounter(config.DefaultLoopDeviceDir)
 	if err != nil {
 		return err
 	}
+	return mounter(source, target)
+}
+
+func mountReadOnlyEROFSImageWithManager(
+	manager *loopdevice.Manager,
+	source, target string,
+) error {
 	device, err := manager.AttachReadOnly(source)
 	if err != nil {
 		return err

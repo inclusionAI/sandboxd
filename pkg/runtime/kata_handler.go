@@ -43,6 +43,7 @@ type KataHandler struct {
 	danConfigDir string
 	loggerBinary string
 	ociLoader    OciLoader
+	mountEROFS   erofsImageMounter
 	shims        cmap.ConcurrentMap[string, *kataShimInstance]
 }
 
@@ -63,6 +64,10 @@ func NewKataHandler(cfg config.Config, binary string, loader OciLoader) (*KataHa
 	if err := validateKataHost(binary, kataConfig); err != nil {
 		return nil, err
 	}
+	mountEROFS, err := newEROFSImageMounter(cfg.RuntimeConfig.LoopDeviceDir)
+	if err != nil {
+		return nil, fmt.Errorf("initialize EROFS loop manager: %w", err)
+	}
 	sandboxRoot := filepath.Join(cfg.RootDir, "containers")
 	if err := os.MkdirAll(sandboxRoot, 0755); err != nil {
 		return nil, fmt.Errorf("create kata sandbox root: %w", err)
@@ -75,6 +80,7 @@ func NewKataHandler(cfg config.Config, binary string, loader OciLoader) (*KataHa
 		danConfigDir: kataConfig.DANConfigDir,
 		loggerBinary: kataConfig.LoggerBinary,
 		ociLoader:    loader,
+		mountEROFS:   mountEROFS,
 		shims:        cmap.New[*kataShimInstance](),
 	}
 	handler.recoverShims()
@@ -127,7 +133,11 @@ func (k *KataHandler) Start(ctx context.Context, startConfig StartConfig) error 
 		return err
 	}
 	kataConfig := cloneKataStartConfig(startConfig)
-	cleanupMounts, err := prepareKataMounts(bundlePath, &kataConfig)
+	cleanupMounts, err := prepareKataMountsWithMounter(
+		bundlePath,
+		&kataConfig,
+		k.mountEROFS,
+	)
 	if err != nil {
 		return fmt.Errorf("prepare Kata mounts: %w", err)
 	}
@@ -143,12 +153,13 @@ func (k *KataHandler) Start(ctx context.Context, startConfig StartConfig) error 
 		)
 	}
 
-	rootfsPlan, err := prepareKataRootfs(
+	rootfsPlan, err := prepareKataRootfsWithMounter(
 		bundlePath,
 		kataConfig.Rootfs,
 		rootfsKind,
 		ociSpec.Mounts,
 		ociSpec.Root.Readonly,
+		k.mountEROFS,
 	)
 	if err != nil {
 		return errors.Join(
