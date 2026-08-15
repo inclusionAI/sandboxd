@@ -63,7 +63,7 @@ BPF_TEST_BUILD_ARGS ?=
 BPF_SOURCE_DIRS := bpf/bpfnat bpf/networkacl
 BPF_C_SOURCES := $(shell find $(BPF_SOURCE_DIRS) -type f \( -name '*.c' -o -name '*.h' \) | sort)
 
-.PHONY: all clean test e2e release release-binary release-cli sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
+.PHONY: all clean test storage-test e2e release release-binary release-cli sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
@@ -86,6 +86,19 @@ sandbox-logger:
 test: ## run tests
 	@$(GO) clean -testcache
 	@$(GOTEST) ${TESTFLAGS} ${PACKAGES}
+
+storage-test: ## run privileged loop-backed filesystem integration tests
+	@set -eu; \
+	tmpdir="$$(mktemp -d)"; \
+	trap 'rm -rf "$${tmpdir}"' EXIT; \
+	$(GO) test ${GO_TAGS} -c -o "$${tmpdir}/volumemanager.test" ./pkg/volumemanager; \
+	$(GO) test ${GO_TAGS} -c -o "$${tmpdir}/runtime.test" ./pkg/runtime; \
+	sudo env SANDBOXD_RUN_STORAGE_INTEGRATION=1 \
+		"$${tmpdir}/volumemanager.test" \
+		-test.v -test.run '^TestLoopBackedFilestoreIntegration$$'; \
+	sudo env SANDBOXD_RUN_STORAGE_INTEGRATION=1 \
+		"$${tmpdir}/runtime.test" \
+		-test.v -test.run '^TestEROFSLoopDeviceDirIntegration$$'
 
 e2e: ## run unit tests and the privileged runsc e2e flow
 	@bash test/e2e/run.sh

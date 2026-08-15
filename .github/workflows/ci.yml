@@ -53,6 +53,35 @@ jobs:
       - name: Run go vet
         run: make vet
 
+  storage:
+    name: Storage integration
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y erofs-utils xfsprogs
+
+      - name: Prepare storage kernel modules
+        run: |
+          sudo modprobe loop
+          sudo modprobe xfs
+          sudo modprobe erofs
+
+      - name: Run privileged storage tests
+        run: make storage-test
+
   protobuf:
     name: Generated protobuf bindings
     runs-on: ubuntu-latest
