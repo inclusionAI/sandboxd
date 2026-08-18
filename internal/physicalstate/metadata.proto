@@ -1,0 +1,53 @@
+// Copyright (c) 2026 Ant Group Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package sandboxd.internal.physicalstate;
+
+option go_package = "github.com/inclusionAI/sandboxd/internal/physicalstate";
+
+// PhysicalPhase is sandboxd-private recovery coordination. Only committed
+// sandboxes may be published through the runtime List API.
+enum PhysicalPhase {
+  PHYSICAL_PHASE_UNSPECIFIED = 0;
+  PHYSICAL_PHASE_INTENT      = 1;
+  PHYSICAL_PHASE_COMMITTED   = 2;
+}
+
+// SandboxMetadata is sandboxd's durable physical record. Field numbers and
+// wire types intentionally match the historical runtime.v1.SandboxMetadata
+// encoding so existing meta.pb files remain readable after this type moves
+// out of the public runtime API.
+message SandboxMetadata {
+  reserved 2, 5;
+
+  string id                         = 1;
+  string runtime_handler            = 3;
+  map<string, string> labels        = 4;
+  string stdout                     = 6;
+  string stderr                     = 7;
+  map<string, string> metric_labels = 8;
+  repeated string ports             = 9;
+  PhysicalPhase physical_phase      = 10;
+  RestoreIdentity restore_identity  = 11;
+  map<string, string> resource_facts = 12;
+}
+
+// RestoreIdentity binds a deterministic physical sandbox to one immutable
+// checkpoint and normalized restore request.
+message RestoreIdentity {
+  string checkpoint_id  = 1;
+  string request_sha256 = 2;
+}

@@ -193,6 +193,10 @@ func ValidateFilestoreOvercommitRatio(value float64) error {
 // NetworkConfig contains network-related configuration for sandboxd.
 type NetworkConfig struct {
 	IPRange string `toml:"ip_range" json:"ipRange"`
+	// HostPortStart and HostPortCount define the sandboxd-owned allocation
+	// range used when a port request carries host port zero.
+	HostPortStart int `toml:"host_port_start" json:"hostPortStart"`
+	HostPortCount int `toml:"host_port_count" json:"hostPortCount"`
 
 	// NatBackend selects the registered NAT implementation used for SNAT/DNAT
 	// rules. Empty defaults to "iptables" for backward compatibility.
@@ -228,6 +232,8 @@ func DefaultConfig() Config {
 			NetworkConfig: NetworkConfig{
 				NatBackend:                         "iptables",
 				IPRange:                            DefaultIPRange,
+				HostPortStart:                      DefaultHostPortStart,
+				HostPortCount:                      DefaultHostPortCount,
 				DNSProxyConcurrencyLimit:           256,
 				DNSProxyPerSandboxConcurrencyLimit: 16,
 			},

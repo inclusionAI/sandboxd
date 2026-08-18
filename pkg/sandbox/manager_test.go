@@ -23,8 +23,8 @@ import (
 	"testing"
 	"time"
 
-	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/physicalstate"
 	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
@@ -51,21 +51,21 @@ func newTestSandboxes(hitId string, hitLabel map[string]string) []*Sandbox {
 	sandboxes = append(sandboxes, nil)
 	sandboxes = append(sandboxes, &Sandbox{})
 	sandboxes = append(sandboxes, &Sandbox{
-		Metadata: &runtime.SandboxMetadata{ID: "test-1"},
+		Metadata: &physicalstate.SandboxMetadata{ID: "test-1"},
 	})
 
 	if len(hitId) != 0 {
 		sandboxes = append(sandboxes, &Sandbox{
-			Metadata: &runtime.SandboxMetadata{ID: hitId},
+			Metadata: &physicalstate.SandboxMetadata{ID: hitId},
 		})
 	}
 
 	sandboxes = append(sandboxes, &Sandbox{
-		Metadata: &runtime.SandboxMetadata{ID: "label-not-hit", Labels: hitLabel},
+		Metadata: &physicalstate.SandboxMetadata{ID: "label-not-hit", Labels: hitLabel},
 	})
 
 	sandboxes = append(sandboxes, &Sandbox{
-		Metadata: &runtime.SandboxMetadata{ID: "label-hit", Labels: map[string]string{
+		Metadata: &physicalstate.SandboxMetadata{ID: "label-hit", Labels: map[string]string{
 			"test-999": "666",
 		}},
 	})
@@ -109,7 +109,7 @@ func TestSandboxMetricsTargets(t *testing.T) {
 	cpuQuota := int64(50_000)
 	cpuPeriod := uint64(100_000)
 	running := &Sandbox{
-		Metadata: &runtime.SandboxMetadata{
+		Metadata: &physicalstate.SandboxMetadata{
 			ID:             "sbox-running",
 			RuntimeHandler: "runsc-class",
 			MetricLabels: map[string]string{
@@ -130,7 +130,7 @@ func TestSandboxMetricsTargets(t *testing.T) {
 		},
 	}
 	exited := &Sandbox{
-		Metadata: &runtime.SandboxMetadata{ID: "sbox-exited", RuntimeHandler: "runsc"},
+		Metadata: &physicalstate.SandboxMetadata{ID: "sbox-exited", RuntimeHandler: "runsc"},
 		Status: &statusStorage{status: Status{
 			StartedAt:  "2026-07-10T00:00:00Z",
 			FinishedAt: "2026-07-10T00:01:00Z",
@@ -138,7 +138,7 @@ func TestSandboxMetricsTargets(t *testing.T) {
 		Spec: &spec.Spec{Linux: &spec.Linux{CgroupsPath: "/akernel/sbox-exited"}},
 	}
 	withoutCgroup := &Sandbox{
-		Metadata: &runtime.SandboxMetadata{ID: "sbox-no-cgroup", RuntimeHandler: "runsc"},
+		Metadata: &physicalstate.SandboxMetadata{ID: "sbox-no-cgroup", RuntimeHandler: "runsc"},
 		Status:   &statusStorage{status: Status{StartedAt: "2026-07-10T00:00:00Z"}},
 		Spec:     &spec.Spec{},
 	}
@@ -205,7 +205,7 @@ func TestSandboxStoppedNotificationIncludesMetricLabels(t *testing.T) {
 			exitNotifiers:   cmap.New[*exitNotifier](),
 		}
 		sb := &Sandbox{
-			Metadata: &runtime.SandboxMetadata{
+			Metadata: &physicalstate.SandboxMetadata{
 				ID:             "sbox-delete-metrics",
 				RuntimeHandler: "runsc",
 				MetricLabels:   map[string]string{"tenantid": "tenant-a"},
@@ -281,7 +281,7 @@ func TestStoreMetadata(t *testing.T) {
 		sandboxes:   cmap.New[*Sandbox](),
 	}
 
-	metadata := &runtime.SandboxMetadata{
+	metadata := &physicalstate.SandboxMetadata{
 		ID:             "test-store-metadata-111111",
 		RuntimeHandler: "runsc",
 	}
@@ -302,7 +302,7 @@ func TestStoreMetadataReturnsPersistenceFailure(t *testing.T) {
 	assert.NoError(t, os.RemoveAll(root))
 	assert.NoError(t, os.WriteFile(root, []byte("not a directory"), 0600))
 
-	metadata := &runtime.SandboxMetadata{
+	metadata := &physicalstate.SandboxMetadata{
 		ID:             "sbox-store-failure",
 		RuntimeHandler: "runsc",
 	}
@@ -337,7 +337,7 @@ func TestStartMonitorGoroutine(t *testing.T) {
 	id := "success-start-monitor-test1"
 
 	sb := &Sandbox{
-		Metadata: &runtime.SandboxMetadata{ID: id, RuntimeHandler: "runsc"},
+		Metadata: &physicalstate.SandboxMetadata{ID: id, RuntimeHandler: "runsc"},
 	}
 	sandboxes.Set(id, sb)
 
@@ -427,7 +427,7 @@ func newWaitForExitManager(t *testing.T, id string) (*Manager, string) {
 		stopChan:        make(chan struct{}),
 	}
 	m.sandboxes.Set(id, &Sandbox{
-		Metadata: &runtime.SandboxMetadata{ID: id, RuntimeHandler: "runsc"},
+		Metadata: &physicalstate.SandboxMetadata{ID: id, RuntimeHandler: "runsc"},
 		Status:   storage,
 	})
 	m.exitNotifiers.Set(id, newExitNotifier())
@@ -458,7 +458,7 @@ func TestReceiveCreatePublishesExitNotifierBeforeReturn(t *testing.T) {
 		syncEventChan:   make(chan Event, 1),
 		stopChan:        make(chan struct{}),
 	}
-	metadata := &runtime.SandboxMetadata{ID: id, RuntimeHandler: "runsc"}
+	metadata := &physicalstate.SandboxMetadata{ID: id, RuntimeHandler: "runsc"}
 	m.sandboxes.Set(id, &Sandbox{
 		Metadata: metadata,
 		Status:   &statusStorage{status: Status{StartedAt: time.Now().Format(time.RFC3339Nano)}},
@@ -485,7 +485,7 @@ func TestReceiveCreateAfterStopDoesNotPublishMonitor(t *testing.T) {
 		syncEventChan:   make(chan Event, 1),
 		stopChan:        make(chan struct{}),
 	}
-	metadata := &runtime.SandboxMetadata{ID: id, RuntimeHandler: "runsc"}
+	metadata := &physicalstate.SandboxMetadata{ID: id, RuntimeHandler: "runsc"}
 
 	m.Stop()
 	m.ReceiveEvent(Event{Type: EventTypeCreate, MetaData: metadata, SandboxID: id})
@@ -508,7 +508,7 @@ func TestReceiveCreateAndStopAreLinearized(t *testing.T) {
 			syncEventChan:   make(chan Event, 1),
 			stopChan:        make(chan struct{}),
 		}
-		metadata := &runtime.SandboxMetadata{ID: id, RuntimeHandler: "runsc"}
+		metadata := &physicalstate.SandboxMetadata{ID: id, RuntimeHandler: "runsc"}
 		start := make(chan struct{})
 		var wg sync.WaitGroup
 		wg.Add(2)

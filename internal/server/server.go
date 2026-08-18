@@ -31,7 +31,10 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/checkpoint"
+	"github.com/inclusionAI/sandboxd/internal/checkpointstate"
 	"github.com/inclusionAI/sandboxd/internal/metrics"
+	"github.com/inclusionAI/sandboxd/internal/physicalstate"
 	"github.com/inclusionAI/sandboxd/internal/trace"
 	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
@@ -67,6 +70,11 @@ type SandboxService interface {
 
 var _ SandboxService = &sandboxService{}
 
+type xpuLeaseManager interface {
+	Acquire(string, []*runtime.XpuAllocation) (*svc.SpecUpdates, error)
+	Release(string)
+}
+
 // sandboxService implements SandboxService.
 type sandboxService struct {
 	// config is the sandbox service config
@@ -85,13 +93,20 @@ type sandboxService struct {
 	resourceMod  *resourcemanager.Module
 	imageMod     *imagemanager.Module
 	volumeMgr    *volumemanager.Module
-	xpuMgr       *xpumanager.Manager
+	xpuMgr       xpuLeaseManager
 
 	store store.DbStore
 
 	runtime.UnimplementedSandboxServiceServer
 
 	fsMgr *fsManager
+
+	checkpointState   *checkpointstate.Coordinator
+	operationCtx      context.Context
+	operationCancel   context.CancelFunc
+	operationMu       sync.Mutex
+	operationWG       sync.WaitGroup
+	operationStopping bool
 
 	ready         atomic.Bool
 	recoveryReady atomic.Bool
@@ -217,6 +232,42 @@ func (h *sandboxService) startSandboxRuntime(
 	return nil
 }
 
+func (h *sandboxService) restoreSandboxRuntime(
+	ctx context.Context,
+	runtimeName string,
+	startConfig svc.StartConfig,
+	checkpointImage string,
+) (err error) {
+	if err = h.checkRuntime(runtimeName); err != nil {
+		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
+	}
+	handler, ok := h.serviceHandler.Get(runtimeName)
+	if !ok {
+		return errord.ToGRPC(errord.ErrNotImplemented)
+	}
+	restoreHandler, ok := handler.(managedCheckpointHandler)
+	if !ok {
+		return errord.ToGRPC(errord.ErrNotImplemented)
+	}
+	if startConfig.CgroupPath != "" {
+		if h.cgroupMgr == nil {
+			return errors.New("cgroup manager is not configured")
+		}
+		hostResources := svc.HostCgroupResources(runtimeName, startConfig.Resources)
+		if err = h.cgroupMgr.Prepare(startConfig.CgroupPath, hostResources); err != nil {
+			return fmt.Errorf("prepare cgroup %s: %w", startConfig.CgroupPath, err)
+		}
+	}
+	if err := restoreHandler.Restore(ctx, startConfig, checkpointImage); err != nil {
+		if errors.Is(err, physicalstate.ErrRestoreCleanupIncomplete) {
+			return err
+		}
+		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
+		return errord.ToGRPC(err)
+	}
+	return nil
+}
+
 func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string) (err error) {
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
@@ -245,7 +296,7 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(errord.ErrNotImplemented)
 	}
 
-	resource, err := h.sandboxManager.CollectResourceByID(sandboxID)
+	resource, err := h.physicalResources(c.Metadata)
 	if err != nil {
 		return err
 	}
@@ -257,6 +308,10 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(err)
 	}
 	metrics.RecordRuntimeCallResult("delete", "success", c.Metadata.RuntimeHandler)
+	if h.networkMgr != nil {
+		h.networkMgr.cleanupDnatRules(sandboxID)
+		h.networkMgr.releaseDnatPorts(sandboxID)
+	}
 	if h.xpuMgr != nil {
 		h.xpuMgr.Release(sandboxID)
 	}
@@ -287,10 +342,13 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) error {
 	resultCh := h.deleteGroup.DoChan(sandboxID, func() (interface{}, error) {
 		cleanupCtx := context.WithoutCancel(ctx)
-
-		if h.networkMgr != nil {
-			h.networkMgr.cleanupDnatRules(sandboxID)
+		if h.checkpointState != nil {
+			if err := h.checkpointState.BeginDelete(sandboxID); err != nil {
+				return nil, err
+			}
+			defer h.checkpointState.EndDelete(sandboxID)
 		}
+
 		return nil, h.deleteSandboxRuntime(cleanupCtx, sandboxID)
 	})
 
@@ -303,36 +361,50 @@ func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) er
 }
 
 func (h *sandboxService) List(ctx context.Context, request *runtime.ListSandboxesRequest) (*runtime.ListSandboxesResponse, error) {
-	var sandboxes []*sandbox.Sandbox
 	response := new(runtime.ListSandboxesResponse)
-	if request.ID != "" {
-		sandboxes = h.sandboxManager.List(sandbox.ListFilterById(request.ID))
-		if len(sandboxes) == 0 {
-			return response, errord.ToGRPC(errord.ErrNotFound)
-		}
-	} else {
-		sandboxes = h.sandboxManager.List(sandbox.ListFilterByLabels(request.Selector))
+	if request == nil {
+		return response, errord.ToGRPC(errord.ErrInvalidArgument)
 	}
 
+	sandboxes := h.sandboxManager.List()
 	for idx := range sandboxes {
-		c := sandboxes[idx]
-		if c == nil || c.Status == nil || c.Metadata == nil {
+		current := sandboxes[idx]
+		if current == nil {
 			continue
 		}
-		response.Sandboxes = append(response.Sandboxes, &runtime.SandboxStatus{
-			ID:           c.Metadata.ID,
-			Runtime:      c.Metadata.RuntimeHandler,
-			State:        c.Status.Get().State(),
-			StartedAt:    util.MustInt64(c.Status.Get().StartedAt),
-			FinishedAt:   util.MustInt64(c.Status.Get().FinishedAt),
-			ExitCode:     c.Status.Get().ExitCode,
-			Labels:       copyStringMap(c.Metadata.Labels),
-			MetricLabels: copyStringMap(c.Metadata.MetricLabels),
-			Stdout:       c.Metadata.Stdout,
-			Stderr:       c.Metadata.Stderr,
-		})
+		status := current.ApiStatus()
+		if sandboxStatusMatchesListRequest(status, request) {
+			response.Sandboxes = append(response.Sandboxes, status)
+		}
+	}
+	if request.ID != "" && len(response.Sandboxes) == 0 {
+		return response, errord.ToGRPC(errord.ErrNotFound)
 	}
 	return response, nil
+}
+
+func sandboxStatusMatchesListRequest(
+	status *runtime.SandboxStatus,
+	request *runtime.ListSandboxesRequest,
+) bool {
+	if status == nil {
+		return false
+	}
+	if request.ID != "" && status.ID != request.ID {
+		return false
+	}
+	if len(request.Selector) == 0 {
+		return true
+	}
+	if status.Labels == nil {
+		return false
+	}
+	for key, value := range request.Selector {
+		if value != "" && status.Labels[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsRequest) (*runtime.StatsResponse, error) {
@@ -347,13 +419,13 @@ func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsReques
 	}
 
 	// Look up the sandbox to verify it exists.
-	_, err := h.sandboxManager.Get(request.ID)
+	current, err := h.sandboxManager.Get(request.ID)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
 	}
 
 	// Get the cgroup path from the sandbox's OCI spec.
-	resource, err := h.sandboxManager.CollectResourceByID(request.ID)
+	resource, err := h.physicalResources(current.Metadata)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
 	}
@@ -415,6 +487,7 @@ func (h *sandboxService) Run() error {
 
 func (h *sandboxService) Shutdown() {
 	logrus.Info("sandbox service shutting down: cleaning up sandboxes")
+	h.stopCheckpointOperations()
 
 	// 1. Force-delete all running sandboxes with per-sandbox timeout.
 	sandboxes := h.sandboxManager.List()
@@ -470,6 +543,26 @@ func (h *sandboxService) Shutdown() {
 		}
 	}
 	logrus.Info("sandbox service shutdown complete")
+}
+
+func (h *sandboxService) acquireCheckpointOperation() (func(), bool) {
+	h.operationMu.Lock()
+	defer h.operationMu.Unlock()
+	if h.operationStopping {
+		return nil, false
+	}
+	h.operationWG.Add(1)
+	return h.operationWG.Done, true
+}
+
+func (h *sandboxService) stopCheckpointOperations() {
+	h.operationMu.Lock()
+	h.operationStopping = true
+	if h.operationCancel != nil {
+		h.operationCancel()
+	}
+	h.operationMu.Unlock()
+	h.operationWG.Wait()
 }
 
 // Healthy aggregates each module's Healthy() signal into a single boolean
@@ -698,6 +791,10 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	imgSvc := imgMod.Service()
 
 	stateStore := store.NewStoreImp(storePath)
+	if err := checkpoint.CleanupStaging(filepath.Join(cfg.RootDir, "checkpoints")); err != nil {
+		return nil, fmt.Errorf("cleanup checkpoint staging directories: %w", err)
+	}
+	operationCtx, operationCancel := context.WithCancel(context.Background())
 	s := &sandboxService{
 		config:                            cfg,
 		store:                             stateStore,
@@ -707,6 +804,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		imageMod:                          imgMod,
 		resourceMod:                       nodeResMod,
 		xpuMgr:                            xpuMgr,
+		checkpointState:                   checkpointstate.NewCoordinator(),
+		operationCtx:                      operationCtx,
+		operationCancel:                   operationCancel,
 	}
 
 	// VolumeManager comes up before runtime handlers. An ordinary directory is
@@ -788,6 +888,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		}()
 	}
 	s.networkMgr = newNetworkManager(interfaceMgr, cfg.NatBackend, cfg.EnableLocalDNAT)
+	if err := s.networkMgr.configureHostPortRange(cfg.HostPortStart, cfg.HostPortCount); err != nil {
+		return nil, err
+	}
 	if cfg.EnableLocalDNAT {
 		logrus.Info("local DNAT forwarding enabled for callers sharing sandboxd's network namespace")
 	}
@@ -834,11 +937,8 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		nodeResMod.SetSandboxMetricsSource(s.sandboxManager)
 		s.sandboxManager.OnSandboxStopped = nodeResMod.MarkSandboxStopped
 	}
-	if err := s.fsMgr.Restore(func(sandboxID string) bool {
-		_, getErr := s.sandboxManager.Get(sandboxID)
-		return getErr == nil
-	}); err != nil {
-		return nil, fmt.Errorf("restore sandbox filesystem state: %w", err)
+	if err := s.recoverPhysicalState(context.Background()); err != nil {
+		return nil, err
 	}
 	if s.aclMgr != nil {
 		bindings, bindErr := s.activeACLBindings()
@@ -860,6 +960,38 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	return s, nil
 }
 
+func (h *sandboxService) restoreSandboxNetworkFacts() error {
+	portFacts := make(map[string][]string)
+	dnatFacts := make(map[string]restoredDnatFact)
+	for _, current := range h.sandboxManager.List() {
+		if current == nil || current.Metadata == nil || len(current.Metadata.Ports) == 0 {
+			continue
+		}
+		sandboxID := current.Metadata.ID
+		resources, err := h.physicalResources(current.Metadata)
+		if err != nil {
+			return fmt.Errorf("collect network resource for sandbox %s: %w", sandboxID, err)
+		}
+		encoded, ok := resources.Resources[config.ResourceNameInterface]
+		if !ok {
+			return fmt.Errorf("sandbox %s has persisted ports but no network resource", sandboxID)
+		}
+		network, err := networkmanager.NewNetResource(encoded)
+		if err != nil {
+			return fmt.Errorf("decode network resource for sandbox %s: %w", sandboxID, err)
+		}
+		portFacts[sandboxID] = clonePorts(current.Metadata.Ports)
+		dnatFacts[sandboxID] = restoredDnatFact{
+			ports:    clonePorts(current.Metadata.Ports),
+			targetIP: network.Ip.String(),
+		}
+	}
+	if err := h.networkMgr.restoreDnatPortFacts(portFacts); err != nil {
+		return err
+	}
+	return h.networkMgr.restoreDnatRuleFacts(dnatFacts)
+}
+
 func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, error) {
 	bindings := make(map[string]networkacl.Binding)
 	for _, current := range h.sandboxManager.List() {
@@ -867,7 +999,7 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 			continue
 		}
 		sandboxID := current.Metadata.ID
-		resources, err := h.sandboxManager.CollectResourceByID(sandboxID)
+		resources, err := h.physicalResources(current.Metadata)
 		if err != nil {
 			return nil, fmt.Errorf("collect network resource for sandbox %s: %w", sandboxID, err)
 		}
@@ -902,6 +1034,9 @@ func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
 }
 
 func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequest) (response *runtime.DeleteResponse, err error) {
+	if request == nil || request.ID == "" {
+		return response, errord.ToGRPC(errord.ErrInvalidArgument)
+	}
 	err = h.deleteSandbox(ctx, request.ID)
 	return response, err
 }
@@ -1005,6 +1140,20 @@ type resourcePrepareResult struct {
 }
 
 func (h *sandboxService) Start(ctx context.Context, request *runtime.StartRequest) (*runtime.StartResponse, error) {
+	return h.createSandbox(ctx, request, createOptions{})
+}
+
+type createOptions struct {
+	checkpointImage string
+	onReserved      func(*runtime.StartRequest, string) error
+	restoreIdentity *physicalstate.RestoreIdentity
+}
+
+func (h *sandboxService) createSandbox(
+	ctx context.Context,
+	request *runtime.StartRequest,
+	options createOptions,
+) (_ *runtime.StartResponse, retErr error) {
 	if request == nil {
 		err := fmt.Errorf("start request is nil")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
@@ -1146,6 +1295,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	var filesystemCommitted bool
 	var runtimeStarted bool
 	var dnatConfigured bool
+	var portsReserved bool
+	var metadataPersisted bool
 	var aclAttempted bool
 	var aclRegistered bool
 	var xpuAcquired bool
@@ -1153,19 +1304,35 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		if startSucceeded {
 			return
 		}
+		if errors.Is(retErr, physicalstate.ErrRestoreCleanupIncomplete) {
+			logrus.Warnf(
+				"retain physical intent and prepared resources for sandbox %s after incomplete restore cleanup",
+				sandboxID,
+			)
+			return
+		}
 		if runtimeStarted {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
 				if err := handler.Delete(cleanupCtx, sandboxID); err != nil {
 					logrus.Warnf("rollback runtime for sandbox %s: %v", sandboxID, err)
+					// Keep the durable INTENT and its resource ownership hidden from
+					// List. Restart reconciliation resolves the uncertain runtime fact.
+					cancel()
+					return
 				} else {
 					h.sandboxManager.CleanSandboxRoot(sandboxID)
 				}
 			}
 			cancel()
+		} else if metadataPersisted {
+			h.sandboxManager.CleanSandboxRoot(sandboxID)
 		}
 		if dnatConfigured {
 			h.networkMgr.cleanupDnatRules(sandboxID)
+		}
+		if portsReserved {
+			h.networkMgr.releaseDnatPorts(sandboxID)
 		}
 		aclCleanupFailed := aclAttempted && !aclRegistered
 		if aclAttempted && h.aclMgr != nil {
@@ -1211,6 +1378,37 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
+	resolvedPorts, err := h.networkMgr.resolveDnatPorts(sandboxID, startReq.Ports)
+	if err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(fmt.Errorf("reserve sandbox ports: %v: %w", err, errord.ErrResourceExhausted))
+	}
+	startReq.Ports = resolvedPorts
+	portsReserved = len(resolvedPorts) > 0
+	metadata := &physicalstate.SandboxMetadata{
+		ID:             sandboxID,
+		RuntimeHandler: startReq.Runtime,
+		Labels:         copyStringMap(startReq.Labels),
+		MetricLabels:   copyStringMap(startReq.MetricLabels),
+		Stdout:         startReq.Stdout,
+		Stderr:         startReq.Stderr,
+		Ports:          clonePorts(startReq.Ports),
+		PhysicalPhase:  physicalstate.PhysicalPhase_PHYSICAL_PHASE_INTENT,
+	}
+	if options.restoreIdentity != nil {
+		metadata.RestoreIdentity = proto.Clone(options.restoreIdentity).(*physicalstate.RestoreIdentity)
+	}
+	if err := h.sandboxManager.PersistMetadata(sandboxID, metadata); err != nil {
+		return &runtime.StartResponse{
+			Code: -1, Message: fmt.Sprintf("Failed to persist sandbox physical identity: %v", err),
+		}, err
+	}
+	metadataPersisted = true
+	if options.onReserved != nil {
+		if err := options.onReserved(startReq, sandboxID); err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+		}
+	}
 
 	fsCh := make(chan fsPrepareResult, 1)
 	resourceCh := make(chan resourcePrepareResult, 1)
@@ -1235,6 +1433,19 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			ID:      "",
 		}, err
 	}
+	if err := h.persistPhysicalResourceFacts(metadata, preparedResources.Resources); err != nil {
+		return &runtime.StartResponse{
+			Code:    -1,
+			Message: fmt.Sprintf("failed to persist sandbox resource facts: %v", err),
+		}, err
+	}
+	if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
+		return &runtime.StartResponse{
+			Code:    -1,
+			Message: fmt.Sprintf("Failed to commit filesystem state: %v", err),
+		}, err
+	}
+	filesystemCommitted = true
 	var specUpdates *svc.SpecUpdates
 	if len(startReq.XpuAllocations) > 0 {
 		if startReq.Runtime != config.RuntimeNameRunsc {
@@ -1347,10 +1558,15 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		WritableLayerLimitBytes: startReq.WritableLayerLimitBytes,
 		EnableKVM:               extraConfig.EnableKVM,
 	}
-	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
+	if options.checkpointImage == "" {
+		err = h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig)
+	} else {
+		err = h.restoreSandboxRuntime(ctx, startReq.Runtime, runtimeConfig, options.checkpointImage)
+	}
+	if err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
-			Message: fmt.Sprintf("Failed to start: %v", err),
+			Message: fmt.Sprintf("Failed to create sandbox runtime: %v", err),
 			ID:      "",
 		}, err
 	}
@@ -1373,25 +1589,16 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		dnatConfigured = true
 	}
 
-	if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
+	metadata.PhysicalPhase = physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED
+	if err := h.sandboxManager.PersistMetadata(sandboxID, metadata); err != nil {
 		return &runtime.StartResponse{
-			Code:    -1,
-			Message: fmt.Sprintf("Failed to commit filesystem state: %v", err),
+			Code: -1, Message: fmt.Sprintf("Failed to commit sandbox physical identity: %v", err),
 		}, err
 	}
-	filesystemCommitted = true
-	metadata := &runtime.SandboxMetadata{
-		ID:             sandboxID,
-		RuntimeHandler: startReq.Runtime,
-		Labels:         copyStringMap(startReq.Labels),
-		MetricLabels:   copyStringMap(startReq.MetricLabels),
-		Stdout:         startReq.Stdout,
-		Stderr:         startReq.Stderr,
-	}
-	if err := h.sandboxManager.StoreMetadata(sandboxID, metadata); err != nil {
+	if err := h.sandboxManager.ActivateMetadata(sandboxID); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
-			Message: fmt.Sprintf("Failed to persist sandbox metadata: %v", err),
+			Message: fmt.Sprintf("Failed to publish sandbox physical identity: %v", err),
 		}, err
 	}
 	h.sandboxManager.ReceiveEvent(sandbox.Event{
@@ -1404,6 +1611,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		Code:    0,
 		Message: "Succeed",
 		ID:      sandboxID,
+		Ports:   clonePorts(startReq.Ports),
 	}, nil
 }
 

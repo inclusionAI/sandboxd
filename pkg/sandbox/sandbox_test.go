@@ -17,13 +17,14 @@ package sandbox
 import (
 	"encoding/json"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/internal/physicalstate"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"testing"
 )
 
 func TestSandbox_EnvValue(t *testing.T) {
 	type fields struct {
-		Metadata *runtime.SandboxMetadata
+		Metadata *physicalstate.SandboxMetadata
 		Status   StatusStorage
 		Spec     *spec.Spec
 		PATH     string
@@ -79,7 +80,7 @@ func TestSandbox_EnvValue(t *testing.T) {
 
 func TestSandbox_ApiStatus(t *testing.T) {
 	type fields struct {
-		Metadata *runtime.SandboxMetadata
+		Metadata *physicalstate.SandboxMetadata
 		Status   StatusStorage
 		Spec     *spec.Spec
 		PATH     string
@@ -92,7 +93,7 @@ func TestSandbox_ApiStatus(t *testing.T) {
 		{
 			name: "test",
 			fields: fields{
-				Metadata: &runtime.SandboxMetadata{
+				Metadata: &physicalstate.SandboxMetadata{
 					ID:             "123",
 					RuntimeHandler: "runsc",
 					Labels: map[string]string{
@@ -143,7 +144,7 @@ func TestSandbox_ApiStatus(t *testing.T) {
 		{
 			name: "test for empty status",
 			fields: fields{
-				Metadata: &runtime.SandboxMetadata{
+				Metadata: &physicalstate.SandboxMetadata{
 					ID:             "123",
 					RuntimeHandler: "runsc",
 					Labels: map[string]string{

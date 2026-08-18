@@ -82,6 +82,12 @@ func IsNotImplemented(err error) bool {
 	return errors.Is(err, ErrNotImplemented)
 }
 
+// IsResourceExhausted returns true if an operation cannot proceed because a
+// managed resource has no remaining capacity.
+func IsResourceExhausted(err error) bool {
+	return errors.Is(err, ErrResourceExhausted)
+}
+
 // IsCanceled returns true if the error is due to `context.Canceled`.
 func IsCanceled(err error) bool {
 	return errors.Is(err, context.Canceled)

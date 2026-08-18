@@ -198,6 +198,20 @@ func (m *fsManager) Release(sandboxID string) error {
 	return m.release(sandboxID, true)
 }
 
+func (m *fsManager) RootfsConfig(sandboxID string) (*runtime.RootfsConfig, error) {
+	m.mu.Lock()
+	state, ok := m.sandboxState[sandboxID]
+	m.mu.Unlock()
+	if !ok || len(state.Rootfs) == 0 {
+		return nil, fmt.Errorf("rootfs source for sandbox %s: %w", sandboxID, errord.ErrNotFound)
+	}
+	rootfs := &runtime.RootfsConfig{}
+	if err := proto.Unmarshal(state.Rootfs, rootfs); err != nil {
+		return nil, fmt.Errorf("decode rootfs source for sandbox %s: %w", sandboxID, err)
+	}
+	return rootfs, nil
+}
+
 func (m *fsManager) Shutdown() {
 	m.mu.Lock()
 	rootfsRefs := make([]*langrtmanager.LanguageRuntime, 0, len(m.sandboxRootfs))

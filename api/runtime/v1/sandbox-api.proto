@@ -22,6 +22,16 @@ option go_package = "github.com/inclusionAI/sandboxd/api/runtime/v1;v1";
 service SandboxService {
   // Start creates and starts a sandbox.
   rpc Start(StartRequest) returns (StartResponse) {}
+  // Checkpoint atomically publishes a verified runsc checkpoint. The source
+  // keeps running only when leave_running is true.
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
+  // Restore restores either a legacy local checkpoint or a verified,
+  // deterministic resume attempt and returns authoritative physical facts.
+  // A deterministic replay succeeds from cache only while the exact runtime
+  // sandbox is still reported RUNNING by its runtime handler.
+  rpc Restore(RestoreRequest) returns (StartResponse) {}
+  // DeleteCheckpoint deletes one exact sandboxd-owned checkpoint artifact.
+  rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse) {}
   // Delete force-deletes a sandbox.
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
   // Wait waits for a sandbox to exit.
@@ -242,6 +252,72 @@ message StartResponse {
   string message = 2;
   // ID is the unique sandbox ID.
   string id = 3;
+  // Ports contains the concrete host/container mappings committed by sandboxd.
+  repeated string ports = 4;
+}
+
+// CheckpointRequest describes a synchronous sandbox checkpoint request.
+message CheckpointRequest {
+  reserved 3 to 5;
+  reserved "timeout", "compress", "trace_id";
+
+  // SandboxID is the source sandbox ID.
+  string id = 1;
+  // CheckpointDir is the caller-selected artifact directory below sandboxd's
+  // managed checkpoint root. Nested directories are supported.
+  string checkpoint_dir = 2;
+  string checkpoint_id = 6;
+  // LeaveRunning keeps the source sandbox alive after publishing the
+  // checkpoint. The committed manifest persists this physical mode so an
+  // RPC replay after sandboxd restart cannot change it.
+  bool leave_running = 7;
+}
+
+// CheckpointResponse is returned only after checkpoint.img and manifest.json
+// have been atomically published and fsynced. The caller must durably retain
+// the returned size and SHA-256 together with checkpoint_id and the complete
+// StartRequest needed by Restore.
+message CheckpointResponse {
+  reserved 1, 2;
+  reserved "success", "message";
+
+  // ArtifactPath is the verified checkpoint.img path.
+  string artifact_path = 3;
+  // ArtifactSize is required as expected_size on deterministic Restore.
+  int64 artifact_size = 4;
+  // ArtifactSHA256 is required as expected_sha256 on deterministic Restore.
+  string artifact_sha256 = 5;
+}
+
+// DeleteCheckpointRequest binds cleanup to one committed physical artifact.
+message DeleteCheckpointRequest {
+  string checkpoint_dir = 1;
+  string checkpoint_id = 2;
+  string source_sandbox_id = 3;
+  int64 expected_size = 4;
+  string expected_sha256 = 5;
+}
+
+// DeleteCheckpointResponse is empty after an exact or already-complete delete.
+message DeleteCheckpointResponse {}
+
+// RestoreRequest preserves the legacy config/checkpoint_dir wire fields and
+// adds the immutable identity required by deterministic cross-node resume.
+// Config must be the complete original StartRequest with the deterministic
+// target sandbox_id. If Checkpoint stopped the source and the same ID is
+// reused, the caller must Delete that EXITED source record before Restore.
+message RestoreRequest {
+  // Config is normalized and hashed into the durable restore identity. A
+  // replay must resend the same normalized logical configuration.
+  StartRequest config = 1;
+  string checkpoint_dir = 2;
+  // CheckpointID identifies the immutable logical snapshot. When set, all
+  // deterministic identity fields are required.
+  string checkpoint_id = 3;
+  // ExpectedSHA256 binds the caller-owned artifact to SnapshotInfo.
+  string expected_sha256 = 4;
+  // ExpectedSize binds the caller-owned artifact to SnapshotInfo.
+  int64 expected_size = 5;
 }
 
 // DeleteRequest describes a force-delete request.
@@ -288,6 +364,11 @@ message ListSandboxesResponse {
 
 // SandboxState is the persisted lifecycle state of a sandbox.
 enum SandboxState {
+  reserved 3 to 5;
+  reserved "SANDBOX_STATE_CHECKPOINTING";
+  reserved "SANDBOX_STATE_CHECKPOINTED";
+  reserved "SANDBOX_STATE_RESTORING";
+
   SANDBOX_STATE_RUNNING = 0;
   SANDBOX_STATE_EXITED  = 1;
   SANDBOX_STATE_UNKNOWN = 2;
@@ -325,6 +406,8 @@ message SandboxStatus {
   LinuxSandboxResources resources = 14;
   // MetricLabels contains sandbox metadata intended for metric dimensions.
   map<string, string> metric_labels = 15;
+  // Ports contains the concrete host/container mappings owned by this sandbox.
+  repeated string ports = 16;
 }
 
 // KeyValue represents a string key-value pair.
@@ -365,28 +448,6 @@ message HugepageLimit {
   string page_size = 1;
   // Limit is the hugepage limit in bytes.
   uint64 limit = 2;
-}
-
-// SandboxMetadata contains the persisted metadata for a sandbox.
-message SandboxMetadata {
-  // ID is the sandbox ID.
-  string id = 1;
-  // RuntimeHandler is the runtime handler name.
-  string runtime_handler = 3;
-  // Labels contains sandbox labels.
-  map<string, string> labels = 4;
-  // Stdout is the configured stdout redirect path.
-  string stdout = 6;
-  // Stderr is the configured stderr redirect path.
-  string stderr = 7;
-  // MetricLabels contains sandbox metadata intended for metric dimensions.
-  map<string, string> metric_labels = 8;
-}
-
-// SandboxMetadataList contains persisted sandbox metadata entries.
-message SandboxMetadataList {
-  // Sandboxes maps sandbox ID to sandbox metadata.
-  map<string, SandboxMetadata> sandboxes = 1;
 }
 
 // StatsRequest describes a sandbox stats request.
