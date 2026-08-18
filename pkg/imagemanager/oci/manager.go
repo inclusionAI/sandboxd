@@ -58,12 +58,31 @@ const (
 
 // Config holds the OCI configuration parsed from config file.
 type Config struct {
-	Proxy *ProxyConfig `json:"proxy,omitempty"`
+	Registry *struct {
+		Proxy *ProxyConfig `json:"proxy,omitempty"`
+	} `json:"registry,omitempty"`
+	Oss *struct {
+		Proxy *ProxyConfig `json:"proxy,omitempty"`
+	} `json:"oss,omitempty"`
 }
 
 // ProxyConfig mirrors distillfs.ProxyConfig for config parsing.
 type ProxyConfig struct {
 	Url string `json:"url"`
+}
+
+// proxyURL returns the effective HTTP proxy URL from config.
+func (c *Config) proxyURL() string {
+	if c == nil {
+		return ""
+	}
+	if c.Registry != nil && c.Registry.Proxy != nil && c.Registry.Proxy.Url != "" {
+		return c.Registry.Proxy.Url
+	}
+	if c.Oss != nil && c.Oss.Proxy != nil && c.Oss.Proxy.Url != "" {
+		return c.Oss.Proxy.Url
+	}
+	return ""
 }
 
 // Manager manages local OCI layer extraction and readonly overlay mounts.
@@ -132,9 +151,11 @@ func NewManager(rootWorkDir string, cfgTempPath string, sharedRegistryClient ...
 		if err != nil {
 			return nil, fmt.Errorf("failed to load config: %w", err)
 		}
-		if cfg.Proxy != nil {
-			proxy = cfg.Proxy.Url
+		proxy = cfg.proxyURL()
+		if proxy != "" {
 			logrus.Infof("OCI manager HTTP proxy: %s", proxy)
+		} else {
+			logrus.Warn("OCI manager proxy not configured, falling back to direct registry access")
 		}
 	}
 
