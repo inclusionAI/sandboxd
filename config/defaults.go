@@ -31,6 +31,8 @@ const (
 	DefaultFilestoreDir  = "/home/akernel/filestore"
 	DefaultLoopDeviceDir = "/dev"
 
+	DefaultFilestoreOvercommitRatio = 1.0
+
 	DefaultHttpAddress = "127.0.0.1:23001"
 
 	DefaultMaxSandboxNum    = 1000

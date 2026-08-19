@@ -50,7 +50,7 @@ func TestLoopBackedFilestoreIntegration(t *testing.T) {
 			root := t.TempDir()
 			deviceDir := makeLoopDeviceDir(t, root)
 			filestoreDir := filepath.Join(root, "filestore")
-			module := NewModule(filestoreDir, "512M", test.xfsEnabled, deviceDir)
+			module := NewModule(filestoreDir, "512M", test.xfsEnabled, 2, deviceDir)
 
 			if err := module.Start(); err != nil {
 				t.Fatalf("start %s filestore: %v", test.filesystem, err)
@@ -78,6 +78,28 @@ func TestLoopBackedFilestoreIntegration(t *testing.T) {
 					test.filesystem,
 					stat.Type,
 					test.magic,
+				)
+			}
+			logicalCapacity, logicalAvailable, err := module.EphemeralStorageCapacity()
+			if err != nil {
+				t.Fatalf("query %s filestore capacity: %v", test.filesystem, err)
+			}
+			physicalCapacity := stat.Blocks * uint64(stat.Bsize)
+			physicalAvailable := stat.Bavail * uint64(stat.Bsize)
+			if logicalCapacity != physicalCapacity*2 {
+				t.Fatalf(
+					"%s logical capacity = %d, want twice physical capacity %d",
+					test.filesystem,
+					logicalCapacity,
+					physicalCapacity,
+				)
+			}
+			if logicalAvailable != physicalAvailable*2 {
+				t.Fatalf(
+					"%s logical available = %d, want twice physical available %d",
+					test.filesystem,
+					logicalAvailable,
+					physicalAvailable,
 				)
 			}
 

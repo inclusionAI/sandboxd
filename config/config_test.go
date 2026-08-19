@@ -15,6 +15,7 @@
 package config
 
 import (
+	"math"
 	"testing"
 
 	"github.com/pelletier/go-toml"
@@ -67,6 +68,66 @@ func TestDefaultConfigUsesOrdinaryFilestore(t *testing.T) {
 	}
 	if cfg.LoopDeviceDir != DefaultLoopDeviceDir {
 		t.Fatalf("loop_device_dir = %q, want %q", cfg.LoopDeviceDir, DefaultLoopDeviceDir)
+	}
+	if cfg.FilestoreOvercommitRatio != DefaultFilestoreOvercommitRatio {
+		t.Fatalf(
+			"filestore_overcommit_ratio = %g, want %g",
+			cfg.FilestoreOvercommitRatio,
+			DefaultFilestoreOvercommitRatio,
+		)
+	}
+}
+
+func TestValidateFilestoreOvercommitRatio(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		ratio   float64
+		wantErr bool
+	}{
+		{name: "identity", ratio: 1},
+		{name: "fractional", ratio: 1.5},
+		{name: "zero", ratio: 0, wantErr: true},
+		{name: "below one", ratio: 0.5, wantErr: true},
+		{name: "negative", ratio: -1, wantErr: true},
+		{name: "nan", ratio: math.NaN(), wantErr: true},
+		{name: "positive infinity", ratio: math.Inf(1), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateFilestoreOvercommitRatio(test.ratio)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ValidateFilestoreOvercommitRatio(%g) error = %v", test.ratio, err)
+			}
+		})
+	}
+}
+
+func TestFilestoreOvercommitRatioTOML(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		toml string
+		want float64
+	}{
+		{name: "omitted", toml: "[plugin.runtime]\n", want: 1},
+		{
+			name: "configured",
+			toml: "[plugin.runtime]\nfilestore_overcommit_ratio = 2.5\n",
+			want: 2.5,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var cfg Config
+			cfg.FilestoreOvercommitRatio = DefaultFilestoreOvercommitRatio
+			if err := toml.Unmarshal([]byte(test.toml), &cfg); err != nil {
+				t.Fatalf("decode config: %v", err)
+			}
+			if cfg.FilestoreOvercommitRatio != test.want {
+				t.Fatalf(
+					"filestore_overcommit_ratio = %g, want %g",
+					cfg.FilestoreOvercommitRatio,
+					test.want,
+				)
+			}
+		})
 	}
 }
 

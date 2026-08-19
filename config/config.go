@@ -18,6 +18,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -97,6 +98,11 @@ type RuntimeConfig struct {
 	// filesystem. ext4 is used by default; XFS is selected explicitly below.
 	FilestoreDirSize string `toml:"filestore_dir_size" json:"filestoreDirSize"`
 
+	// FilestoreOvercommitRatio converts physical filestore capacity into the
+	// logical capacity advertised to and enforced for schedulers. It does not
+	// change the size of the underlying ext4 or XFS filesystem.
+	FilestoreOvercommitRatio float64 `toml:"filestore_overcommit_ratio" json:"filestoreOvercommitRatio"`
+
 	// FilestoreXFSEnabled selects XFS for a bounded filestore.
 	FilestoreXFSEnabled bool `toml:"filestore_xfs_enabled" json:"filestoreXFSEnabled"`
 
@@ -163,6 +169,16 @@ func NormalizeCPULimitMode(value string) (string, error) {
 	}
 }
 
+// ValidateFilestoreOvercommitRatio checks the physical-to-logical storage
+// multiplier. The caller supplies the default before decoding configuration so
+// an explicitly configured zero is rejected rather than treated as omitted.
+func ValidateFilestoreOvercommitRatio(value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 1 {
+		return fmt.Errorf("filestore_overcommit_ratio must be finite and at least 1.0, got %g", value)
+	}
+	return nil
+}
+
 // NetworkConfig contains network-related configuration for sandboxd.
 type NetworkConfig struct {
 	IPRange string `toml:"ip_range" json:"ipRange"`
@@ -212,9 +228,10 @@ func DefaultConfig() Config {
 				BasicSpec: map[string]string{
 					RuntimeNameRunsc: "/home/akernel/images/config.json",
 				},
-				ImageLibDir:   DefaultImageLibDir,
-				FilestoreDir:  DefaultFilestoreDir,
-				LoopDeviceDir: DefaultLoopDeviceDir,
+				ImageLibDir:              DefaultImageLibDir,
+				FilestoreDir:             DefaultFilestoreDir,
+				FilestoreOvercommitRatio: DefaultFilestoreOvercommitRatio,
+				LoopDeviceDir:            DefaultLoopDeviceDir,
 			},
 			ResourceConfig: ResourceConfig{
 				MaxInstanceNum:     DefaultMaxSandboxNum,

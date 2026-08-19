@@ -58,6 +58,9 @@ image_lib_dir = "/var/lib/sandboxd/images"
 # creates a bounded ext4 filestore; enable XFS only when reflink is required.
 filestore_dir = "/var/lib/sandboxd/filestore"
 filestore_xfs_enabled = false
+# Convert physical total and available bytes into scheduler-visible logical
+# storage. This does not change the ext4/XFS mount size or requested quota.
+filestore_overcommit_ratio = 1.0
 # filestore_dir_size = "100G"
 loop_device_dir = "/dev"
 overlay_tmpfs_size = "256M"

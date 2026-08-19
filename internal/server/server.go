@@ -584,6 +584,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 
 	// read and unmarshal config.toml
 	var cfg config.Config
+	cfg.RuntimeConfig.FilestoreOvercommitRatio = config.DefaultFilestoreOvercommitRatio
 	if configBytes, err := os.ReadFile(configPath); err != nil {
 		return nil, err
 	} else if err := toml.NewDecoder(bytes.NewReader(configBytes)).Decode(&cfg); err != nil {
@@ -714,6 +715,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		cfg.RuntimeConfig.FilestoreDir,
 		cfg.RuntimeConfig.FilestoreDirSize,
 		cfg.RuntimeConfig.FilestoreXFSEnabled,
+		cfg.RuntimeConfig.FilestoreOvercommitRatio,
 		cfg.RuntimeConfig.LoopDeviceDir,
 	)
 	if vErr := s.volumeMgr.Start(); vErr != nil {
@@ -885,6 +887,9 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
 	if _, runscEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameRunsc]; runscEnabled && strings.TrimSpace(runtimeConfig.FilestoreDir) == "" {
 		return errors.New("runsc requires plugin.runtime.filestore_dir")
+	}
+	if err := config.ValidateFilestoreOvercommitRatio(runtimeConfig.FilestoreOvercommitRatio); err != nil {
+		return fmt.Errorf("plugin.runtime: %w", err)
 	}
 	return nil
 }
@@ -1095,30 +1100,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			err := errors.New("writable layer storage manager is unavailable")
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
 				errord.ToGRPC(errord.ErrFailedPrecondition)
-		}
-		capacity, allocatable, capacityErr := h.volumeMgr.EphemeralStorageCapacity()
-		if capacityErr != nil {
-			err := fmt.Errorf("query writable layer capacity: %w", capacityErr)
-			return &runtime.StartResponse{Code: -1, Message: err.Error()},
-				errord.ToGRPC(errord.ErrFailedPrecondition)
-		}
-		if startReq.WritableLayerLimitBytes > capacity {
-			err := fmt.Errorf(
-				"writable layer limit %d exceeds node capacity %d bytes",
-				startReq.WritableLayerLimitBytes,
-				capacity,
-			)
-			return &runtime.StartResponse{Code: -1, Message: err.Error()},
-				errord.ToGRPC(errord.ErrInvalidArgument)
-		}
-		if startReq.WritableLayerLimitBytes > allocatable {
-			err := fmt.Errorf(
-				"writable layer limit %d exceeds node allocatable storage %d bytes",
-				startReq.WritableLayerLimitBytes,
-				allocatable,
-			)
-			return &runtime.StartResponse{Code: -1, Message: err.Error()},
-				errord.ToGRPC(errord.ErrResourceExhausted)
 		}
 	}
 

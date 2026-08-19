@@ -16,6 +16,7 @@ package volumemanager
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,7 +26,7 @@ import (
 
 func TestModuleStartUsesOrdinaryDirectoryWithoutSize(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "filestore")
-	m := NewModule(dir, "", false)
+	m := NewModule(dir, "", false, 1)
 	m.ensureMount = func(string, string, bool, *loopdevice.Manager) (*loopdevice.Device, error) {
 		t.Fatal("bounded mount called without size")
 		return nil, nil
@@ -48,7 +49,7 @@ func TestModuleStartUsesOrdinaryDirectoryWithoutSize(t *testing.T) {
 }
 
 func TestModuleStartFailsWhenConfiguredMountFails(t *testing.T) {
-	m := NewModule(filepath.Join(t.TempDir(), "filestore"), "1G", false)
+	m := NewModule(filepath.Join(t.TempDir(), "filestore"), "1G", false, 1)
 	m.ensureMount = func(string, string, bool, *loopdevice.Manager) (*loopdevice.Device, error) {
 		return nil, errors.New("loop unavailable")
 	}
@@ -62,7 +63,7 @@ func TestModuleStartFailsWhenConfiguredMountFails(t *testing.T) {
 
 func TestModuleStartUsesExt4ByDefault(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "filestore")
-	m := NewModule(dir, "1G", false)
+	m := NewModule(dir, "1G", false, 1)
 	m.ensureMount = func(gotDir, gotSize string, gotXFS bool, _ *loopdevice.Manager) (*loopdevice.Device, error) {
 		if gotDir != dir || gotSize != "1G" || gotXFS {
 			t.Fatalf("ensureMount(%q, %q, %t)", gotDir, gotSize, gotXFS)
@@ -79,7 +80,7 @@ func TestModuleStartUsesExt4ByDefault(t *testing.T) {
 }
 
 func TestModuleStartUsesXFSWhenEnabled(t *testing.T) {
-	m := NewModule(filepath.Join(t.TempDir(), "filestore"), "1G", true)
+	m := NewModule(filepath.Join(t.TempDir(), "filestore"), "1G", true, 1)
 	m.ensureMount = func(_ string, _ string, gotXFS bool, _ *loopdevice.Manager) (*loopdevice.Device, error) {
 		if !gotXFS {
 			t.Fatal("XFS was not enabled")
@@ -96,7 +97,7 @@ func TestModuleStartUsesXFSWhenEnabled(t *testing.T) {
 }
 
 func TestEphemeralStorageCapacity(t *testing.T) {
-	m := NewModule(t.TempDir(), "", false)
+	m := NewModule(t.TempDir(), "", false, 1)
 	capacity, allocatable, err := m.EphemeralStorageCapacity()
 	if err != nil {
 		t.Fatal(err)
@@ -107,8 +108,40 @@ func TestEphemeralStorageCapacity(t *testing.T) {
 }
 
 func TestEphemeralStorageCapacityRequiresFilestore(t *testing.T) {
-	m := NewModule("", "", false)
+	m := NewModule("", "", false, 1)
 	if _, _, err := m.EphemeralStorageCapacity(); err == nil {
 		t.Fatal("expected unconfigured filestore error")
+	}
+}
+
+func TestScaleStorageBytes(t *testing.T) {
+	maxUint64 := ^uint64(0)
+	for _, test := range []struct {
+		name          string
+		physicalBytes uint64
+		ratio         float64
+		want          uint64
+		wantErr       bool
+	}{
+		{name: "identity", physicalBytes: maxUint64, ratio: 1, want: maxUint64},
+		{name: "integer", physicalBytes: 300, ratio: 2, want: 600},
+		{name: "fractional floors", physicalBytes: 3, ratio: 1.5, want: 4},
+		{name: "invalid ratio", physicalBytes: 300, ratio: 0.5, wantErr: true},
+		{
+			name:          "overflow",
+			physicalBytes: maxUint64,
+			ratio:         math.Nextafter(1, 2),
+			wantErr:       true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := scaleStorageBytes(test.physicalBytes, test.ratio)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("scaleStorageBytes(%d, %g) error = %v", test.physicalBytes, test.ratio, err)
+			}
+			if err == nil && got != test.want {
+				t.Fatalf("scaleStorageBytes(%d, %g) = %d, want %d", test.physicalBytes, test.ratio, got, test.want)
+			}
+		})
 	}
 }

@@ -31,6 +31,7 @@ import (
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
+	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
@@ -228,6 +229,26 @@ func TestStartRejectsConflictingWritableLayerLimits(t *testing.T) {
 		WritableLayerLimitBytes: 1 << 30,
 	})
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestStartDoesNotApplyWritableLayerAdmission(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
+	})
+	filestoreDir := t.TempDir()
+	s.volumeMgr = volumemanager.NewModule(filestoreDir, "", false, 2)
+	s.config.FilestoreDir = filestoreDir
+
+	// Force a deterministic failure immediately after the writable-layer
+	// capability checks. Even the maximum uint64 request must reach the runtime
+	// check because aggregate storage admission belongs to the scheduler.
+	s.serviceHandler.Remove(config.RuntimeNameRunsc)
+	_, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:                 config.RuntimeNameRunsc,
+		Rootfs:                  &runtime.RootfsConfig{},
+		WritableLayerLimitBytes: ^uint64(0),
+	})
+	assert.ErrorContains(t, err, "runtime handler \"runsc\" is not supported")
 }
 
 func TestList_ById_NotFound(t *testing.T) {
@@ -604,15 +625,23 @@ func TestResolveNATBackend(t *testing.T) {
 
 func TestValidateRuntimeFilestore(t *testing.T) {
 	assert.ErrorContains(t, validateRuntimeFilestore(config.RuntimeConfig{
-		RuntimeBinary: map[string]string{config.RuntimeNameRunsc: "/usr/local/bin/runsc"},
+		RuntimeBinary:            map[string]string{config.RuntimeNameRunsc: "/usr/local/bin/runsc"},
+		FilestoreOvercommitRatio: 1,
 	}), "plugin.runtime.filestore_dir")
 	assert.NoError(t, validateRuntimeFilestore(config.RuntimeConfig{
-		RuntimeBinary: map[string]string{config.RuntimeNameRunsc: "/usr/local/bin/runsc"},
-		FilestoreDir:  "/var/lib/sandboxd/filestore",
+		RuntimeBinary:            map[string]string{config.RuntimeNameRunsc: "/usr/local/bin/runsc"},
+		FilestoreDir:             "/var/lib/sandboxd/filestore",
+		FilestoreOvercommitRatio: 2,
 	}))
 	assert.NoError(t, validateRuntimeFilestore(config.RuntimeConfig{
-		RuntimeBinary: map[string]string{config.RuntimeNameKata: "/usr/local/bin/containerd-shim-kata-v2"},
+		RuntimeBinary:            map[string]string{config.RuntimeNameKata: "/usr/local/bin/containerd-shim-kata-v2"},
+		FilestoreOvercommitRatio: 1,
 	}))
+	assert.ErrorContains(t, validateRuntimeFilestore(config.RuntimeConfig{
+		RuntimeBinary:            map[string]string{config.RuntimeNameRunsc: "/usr/local/bin/runsc"},
+		FilestoreDir:             "/var/lib/sandboxd/filestore",
+		FilestoreOvercommitRatio: 0.5,
+	}), "filestore_overcommit_ratio")
 }
 
 // newDnatTestService creates a sandboxService with a fake NetworkManager registered.

@@ -16,6 +16,7 @@ package volumemanager
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sync/atomic"
 	"syscall"
@@ -29,10 +30,11 @@ import (
 // filesystem adds an aggregate capacity limit, while XFS is available for
 // deployments that require it.
 type Module struct {
-	FilestoreDir  string
-	Size          string
-	XFSEnabled    bool
-	LoopDeviceDir string
+	FilestoreDir    string
+	Size            string
+	XFSEnabled      bool
+	LoopDeviceDir   string
+	overcommitRatio float64
 
 	loopDevice   *loopdevice.Device
 	ensureMount  func(string, string, bool, *loopdevice.Manager) (*loopdevice.Device, error)
@@ -43,18 +45,24 @@ type Module struct {
 }
 
 // NewModule constructs a Module rooted at filestoreDir.
-func NewModule(filestoreDir, size string, xfsEnabled bool, loopDeviceDir ...string) *Module {
+func NewModule(
+	filestoreDir, size string,
+	xfsEnabled bool,
+	overcommitRatio float64,
+	loopDeviceDir ...string,
+) *Module {
 	deviceDir := "/dev"
 	if len(loopDeviceDir) > 0 && loopDeviceDir[0] != "" {
 		deviceDir = loopDeviceDir[0]
 	}
 	return &Module{
-		FilestoreDir:  filestoreDir,
-		Size:          size,
-		XFSEnabled:    xfsEnabled,
-		LoopDeviceDir: deviceDir,
-		ensureMount:   ensureFilestoreMount,
-		cleanupMount:  cleanupFilestoreMount,
+		FilestoreDir:    filestoreDir,
+		Size:            size,
+		XFSEnabled:      xfsEnabled,
+		LoopDeviceDir:   deviceDir,
+		overcommitRatio: overcommitRatio,
+		ensureMount:     ensureFilestoreMount,
+		cleanupMount:    cleanupFilestoreMount,
 	}
 }
 
@@ -112,7 +120,9 @@ func (m *Module) Stop() error {
 // Healthy reports whether Start established the selected filestore mode.
 func (m *Module) Healthy() bool { return m.healthy.Load() }
 
-// EphemeralStorageCapacity reports total and available bytes on the filestore.
+// EphemeralStorageCapacity reports logical total and available bytes on the
+// filestore. The overcommit ratio is applied exactly once here, at the boundary
+// between physical filesystem statistics and scheduler-visible storage.
 func (m *Module) EphemeralStorageCapacity() (uint64, uint64, error) {
 	if m.FilestoreDir == "" {
 		return 0, 0, fmt.Errorf("filestore_dir is not configured")
@@ -125,5 +135,33 @@ func (m *Module) EphemeralStorageCapacity() (uint64, uint64, error) {
 		return 0, 0, fmt.Errorf("statfs %s returned invalid block size %d", m.FilestoreDir, stat.Bsize)
 	}
 	blockSize := uint64(stat.Bsize)
-	return stat.Blocks * blockSize, stat.Bavail * blockSize, nil
+	physicalCapacity := stat.Blocks * blockSize
+	physicalAvailable := stat.Bavail * blockSize
+	capacity, err := scaleStorageBytes(physicalCapacity, m.overcommitRatio)
+	if err != nil {
+		return 0, 0, fmt.Errorf("scale filestore capacity: %w", err)
+	}
+	available, err := scaleStorageBytes(physicalAvailable, m.overcommitRatio)
+	if err != nil {
+		return 0, 0, fmt.Errorf("scale filestore available bytes: %w", err)
+	}
+	return capacity, available, nil
+}
+
+func scaleStorageBytes(physicalBytes uint64, ratio float64) (uint64, error) {
+	if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio < 1 {
+		return 0, fmt.Errorf("overcommit ratio must be finite and at least 1.0, got %g", ratio)
+	}
+	if ratio == 1 {
+		return physicalBytes, nil
+	}
+	scaled := float64(physicalBytes) * ratio
+	if scaled >= math.Ldexp(1, 64) {
+		return 0, fmt.Errorf(
+			"logical storage overflows uint64: physical bytes %d, ratio %g",
+			physicalBytes,
+			ratio,
+		)
+	}
+	return uint64(scaled), nil
 }
