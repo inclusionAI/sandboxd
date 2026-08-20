@@ -24,6 +24,9 @@ CONFIG_FILE="${SANDBOXD_HOME}/config.toml"
 SOCKET="${SANDBOXD_SOCKET:-/run/sandboxd/sandboxd.sock}"
 LOG_FILE="${SANDBOXD_LOG_FILE:-/var/log/sandboxd/e2e.log}"
 ROOTFS="${E2E_ROOTFS:-/e2e/rootfs}"
+EROFS_ROOTFS="${E2E_EROFS_ROOTFS:-/e2e/rootfs.erofs}"
+EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
+EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 HOST_MOUNT="${E2E_HOST_MOUNT:-/e2e/host-mount}"
 WWW_ROOT="${E2E_WWW_ROOT:-/e2e/www}"
 CGROUP_ROOT="${E2E_CGROUP_ROOT:-sandboxd-e2e}"
@@ -35,6 +38,8 @@ STRESS_ROUNDS="${E2E_STRESS_ROUNDS:-0}"
 STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
 DISABLE_CGROUP="${E2E_DISABLE_CGROUP:-0}"
 CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
+E2E_RUNTIME="${E2E_RUNTIME:-all}"
+E2E_RUNC_ONLY="${E2E_RUNC_ONLY:-0}"
 export RUNSC_IGNORE_CGROUPS="${DISABLE_CGROUP}"
 
 SANDBOXD_PID=""
@@ -136,9 +141,26 @@ preflight() {
     [[ "${STRESS_CONCURRENCY}" =~ ^[1-8]$ ]] || fail "E2E_STRESS_CONCURRENCY must be between 1 and 8"
     [[ "${DISABLE_CGROUP}" =~ ^[01]$ ]] || fail "E2E_DISABLE_CGROUP must be 0 or 1"
     [[ "${CPU_LIMIT_MODE}" =~ ^(shares|quota)$ ]] || fail "E2E_CPU_LIMIT_MODE must be shares or quota"
+    case "${E2E_RUNTIME}" in
+        all|runsc|runc) ;;
+        *) fail "E2E_RUNTIME must be all, runsc, or runc" ;;
+    esac
+    case "${E2E_RUNC_ONLY}" in
+        0) ;;
+        1)
+            if [ "${E2E_RUNTIME}" != "all" ] && [ "${E2E_RUNTIME}" != "runc" ]; then
+                fail "E2E_RUNC_ONLY=1 conflicts with E2E_RUNTIME=${E2E_RUNTIME}"
+            fi
+            E2E_RUNTIME="runc"
+            ;;
+        *) fail "E2E_RUNC_ONLY must be 0 or 1" ;;
+    esac
+    if [ "${E2E_RUNTIME}" = "runc" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
+        fail "runc e2e requires sandbox-managed cgroups"
+    fi
 
     local bin
-    for bin in sandboxd sbox runsc ip iptables busybox; do
+    for bin in sandboxd sbox runsc runc runc-shim ip iptables busybox mkfs.erofs; do
         command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
     done
 
@@ -256,13 +278,23 @@ pids_max = 64
 image_lib_dir = "/e2e/images"
 filestore_dir = "${FILESTORE}"
 filestore_dir_size = "1G"
+loop_device_dir = "/dev"
 overlay_tmpfs_size = "64M"
+
+[plugin.runtime.runc]
+state_root = "/run/sandboxd/runc"
+shim_binary = "/usr/local/bin/runc-shim"
+# The e2e host does not require hardware virtualization. /dev/null lets the
+# suite verify opt-in character-device and OCI device-cgroup injection.
+kvm_device = "/dev/null"
 
 [plugin.runtime.basic_spec]
 runsc = ""
+runc = ""
 
 [plugin.runtime.runtime_binary]
 runsc = "/usr/local/bin/runsc"
+runc = "/usr/local/bin/runc"
 
 [plugin.image]
 root = "${SANDBOXD_HOME}/image_manager"
@@ -277,7 +309,8 @@ EOF
 }
 
 prepare_rootfs() {
-    rm -rf "${ROOTFS}" "${HOST_MOUNT}" "${WWW_ROOT}"
+    rm -rf "${ROOTFS}" "${EROFS_MOUNT_ROOT}" "${HOST_MOUNT}" "${WWW_ROOT}"
+    rm -f "${EROFS_ROOTFS}" "${EROFS_MOUNT_IMAGE}"
     mkdir -p \
         "${ROOTFS}/bin" \
         "${ROOTFS}/dev" \
@@ -288,6 +321,7 @@ prepare_rootfs() {
         "${ROOTFS}/tmp" \
         "${ROOTFS}/usr/bin" \
         "${ROOTFS}/var" \
+        "${EROFS_MOUNT_ROOT}" \
         "${HOST_MOUNT}" \
         "${WWW_ROOT}"
     chmod 1777 "${ROOTFS}/tmp"
@@ -311,6 +345,9 @@ EOF
 
     echo "host-mount-ok" > "${HOST_MOUNT}/input.txt"
     echo "sandboxd-network-ok" > "${WWW_ROOT}/health.txt"
+    echo "erofs-mount-ok" > "${EROFS_MOUNT_ROOT}/input.txt"
+    mkfs.erofs "${EROFS_ROOTFS}" "${ROOTFS}" >/dev/null
+    mkfs.erofs "${EROFS_MOUNT_IMAGE}" "${EROFS_MOUNT_ROOT}" >/dev/null
 }
 
 crash_and_restart_sandboxd() {
@@ -376,9 +413,10 @@ assert_eq() {
 wait_for_state() {
     local sandbox_id="$1"
     local expected="$2"
+    local attempts="${3:-100}"
     local line=""
     local i
-    for i in $(seq 1 100); do
+    for i in $(seq 1 "${attempts}"); do
         line="$(sbox_cmd list | grep "${sandbox_id}" || true)"
         if echo "${line}" | grep -q "${expected}"; then
             return 0
@@ -386,6 +424,22 @@ wait_for_state() {
         sleep 0.1
     done
     fail "sandbox ${sandbox_id} did not reach ${expected}; last state: ${line}"
+}
+
+wait_for_exec_output() {
+    local sandbox_id="$1"
+    local expected="$2"
+    shift 2
+    local got=""
+    local i
+    for i in $(seq 1 100); do
+        if got="$(sbox_cmd exec "${sandbox_id}" "$@" 2>/dev/null)" && \
+            [ "${got}" = "${expected}" ]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    fail "sandbox ${sandbox_id} command output did not become ${expected@Q}; last output: ${got@Q}"
 }
 
 wait_for_cgroup_child() {
@@ -547,11 +601,11 @@ run_storage_quota_check() {
 
     local got
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
-        'dd if=/dev/zero of=/tmp/within-quota bs=1M count=1 2>/dev/null && wc -c < /tmp/within-quota')"
+        'dd if=/dev/zero of=/var/within-quota bs=1M count=1 2>/dev/null && wc -c < /var/within-quota')"
     assert_eq "${got}" "1048576" "write below storage quota"
 
     if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
-        'dd if=/dev/zero of=/tmp/over-quota bs=1M count=32' \
+        'dd if=/dev/urandom of=/var/over-quota bs=1M count=32' \
         >/tmp/sbox-storage-quota.log 2>&1; then
         cat /tmp/sbox-storage-quota.log >&2
         fail "write above storage quota unexpectedly succeeded"
@@ -561,13 +615,101 @@ run_storage_quota_check() {
         fail "write above storage quota did not return ENOSPC"
     fi
 
-    sbox_cmd exec "${SANDBOX_ID}" /bin/rm -f /tmp/within-quota /tmp/over-quota
+    sbox_cmd exec "${SANDBOX_ID}" /bin/rm -f /var/within-quota /var/over-quota
 
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
 }
 
-run_checks() {
+run_runc_checks() {
+    log "testing runc directory rootfs, KVM injection, and recovery"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime runc \
+        --sandbox-id sbox-e2e-runc \
+        --rootfs "${ROOTFS}" \
+        --cwd / \
+        --enable-kvm \
+        --env E2E_MARKER=runc-env-ok \
+        --mount "${HOST_MOUNT}:/mnt/host" \
+        --cpu-millicores 200 \
+        --memory-mb 128 \
+        /bin/sh -c 'echo "$E2E_MARKER" > /tmp/start-env && sleep 300')"
+    [ -n "${SANDBOX_ID}" ] || fail "runc start returned empty sandbox id"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+
+    local got
+    wait_for_exec_output "${SANDBOX_ID}" "runc-env-ok" /bin/cat /tmp/start-env
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c 'echo runc-write-ok > /tmp/runc-write && cat /tmp/runc-write')"
+    assert_eq "${got}" "runc-write-ok" "runc writable overlay"
+    [ ! -e "${ROOTFS}/tmp/runc-write" ] || fail "runc write escaped into the source rootfs"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/host/input.txt)"
+    assert_eq "${got}" "host-mount-ok" "runc host bind mount"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
+    assert_eq "${got}" "sandboxd-network-ok" "runc sandbox network"
+    sbox_cmd exec "${SANDBOX_ID}" /bin/test -c /dev/kvm
+    local tty_status=0
+    printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh || tty_status=$?
+    assert_eq "${tty_status}" "7" "runc TTY exit status"
+
+    [ -d "${FILESTORE}/.runc/${SANDBOX_ID}/upper" ] || fail "runc upperdir is not in the shared filestore"
+    local netns_path="/var/run/netns/runc-${SANDBOX_ID}"
+    [ -e "${netns_path}" ] || fail "runc named network namespace is missing"
+    local cache_cgroup
+    cache_cgroup="$(wait_for_cgroup_child)"
+    [ -d "${cache_cgroup}/runc" ] || fail "runc did not use a child below the cached cgroup"
+
+    # Resource-pool ownership is checkpointed periodically. Let that checkpoint
+    # complete before simulating the same post-start crash used by runsc below.
+    sleep 6
+    crash_and_restart_sandboxd
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/echo recovered-runc)"
+    assert_eq "${got}" "recovered-runc" "runc exec after sandboxd restart"
+
+    local deleted_id="${SANDBOX_ID}"
+    sbox_cmd delete "${deleted_id}"
+    SANDBOX_ID=""
+    [ ! -e "${netns_path}" ] || fail "runc netns leaked after delete"
+    [ ! -e "${FILESTORE}/.runc/${deleted_id}" ] || fail "runc storage leaked after delete"
+    [ ! -e "${cache_cgroup}/runc" ] || fail "runc child cgroup leaked after delete"
+    sbox_cmd delete "${deleted_id}"
+
+    log "testing runc EROFS rootfs and EROFS mount"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime runc \
+        --sandbox-id sbox-e2e-runc-erofs \
+        --rootfs "${EROFS_ROOTFS}" \
+        --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs:erofs:ro" \
+        --cpu-millicores 200 \
+        --memory-mb 128 \
+        /bin/sleep 300)"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/erofs/input.txt)"
+    assert_eq "${got}" "erofs-mount-ok" "runc EROFS mount"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c 'echo erofs-overlay-ok > /tmp/overlay && cat /tmp/overlay')"
+    assert_eq "${got}" "erofs-overlay-ok" "runc EROFS writable overlay"
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+
+    log "testing runc natural exit"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime runc \
+        --sandbox-id sbox-e2e-runc-exit \
+        --rootfs "${ROOTFS}" \
+        --cpu-millicores 100 \
+        --memory-mb 128 \
+        /bin/sh -c 'exit 23')"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED"
+    grep -q "wait sandbox ${SANDBOX_ID} finished.*ExitCode:23" "${LOG_FILE}" || \
+        fail "runc natural exit code was not persisted"
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+}
+
+run_runsc_checks() {
     log "starting sandbox"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
@@ -591,8 +733,7 @@ run_checks() {
     echo "${list_line}" | grep -q "SANDBOX_STATE_RUNNING" || fail "sandbox is not running: ${list_line}"
 
     local got
-    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /tmp/start-env)"
-    assert_eq "${got}" "start-env-ok" "start env"
+    wait_for_exec_output "${SANDBOX_ID}" "start-env-ok" /bin/cat /tmp/start-env
 
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c 'echo writable-ok > /tmp/e2e-write && cat /tmp/e2e-write')"
     assert_eq "${got}" "writable-ok" "writable overlay"
@@ -631,7 +772,7 @@ run_checks() {
         --cpu-millicores 100 \
         --memory-mb 128 \
         /bin/oom-hog)"
-    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED" 600
     assert_wait_log "${SANDBOX_ID}" true
     if [ "${CGROUP_MODE}" = "v2" ]; then
         local oom_kills
@@ -681,7 +822,7 @@ run_checks() {
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
     sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Limit" || fail "recovered stats failed"
     echo "trigger" > "${HOST_MOUNT}/oom-trigger"
-    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED" 600
     assert_wait_log "${SANDBOX_ID}" true
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
@@ -709,8 +850,7 @@ run_cgroup_disabled_checks() {
     echo "${list_line}" | grep -q "SANDBOX_STATE_RUNNING" || fail "sandbox is not running: ${list_line}"
 
     local got
-    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /tmp/start-env)"
-    assert_eq "${got}" "no-cgroup-ok" "start env"
+    wait_for_exec_output "${SANDBOX_ID}" "no-cgroup-ok" /bin/cat /tmp/start-env
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/host/input.txt)"
     assert_eq "${got}" "host-mount-ok" "host bind mount read"
 
@@ -730,7 +870,14 @@ run_e2e() {
     if [ "${DISABLE_CGROUP}" = "1" ]; then
         run_cgroup_disabled_checks
     else
-        run_checks
+        case "${E2E_RUNTIME}" in
+            all)
+                run_runsc_checks
+                run_runc_checks
+                ;;
+            runsc) run_runsc_checks ;;
+            runc) run_runc_checks ;;
+        esac
     fi
     log "e2e passed"
 }

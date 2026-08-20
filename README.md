@@ -1,6 +1,6 @@
 # sandboxd
 
-**sandboxd** is the Linux sandbox lifecycle service used by [AKernel](https://github.com/akernel-dev/akernel). It exposes a small gRPC API, manages sandbox resources, and runs sandboxes with [gVisor](https://github.com/google/gvisor) or [Kata Containers](https://github.com/kata-containers/kata-containers).
+**sandboxd** is the Linux sandbox lifecycle service used by [AKernel](https://github.com/akernel-dev/akernel). It exposes a small gRPC API, manages sandbox resources, and runs sandboxes with [gVisor](https://github.com/google/gvisor), [Kata Containers](https://github.com/kata-containers/kata-containers), or the optional host-kernel [runc](https://github.com/opencontainers/runc) adapter.
 
 ## Responsibilities
 
@@ -15,7 +15,7 @@
 gRPC service
     |
 sandbox lifecycle manager
-    ├── sandbox runtime adapter ──> gVisor / Kata Containers
+    ├── sandbox runtime adapter ──> gVisor / Kata Containers / runc
     ├── image manager ────────────> distill-fs / OCI
     └── resource managers ────────> cgroup v1 or v2 / veth / iptables / eBPF
 ```
@@ -23,6 +23,8 @@ sandbox lifecycle manager
 ## API / CLI
 
 The public protobuf contract is [api/runtime/v1/sandbox-api.proto](api/runtime/v1/sandbox-api.proto).
+Runtime isolation, host requirements, and lifecycle differences are summarized
+in [doc/runtime.md](doc/runtime.md).
 
 The `sbox` binary is an administrative CLI for managing sandboxes.
 
@@ -98,12 +100,14 @@ stateful TCP, UDP, ICMP and related errors, IPv4 fragments, DNS redirection,
 policy replacement, restart recovery, and policy removal. `bpfnat-test` adds
 backend-specific NAT, map lifecycle, and garbage-collection coverage.
 
-The privileged E2E suite requires Docker, iptables, and the tested runsc
-release. It validates both a writable cgroup v1/v2 hierarchy and the
-cgroup-disabled mode with `/sys/fs/cgroup` mounted read-only:
+The privileged E2E suite requires Docker, iptables, and the tested runsc and
+runc releases. It validates each adapter independently, plus runsc with the
+cgroup hierarchy mounted read-only:
 
 ```bash
-RUNSC_BINARY=/usr/local/bin/runsc make e2e
+RUNSC_BINARY=/usr/local/bin/runsc \
+RUNC_BINARY=/usr/local/bin/runc \
+make e2e
 ```
 
 See [test/e2e/README.md](test/e2e/README.md) for the developer test environment. AKernel integration is validated through the all-in-one node image and standalone deployment in the AKernel repository.
@@ -133,7 +137,7 @@ pkg/imagemanager/    rootfs and mount integration
 pkg/networkmanager/  veth, iptables, and eBPF NAT integration
 pkg/cgroupmanager/   transparent cgroup v1/v2 integration and cache
 pkg/xpumanager/      accelerator discovery, inventory, and local leases
-test/e2e/            privileged runsc E2E
+test/e2e/            privileged runtime E2E
 tools/               pinned protobuf code-generation image
 ```
 

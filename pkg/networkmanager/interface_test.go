@@ -15,6 +15,7 @@
 package networkmanager
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 func initInterfaceCacheForCleanup() *InterfaceManager {
@@ -441,6 +443,157 @@ func TestInterfaceDiscardQuarantinesLeaseWhenDestroyFails(t *testing.T) {
 	assert.Equal(t, 0, m.interfaces.Length())
 	assert.Equal(t, 1, m.total)
 	assert.Equal(t, 0, m.idleIp.Length())
+}
+
+func TestAllocateEphemeralCreatesDedicatedLease(t *testing.T) {
+	base := (&NetResource{
+		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
+		Ip:        net.ParseIP("10.88.0.2"),
+		Mask:      net.CIDRMask(16, 32),
+		Gateway:   net.ParseIP("10.88.0.1"),
+		Type:      "bridge",
+	}).ToString()
+	db := store.NewMockStore()
+	m := &InterfaceManager{
+		db:              db,
+		size:            1,
+		interfaces:      util.New(""),
+		usingInterfaces: cmap.New[struct{}](),
+		idleIp:          util.New(""),
+		setupNetNS: func(sandboxID string, resource *NetResource) (string, error) {
+			assert.Equal(t, "sbox-ephemeral", sandboxID)
+			assert.Equal(t, InterfaceLifecycleEphemeral, resource.Lifecycle)
+			return "/var/run/netns/runc-sbox-ephemeral", nil
+		},
+	}
+	createPatch := gomonkey.ApplyPrivateMethod(
+		m,
+		"doCreate",
+		func(*InterfaceManager) (string, error) { return base, nil },
+	)
+	defer createPatch.Reset()
+
+	lease, err := m.AllocateEphemeral("sbox-ephemeral")
+	require.NoError(t, err)
+	resource, err := NewNetResource(lease)
+	require.NoError(t, err)
+	assert.Equal(t, InterfaceLifecycleEphemeral, resource.Lifecycle)
+	assert.Equal(t, "/var/run/netns/runc-sbox-ephemeral", resource.NetNSPath)
+	assert.True(t, m.usingInterfaces.Has(lease))
+	assert.Equal(t, 0, m.interfaces.Length())
+	assert.Equal(t, 1, m.total)
+
+	stored, err := db.LoadRaw(config.BridgeIpBucket)
+	require.NoError(t, err)
+	var state storedInterfaceIDs
+	require.NoError(t, json.Unmarshal(stored, &state))
+	assert.Equal(t, []string{lease}, state.Items)
+}
+
+func TestReleaseEphemeralDestroysInsteadOfRecycling(t *testing.T) {
+	resource := (&NetResource{
+		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
+		Ip:        net.ParseIP("10.88.0.2"),
+		Mask:      net.CIDRMask(16, 32),
+		Gateway:   net.ParseIP("10.88.0.1"),
+		Type:      "bridge",
+		NetNSPath: "/var/run/netns/runc-sbox-release",
+		Lifecycle: InterfaceLifecycleEphemeral,
+	}).ToString()
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: config.HostVethPrefix + "0a580002"}}
+	var deletedNetNS string
+	m := &InterfaceManager{
+		db:              store.NewMockStore(),
+		interfaces:      util.New(""),
+		usingInterfaces: cmap.New[struct{}](),
+		idleIp:          util.New(""),
+		linkOps:         &fakeLinkOperations{link: link},
+		deleteNetNS: func(path string) error {
+			deletedNetNS = path
+			return nil
+		},
+		total: 1,
+	}
+	m.usingInterfaces.Set(resource, struct{}{})
+
+	require.NoError(t, m.Release(resource))
+	assert.False(t, m.usingInterfaces.Has(resource))
+	assert.Equal(t, 0, m.interfaces.Length(), "ephemeral links must not enter the idle cache")
+	assert.Equal(t, 0, m.total)
+	assert.Equal(t, 1, m.idleIp.Length())
+	assert.Equal(t, "/var/run/netns/runc-sbox-release", deletedNetNS)
+}
+
+func TestLoadReservesIPForEphemeralPeerOutsideHostNamespace(t *testing.T) {
+	resource := (&NetResource{
+		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
+		Ip:        net.ParseIP("10.88.0.2"),
+		Mask:      net.CIDRMask(16, 32),
+		Gateway:   net.ParseIP("10.88.0.1"),
+		Type:      "bridge",
+		NetNSPath: "/var/run/netns/runc-sbox-recovered",
+		Lifecycle: InterfaceLifecycleEphemeral,
+	}).ToString()
+	m := &InterfaceManager{
+		IpRange:         "10.88.0.1/16",
+		BridgeIp:        net.ParseIP("10.88.0.1"),
+		mask:            net.CIDRMask(16, 32),
+		interfaces:      util.New(""),
+		usingInterfaces: cmap.New[struct{}](),
+		idleIp:          util.New(""),
+		listLinks: func() ([]net.Interface, error) {
+			return []net.Interface{{Name: config.HostVethPrefix + "0a580002"}}, nil
+		},
+		listNetNS: func() ([]os.DirEntry, error) { return nil, nil },
+	}
+	m.usingInterfaces.Set(resource, struct{}{})
+	ips := sets.New("10.88.0.2", "10.88.0.3")
+
+	require.NoError(t, m.load(ips))
+	assert.True(t, m.usingInterfaces.Has(resource))
+	assert.False(t, m.idleIp.Has("10.88.0.2"), "active runc IP must not become allocatable")
+	assert.True(t, m.idleIp.Has("10.88.0.3"))
+}
+
+func TestLoadDeletesEphemeralLeaseWithoutSandboxMetadata(t *testing.T) {
+	resource := (&NetResource{
+		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
+		Ip:        net.ParseIP("10.88.0.2"),
+		Mask:      net.CIDRMask(16, 32),
+		Gateway:   net.ParseIP("10.88.0.1"),
+		Type:      "bridge",
+		NetNSPath: "/var/run/netns/runc-sbox-orphan",
+		Lifecycle: InterfaceLifecycleEphemeral,
+	}).ToString()
+	host := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: config.HostVethPrefix + "0a580002"}}
+	links := &fakeLinkOperations{link: host}
+	var deletedNetNS string
+	m := &InterfaceManager{
+		IpRange:         "10.88.0.1/16",
+		BridgeIp:        net.ParseIP("10.88.0.1"),
+		mask:            net.CIDRMask(16, 32),
+		sandboxRoot:     t.TempDir(),
+		interfaces:      util.New(""),
+		usingInterfaces: cmap.New[struct{}](),
+		idleIp:          util.New(""),
+		linkOps:         links,
+		listLinks: func() ([]net.Interface, error) {
+			return []net.Interface{{Name: config.HostVethPrefix + "0a580002"}}, nil
+		},
+		listNetNS: func() ([]os.DirEntry, error) { return nil, nil },
+		deleteNetNS: func(path string) error {
+			deletedNetNS = path
+			return nil
+		},
+	}
+	m.usingInterfaces.Set(resource, struct{}{})
+	ips := sets.New("10.88.0.2")
+
+	require.NoError(t, m.load(ips))
+	assert.False(t, m.usingInterfaces.Has(resource))
+	assert.Same(t, host, links.deleted)
+	assert.Equal(t, "/var/run/netns/runc-sbox-orphan", deletedNetNS)
+	assert.True(t, m.idleIp.Has("10.88.0.2"))
 }
 
 func TestValidateIPRangeNoOverlapRejectsExistingDeviceSubnet(t *testing.T) {

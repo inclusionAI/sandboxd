@@ -63,12 +63,12 @@ BPF_TEST_BUILD_ARGS ?=
 BPF_SOURCE_DIRS := bpf/bpfnat bpf/networkacl
 BPF_C_SOURCES := $(shell find $(BPF_SOURCE_DIRS) -type f \( -name '*.c' -o -name '*.h' \) | sort)
 
-.PHONY: all clean test storage-test e2e release release-binary release-cli sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
+.PHONY: all clean test storage-test e2e release release-binary release-cli runc-shim sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
 
-release: release-binary release-cli sandbox-logger
+release: release-binary release-cli runc-shim sandbox-logger
 	@echo "Built $(RELEASE)."
 
 release-binary:
@@ -78,6 +78,10 @@ release-binary:
 release-cli:
 	@echo "Building output/sbox"
 	@CGO_ENABLED=1 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) $(GO) build -o output/sbox ./cmd/sbox
+
+runc-shim:
+	@echo "Building output/runc-shim"
+	@CGO_ENABLED=0 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) $(GO) build -o output/runc-shim ./cmd/runc-shim
 
 sandbox-logger:
 	@echo "Building output/sandbox-logger"
@@ -100,7 +104,7 @@ storage-test: ## run privileged loop-backed filesystem integration tests
 		"$${tmpdir}/runtime.test" \
 		-test.v -test.run '^TestEROFSLoopDeviceDirIntegration$$'
 
-e2e: ## run unit tests and the privileged runsc e2e flow
+e2e: ## run unit tests and the selected privileged runtime e2e flows
 	@bash test/e2e/run.sh
 
 FORCE:

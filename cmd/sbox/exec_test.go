@@ -71,3 +71,53 @@ func TestRunscExecCommand(t *testing.T) {
 		"echo ok",
 	}, command.Args)
 }
+
+func TestParseRuncExecUser(t *testing.T) {
+	user, err := parseRuncExecUser("1000:1001")
+	assert.NoError(t, err)
+	assert.Equal(t, uint32(1000), user.UID)
+	assert.Equal(t, uint32(1001), user.GID)
+	_, err = parseRuncExecUser("root")
+	assert.Error(t, err)
+}
+
+func TestNewRuncExecProcessDefaultsCwd(t *testing.T) {
+	process, err := newRuncExecProcess(execRequest{
+		command: "/bin/echo",
+		args:    []string{"ok"},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, "/", process.Cwd)
+	assert.Equal(t, []string{"/bin/echo", "ok"}, process.Args)
+}
+
+func TestRuncExecCommand(t *testing.T) {
+	runner := &runcExecRunner{
+		binary: "/usr/local/bin/runc",
+		root:   "/run/runc",
+	}
+	command := runner.command(
+		"sbox-test",
+		"/tmp/process.json",
+		"--console-socket",
+		"/tmp/console.sock",
+		"--detach",
+		"--pid-file",
+		"/tmp/exec.pid",
+	)
+
+	assert.Equal(t, []string{
+		"/usr/local/bin/runc",
+		"--root",
+		"/run/runc",
+		"exec",
+		"--process",
+		"/tmp/process.json",
+		"--console-socket",
+		"/tmp/console.sock",
+		"--detach",
+		"--pid-file",
+		"/tmp/exec.pid",
+		"sbox-test",
+	}, command.Args)
+}

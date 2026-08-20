@@ -53,6 +53,7 @@ type StartConfig struct {
 	DisableCgroup           bool
 	SpecUpdates             *SpecUpdates
 	WritableLayerLimitBytes uint64
+	EnableKVM               bool
 }
 
 // SpecUpdates contains provider-resolved OCI changes. Device providers use
@@ -90,6 +91,18 @@ func NewHandler(cfg config.Config, bin, runtimeName string) (Handler, error) {
 			return nil, err
 		}
 		return NewKataHandler(cfg, bin, loader)
+	case config.RuntimeNameRunc:
+		if cfg.RuntimeConfig.BasicSpec == nil {
+			cfg.RuntimeConfig.BasicSpec = make(map[string]string)
+		}
+		loader, err := NewBundleLoader(
+			cfg.RuntimeConfig.BasicSpec[config.RuntimeNameRunc],
+			sandboxRoot,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return NewRuncHandler(cfg, bin, loader)
 	default:
 		return nil, errord.ErrNotImplemented
 	}

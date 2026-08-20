@@ -60,3 +60,13 @@ func TestStorageMBToBytes(t *testing.T) {
 	_, err = storageMBToBytes(^uint64(0))
 	require.Error(t, err)
 }
+
+func TestStartExtraConfig(t *testing.T) {
+	value, err := startExtraConfig(false)
+	require.NoError(t, err)
+	assert.Empty(t, value)
+
+	value, err = startExtraConfig(true)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"enableKVM":true}`, value)
+}

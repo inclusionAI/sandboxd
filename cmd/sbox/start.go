@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -45,6 +46,10 @@ var StartCmd = cli.Command{
 		cli.BoolFlag{
 			Name:  "rootfs-readonly",
 			Usage: "mark rootfs readonly in the Start request",
+		},
+		cli.BoolFlag{
+			Name:  "enable-kvm",
+			Usage: "expose the configured KVM device in a runc sandbox",
 		},
 		cli.StringFlag{
 			Name:  "cwd",
@@ -125,6 +130,10 @@ var StartCmd = cli.Command{
 		if err != nil {
 			return err
 		}
+		extraConfig, err := startExtraConfig(context.Bool("enable-kvm"))
+		if err != nil {
+			return err
+		}
 
 		resources := make(map[string]float64)
 		if cpu := context.Float64("cpu-millicores"); cpu > 0 {
@@ -161,6 +170,7 @@ var StartCmd = cli.Command{
 			Ports:                   context.StringSlice("port"),
 			XpuAllocations:          xpuAllocations,
 			WritableLayerLimitBytes: writableLayerLimitBytes,
+			ExtraConfig:             extraConfig,
 		})
 		if err != nil {
 			return err
@@ -176,6 +186,19 @@ var StartCmd = cli.Command{
 		fmt.Printf("Started sandbox %s\n", resp.ID)
 		return nil
 	},
+}
+
+func startExtraConfig(enableKVM bool) (string, error) {
+	if !enableKVM {
+		return "", nil
+	}
+	data, err := json.Marshal(struct {
+		EnableKVM bool `json:"enableKVM"`
+	}{EnableKVM: true})
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func storageMBToBytes(storageMB uint64) (uint64, error) {

@@ -8,4 +8,6 @@ output/*
 !output/sbox
 !output/sandbox-logger
 !output/runsc
+!output/runc
+!output/runc-shim
 !output/oom-hog

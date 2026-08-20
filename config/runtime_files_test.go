@@ -21,3 +21,12 @@ func TestDefaultConfigUsesHostResolver(t *testing.T) {
 		t.Fatalf("default resolver path = %q", got)
 	}
 }
+
+func TestDefaultRuncPaths(t *testing.T) {
+	runc := DefaultConfig().RuntimeConfig.Runc
+	if runc.StateRoot != DefaultRuncStateRoot ||
+		runc.ShimBinary != DefaultRuncShimBinary ||
+		runc.KVMDevice != DefaultKVMDevice {
+		t.Fatalf("unexpected runc defaults: %+v", runc)
+	}
+}

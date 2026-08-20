@@ -40,7 +40,7 @@ func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*
 	for _, name := range required {
 		name := name
 		go func() {
-			value, network, err := h.allocateStartResource(name)
+			value, network, err := h.allocateStartResource(runtimeName, sandboxID, name)
 			resultCh <- resourceResult{name: name, value: value, network: network, err: err}
 		}()
 	}
@@ -81,6 +81,9 @@ func requiredStartResources(runtimeName string, disableCgroup bool) ([]string, e
 	if configured == nil {
 		return nil, fmt.Errorf("runtime %s is not supported when preparing resources", runtimeName)
 	}
+	if disableCgroup && runtimeName == config.RuntimeNameRunc {
+		return nil, fmt.Errorf("runtime %s requires cgroup management", runtimeName)
+	}
 	required := make([]string, 0, len(configured))
 	for _, name := range configured {
 		if disableCgroup && name == config.ResourceNameCgroup {
@@ -98,7 +101,11 @@ type resourceResult struct {
 	err     error
 }
 
-func (h *sandboxService) allocateStartResource(name string) (string, *networkmanager.NetResource, error) {
+func (h *sandboxService) allocateStartResource(
+	runtimeName,
+	sandboxID,
+	name string,
+) (string, *networkmanager.NetResource, error) {
 	switch name {
 	case config.ResourceNameCgroup:
 		if h.cgroupMgr == nil {
@@ -110,7 +117,7 @@ func (h *sandboxService) allocateStartResource(name string) (string, *networkman
 		if h.networkMgr == nil {
 			return "", nil, fmt.Errorf("network manager not configured")
 		}
-		network, err := h.networkMgr.Prepare()
+		network, err := h.networkMgr.Prepare(runtimeName, sandboxID)
 		if err != nil {
 			return "", nil, err
 		}

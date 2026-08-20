@@ -68,9 +68,18 @@ overlay_tmpfs_size = "256M"
 [plugin.runtime.basic_spec]
 # Empty uses sandboxd's built-in OCI base specification.
 runsc = ""
+# runc = ""
+
+# Runc is optional and is registered only when runtime_binary.runc is set.
+# It shares filestore_dir for writable overlays and owns a private state root.
+#[plugin.runtime.runc]
+#state_root = "/run/sandboxd/runc"
+#shim_binary = "/usr/local/bin/runc-shim"
+#kvm_device = "/dev/kvm"
 
 [plugin.runtime.runtime_binary]
 runsc = "/usr/local/bin/runsc"
+# runc = "/usr/local/bin/runc"
 
 [plugin.image]
 root = "/var/lib/sandboxd/image-manager"

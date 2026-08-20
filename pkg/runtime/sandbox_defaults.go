@@ -53,6 +53,10 @@ func (k *KataHandler) SandboxDefaults() SandboxDefaults {
 	return loaderSandboxDefaults(k.ociLoader)
 }
 
+func (r *RuncHandler) SandboxDefaults() SandboxDefaults {
+	return loaderSandboxDefaults(r.ociLoader)
+}
+
 func loaderSandboxDefaults(loader OciLoader) SandboxDefaults {
 	if provider, ok := loader.(SandboxDefaultsProvider); ok {
 		return provider.SandboxDefaults()

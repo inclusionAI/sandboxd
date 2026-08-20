@@ -192,6 +192,44 @@ func TestStartRejectsWritableLayerLimitForKata(t *testing.T) {
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
+func TestStartRejectsWritableLayerLimitForRunc(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunc: svc.NewFakeRuntimeHandler(),
+	})
+	_, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:                 config.RuntimeNameRunc,
+		Rootfs:                  &runtime.RootfsConfig{},
+		WritableLayerLimitBytes: 1 << 30,
+	})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestStartRejectsEnableKVMForRunsc(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
+	})
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:     config.RuntimeNameRunsc,
+		Rootfs:      &runtime.RootfsConfig{},
+		ExtraConfig: `{"enableKVM":true}`,
+	})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, response.Message, "enableKVM")
+}
+
+func TestStartRejectsNetworkStackForRunc(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunc: svc.NewFakeRuntimeHandler(),
+	})
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:     config.RuntimeNameRunc,
+		Rootfs:      &runtime.RootfsConfig{},
+		ExtraConfig: `{"networkStack":"netstack"}`,
+	})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, response.Message, "networkStack")
+}
+
 func TestStartRejectsWritableLayerLimitWithoutFilestore(t *testing.T) {
 	s := newTestService(t, map[string]svc.Handler{
 		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),

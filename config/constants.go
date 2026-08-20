@@ -25,6 +25,7 @@ import (
 const (
 	RuntimeNameRunsc = "runsc"
 	RuntimeNameKata  = "kata"
+	RuntimeNameRunc  = "runc"
 )
 
 // Sandbox service related constants.
@@ -78,6 +79,7 @@ const (
 var RuntimeResources = map[string][]string{
 	RuntimeNameRunsc: {ResourceNameCgroup, ResourceNameInterface},
 	RuntimeNameKata:  {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameRunc:  {ResourceNameCgroup, ResourceNameInterface},
 }
 
 const (

@@ -16,6 +16,13 @@ package config
 
 import "testing"
 
+func TestRuncRuntimeResources(t *testing.T) {
+	resources := RuntimeResources[RuntimeNameRunc]
+	if len(resources) != 2 || resources[0] != ResourceNameCgroup || resources[1] != ResourceNameInterface {
+		t.Fatalf("unexpected runc resources: %v", resources)
+	}
+}
+
 func TestIsValidSandboxID(t *testing.T) {
 	tests := []struct {
 		id    string

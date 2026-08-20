@@ -71,11 +71,17 @@ func newNetworkManager(
 	}
 }
 
-func (m *networkManager) Prepare() (*preparedNetwork, error) {
+func (m *networkManager) Prepare(runtimeName, sandboxID string) (*preparedNetwork, error) {
 	if m.iface == nil {
 		return nil, fmt.Errorf("interface manager not configured")
 	}
-	resource, err := m.iface.Allocate()
+	var resource string
+	var err error
+	if runtimeName == config.RuntimeNameRunc {
+		resource, err = m.iface.AllocateEphemeral(sandboxID)
+	} else {
+		resource, err = m.iface.Allocate()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +105,7 @@ func (m *networkManager) Release(resource string) error {
 	if m.iface == nil {
 		return fmt.Errorf("interface manager not configured")
 	}
-	return m.iface.Recycle(resource)
+	return m.iface.Release(resource)
 }
 
 func (m *networkManager) Discard(resource string) error {

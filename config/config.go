@@ -84,6 +84,10 @@ type RuntimeConfig struct {
 	// loaded only when runtime_binary contains a "kata" entry.
 	Kata KataConfig `toml:"kata" json:"kata"`
 
+	// Runc configures the optional host-kernel OCI runtime adapter. Runc is
+	// loaded only when runtime_binary contains a "runc" entry.
+	Runc RuncConfig `toml:"runc" json:"runc"`
+
 	// BasicSpec is the basic spec file for different runtime type.
 	BasicSpec map[string]string `toml:"basic_spec" json:"basicSpec"`
 
@@ -123,6 +127,13 @@ type KataConfig struct {
 	KVMDevice    string `toml:"kvm_device" json:"kvmDevice"`
 	DANConfigDir string `toml:"dan_config_dir" json:"danConfigDir"`
 	LoggerBinary string `toml:"logger_binary" json:"loggerBinary"`
+}
+
+// RuncConfig contains host paths owned by the runc adapter.
+type RuncConfig struct {
+	StateRoot  string `toml:"state_root" json:"stateRoot"`
+	ShimBinary string `toml:"shim_binary" json:"shimBinary"`
+	KVMDevice  string `toml:"kvm_device" json:"kvmDevice"`
 }
 
 type ResourceConfig struct {
@@ -227,6 +238,11 @@ func DefaultConfig() Config {
 				ResolvConfPath: "/etc/resolv.conf",
 				BasicSpec: map[string]string{
 					RuntimeNameRunsc: "/home/akernel/images/config.json",
+				},
+				Runc: RuncConfig{
+					StateRoot:  DefaultRuncStateRoot,
+					ShimBinary: DefaultRuncShimBinary,
+					KVMDevice:  DefaultKVMDevice,
 				},
 				ImageLibDir:              DefaultImageLibDir,
 				FilestoreDir:             DefaultFilestoreDir,

@@ -82,6 +82,75 @@ jobs:
       - name: Run privileged storage tests
         run: make storage-test
 
+  runtime-e2e:
+    name: Runtime e2e
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    env:
+      E2E_RUNTIME: all
+      GVISOR_RELEASE: release-20260706.0
+      GVISOR_RELEASE_BASE_URL: https://storage.googleapis.com/gvisor/releases
+      RUNC_VERSION: 1.5.1
+      RUNC_AMD64_SHA256: 177df879d50c913eb205e898d5c1c05a18f574053c0ce5524c471208eaf06f6f
+      RUNC_RELEASE_BASE_URL: https://github.com/opencontainers/runc/releases/download
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+          if ! grep -qw erofs /proc/filesystems; then
+            sudo modprobe erofs
+          fi
+
+      - name: Download checksum-verified runtime binaries
+        run: |
+          runtime_bin="${RUNNER_TEMP}/runtime-bin"
+          gvisor_version="${GVISOR_RELEASE#release-}"
+          if [ "${gvisor_version}" = "${GVISOR_RELEASE}" ]; then
+            echo "GVISOR_RELEASE must be an official release-* tag" >&2
+            exit 1
+          fi
+          gvisor_url="${GVISOR_RELEASE_BASE_URL}/release/${gvisor_version}/x86_64"
+          mkdir -p "${runtime_bin}"
+
+          curl --fail --location --retry 3 \
+            --output "${runtime_bin}/runsc" \
+            "${gvisor_url}/runsc"
+          curl --fail --location --retry 3 \
+            --output "${runtime_bin}/runsc.sha512" \
+            "${gvisor_url}/runsc.sha512"
+          (
+            cd "${runtime_bin}"
+            sha512sum --check runsc.sha512
+          )
+
+          curl --fail --location --retry 3 \
+            --output "${runtime_bin}/runc" \
+            "${RUNC_RELEASE_BASE_URL}/v${RUNC_VERSION}/runc.amd64"
+          (
+            cd "${runtime_bin}"
+            printf '%s  runc\n' "${RUNC_AMD64_SHA256}" | sha256sum --check -
+          )
+          chmod 0755 "${runtime_bin}/runsc" "${runtime_bin}/runc"
+
+      - name: Run runsc and runc e2e
+        env:
+          RUNSC_BINARY: ${{ runner.temp }}/runtime-bin/runsc
+          RUNC_BINARY: ${{ runner.temp }}/runtime-bin/runc
+          RUN_UNIT_TESTS: "0"
+        run: make e2e
+
   protobuf:
     name: Generated protobuf bindings
     runs-on: ubuntu-latest

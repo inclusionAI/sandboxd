@@ -109,6 +109,9 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		}
 	}
 	ociSpec.Linux.CgroupsPath = options.CgroupPath
+	if options.NetworkNameSpace != "" {
+		setNetworkNamespace(ociSpec.Linux, options.NetworkNameSpace)
+	}
 
 	if options.Config.Cwd != "" {
 		ociSpec.Process.Cwd = options.Config.Cwd
@@ -204,6 +207,19 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 	buf, _ := util.UnescapedMarshal(ociSpec)
 	logrus.Debugf("write spec to %v, content: %v", ociFile, string(buf))
 	return bundleDir, ociSpec, os.WriteFile(ociFile, buf, 0644)
+}
+
+func setNetworkNamespace(linux *Linux, path string) {
+	for index := range linux.Namespaces {
+		if linux.Namespaces[index].Type == NetworkNamespace {
+			linux.Namespaces[index].Path = path
+			return
+		}
+	}
+	linux.Namespaces = append(linux.Namespaces, LinuxNamespace{
+		Type: NetworkNamespace,
+		Path: path,
+	})
 }
 
 func applyGVisorRootfsImageAnnotations(

@@ -769,7 +769,12 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	var interfaceMgr *networkmanager.InterfaceManager
 	if cfg.InterfaceCacheSize > 0 {
 		interfaceMgr, err = networkmanager.NewInterfaceManager(
-			s.store, cfg.IPRange, maxSandboxLimit, cfg.InterfaceCacheSize, cfg.NatBackend,
+			s.store,
+			cfg.IPRange,
+			maxSandboxLimit,
+			cfg.InterfaceCacheSize,
+			cfg.NatBackend,
+			sandboxRoot,
 		)
 		if err != nil {
 			return nil, err
@@ -885,8 +890,10 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 }
 
 func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
-	if _, runscEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameRunsc]; runscEnabled && strings.TrimSpace(runtimeConfig.FilestoreDir) == "" {
-		return errors.New("runsc requires plugin.runtime.filestore_dir")
+	_, runscEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameRunsc]
+	_, runcEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameRunc]
+	if (runscEnabled || runcEnabled) && strings.TrimSpace(runtimeConfig.FilestoreDir) == "" {
+		return errors.New("runsc and runc require plugin.runtime.filestore_dir")
 	}
 	if err := config.ValidateFilestoreOvercommitRatio(runtimeConfig.FilestoreOvercommitRatio); err != nil {
 		return fmt.Errorf("plugin.runtime: %w", err)
@@ -981,6 +988,10 @@ type ExtraConfig struct {
 	// NetworkStack selects the in-sandbox network stack. The open-source runsc
 	// adapter supports gVisor netstack only; empty is treated as netstack.
 	NetworkStack string `json:"networkStack,omitempty"`
+
+	// EnableKVM exposes the configured character device as /dev/kvm. It is
+	// intentionally opt-in and valid only for the host-kernel runc runtime.
+	EnableKVM bool `json:"enableKVM,omitempty"`
 }
 
 type fsPrepareResult struct {
@@ -1066,8 +1077,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 				errord.ToGRPC(errord.ErrInvalidArgument)
 		}
 	}
+	extraConfig := ExtraConfig{}
 	if startReq.ExtraConfig != "" {
-		var extraConfig ExtraConfig
 		if err := json.Unmarshal([]byte(startReq.ExtraConfig), &extraConfig); err != nil {
 			return &runtime.StartResponse{
 				Code:    -1,
@@ -1080,6 +1091,16 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 				Message: fmt.Sprintf("unsupported network stack %q", extraConfig.NetworkStack),
 			}, errord.ToGRPC(errord.ErrInvalidArgument)
 		}
+	}
+	if extraConfig.NetworkStack != "" && startReq.Runtime != config.RuntimeNameRunsc {
+		err := fmt.Errorf("networkStack is supported only by runtime %q", config.RuntimeNameRunsc)
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(errord.ErrInvalidArgument)
+	}
+	if extraConfig.EnableKVM && startReq.Runtime != config.RuntimeNameRunc {
+		err := fmt.Errorf("enableKVM is supported only by runtime %q", config.RuntimeNameRunc)
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(errord.ErrInvalidArgument)
 	}
 	if startReq.WritableLayerLimitBytes > 0 {
 		if startReq.Runtime != config.RuntimeNameRunsc {
@@ -1324,6 +1345,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		DisableCgroup:           h.config.DisableCgroup,
 		SpecUpdates:             specUpdates,
 		WritableLayerLimitBytes: startReq.WritableLayerLimitBytes,
+		EnableKVM:               extraConfig.EnableKVM,
 	}
 	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
 		return &runtime.StartResponse{
