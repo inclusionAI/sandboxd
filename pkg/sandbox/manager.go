@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/inclusionAI/sandboxd/internal/metrics"
+	"github.com/inclusionAI/sandboxd/internal/physicalstate"
 	"github.com/inclusionAI/sandboxd/internal/util"
 	cmap "github.com/orcaman/concurrent-map/v2"
 
@@ -49,6 +50,9 @@ type Manager struct {
 	recyclePath string
 
 	sandboxes cmap.ConcurrentMap[string, *Sandbox]
+	// physicalIntents caches durable INTENT metadata without publishing it
+	// through Get/List. meta.pb remains authoritative across restart.
+	physicalIntents *cmap.ConcurrentMap[string, *Sandbox]
 	// serviceHandler maps a configured runtime name to its runsc or Kata
 	// implementation. Handlers are loaded before Manager is constructed.
 	serviceHandler cmap.ConcurrentMap[string, svc.Handler]
@@ -144,6 +148,11 @@ func NewManager(
 	for sandboxID := range m.sandboxes.Items() {
 		m.idGenerator.Reserve(sandboxID)
 	}
+	if m.physicalIntents != nil {
+		for sandboxID := range m.physicalIntents.Items() {
+			m.idGenerator.Reserve(sandboxID)
+		}
+	}
 
 	// Start monitors for recovered sandboxes immediately (don't wait for housekeeping).
 	for item := range m.sandboxes.IterBuffered() {
@@ -229,8 +238,10 @@ func (m *Manager) syncEvent(event Event) {
 	}
 }
 
-// StoreMetadata store all sandbox metadata to disk.
-func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error {
+// PersistMetadata atomically records sandboxd's physical identity before the
+// runtime is exposed. It deliberately does not publish the sandbox through
+// List until ActivateMetadata observes the runtime status/spec files.
+func (m *Manager) PersistMetadata(id string, data *physicalstate.SandboxMetadata) error {
 	if data == nil || data.ID != id {
 		return fmt.Errorf("sandbox metadata ID does not match %q", id)
 	}
@@ -254,13 +265,49 @@ func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error 
 	if err := util.AtomicWriteFile(dataFile, bytes, 0600); err != nil {
 		return fmt.Errorf("save sandbox metadata %s: %w", data.ID, err)
 	}
+	if data.PhysicalPhase == physicalstate.PhysicalPhase_PHYSICAL_PHASE_INTENT &&
+		m.physicalIntents != nil {
+		metadata := proto.Clone(data).(*physicalstate.SandboxMetadata)
+		m.physicalIntents.Set(id, &Sandbox{Metadata: metadata, PATH: sandboxRoot})
+	}
+	logrus.Debugf("persist sandbox %s metadata success, cost %v", data.ID, time.Since(start).String())
+	return nil
+}
+
+// ActivateMetadata publishes a persisted, physically created sandbox through
+// the manager. PersistMetadata remains the durable source used after restart.
+func (m *Manager) ActivateMetadata(id string) error {
+	sandboxRoot, err := util.JoinWithinRoot(m.root, id)
+	if err != nil {
+		return fmt.Errorf("resolve sandbox %q root: %w", id, err)
+	}
 	stored, err := m.loadSandbox(sandboxRoot)
 	if err != nil {
-		return fmt.Errorf("load stored sandbox metadata %s: %w", data.ID, err)
+		return fmt.Errorf("load stored sandbox metadata %s: %w", id, err)
 	}
-	m.sandboxes.Set(data.ID, stored)
-	logrus.Debugf("store sandbox %s metadata success, cost %v", data.ID, time.Since(start).String())
+	if stored.Metadata == nil ||
+		stored.Metadata.PhysicalPhase == physicalstate.PhysicalPhase_PHYSICAL_PHASE_INTENT {
+		return fmt.Errorf("sandbox %s physical intent is not committed: %w",
+			id, errord.ErrFailedPrecondition)
+	}
+	if m.physicalIntents != nil {
+		m.physicalIntents.Remove(id)
+	}
+	m.sandboxes.Set(id, stored)
 	return nil
+}
+
+// StoreMetadata atomically persists and publishes metadata for an already
+// materialized sandbox. New sandbox creation uses PersistMetadata before the
+// runtime start and ActivateMetadata after physical creation completes.
+func (m *Manager) StoreMetadata(id string, data *physicalstate.SandboxMetadata) error {
+	if data != nil {
+		data.PhysicalPhase = physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED
+	}
+	if err := m.PersistMetadata(id, data); err != nil {
+		return err
+	}
+	return m.ActivateMetadata(id)
 }
 
 func (m *Manager) housekeeping() {
@@ -387,8 +434,9 @@ func (m *Manager) loadSandbox(sandboxRoot string) (*Sandbox, error) {
 		return nil, err
 	}
 
-	// unmarshal bytes to runtime.SandboxMetadata
-	var meta runtime.SandboxMetadata
+	// Unmarshal sandboxd-private physical metadata. Its field numbers preserve
+	// compatibility with meta.pb files written before the type moved internal.
+	var meta physicalstate.SandboxMetadata
 	if err = proto.Unmarshal(b, &meta); err != nil {
 		return nil, err
 	}
@@ -433,6 +481,8 @@ func (m *Manager) loadSandboxes() error {
 	logrus.Debugf("manager loaded sandboxes under %s", m.root)
 
 	m.sandboxes = cmap.New[*Sandbox]()
+	intents := cmap.New[*Sandbox]()
+	m.physicalIntents = &intents
 
 	// load sandbox metadata and spec
 	for _, sandboxDir := range list {
@@ -445,6 +495,11 @@ func (m *Manager) loadSandboxes() error {
 			logrus.Errorf("load sandbox %s failed: %v", sandboxDir.Name(), err)
 			continue
 		}
+		if sb.Metadata != nil &&
+			sb.Metadata.PhysicalPhase == physicalstate.PhysicalPhase_PHYSICAL_PHASE_INTENT {
+			m.physicalIntents.Set(sandboxDir.Name(), sb)
+			continue
+		}
 		m.sandboxes.Set(sandboxDir.Name(), sb)
 	}
 	return nil
@@ -453,7 +508,7 @@ func (m *Manager) loadSandboxes() error {
 // Notice: Do not run this method in goroutine, it meant to start the goroutine by itself
 // Maintain the serviceHandler synchronously instead of doing it in goroutine to avoid trace condition
 // e.g. run `go m.startMonitor()` then run `m.Delete(id)` the Delete could run before startMonitor
-func (m *Manager) startMonitorGoroutine(metaData *runtime.SandboxMetadata, stop chan struct{}) {
+func (m *Manager) startMonitorGoroutine(metaData *physicalstate.SandboxMetadata, stop chan struct{}) {
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
 	if m.stopped {
@@ -481,7 +536,7 @@ func (m *Manager) startMonitorGoroutine(metaData *runtime.SandboxMetadata, stop 
 }
 
 // startMonitor monitors a running sandbox for exit events.
-func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan struct{}, handler svc.Handler) {
+func (m *Manager) __startMonitor(metaData *physicalstate.SandboxMetadata, stop chan struct{}, handler svc.Handler) {
 	logrus.Infof("start monitor sandbox %s", metaData.ID)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -607,6 +662,47 @@ func (m *Manager) List(option ...ListOption) []*Sandbox {
 		}
 	}
 	return sandboxes
+}
+
+// HasPhysicalRecord reports whether sandboxd owns either a published sandbox
+// or a hidden creation intent for the deterministic ID.
+func (m *Manager) HasPhysicalRecord(id string) bool {
+	if m.sandboxes.Has(id) {
+		return true
+	}
+	return m.physicalIntents != nil && m.physicalIntents.Has(id)
+}
+
+// ListPhysicalIntents returns immutable snapshots of incomplete physical
+// records for startup reconciliation. INTENT records never appear in Get/List.
+func (m *Manager) ListPhysicalIntents() []*physicalstate.SandboxMetadata {
+	if m.physicalIntents == nil {
+		return nil
+	}
+	items := m.physicalIntents.Items()
+	result := make([]*physicalstate.SandboxMetadata, 0, len(items))
+	for _, sb := range items {
+		if sb == nil || sb.Metadata == nil {
+			continue
+		}
+		result = append(result, proto.Clone(sb.Metadata).(*physicalstate.SandboxMetadata))
+	}
+	return result
+}
+
+// ListCommittedRestores returns immutable snapshots of published restore
+// records. Callers must still confirm each record against the runtime handler;
+// COMMITTED describes the durable sandboxd record, not runtime liveness.
+func (m *Manager) ListCommittedRestores() []*physicalstate.SandboxMetadata {
+	result := make([]*physicalstate.SandboxMetadata, 0)
+	for _, sb := range m.sandboxes.Items() {
+		if sb == nil || sb.Metadata == nil || sb.Metadata.RestoreIdentity == nil ||
+			sb.Metadata.PhysicalPhase != physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED {
+			continue
+		}
+		result = append(result, proto.Clone(sb.Metadata).(*physicalstate.SandboxMetadata))
+	}
+	return result
 }
 
 // MetricsTarget is an immutable snapshot of the information needed to collect
@@ -817,6 +913,9 @@ func (m *Manager) CleanSandboxRoot(id string) {
 				logrus.Warnf("remove sandbox %s root failed: %v", sandboxRoot, err)
 			}
 		}
+	}
+	if m.physicalIntents != nil {
+		m.physicalIntents.Remove(id)
 	}
 }
 

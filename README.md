@@ -25,6 +25,8 @@ sandbox lifecycle manager
 The public protobuf contract is [api/runtime/v1/sandbox-api.proto](api/runtime/v1/sandbox-api.proto).
 Runtime isolation, host requirements, and lifecycle differences are summarized
 in [doc/runtime.md](doc/runtime.md).
+Runsc checkpoint/restore durability, replay, and cleanup semantics are defined
+in [doc/checkpoint.md](doc/checkpoint.md).
 
 The `sbox` binary is an administrative CLI for managing sandboxes.
 

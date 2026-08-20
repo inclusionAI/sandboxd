@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -27,12 +28,16 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/physicalstate"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
 	cmap "github.com/orcaman/concurrent-map/v2"
+	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -88,7 +93,7 @@ func TestWait(t *testing.T) {
 	// Wait now reads the terminal state maintained by the sandbox
 	// manager rather than calling runtime.Wait directly. Stage a sandbox
 	// that has already exited so the RPC can resolve via the fast path.
-	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
+	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &physicalstate.SandboxMetadata{
 		ID:             id,
 		RuntimeHandler: "runsc",
 	}))
@@ -306,7 +311,7 @@ func TestList_WithStoredContainer(t *testing.T) {
 	})
 
 	sandboxID := "sbox-test-list-001"
-	meta := &runtime.SandboxMetadata{
+	meta := &physicalstate.SandboxMetadata{
 		ID:             sandboxID,
 		RuntimeHandler: "runsc",
 		Labels:         map[string]string{"env": "test"},
@@ -338,7 +343,7 @@ func TestList_ByLabel(t *testing.T) {
 	})
 
 	sandboxID := "sbox-test-label-001"
-	meta := &runtime.SandboxMetadata{
+	meta := &physicalstate.SandboxMetadata{
 		ID:             sandboxID,
 		RuntimeHandler: "runsc",
 		Labels:         map[string]string{"app": "myapp"},
@@ -380,6 +385,454 @@ func TestDelete_NotFoundIsIdempotent(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+type restoreCleanupIncompleteHandler struct {
+	*svc.FakeRuntimeHandler
+}
+
+type fixedListHandler struct {
+	*svc.FakeRuntimeHandler
+	states    []*svc.State
+	listErr   error
+	listCalls int
+	deletes   int
+}
+
+func (h *fixedListHandler) List(context.Context) ([]*svc.State, error) {
+	h.listCalls++
+	return h.states, h.listErr
+}
+
+func (h *fixedListHandler) Delete(context.Context, string) error {
+	h.deletes++
+	return nil
+}
+
+func TestExistingRestorePhysicalFactRejectsCommittedRecordWithoutRunningRuntime(t *testing.T) {
+	handler := &fixedListHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	const sandboxID = "sbox-stale-restore-fact"
+	identity := &physicalstate.RestoreIdentity{
+		CheckpointID:  "checkpoint-1",
+		RequestSha256: "restore-request-sha256",
+	}
+	assert.NoError(t, s.sandboxManager.StoreMetadata(sandboxID, &physicalstate.SandboxMetadata{
+		ID:              sandboxID,
+		RuntimeHandler:  config.RuntimeNameRunsc,
+		PhysicalPhase:   physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED,
+		RestoreIdentity: identity,
+	}))
+
+	response, found, err := s.existingRestorePhysicalFact(context.Background(), &runtime.StartRequest{
+		SandboxID: sandboxID,
+		Runtime:   config.RuntimeNameRunsc,
+	}, identity)
+
+	assert.NoError(t, err)
+	assert.False(t, found, "a persisted record without a running runtime is not a physical fact")
+	assert.Nil(t, response)
+	assert.Equal(t, 1, handler.listCalls)
+}
+
+func TestExistingRestorePhysicalFactReturnsRunningRuntime(t *testing.T) {
+	const sandboxID = "sbox-live-restore-fact"
+	handler := &fixedListHandler{
+		FakeRuntimeHandler: svc.NewFakeRuntimeHandler(),
+		states: []*svc.State{{
+			ID:     sandboxID,
+			Status: svc.SandboxStatusRunning,
+		}},
+	}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	identity := &physicalstate.RestoreIdentity{
+		CheckpointID:  "checkpoint-1",
+		RequestSha256: "restore-request-sha256",
+	}
+	assert.NoError(t, s.sandboxManager.StoreMetadata(sandboxID, &physicalstate.SandboxMetadata{
+		ID:              sandboxID,
+		RuntimeHandler:  config.RuntimeNameRunsc,
+		PhysicalPhase:   physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED,
+		RestoreIdentity: identity,
+	}))
+
+	response, found, err := s.existingRestorePhysicalFact(context.Background(), &runtime.StartRequest{
+		SandboxID: sandboxID,
+		Runtime:   config.RuntimeNameRunsc,
+	}, identity)
+
+	assert.NoError(t, err)
+	assert.True(t, found)
+	if assert.NotNil(t, response) {
+		assert.Equal(t, sandboxID, response.ID)
+	}
+	assert.Equal(t, 1, handler.listCalls)
+	assert.Equal(t, 0, handler.deletes)
+}
+
+func TestExistingRestorePhysicalFactFailsClosedWhenRuntimeListFails(t *testing.T) {
+	handler := &fixedListHandler{
+		FakeRuntimeHandler: svc.NewFakeRuntimeHandler(),
+		listErr:            errors.New("runtime unavailable"),
+	}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	const sandboxID = "sbox-unknown-restore-fact"
+	identity := &physicalstate.RestoreIdentity{
+		CheckpointID:  "checkpoint-1",
+		RequestSha256: "restore-request-sha256",
+	}
+	assert.NoError(t, s.sandboxManager.StoreMetadata(sandboxID, &physicalstate.SandboxMetadata{
+		ID:              sandboxID,
+		RuntimeHandler:  config.RuntimeNameRunsc,
+		PhysicalPhase:   physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED,
+		RestoreIdentity: identity,
+	}))
+
+	response, found, err := s.existingRestorePhysicalFact(context.Background(), &runtime.StartRequest{
+		SandboxID: sandboxID,
+		Runtime:   config.RuntimeNameRunsc,
+	}, identity)
+
+	assert.ErrorIs(t, err, errord.ErrUnavailable)
+	assert.True(t, found, "an indeterminate runtime fact must not start a second restore")
+	assert.Nil(t, response)
+	assert.Equal(t, 1, handler.listCalls)
+	assert.Equal(t, 0, handler.deletes)
+}
+
+func TestReconcileRestoreRecordRemovesMatchingCommittedRecordWithoutRuntime(t *testing.T) {
+	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	const sandboxID = "sbox-stale-committed-restore"
+	identity := &physicalstate.RestoreIdentity{
+		CheckpointID:  "checkpoint-1",
+		RequestSha256: "restore-request-sha256",
+	}
+	reservedID, err := s.sandboxManager.ReserveID(sandboxID)
+	assert.NoError(t, err)
+	assert.Equal(t, sandboxID, reservedID)
+	bundleDir := filepath.Join(s.config.RootDir, "containers", sandboxID)
+	assert.NoError(t, os.MkdirAll(bundleDir, 0755))
+	assert.NoError(t, os.WriteFile(
+		filepath.Join(bundleDir, config.SandboxSpecFile),
+		[]byte(`{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
+		0600,
+	))
+	assert.NoError(t, s.sandboxManager.StoreMetadata(sandboxID, &physicalstate.SandboxMetadata{
+		ID:              sandboxID,
+		RuntimeHandler:  config.RuntimeNameRunsc,
+		PhysicalPhase:   physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED,
+		RestoreIdentity: identity,
+	}))
+
+	running, err := s.reconcileRestoreRecord(context.Background(), &runtime.StartRequest{
+		SandboxID: sandboxID,
+		Runtime:   config.RuntimeNameRunsc,
+	}, identity)
+	assert.NoError(t, err)
+	assert.False(t, running)
+
+	_, err = s.sandboxManager.Get(sandboxID)
+	assert.Error(t, err, "stale committed record must not remain published")
+	assert.NoDirExists(t, bundleDir)
+	assert.Equal(t, 1, handler.calls, "runsc cleanup must clear private restore state")
+	reservedID, err = s.sandboxManager.ReserveID(sandboxID)
+	assert.NoError(t, err, "stale committed cleanup must release the deterministic ID")
+	assert.Equal(t, sandboxID, reservedID)
+}
+
+func TestRecoverPhysicalStateRemovesCommittedRestoreRecordWithoutRuntime(t *testing.T) {
+	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	const sandboxID = "sbox-restart-stale-restore"
+	bundleDir := filepath.Join(s.config.RootDir, "containers", sandboxID)
+	assert.NoError(t, os.MkdirAll(bundleDir, 0755))
+	assert.NoError(t, os.WriteFile(
+		filepath.Join(bundleDir, config.SandboxSpecFile),
+		[]byte(`{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
+		0600,
+	))
+	assert.NoError(t, s.sandboxManager.StoreMetadata(sandboxID, &physicalstate.SandboxMetadata{
+		ID:             sandboxID,
+		RuntimeHandler: config.RuntimeNameRunsc,
+		PhysicalPhase:  physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED,
+		RestoreIdentity: &physicalstate.RestoreIdentity{
+			CheckpointID:  "checkpoint-1",
+			RequestSha256: "restore-request-sha256",
+		},
+	}))
+
+	assert.NoError(t, s.recoverPhysicalState(context.Background()))
+
+	_, err := s.sandboxManager.Get(sandboxID)
+	assert.Error(t, err, "startup recovery must not publish a missing runtime")
+	assert.NoDirExists(t, bundleDir)
+	assert.Equal(t, 1, handler.calls)
+}
+
+func TestRecoverPhysicalStateAfterManagerRestartRemovesPhantomRestore(t *testing.T) {
+	handler := &fixedListHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	beforeRestart := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	const sandboxID = "sbox-phantom-after-restart"
+	bundleDir := filepath.Join(beforeRestart.config.RootDir, "containers", sandboxID)
+	assert.NoError(t, os.MkdirAll(bundleDir, 0755))
+	assert.NoError(t, os.WriteFile(
+		filepath.Join(bundleDir, config.SandboxSpecFile),
+		[]byte(`{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
+		0600,
+	))
+	assert.NoError(t, beforeRestart.sandboxManager.StoreMetadata(sandboxID, &physicalstate.SandboxMetadata{
+		ID:             sandboxID,
+		RuntimeHandler: config.RuntimeNameRunsc,
+		PhysicalPhase:  physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED,
+		RestoreIdentity: &physicalstate.RestoreIdentity{
+			CheckpointID:  "checkpoint-1",
+			RequestSha256: "restore-request-sha256",
+		},
+	}))
+	beforeRestart.sandboxManager.Stop()
+
+	restartedManager, err := sandbox.NewManager(
+		beforeRestart.config.RootDir,
+		beforeRestart.serviceHandler,
+		make(chan bool, 10),
+		nil,
+		1000,
+	)
+	assert.NoError(t, err)
+	defer restartedManager.Stop()
+	afterRestart := &sandboxService{
+		config:                            beforeRestart.config,
+		serviceHandler:                    beforeRestart.serviceHandler,
+		sandboxManager:                    restartedManager,
+		store:                             store.NewMockStore(),
+		UnimplementedSandboxServiceServer: runtime.UnimplementedSandboxServiceServer{},
+		fsMgr:                             newFSManager(nil),
+		networkMgr:                        newNetworkManager(nil, "", false),
+	}
+
+	assert.NoError(t, afterRestart.recoverPhysicalState(context.Background()))
+
+	_, err = afterRestart.sandboxManager.Get(sandboxID)
+	assert.Error(t, err, "restarted manager must not publish a missing runtime")
+	assert.NoDirExists(t, bundleDir)
+	assert.Equal(t, 1, handler.deletes)
+}
+
+func TestRecoverPhysicalStateRetainsRunningRestoreAndOrdinaryCommittedRecord(t *testing.T) {
+	const restoreID = "sbox-running-restore"
+	const ordinaryID = "sbox-ordinary-committed"
+	handler := &fixedListHandler{
+		FakeRuntimeHandler: svc.NewFakeRuntimeHandler(),
+		states: []*svc.State{{
+			ID:     restoreID,
+			Status: svc.SandboxStatusRunning,
+		}},
+	}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	assert.NoError(t, s.sandboxManager.StoreMetadata(restoreID, &physicalstate.SandboxMetadata{
+		ID:             restoreID,
+		RuntimeHandler: config.RuntimeNameRunsc,
+		PhysicalPhase:  physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED,
+		RestoreIdentity: &physicalstate.RestoreIdentity{
+			CheckpointID:  "checkpoint-1",
+			RequestSha256: "restore-request-sha256",
+		},
+	}))
+	assert.NoError(t, s.sandboxManager.StoreMetadata(ordinaryID, &physicalstate.SandboxMetadata{
+		ID:             ordinaryID,
+		RuntimeHandler: config.RuntimeNameRunsc,
+		PhysicalPhase:  physicalstate.PhysicalPhase_PHYSICAL_PHASE_COMMITTED,
+	}))
+
+	assert.NoError(t, s.recoverPhysicalState(context.Background()))
+
+	_, restoreErr := s.sandboxManager.Get(restoreID)
+	assert.NoError(t, restoreErr)
+	_, ordinaryErr := s.sandboxManager.Get(ordinaryID)
+	assert.NoError(t, ordinaryErr)
+	assert.Equal(t, 1, handler.listCalls, "startup must collect one authoritative runtime view per handler")
+	assert.Equal(t, 0, handler.deletes)
+}
+
+func (h *restoreCleanupIncompleteHandler) Checkpoint(
+	context.Context, string, string, bool,
+) error {
+	return nil
+}
+
+func (h *restoreCleanupIncompleteHandler) Restore(
+	context.Context, svc.StartConfig, string,
+) error {
+	return errors.Join(
+		errors.New("remove restored gVisor checkpoint image"),
+		errors.New("delete permanently unavailable"),
+		context.DeadlineExceeded,
+		physicalstate.ErrRestoreCleanupIncomplete,
+	)
+}
+
+func TestRestoreSandboxRuntimePreservesPhysicalIntentWhenCleanupIsIncomplete(t *testing.T) {
+	handler := &restoreCleanupIncompleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	const sandboxID = "sbox-restore-cleanup-incomplete"
+	bundleDir := filepath.Join(s.config.RootDir, "containers", sandboxID)
+	assert.NoError(t, os.MkdirAll(bundleDir, 0755))
+	assert.NoError(t, os.WriteFile(
+		filepath.Join(bundleDir, config.SandboxSpecFile),
+		[]byte(`{"ociVersion":"1.0.2","root":{"path":"rootfs"}}`),
+		0600,
+	))
+	assert.NoError(t, s.sandboxManager.PersistMetadata(sandboxID, &physicalstate.SandboxMetadata{
+		ID:             sandboxID,
+		RuntimeHandler: config.RuntimeNameRunsc,
+		PhysicalPhase:  physicalstate.PhysicalPhase_PHYSICAL_PHASE_INTENT,
+	}))
+
+	err := s.restoreSandboxRuntime(context.Background(), config.RuntimeNameRunsc, svc.StartConfig{
+		ID: sandboxID,
+	}, filepath.Join(t.TempDir(), "checkpoint.img"))
+
+	assert.ErrorIs(t, err, physicalstate.ErrRestoreCleanupIncomplete)
+	assert.FileExists(t, filepath.Join(bundleDir, config.SandboxSpecFile))
+	intents := s.sandboxManager.ListPhysicalIntents()
+	if assert.Len(t, intents, 1) {
+		assert.Equal(t, sandboxID, intents[0].ID)
+	}
+}
+
+func TestCreateSandboxDeferRetainsIntentForDeadlineCleanupIncomplete(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
+	})
+	const sandboxID = "sbox-create-cleanup-incomplete"
+	rootfsDir := filepath.Join(t.TempDir(), "rootfs")
+	assert.NoError(t, os.MkdirAll(rootfsDir, 0755))
+	failure := errors.Join(context.DeadlineExceeded, physicalstate.ErrRestoreCleanupIncomplete)
+
+	_, err := s.createSandbox(context.Background(), &runtime.StartRequest{
+		SandboxID: sandboxID,
+		Runtime:   config.RuntimeNameRunsc,
+		Rootfs: &runtime.RootfsConfig{
+			Type:   runtime.RootfsSrcType_LOCAL,
+			Source: &runtime.RootfsConfig_Path{Path: rootfsDir},
+		},
+	}, createOptions{
+		checkpointImage: filepath.Join(t.TempDir(), "checkpoint.img"),
+		onReserved: func(*runtime.StartRequest, string) error {
+			return failure
+		},
+	})
+
+	assert.ErrorIs(t, err, physicalstate.ErrRestoreCleanupIncomplete)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	intents := s.sandboxManager.ListPhysicalIntents()
+	if assert.Len(t, intents, 1) {
+		assert.Equal(t, sandboxID, intents[0].ID)
+	}
+	_, reserveErr := s.sandboxManager.ReserveID(sandboxID)
+	assert.Error(t, reserveErr, "retained physical intent must keep the deterministic ID reserved")
+}
+
+type recordingXPULeaseManager struct {
+	released []string
+}
+
+func (m *recordingXPULeaseManager) Acquire(
+	string, []*runtime.XpuAllocation,
+) (*svc.SpecUpdates, error) {
+	return nil, nil
+}
+
+func (m *recordingXPULeaseManager) Release(sandboxID string) {
+	m.released = append(m.released, sandboxID)
+}
+
+type absentNonIdempotentDeleteHandler struct {
+	*svc.FakeRuntimeHandler
+	deleteCalls int
+}
+
+func (h *absentNonIdempotentDeleteHandler) Delete(context.Context, string) error {
+	h.deleteCalls++
+	return errors.New("runtime was never created")
+}
+
+func TestReconcilePhysicalIntentUsesIdempotentRunscDeleteForAbsentRuntime(t *testing.T) {
+	logger := logrus.StandardLogger()
+	originalHooks := logger.ReplaceHooks(make(logrus.LevelHooks))
+	hook := logtest.NewGlobal()
+	defer logger.ReplaceHooks(originalHooks)
+	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: handler})
+	xpuMgr := &recordingXPULeaseManager{}
+	s.xpuMgr = xpuMgr
+	const sandboxID = "sbox-reconcile-absent-runtime"
+	reservedID, err := s.sandboxManager.ReserveID(sandboxID)
+	assert.NoError(t, err)
+	assert.Equal(t, sandboxID, reservedID)
+	bundleDir := filepath.Join(s.config.RootDir, "containers", sandboxID)
+	assert.NoError(t, os.MkdirAll(bundleDir, 0755))
+	assert.NoError(t, os.WriteFile(
+		filepath.Join(bundleDir, config.SandboxSpecFile),
+		[]byte(`{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
+		0600,
+	))
+	metadata := &physicalstate.SandboxMetadata{
+		ID:             sandboxID,
+		RuntimeHandler: config.RuntimeNameRunsc,
+		PhysicalPhase:  physicalstate.PhysicalPhase_PHYSICAL_PHASE_INTENT,
+	}
+	assert.NoError(t, s.sandboxManager.PersistMetadata(sandboxID, metadata))
+
+	assert.NoError(t, s.reconcilePhysicalIntent(context.Background(), metadata))
+
+	assert.Equal(t, 1, handler.calls, "runsc Delete owns absent-runtime prepared-state cleanup")
+	assert.Equal(t, sandboxID, handler.sandboxID)
+	assert.Equal(t, []string{sandboxID}, xpuMgr.released)
+	assert.NoDirExists(t, bundleDir)
+	assert.Empty(t, s.sandboxManager.ListPhysicalIntents())
+	reservedID, err = s.sandboxManager.ReserveID(sandboxID)
+	assert.NoError(t, err, "reconciliation must release the deterministic ID")
+	assert.Equal(t, sandboxID, reservedID)
+	var completionFields logrus.Fields
+	for _, entry := range hook.AllEntries() {
+		if entry.Message == "reconciled sandbox physical record" {
+			completionFields = entry.Data
+			break
+		}
+	}
+	if assert.NotNil(t, completionFields, "physical reconciliation must emit a completion boundary") {
+		assert.Equal(t, sandboxID, completionFields["sandbox_id"])
+		assert.Equal(t, config.RuntimeNameRunsc, completionFields["runtime_handler"])
+		assert.Equal(t, "physical_intent_recovery", completionFields["reason"])
+		assert.Equal(t, false, completionFields["runtime_exists"])
+	}
+}
+
+func TestReconcilePhysicalIntentSkipsDeleteForAbsentRuntimeWithoutPreparedCleaner(t *testing.T) {
+	handler := &absentNonIdempotentDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameKata: handler})
+	const sandboxID = "sbox-kata-intent-before-runtime"
+	bundleDir := filepath.Join(s.config.RootDir, "containers", sandboxID)
+	assert.NoError(t, os.MkdirAll(bundleDir, 0755))
+	assert.NoError(t, os.WriteFile(
+		filepath.Join(bundleDir, config.SandboxSpecFile),
+		[]byte(`{"ociVersion":"1.0.2","root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
+		0600,
+	))
+	metadata := &physicalstate.SandboxMetadata{
+		ID:             sandboxID,
+		RuntimeHandler: config.RuntimeNameKata,
+		PhysicalPhase:  physicalstate.PhysicalPhase_PHYSICAL_PHASE_INTENT,
+	}
+	assert.NoError(t, s.sandboxManager.PersistMetadata(sandboxID, metadata))
+
+	assert.NoError(t, s.reconcilePhysicalIntent(context.Background(), metadata))
+
+	assert.Equal(t, 0, handler.deleteCalls)
+	assert.NoDirExists(t, bundleDir)
+	assert.Empty(t, s.sandboxManager.ListPhysicalIntents())
+}
+
 type recordingDeleteHandler struct {
 	*svc.FakeRuntimeHandler
 	calls     int
@@ -407,7 +860,7 @@ func TestDeleteRoutesSandboxIDToRuntime(t *testing.T) {
 		[]byte(`{"ociVersion":"1.0.2","process":{"cwd":"/"},"root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
 		0600,
 	))
-	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
+	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &physicalstate.SandboxMetadata{
 		ID:             id,
 		RuntimeHandler: "runsc",
 	}))
@@ -448,7 +901,7 @@ func storeSandboxForDelete(t *testing.T, s *sandboxService, id string) {
 		[]byte(`{"ociVersion":"1.0.2","process":{"cwd":"/"},"root":{"path":"rootfs"},"linux":{"cgroupsPath":""},"annotations":{}}`),
 		0600,
 	))
-	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &runtime.SandboxMetadata{
+	assert.NoError(t, s.sandboxManager.StoreMetadata(id, &physicalstate.SandboxMetadata{
 		ID:             id,
 		RuntimeHandler: "runsc",
 	}))

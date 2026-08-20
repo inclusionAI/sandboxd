@@ -111,7 +111,8 @@ FORCE:
 
 .PHONY: gen-protoc-v1
 gen-protoc-v1:
-	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative api/runtime/v1/*.proto
+	protoc --go_out=. --go_opt=paths=source_relative api/runtime/v1/*.proto internal/physicalstate/*.proto
+	protoc --go-grpc_out=. --go-grpc_opt=paths=source_relative api/runtime/v1/*.proto
 
 protobuf-image:
 	$(DOCKER) build $(PROTOBUF_BUILD_ARGS) \
@@ -130,11 +131,11 @@ protos: protobuf-image ## regenerate protobuf code with the pinned toolchain
 		$(PROTOBUF_TOOL_IMAGE)
 
 protos-local: gen-protoc-v1
-	go-fix-acronym -w -a '(Id|Io|Uuid|Os)$$' $(shell find api -name '*.pb.go')
+	go-fix-acronym -w -a '(Id|Io|Uuid|Os)$$' $(shell find api internal/physicalstate -name '*.pb.go')
 
 check-protos: protos ## verify generated protobuf code is up to date
-	@git diff --exit-code -- api
-	@test -z "$$(git ls-files --others --exclude-standard -- api | tee /dev/stderr)"
+	@git diff --exit-code -- api internal/physicalstate
+	@test -z "$$(git ls-files --others --exclude-standard -- api internal/physicalstate | tee /dev/stderr)"
 
 bpf-image:
 	$(DOCKER) build $(BPF_BUILD_ARGS) \

@@ -58,6 +58,10 @@ type OciLoadOptions struct {
 	UseGVisorRootfsImageAnnotations bool
 	RootfsOverlayDir                string
 	RootfsOverlaySize               string
+
+	// ManagedAnnotations are applied after request and provider annotations.
+	// Callers use this for runtime control fields that must not be overridden.
+	ManagedAnnotations map[string]string
 }
 
 var _ OciLoader = &BundleLoader{}
@@ -125,7 +129,31 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		ociSpec.Process.Env = combineEnvs(ociSpec.Process.Env, options.Config.Envs)
 	}
 
+	// Runtime-provided mounts override base-spec mounts at the same OCI
+	// destination. Keeping both is ambiguous at start and, more importantly,
+	// makes an otherwise valid checkpoint impossible to restore because runsc
+	// rejects duplicate destinations with different physical sources.
+	if len(options.Config.Mounts) > 0 {
+		overridden := make(map[string]struct{}, len(options.Config.Mounts))
+		for _, mnt := range options.Config.Mounts {
+			if mnt == nil || mnt.GetTarget() == "" {
+				continue
+			}
+			overridden[filepath.Clean(mnt.GetTarget())] = struct{}{}
+		}
+		baseMounts := make([]Mount, 0, len(ociSpec.Mounts))
+		for _, mnt := range ociSpec.Mounts {
+			if _, ok := overridden[filepath.Clean(mnt.Destination)]; ok {
+				continue
+			}
+			baseMounts = append(baseMounts, mnt)
+		}
+		ociSpec.Mounts = baseMounts
+	}
 	for _, mnt := range options.Config.Mounts {
+		if mnt == nil {
+			continue
+		}
 		ociSpec.Mounts = append(ociSpec.Mounts, Mount{
 			Destination: mnt.GetTarget(),
 			Type:        mnt.GetType(),
@@ -193,6 +221,7 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		}
 		ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, updates.Annotations)
 	}
+	ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, options.ManagedAnnotations)
 
 	ociFile := filepath.Join(bundleDir, config.SandboxSpecFile)
 

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,8 +35,18 @@ import (
 const (
 	contMgrCreateLinksAndRoutes = "containerManager.CreateLinksAndRoutes"
 	contMgrRootContainerStart   = "containerManager.StartRoot"
+	contMgrRestore              = "containerManager.Restore"
 	contMgrWait                 = "containerManager.Wait"
 )
+
+type controlRPC interface {
+	Call(method string, arg, result any) error
+	Close() error
+}
+
+type interruptibleControlRPC interface {
+	Interrupt() error
+}
 
 // Client is sandboxd's narrow adapter over upstream gVisor runsc. It avoids
 // linking runsc/boot or runsc/container directly because those packages pull in
@@ -44,6 +55,9 @@ type Client struct {
 	Binary  string
 	RootDir string
 	Options Options
+
+	connectControl func(string) (controlRPC, error)
+	openRawSocket  func(net.Interface) (*os.File, error)
 }
 
 type Options struct {
@@ -71,6 +85,10 @@ func NewClientWithOptions(binary, rootDir string, options Options) *Client {
 		Binary:  binary,
 		RootDir: rootDir,
 		Options: options,
+		connectControl: func(path string) (controlRPC, error) {
+			return connectRPC(path)
+		},
+		openRawSocket: OpenRawSocket,
 	}
 }
 
@@ -199,7 +217,7 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	logrus.Debugf("runsc start loaded state, id: %s, control_socket: %s", args.ID, state.Sandbox.ControlSocketPath)
 
 	logrus.Debugf("runsc start opening raw socket, id: %s, interface: %+v", args.ID, args.Network.Interface)
-	rawSocket, err := OpenRawSocket(*args.Network.Interface)
+	rawSocket, err := c.openRawSocket(*args.Network.Interface)
 	if err != nil {
 		return err
 	}
@@ -213,7 +231,7 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	logrus.Debugf("runsc start built network args, id: %s", args.ID)
 
 	logrus.Debugf("runsc start connecting control socket, id: %s, socket: %s", args.ID, state.Sandbox.ControlSocketPath)
-	conn, err := connectRPC(state.Sandbox.ControlSocketPath)
+	conn, err := c.connectControl(state.Sandbox.ControlSocketPath)
 	if err != nil {
 		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
 	}
@@ -232,7 +250,108 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	return nil
 }
 
-func callContext(ctx context.Context, conn *rpcClient, method string, arg, result any) error {
+// Checkpoint saves a sandbox to imageDir using the stable upstream runsc CLI.
+// leaveRunning is used by pause/resume so source recovery before the PAUSED
+// commit does not require a second physical sandbox restore.
+func (c *Client) Checkpoint(ctx context.Context, id, imageDir string, leaveRunning bool) error {
+	if id == "" {
+		return fmt.Errorf("container id is empty")
+	}
+	if imageDir == "" {
+		return fmt.Errorf("checkpoint image directory is empty for %s", id)
+	}
+
+	args := append(c.globalArgs(),
+		"checkpoint",
+		"--compression=flate-best-speed",
+	)
+	if leaveRunning {
+		args = append(args, "--leave-running")
+	}
+	args = append(args, "--image-path", imageDir, id)
+	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("runsc checkpoint %s failed: %w: %s", id, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+type restoreOpts struct {
+	payload filePayload `json:"-"`
+
+	HavePagesFile      bool
+	HaveDeviceFile     bool
+	Background         bool
+	UseCheckpointGofer bool `json:"use_checkpoint_gofer"`
+}
+
+func (o *restoreOpts) filePayload() []*os.File {
+	return o.payload.Files
+}
+
+func (o *restoreOpts) setFilePayload(files []*os.File) {
+	o.payload.Files = files
+}
+
+// Restore connects a runsc sandbox previously created with Create, installs
+// its target networking, and restores the single compressed checkpoint file.
+// The Restore RPC has no fixed timeout because loading a large image may take
+// arbitrarily long; it remains cancellable through ctx.
+func (c *Client) Restore(ctx context.Context, args StartArgs, imagePath string) error {
+	if args.ID == "" {
+		return fmt.Errorf("container id is empty")
+	}
+	if imagePath == "" {
+		return fmt.Errorf("checkpoint image path is empty for %s", args.ID)
+	}
+	if args.Network.Interface == nil {
+		return fmt.Errorf("network interface is nil for %s", args.ID)
+	}
+
+	state, err := c.loadState(args.ID)
+	if err != nil {
+		return fmt.Errorf("load runsc state for %s: %w", args.ID, err)
+	}
+	rawSocket, err := c.openRawSocket(*args.Network.Interface)
+	if err != nil {
+		return err
+	}
+	defer rawSocket.Close()
+
+	networkArgs, err := BuildNetworkArgs(args.Network, rawSocket)
+	if err != nil {
+		return err
+	}
+	conn, err := c.connectControl(state.Sandbox.ControlSocketPath)
+	if err != nil {
+		return fmt.Errorf("connect runsc control socket for %s: %w", args.ID, err)
+	}
+	defer conn.Close()
+
+	if err := callContextWithTimeout(ctx, conn, contMgrCreateLinksAndRoutes, networkArgs, nil, 30*time.Second); err != nil {
+		return fmt.Errorf("create links and routes for %s: %w", args.ID, err)
+	}
+	image, err := os.Open(imagePath)
+	if err != nil {
+		return fmt.Errorf("open checkpoint image for %s: %w", args.ID, err)
+	}
+	defer image.Close()
+
+	opts := &restoreOpts{payload: filePayload{Files: []*os.File{image}}}
+	if err := callContext(ctx, conn, contMgrRestore, opts, nil); err != nil {
+		return fmt.Errorf("restore root container %s: %w", args.ID, err)
+	}
+	if err := c.markStateRunning(args.ID); err != nil {
+		return fmt.Errorf("mark runsc state running for %s: %w", args.ID, err)
+	}
+	return nil
+}
+
+func callContext(ctx context.Context, conn controlRPC, method string, arg, result any) error {
 	done := make(chan error, 1)
 	go func() {
 		done <- conn.Call(method, arg, result)
@@ -241,12 +360,16 @@ func callContext(ctx context.Context, conn *rpcClient, method string, arg, resul
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		conn.Close()
+		if interruptible, ok := conn.(interruptibleControlRPC); ok {
+			_ = interruptible.Interrupt()
+		} else {
+			_ = conn.Close()
+		}
 		return ctx.Err()
 	}
 }
 
-func callContextWithTimeout(ctx context.Context, conn *rpcClient, method string, arg, result any, timeout time.Duration) error {
+func callContextWithTimeout(ctx context.Context, conn controlRPC, method string, arg, result any, timeout time.Duration) error {
 	start := time.Now()
 	logrus.Debugf("runsc urpc call %s started", method)
 	if timeout <= 0 {
@@ -270,7 +393,7 @@ func (c *Client) Wait(ctx context.Context, id string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("load runsc state for %s: %w", id, err)
 	}
-	conn, err := connectRPC(state.Sandbox.ControlSocketPath)
+	conn, err := c.connectControl(state.Sandbox.ControlSocketPath)
 	if err != nil {
 		return 0, fmt.Errorf("connect runsc control socket for %s: %w", id, err)
 	}

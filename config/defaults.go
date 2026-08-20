@@ -40,7 +40,9 @@ const (
 
 	DefaultCgroupRoot = "/sandbox"
 
-	DefaultIPRange = "10.88.0.1/16"
+	DefaultIPRange       = "10.88.0.1/16"
+	DefaultHostPortStart = 21006
+	DefaultHostPortCount = 65535 - DefaultHostPortStart + 1
 
 	DefaultRunscBinary    = "/usr/local/bin/runsc"
 	DefaultRuncBinary     = "/usr/local/bin/runc"

@@ -92,6 +92,20 @@ func (c *rpcClient) Close() error {
 	return err
 }
 
+// Interrupt unblocks an in-flight Call without waiting for Call's serialization
+// mutex. The caller still owns Close, which releases the descriptor after the
+// blocked syscall has returned.
+func (c *rpcClient) Interrupt() error {
+	if c.fd < 0 {
+		return nil
+	}
+	err := unix.Shutdown(c.fd, unix.SHUT_RDWR)
+	if err == unix.ENOTCONN || err == unix.EINVAL {
+		return nil
+	}
+	return err
+}
+
 func (c *rpcClient) Call(method string, arg any, result any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

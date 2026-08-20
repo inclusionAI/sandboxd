@@ -54,6 +54,8 @@ func ToGRPC(err error) error {
 		return status.Error(codes.Unavailable, err.Error())
 	case IsNotImplemented(err):
 		return status.Error(codes.Unimplemented, err.Error())
+	case IsResourceExhausted(err):
+		return status.Error(codes.ResourceExhausted, err.Error())
 	case IsCanceled(err):
 		return status.Error(codes.Canceled, err.Error())
 	case IsDeadlineExceeded(err):
@@ -92,6 +94,8 @@ func FromGRPC(err error) error {
 		cls = ErrFailedPrecondition
 	case codes.Unimplemented:
 		cls = ErrNotImplemented
+	case codes.ResourceExhausted:
+		cls = ErrResourceExhausted
 	case codes.Canceled:
 		cls = context.Canceled
 	case codes.DeadlineExceeded:
