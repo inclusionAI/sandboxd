@@ -43,6 +43,7 @@ const (
 	DefaultIPRange = "10.88.0.1/16"
 
 	DefaultRunscBinary    = "/usr/local/bin/runsc"
+	DefaultRunscPlatform  = RunscPlatformSystrap
 	DefaultRuncBinary     = "/usr/local/bin/runc"
 	DefaultRuncShimBinary = "/usr/local/bin/runc-shim"
 	DefaultRuncStateRoot  = "/run/sandboxd/runc"

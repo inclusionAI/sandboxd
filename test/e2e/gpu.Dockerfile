@@ -33,8 +33,6 @@ RUN make release && \
 FROM ${GPU_ROOTFS_IMAGE} AS gpu-rootfs
 
 FROM docker.io/library/ubuntu:24.04
-ARG GVISOR_RELEASE=release-20260706.0
-ARG GVISOR_RELEASE_BASE_URL=https://storage.googleapis.com/gvisor/releases
 ARG LIBNVIDIA_CONTAINER_VERSION=1.19.1-1
 ENV DEBIAN_FRONTEND=noninteractive \
     E2E_DISABLE_CGROUP=1
@@ -71,17 +69,15 @@ RUN set -eux; \
       "libnvidia-container-tools=${LIBNVIDIA_CONTAINER_VERSION}"; \
     rm -rf /var/lib/apt/lists/*
 
+COPY third_party/runtime-versions.env /tmp/runtime-versions.env
 RUN set -eux; \
-    gvisor_version="${GVISOR_RELEASE#release-}"; \
-    test "${gvisor_version}" != "${GVISOR_RELEASE}"; \
-    gvisor_url="${GVISOR_RELEASE_BASE_URL}/release/${gvisor_version}/x86_64"; \
-    mkdir -p /tmp/gvisor-release; \
-    cd /tmp/gvisor-release; \
-    curl -fSLO --retry 10 --retry-delay 2 --retry-all-errors "${gvisor_url}/runsc"; \
-    curl -fSLO --retry 10 --retry-delay 2 --retry-all-errors "${gvisor_url}/runsc.sha512"; \
-    sha512sum -c runsc.sha512; \
-    install -m 0755 runsc /usr/local/bin/runsc; \
-    rm -rf /tmp/gvisor-release
+    . /tmp/runtime-versions.env; \
+    asset=/tmp/runsc; \
+    curl -fSL --retry 10 --retry-delay 2 --retry-all-errors \
+      "${GVISOR_AMD64_URL}" -o "${asset}"; \
+    echo "${GVISOR_AMD64_SHA512}  ${asset}" | sha512sum -c -; \
+    install -m 0755 "${asset}" /usr/local/bin/runsc; \
+    rm -f "${asset}" /tmp/runtime-versions.env
 
 COPY --from=sandboxd-builder /src/sandboxd/output/sandboxd /usr/local/bin/sandboxd
 COPY --from=sandboxd-builder /src/sandboxd/output/sbox /usr/local/bin/sbox

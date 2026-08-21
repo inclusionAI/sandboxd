@@ -38,6 +38,9 @@ func TestPublicSampleConfigIsComplete(t *testing.T) {
 	if cfg.RuntimeBinary[RuntimeNameRunsc] == "" {
 		t.Fatal("sample config must define the runsc binary")
 	}
+	if cfg.Runsc.Platform != RunscPlatformSystrap {
+		t.Fatalf("sample runsc platform = %q, want %q", cfg.Runsc.Platform, RunscPlatformSystrap)
+	}
 	if cfg.FilestoreDir == "" || cfg.FilestoreDirSize != "" {
 		t.Fatalf("sample filestore must default to an ordinary directory: %+v", cfg.RuntimeConfig)
 	}

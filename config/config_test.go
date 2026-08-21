@@ -21,6 +21,53 @@ import (
 	"github.com/pelletier/go-toml"
 )
 
+func TestNormalizeRunscPlatform(t *testing.T) {
+	for _, test := range []struct {
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{input: "", want: RunscPlatformSystrap},
+		{input: " systrap ", want: RunscPlatformSystrap},
+		{input: "KVM", want: RunscPlatformKVM},
+		{input: "ptrace", wantErr: true},
+		{input: "systrap|kvm", wantErr: true},
+	} {
+		got, err := NormalizeRunscPlatform(test.input)
+		if test.wantErr {
+			if err == nil {
+				t.Errorf("NormalizeRunscPlatform(%q) unexpectedly succeeded", test.input)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("NormalizeRunscPlatform(%q): %v", test.input, err)
+			continue
+		}
+		if got != test.want {
+			t.Errorf("NormalizeRunscPlatform(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func TestDefaultConfigUsesRunscSystrap(t *testing.T) {
+	if got := DefaultConfig().RuntimeConfig.Runsc.Platform; got != RunscPlatformSystrap {
+		t.Fatalf("DefaultConfig runsc platform = %q, want %q", got, RunscPlatformSystrap)
+	}
+}
+
+func TestRunscPlatformTOML(t *testing.T) {
+	var cfg Config
+	if err := toml.Unmarshal([]byte(
+		"[plugin.runtime.runsc]\nplatform = \"kvm\"\n",
+	), &cfg); err != nil {
+		t.Fatalf("decode runsc platform: %v", err)
+	}
+	if got := cfg.RuntimeConfig.Runsc.Platform; got != RunscPlatformKVM {
+		t.Fatalf("configured runsc platform = %q, want %q", got, RunscPlatformKVM)
+	}
+}
+
 func TestNormalizeCPULimitMode(t *testing.T) {
 	for _, test := range []struct {
 		input   string

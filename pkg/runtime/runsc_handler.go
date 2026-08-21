@@ -61,6 +61,10 @@ func NewRunscHandler(cfg config.Config, bin string, loader OciLoader) (*RunscHan
 	if cfg.RuntimeConfig.FilestoreDir == "" {
 		return nil, fmt.Errorf("runsc requires plugin.runtime.filestore_dir")
 	}
+	platform, err := config.NormalizeRunscPlatform(cfg.RuntimeConfig.Runsc.Platform)
+	if err != nil {
+		return nil, fmt.Errorf("configure runsc: %w", err)
+	}
 	root := cfg.RootDir
 	runscRoot := filepath.Join(root, config.RuntimeNameRunsc)
 	if err := os.MkdirAll(runscRoot, 0711); err != nil {
@@ -78,6 +82,7 @@ func NewRunscHandler(cfg config.Config, bin string, loader OciLoader) (*RunscHan
 
 	return &RunscHandler{
 		runsc: runscapi.NewClientWithOptions(bin, runscRoot, runscapi.Options{
+			Platform:         platform,
 			FilestoreDir:     cfg.RuntimeConfig.FilestoreDir,
 			OverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,
 			DebugLogPath:     runscLogPath,

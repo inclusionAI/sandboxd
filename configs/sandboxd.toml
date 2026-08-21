@@ -65,6 +65,10 @@ filestore_overcommit_ratio = 1.0
 loop_device_dir = "/dev"
 overlay_tmpfs_size = "256M"
 
+# Systrap is the default. Select kvm only when /dev/kvm is usable.
+[plugin.runtime.runsc]
+platform = "systrap"
+
 [plugin.runtime.basic_spec]
 # Empty uses sandboxd's built-in OCI base specification.
 runsc = ""

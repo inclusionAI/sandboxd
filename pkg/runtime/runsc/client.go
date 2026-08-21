@@ -47,6 +47,7 @@ type Client struct {
 }
 
 type Options struct {
+	Platform         string
 	FilestoreDir     string
 	OverlayTmpfsSize string
 	DebugLogPath     string
@@ -157,6 +158,9 @@ func RootFileOverlay(dir, size string) string {
 
 func (c *Client) globalArgs() []string {
 	args := []string{"--root", c.RootDir}
+	if c.Options.Platform != "" {
+		args = append(args, "--platform="+c.Options.Platform)
+	}
 	if c.Options.IgnoreCgroups {
 		args = append(args, "--ignore-cgroups")
 	}

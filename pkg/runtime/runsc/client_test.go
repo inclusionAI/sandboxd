@@ -105,6 +105,16 @@ func TestCreateRejectsMissingFilestore(t *testing.T) {
 	}
 }
 
+func TestGlobalArgsIncludePlatform(t *testing.T) {
+	client := NewClientWithOptions("/usr/local/bin/runsc", "/run/runsc", Options{
+		Platform: "kvm",
+	})
+	args := client.globalArgs()
+	if got := strings.Join(args, " "); got != "--root /run/runsc --platform=kvm" {
+		t.Fatalf("global args = %q", got)
+	}
+}
+
 func TestGlobalArgsIgnoreCgroups(t *testing.T) {
 	client := NewClientWithOptions("/usr/local/bin/runsc", "/run/runsc", Options{
 		IgnoreCgroups: true,

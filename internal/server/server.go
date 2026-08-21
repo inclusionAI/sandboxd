@@ -593,6 +593,12 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	if err := validateRuntimeFilestore(cfg.RuntimeConfig); err != nil {
 		return nil, err
 	}
+	runscPlatform, err := config.NormalizeRunscPlatform(cfg.RuntimeConfig.Runsc.Platform)
+	if err != nil {
+		return nil, fmt.Errorf("runtime configuration: %w", err)
+	}
+	cfg.RuntimeConfig.Runsc.Platform = runscPlatform
+
 	cpuLimitMode, err := config.NormalizeCPULimitMode(cfg.CPULimitMode)
 	if err != nil {
 		return nil, fmt.Errorf("resource configuration: %w", err)

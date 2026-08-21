@@ -40,6 +40,7 @@ DISABLE_CGROUP="${E2E_DISABLE_CGROUP:-0}"
 CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
 E2E_RUNTIME="${E2E_RUNTIME:-all}"
 E2E_RUNC_ONLY="${E2E_RUNC_ONLY:-0}"
+RUNSC_PLATFORM="${E2E_RUNSC_PLATFORM:-systrap}"
 export RUNSC_IGNORE_CGROUPS="${DISABLE_CGROUP}"
 
 SANDBOXD_PID=""
@@ -145,6 +146,7 @@ preflight() {
         all|runsc|runc) ;;
         *) fail "E2E_RUNTIME must be all, runsc, or runc" ;;
     esac
+    [[ "${RUNSC_PLATFORM}" =~ ^(systrap|kvm)$ ]] || fail "E2E_RUNSC_PLATFORM must be systrap or kvm"
     case "${E2E_RUNC_ONLY}" in
         0) ;;
         1)
@@ -280,6 +282,9 @@ filestore_dir = "${FILESTORE}"
 filestore_dir_size = "1G"
 loop_device_dir = "/dev"
 overlay_tmpfs_size = "64M"
+
+[plugin.runtime.runsc]
+platform = "${RUNSC_PLATFORM}"
 
 [plugin.runtime.runc]
 state_root = "/run/sandboxd/runc"

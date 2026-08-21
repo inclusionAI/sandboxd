@@ -42,6 +42,7 @@ func TestNewRunscHandlerUsesSharedLogFile(t *testing.T) {
 		t.Fatalf("runsc client has unexpected type %T", handler.runsc)
 	}
 	assert.Equal(t, filepath.Join(baseDir, "logs", config.RuntimeNameRunsc, "runsc.log"), client.Options.DebugLogPath)
+	assert.Equal(t, config.RunscPlatformSystrap, client.Options.Platform)
 }
 
 func TestNewRunscHandlerPropagatesIgnoreCgroups(t *testing.T) {
@@ -54,6 +55,27 @@ func TestNewRunscHandlerPropagatesIgnoreCgroups(t *testing.T) {
 
 	client := handler.runsc.(*runscapi.Client)
 	assert.True(t, client.Options.IgnoreCgroups)
+}
+
+func TestNewRunscHandlerPropagatesKVMPlatform(t *testing.T) {
+	rootDir := filepath.Join(t.TempDir(), "sandboxd", "root")
+	cfg := config.Config{RootDir: rootDir}
+	cfg.RuntimeConfig.FilestoreDir = filepath.Join(t.TempDir(), "filestore")
+	cfg.RuntimeConfig.Runsc.Platform = config.RunscPlatformKVM
+	handler, err := NewRunscHandler(cfg, "/usr/local/bin/runsc", nil)
+	assert.NoError(t, err)
+
+	client := handler.runsc.(*runscapi.Client)
+	assert.Equal(t, config.RunscPlatformKVM, client.Options.Platform)
+}
+
+func TestNewRunscHandlerRejectsInvalidPlatform(t *testing.T) {
+	rootDir := filepath.Join(t.TempDir(), "sandboxd", "root")
+	cfg := config.Config{RootDir: rootDir}
+	cfg.RuntimeConfig.FilestoreDir = filepath.Join(t.TempDir(), "filestore")
+	cfg.RuntimeConfig.Runsc.Platform = "ptrace"
+	_, err := NewRunscHandler(cfg, "/usr/local/bin/runsc", nil)
+	assert.ErrorContains(t, err, "runsc platform must be")
 }
 
 func TestNewRunscHandlerRejectsMissingFilestore(t *testing.T) {

@@ -30,6 +30,7 @@ E2E_STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
 E2E_CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
 E2E_RUNTIME="${E2E_RUNTIME:-all}"
 E2E_RUNC_ONLY="${E2E_RUNC_ONLY:-0}"
+E2E_RUNSC_PLATFORM="${E2E_RUNSC_PLATFORM:-systrap}"
 
 log() {
     printf '[e2e-run] %s\n' "$*"
@@ -55,6 +56,10 @@ cd "${ROOT_DIR}"
 case "${E2E_RUNTIME}" in
     all|runsc|runc) ;;
     *) fail "E2E_RUNTIME must be all, runsc, or runc" ;;
+esac
+case "${E2E_RUNSC_PLATFORM}" in
+    systrap|kvm) ;;
+    *) fail "E2E_RUNSC_PLATFORM must be systrap or kvm" ;;
 esac
 case "${E2E_RUNC_ONLY}" in
     0) ;;
@@ -126,6 +131,7 @@ set +e
     -e "E2E_STRESS_CONCURRENCY=${E2E_STRESS_CONCURRENCY}" \
     -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
     -e "E2E_RUNTIME=${E2E_RUNTIME}" \
+    -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
     --tmpfs /home/akernel:rw,exec,size=2g \
     --tmpfs /e2e:rw,exec,size=512m \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
@@ -152,6 +158,7 @@ set +e
     --net bridge \
     -e E2E_DISABLE_CGROUP=1 \
     -e E2E_RUNTIME=runsc \
+    -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
     -e E2E_CPU_LIMIT_MODE=shares \
     --tmpfs /home/akernel:rw,exec,size=2g \
     --tmpfs /e2e:rw,exec,size=512m \
