@@ -63,7 +63,7 @@ BPF_TEST_BUILD_ARGS ?=
 BPF_SOURCE_DIRS := bpf/bpfnat bpf/networkacl
 BPF_C_SOURCES := $(shell find $(BPF_SOURCE_DIRS) -type f \( -name '*.c' -o -name '*.h' \) | sort)
 
-.PHONY: all clean test storage-test e2e release release-binary release-cli runc-shim sandbox-logger firecracker-agent protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
+.PHONY: all clean test storage-test e2e e2e-runtime-binaries e2e-runtime-case e2e-runtime-suite release release-binary release-cli runc-shim sandbox-logger firecracker-agent protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
@@ -110,6 +110,15 @@ storage-test: ## run privileged loop-backed filesystem integration tests
 
 e2e: ## run unit tests and the selected privileged runtime e2e flows
 	@bash test/e2e/run.sh
+
+e2e-runtime-binaries: ## build the project-owned runtime E2E binaries
+	@bash test/e2e/build-binaries.sh
+
+e2e-runtime-case: ## build and run one E2E_CASE runtime image
+	@bash test/e2e/runtime-case.sh
+
+e2e-runtime-suite: ## build binaries once and test every supported runtime
+	@bash test/e2e/runtime-suite.sh
 
 FORCE:
 

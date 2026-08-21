@@ -20,7 +20,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         busybox-static \
         ca-certificates \
-        curl \
+        e2fsprogs \
         erofs-utils \
         iproute2 \
         iptables \
@@ -39,21 +39,26 @@ RUN apt-get update && \
 
 COPY output/sandboxd /usr/local/bin/sandboxd
 COPY output/sbox /usr/local/bin/sbox
-COPY output/runsc /usr/local/bin/runsc
-COPY output/runc /usr/local/bin/runc
-COPY output/runc-shim /usr/local/bin/runc-shim
+COPY output/sandbox-logger /usr/local/bin/sandbox-logger
 COPY output/oom-hog /usr/local/bin/oom-hog
 COPY output/network-policy-client /usr/local/bin/network-policy-client
+COPY output/kata/ /opt/kata/
 COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
 
-RUN chmod 0755 \
+RUN ln -s \
+        /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 \
+        /usr/local/bin/containerd-shim-kata-v2 && \
+    chmod 0755 \
         /usr/local/bin/sandboxd \
         /usr/local/bin/sbox \
-        /usr/local/bin/runsc \
-        /usr/local/bin/runc \
-        /usr/local/bin/runc-shim \
+        /usr/local/bin/sandbox-logger \
         /usr/local/bin/oom-hog \
         /usr/local/bin/network-policy-client \
-        /usr/local/bin/sandboxd-e2e-run
+        /usr/local/bin/containerd-shim-kata-v2 \
+        /usr/local/bin/sandboxd-e2e-run && \
+    chmod 0644 \
+        /opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml \
+        /opt/kata/share/kata-containers/kata-containers.img \
+        /opt/kata/share/kata-containers/vmlinux-dragonball-experimental.container
 
 ENTRYPOINT ["/usr/local/bin/sandboxd-e2e-run"]

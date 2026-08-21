@@ -18,6 +18,7 @@ import (
 	"flag"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"time"
 )
 
@@ -32,7 +33,8 @@ func main() {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	const chunkSize = 1 << 20
+	debug.SetGCPercent(-1)
+	const chunkSize = 8 << 20
 	chunks := make([][]byte, 0, 1024)
 	for {
 		chunk := make([]byte, chunkSize)

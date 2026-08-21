@@ -23,8 +23,8 @@ make bpfnat-test
 
 `make bpfnat-test` runs privileged dataplane, map, garbage-collection,
 restart, and lifecycle tests in an isolated container network namespace and
-bpffs mount, so it is intentionally not part of the default GitHub CI
-workflow.
+bpffs mount. The default GitHub CI workflow runs it in the network dataplane
+job.
 
 When changing bpfnat behavior, extend the regular unit tests for pure parsing
 and policy logic and add or update the tagged integration tests for
@@ -48,6 +48,27 @@ Build a gVisor candidate through the gated workflow in
 sandboxd runtime suite and the AKernel standalone E2E. Promote the candidate
 without rebuilding it. Only after promotion should this repository pin the
 published release URL and its verified SHA-512 digest.
+
+The AKernel Firecracker release is a checksum-pinned runtime bundle from
+`akernel-dev/firecracker`. It reuses the official VMM binary and packages the
+tested guest kernel, resolved configuration, licenses, checksums, and
+provenance. Build and test an expiring candidate with sandboxd and AKernel,
+then promote those exact bytes without rebuilding them. Only after promotion
+should this repository update the bundle release, URL, and SHA-256 pin. The
+sandboxd-built `firecracker-agent` initrd deliberately remains outside that
+bundle so its guest protocol always matches the consuming sandboxd revision.
+
+Run the complete runtime compatibility suite on a nested-KVM host with:
+
+```sh
+make e2e-runtime-suite
+```
+
+The suite builds the project binaries once, assembles targeted runtime images,
+and tests runsc with systrap, runsc with KVM, Kata, Firecracker, and runc. CI
+passes those binaries to five independent matrix jobs. Keep the gVisor TAP
+contract, network ACL cases, and AKernel's shared manifest consumer in sync
+when changing this path.
 
 # Firecracker Storage Contract
 

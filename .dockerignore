@@ -11,3 +11,10 @@ output/*
 !output/runc
 !output/runc-shim
 !output/oom-hog
+!output/network-policy-client
+!output/firecracker-agent
+!output/firecracker
+!output/firecracker-vmlinux
+!output/firecracker-initrd.img
+!output/kata/
+!output/kata/**

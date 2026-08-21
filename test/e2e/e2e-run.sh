@@ -27,12 +27,17 @@ ROOTFS="${E2E_ROOTFS:-/e2e/rootfs}"
 EROFS_ROOTFS="${E2E_EROFS_ROOTFS:-/e2e/rootfs.erofs}"
 EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
 EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
+FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
+FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
+FIRECRACKER_OVERLAY_BYTES="${E2E_FIRECRACKER_OVERLAY_BYTES:-134217728}"
 HOST_MOUNT="${E2E_HOST_MOUNT:-/e2e/host-mount}"
 WWW_ROOT="${E2E_WWW_ROOT:-/e2e/www}"
 CGROUP_ROOT="${E2E_CGROUP_ROOT:-sandboxd-e2e}"
 NETWORK_CIDR="${E2E_NETWORK_CIDR:-10.88.0.1/16}"
 GATEWAY_IP="${E2E_GATEWAY_IP:-10.88.0.1}"
 HTTP_PORT="${E2E_HTTP_PORT:-18080}"
+DNAT_HOST_PORT="${E2E_DNAT_HOST_PORT:-18181}"
+DNAT_GUEST_PORT="${E2E_DNAT_GUEST_PORT:-18180}"
 BRIDGE_NAME="${E2E_BRIDGE_NAME:-sandbox0}"
 STRESS_ROUNDS="${E2E_STRESS_ROUNDS:-0}"
 STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
@@ -133,6 +138,13 @@ cleanup() {
         log "sandboxd log tail"
         tail -200 "${LOG_FILE}" >&2
     fi
+    if [ "${status}" -ne 0 ] && [ -d /home/akernel/logs/runsc ]; then
+        local runsc_log
+        while IFS= read -r runsc_log; do
+            log "runsc log tail: ${runsc_log}"
+            tail -200 "${runsc_log}" >&2
+        done < <(find /home/akernel/logs/runsc -type f | sort)
+    fi
 }
 trap cleanup EXIT
 
@@ -143,8 +155,8 @@ preflight() {
     [[ "${DISABLE_CGROUP}" =~ ^[01]$ ]] || fail "E2E_DISABLE_CGROUP must be 0 or 1"
     [[ "${CPU_LIMIT_MODE}" =~ ^(shares|quota)$ ]] || fail "E2E_CPU_LIMIT_MODE must be shares or quota"
     case "${E2E_RUNTIME}" in
-        all|runsc|runc) ;;
-        *) fail "E2E_RUNTIME must be all, runsc, or runc" ;;
+        all|runsc|runc|kata|firecracker) ;;
+        *) fail "E2E_RUNTIME must be all, runsc, runc, kata, or firecracker" ;;
     esac
     [[ "${RUNSC_PLATFORM}" =~ ^(systrap|kvm)$ ]] || fail "E2E_RUNSC_PLATFORM must be systrap or kvm"
     case "${E2E_RUNC_ONLY}" in
@@ -160,11 +172,48 @@ preflight() {
     if [ "${E2E_RUNTIME}" = "runc" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
         fail "runc e2e requires sandbox-managed cgroups"
     fi
+    if [ "${E2E_RUNTIME}" = "kata" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
+        fail "Kata e2e requires sandbox-managed cgroups"
+    fi
+    if [ "${E2E_RUNTIME}" = "firecracker" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
+        fail "Firecracker e2e requires sandbox-managed cgroups"
+    fi
 
     local bin
-    for bin in sandboxd sbox runsc runc runc-shim ip iptables busybox mkfs.erofs; do
+    for bin in sandboxd sbox ip iptables busybox mkfs.erofs; do
         command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
     done
+    case "${E2E_RUNTIME}" in
+        all)
+            for bin in runsc runc runc-shim; do
+                command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
+            done
+            ;;
+        runsc)
+            command -v runsc >/dev/null 2>&1 || fail "missing command: runsc"
+            ;;
+        runc)
+            for bin in runc runc-shim; do
+                command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
+            done
+            ;;
+        kata)
+            command -v containerd-shim-kata-v2 >/dev/null 2>&1 ||
+                fail "missing command: containerd-shim-kata-v2"
+            command -v sandbox-logger >/dev/null 2>&1 ||
+                fail "missing command: sandbox-logger"
+            [ -c /dev/kvm ] || fail "Kata e2e requires /dev/kvm"
+            [ -f /opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml ] ||
+                fail "missing Kata Dragonball configuration"
+            ;;
+        firecracker)
+            command -v firecracker >/dev/null 2>&1 || fail "missing command: firecracker"
+            command -v mkfs.ext4 >/dev/null 2>&1 || fail "missing command: mkfs.ext4"
+            [ -c /dev/kvm ] || fail "Firecracker e2e requires /dev/kvm"
+            [ -f "${FIRECRACKER_KERNEL}" ] || fail "missing Firecracker kernel"
+            [ -f "${FIRECRACKER_INITRD}" ] || fail "missing Firecracker initrd"
+            ;;
+    esac
 
     if [ "${DISABLE_CGROUP}" = "1" ]; then
         log "cgroup management disabled; skipping writable-cgroup preflight"
@@ -259,6 +308,25 @@ EOF
         disable_cgroup=true
     fi
 
+    local runtime_binaries
+    case "${E2E_RUNTIME}" in
+        all)
+            runtime_binaries=$'runsc = "/usr/local/bin/runsc"\nrunc = "/usr/local/bin/runc"'
+            ;;
+        runsc)
+            runtime_binaries='runsc = "/usr/local/bin/runsc"'
+            ;;
+        runc)
+            runtime_binaries='runc = "/usr/local/bin/runc"'
+            ;;
+        kata)
+            runtime_binaries='kata = "/usr/local/bin/containerd-shim-kata-v2"'
+            ;;
+        firecracker)
+            runtime_binaries='firecracker = "/usr/local/bin/firecracker"'
+            ;;
+    esac
+
     cat > "${CONFIG_FILE}" <<EOF
 rootDir = "${SANDBOXD_ROOT}"
 storeDir = "${SANDBOXD_STORE}"
@@ -266,6 +334,8 @@ storeDir = "${SANDBOXD_STORE}"
 [plugin.network]
 ip_range = "${NETWORK_CIDR}"
 nat_backend = "iptables"
+enable_local_dnat = true
+enable_network_acl = true
 
 [plugin.resource]
 disable_cgroup = ${disable_cgroup}
@@ -293,13 +363,29 @@ shim_binary = "/usr/local/bin/runc-shim"
 # suite verify opt-in character-device and OCI device-cgroup injection.
 kvm_device = "/dev/null"
 
+[plugin.runtime.kata]
+config_path = "/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml"
+kvm_device = "/dev/kvm"
+dan_config_dir = "/run/kata-containers/dans"
+logger_binary = "/usr/local/bin/sandbox-logger"
+
+[plugin.runtime.firecracker]
+kernel_image_path = "${FIRECRACKER_KERNEL}"
+initrd_path = "${FIRECRACKER_INITRD}"
+kernel_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init random.trust_cpu=on"
+kvm_device = "/dev/kvm"
+default_vcpu_count = 1
+default_memory_mib = 256
+default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
+
 [plugin.runtime.basic_spec]
 runsc = ""
 runc = ""
+kata = ""
+firecracker = ""
 
 [plugin.runtime.runtime_binary]
-runsc = "/usr/local/bin/runsc"
-runc = "/usr/local/bin/runc"
+${runtime_binaries}
 
 [plugin.image]
 root = "${SANDBOXD_HOME}/image_manager"
@@ -355,11 +441,15 @@ EOF
     mkfs.erofs "${EROFS_MOUNT_IMAGE}" "${EROFS_MOUNT_ROOT}" >/dev/null
 }
 
-crash_and_restart_sandboxd() {
+crash_sandboxd() {
     log "crashing sandboxd to exercise recovery"
     kill -9 "${SANDBOXD_PID}"
     wait "${SANDBOXD_PID}" >/dev/null 2>&1 || true
     SANDBOXD_PID=""
+}
+
+crash_and_restart_sandboxd() {
+    crash_sandboxd
     start_sandboxd
 }
 
@@ -406,6 +496,29 @@ sbox_cmd() {
     /usr/local/bin/sbox --address "${SOCKET}" --timeout 30s "$@"
 }
 
+set_network_policy() {
+    local sandbox_id="$1"
+    local policy="$2"
+    shift 2
+    /usr/local/bin/network-policy-client \
+        --address "${SOCKET}" \
+        --sandbox-id "${sandbox_id}" \
+        --policy "${policy}" \
+        "$@"
+}
+
+http_get_without_proxy() {
+    local address="$1"
+    local port="$2"
+    local path="$3"
+    printf 'GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n' \
+        "${path}" "${address}" |
+        /bin/nc -w 2 "${address}" "${port}" |
+        tr -d '\r' |
+        awk 'body { print } /^$/ { body = 1 }' |
+        tail -1
+}
+
 assert_eq() {
     local got="$1"
     local want="$2"
@@ -413,6 +526,127 @@ assert_eq() {
     if [ "${got}" != "${want}" ]; then
         fail "${name}: got ${got@Q}, want ${want@Q}"
     fi
+}
+
+run_network_acl_checks() {
+    local runtime_name="$1"
+    local log_slug="$2"
+
+    log "testing ${runtime_name} TAP network ACL updates"
+    set_network_policy "${SANDBOX_ID}" deny-all
+    if sbox_cmd exec "${SANDBOX_ID}" /bin/wget -T 2 -t 1 -qO- \
+        "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt" \
+        >"/tmp/${log_slug}-acl-deny.log" 2>&1; then
+        cat "/tmp/${log_slug}-acl-deny.log" >&2
+        fail "${runtime_name} deny-all policy allowed gateway HTTP"
+    fi
+
+    set_network_policy "${SANDBOX_ID}" allow-http \
+        --peer-address "${GATEWAY_IP}" \
+        --peer-port "${HTTP_PORT}"
+    local got
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- \
+        "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
+    assert_eq "${got}" "sandboxd-network-ok" \
+        "${runtime_name} allowlisted gateway HTTP"
+
+    set_network_policy "${SANDBOX_ID}" dns-deny-all
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/awk \
+        '/^nameserver / { print $2; exit }' /etc/resolv.conf)"
+    assert_eq "${got}" "${GATEWAY_IP}" "${runtime_name} managed resolver"
+    if sbox_cmd exec "${SANDBOX_ID}" \
+        /bin/timeout 2 /bin/nslookup blocked.invalid \
+        >"/tmp/${log_slug}-dns-deny.log" 2>&1; then
+        cat "/tmp/${log_slug}-dns-deny.log" >&2
+        fail "${runtime_name} DNS deny-all policy allowed a query"
+    fi
+
+    set_network_policy "${SANDBOX_ID}" clear
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- \
+        "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
+    assert_eq "${got}" "sandboxd-network-ok" \
+        "${runtime_name} cleared network policy"
+}
+
+run_dnat_check() {
+    local runtime="$1"
+    local runtime_name="$2"
+    local rootfs="$3"
+    local memory_mb="$4"
+    local expected="${runtime}-dnat-ok"
+
+    log "testing ${runtime_name} DNAT port forwarding"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime "${runtime}" \
+        --sandbox-id "sbox-e2e-${runtime}-dnat" \
+        --rootfs "${rootfs}" \
+        --port "tcp:${DNAT_HOST_PORT}:${DNAT_GUEST_PORT}" \
+        --cpu-millicores 100 \
+        --memory-mb "${memory_mb}" \
+        /bin/sh -c "mkdir -p /var/www; \
+            echo ${expected} > /var/www/health.txt; \
+            exec /bin/httpd -f -p 0.0.0.0:${DNAT_GUEST_PORT} -h /var/www")"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+
+    local dnat_target_ip
+    dnat_target_ip="$(iptables -t nat -S PREROUTING | awk \
+        -v port="${DNAT_HOST_PORT}" \
+        '$0 ~ "--dport " port {
+            for (field = 1; field <= NF; field++) {
+                if ($field == "--to-destination") {
+                    split($(field + 1), destination, ":")
+                    print destination[1]
+                    exit
+                }
+            }
+        }')"
+    [ -n "${dnat_target_ip}" ] ||
+        fail "${runtime_name} DNAT target IP is missing"
+
+    local direct_response=""
+    local dnat_response=""
+    local dnat_attempt
+    for dnat_attempt in $(seq 1 100); do
+        direct_response="$(http_get_without_proxy \
+            "${dnat_target_ip}" "${DNAT_GUEST_PORT}" /health.txt || true)"
+        if [ "${direct_response}" = "${expected}" ]; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "${direct_response}" != "${expected}" ]; then
+        sbox_cmd exec "${SANDBOX_ID}" /bin/netstat -ltn >&2 || true
+        sbox_cmd exec "${SANDBOX_ID}" /bin/ip address show >&2 || true
+        sbox_cmd exec "${SANDBOX_ID}" /bin/ip route show >&2 || true
+        ping -c 1 -W 1 "${dnat_target_ip}" >&2 || true
+        ip neigh show "${dnat_target_ip}" >&2 || true
+        bridge fdb show >&2 || true
+        iptables -t nat -nvL OUTPUT >&2 || true
+        iptables -t nat -nvL PREROUTING >&2 || true
+    fi
+    assert_eq "${direct_response}" "${expected}" \
+        "${runtime_name} published service"
+
+    for dnat_attempt in $(seq 1 100); do
+        dnat_response="$(http_get_without_proxy \
+            "${GATEWAY_IP}" "${DNAT_HOST_PORT}" /health.txt || true)"
+        if [ "${dnat_response}" = "${expected}" ]; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "${dnat_response}" != "${expected}" ]; then
+        iptables -t nat -nvL OUTPUT >&2 || true
+        iptables -t nat -nvL PREROUTING >&2 || true
+        iptables -t nat -nvL POSTROUTING >&2 || true
+        ip route show >&2 || true
+    fi
+    assert_eq "${dnat_response}" "${expected}" \
+        "${runtime_name} local DNAT"
+
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
 }
 
 wait_for_state() {
@@ -447,6 +681,41 @@ wait_for_exec_output() {
     fail "sandbox ${sandbox_id} command output did not become ${expected@Q}; last output: ${got@Q}"
 }
 
+wait_for_file_text() {
+    local path="$1"
+    local expected="$2"
+    local i
+    for i in $(seq 1 100); do
+        if [ -f "${path}" ] && grep -Fq "${expected}" "${path}"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    fail "file ${path} did not contain ${expected@Q}"
+}
+
+list_cached_taps() {
+    ip -o link show master "${BRIDGE_NAME}" 2>/dev/null |
+        awk -F ': ' '$2 ~ /^tap\./ { sub(/@.*/, "", $2); print $2 }' |
+        sort
+}
+
+wait_for_leased_tap() {
+    local tap
+    local i
+    for i in $(seq 1 100); do
+        while IFS= read -r tap; do
+            if [ -n "${tap}" ] &&
+                ip -o link show "${tap}" | grep -q '<[^>]*UP'; then
+                echo "${tap}"
+                return 0
+            fi
+        done < <(list_cached_taps)
+        sleep 0.1
+    done
+    fail "no leased TAP appeared on bridge ${BRIDGE_NAME}"
+}
+
 wait_for_cgroup_child() {
     local i
     local child=""
@@ -473,6 +742,25 @@ wait_for_cgroup_count() {
         sleep 0.1
     done
     fail "cgroup child count did not reach ${expected}; last count: ${count}"
+}
+
+wait_for_process_exit() {
+    local pid="$1"
+    local description="$2"
+    local remaining=100
+    local state=""
+    while [ "${remaining}" -gt 0 ]; do
+        if [ ! -r "/proc/${pid}/stat" ]; then
+            return 0
+        fi
+        state="$(sed -n 's/^.*) \([^ ]\).*/\1/p' "/proc/${pid}/stat")"
+        if [ -z "${state}" ] || [ "${state}" = "Z" ]; then
+            return 0
+        fi
+        remaining=$((remaining - 1))
+        sleep 0.1
+    done
+    fail "${description} pid ${pid} is still running"
 }
 
 assert_cgroup_limits() {
@@ -520,6 +808,21 @@ assert_cgroup_limits() {
     fi
 }
 
+wait_for_exit_code_log() {
+    local sandbox_id="$1"
+    local exit_code="$2"
+    local i
+    for i in $(seq 1 100); do
+        if grep -q \
+            "wait sandbox ${sandbox_id} finished.*ExitCode:${exit_code}" \
+            "${LOG_FILE}"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    fail "sandbox ${sandbox_id} did not record exit code ${exit_code}"
+}
+
 assert_wait_log() {
     local sandbox_id="$1"
     local oom="$2"
@@ -540,11 +843,13 @@ assert_wait_log() {
 }
 
 run_stress_checks() {
+    local runtime="${1:-runsc}"
+    local rootfs="${2:-${ROOTFS}}"
     if [ "${STRESS_ROUNDS}" -eq 0 ]; then
         return
     fi
 
-    log "running ${STRESS_ROUNDS} stress rounds at concurrency ${STRESS_CONCURRENCY}"
+    log "running ${STRESS_ROUNDS} ${runtime} stress rounds at concurrency ${STRESS_CONCURRENCY}"
     local round
     local slot
     local id
@@ -557,9 +862,9 @@ run_stress_checks() {
             STRESS_IDS+=("${id}")
             sbox_cmd start \
                 --quiet \
-                --runtime runsc \
+                --runtime "${runtime}" \
                 --sandbox-id "${id}" \
-                --rootfs "${ROOTFS}" \
+                --rootfs "${rootfs}" \
                 --cpu-millicores 100 \
                 --memory-mb 128 \
                 /bin/sleep 300 >"/tmp/${id}.start.log" 2>&1 &
@@ -594,12 +899,15 @@ run_stress_checks() {
 }
 
 run_storage_quota_check() {
-    log "testing writable-layer storage quota"
+    local runtime="${1:-runsc}"
+    local rootfs="${2:-${ROOTFS}}"
+
+    log "testing ${runtime} writable-layer storage quota"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
-        --runtime runsc \
+        --runtime "${runtime}" \
         --sandbox-id sbox-e2e-storage \
-        --rootfs "${ROOTFS}" \
+        --rootfs "${rootfs}" \
         --storage-mb 16 \
         /bin/sleep 300)"
     [ -n "${SANDBOX_ID}" ] || fail "storage quota start returned empty sandbox id"
@@ -708,10 +1016,324 @@ run_runc_checks() {
         --memory-mb 128 \
         /bin/sh -c 'exit 23')"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED"
-    grep -q "wait sandbox ${SANDBOX_ID} finished.*ExitCode:23" "${LOG_FILE}" || \
-        fail "runc natural exit code was not persisted"
+    wait_for_exit_code_log "${SANDBOX_ID}" 23
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
+}
+
+run_kata_checks() {
+    log "testing Kata runtime-rs with a cached TAP endpoint"
+    # Keep BusyBox ash from waiting as PID 1: Kata exec exits deliver SIGCHLD
+    # to the container init process and can otherwise end its foreground sleep.
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime kata \
+        --sandbox-id sbox-e2e-kata \
+        --rootfs "${ROOTFS}" \
+        --cwd / \
+        --env E2E_MARKER=kata-env-ok \
+        --mount "${HOST_MOUNT}:/mnt/host" \
+        --cpu-millicores 500 \
+        --memory-mb 512 \
+        /bin/sh -c 'echo "$E2E_MARKER" > /tmp/start-env && exec sleep 300')"
+    [ -n "${SANDBOX_ID}" ] || fail "Kata start returned empty sandbox id"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+
+    local cached_tap
+    cached_tap="$(wait_for_leased_tap)"
+    if ! ip -o link show "${cached_tap}" | grep -q '<[^>]*UP'; then
+        fail "leased Kata TAP ${cached_tap} is not administratively up"
+    fi
+    local dan_config="/run/kata-containers/dans/${SANDBOX_ID}.json"
+    [ -f "${dan_config}" ] || fail "Kata DAN configuration is missing"
+    jq -e --arg tap "${cached_tap}" \
+        '.devices[0].device.type == "host-tap" and
+         .devices[0].device.tap_name == $tap and
+         .devices[0].name == "eth0"' \
+        "${dan_config}" >/dev/null ||
+        fail "Kata DAN configuration does not reference cached TAP ${cached_tap}"
+
+    local cache_cgroup
+    cache_cgroup="$(wait_for_cgroup_child)"
+    assert_cgroup_limits "${cache_cgroup}" 500 512
+
+    local got
+    wait_for_exec_output "${SANDBOX_ID}" "kata-env-ok" /bin/cat /tmp/start-env
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo kata-write-ok > /tmp/kata-write && cat /tmp/kata-write')"
+    assert_eq "${got}" "kata-write-ok" "Kata writable rootfs"
+    [ ! -e "${ROOTFS}/tmp/kata-write" ] ||
+        fail "Kata write escaped into the source rootfs"
+    got="$(printf 'kata-stdin-ok' | sbox_cmd exec "${SANDBOX_ID}" /bin/cat)"
+    assert_eq "${got}" "kata-stdin-ok" "Kata exec stdin"
+
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/host/input.txt)"
+    assert_eq "${got}" "host-mount-ok" "Kata host bind mount"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- \
+        "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
+    assert_eq "${got}" "sandboxd-network-ok" "Kata cached TAP network"
+    run_network_acl_checks "Kata" kata
+    sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" ||
+        fail "Kata stats output missing memory usage"
+
+    local tty_status=0
+    printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh >/dev/null ||
+        tty_status=$?
+    assert_eq "${tty_status}" "7" "Kata TTY exit status"
+
+    sleep 6
+    crash_and_restart_sandboxd
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/echo recovered-kata)"
+    assert_eq "${got}" "recovered-kata" "Kata exec after sandboxd restart"
+
+    local deleted_id="${SANDBOX_ID}"
+    sbox_cmd delete "${deleted_id}"
+    SANDBOX_ID=""
+    [ ! -e "${dan_config}" ] || fail "Kata DAN configuration leaked after delete"
+    if ip -o link show "${cached_tap}" | grep -q '<[^>]*UP'; then
+        fail "recycled Kata TAP ${cached_tap} remained administratively up"
+    fi
+    sbox_cmd delete "${deleted_id}"
+
+    run_dnat_check kata "Kata" "${ROOTFS}" 256
+
+    log "testing Kata natural exit"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime kata \
+        --sandbox-id sbox-e2e-kata-exit \
+        --rootfs "${ROOTFS}" \
+        --cpu-millicores 100 \
+        --memory-mb 256 \
+        /bin/sh -c 'exit 23')"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED" 300
+    wait_for_exit_code_log "${SANDBOX_ID}" 23
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+}
+
+run_firecracker_checks() {
+    log "testing Firecracker EROFS root, writable layer, exec, and network"
+    local main_stdout="/tmp/firecracker-main.stdout"
+    local main_stderr="/tmp/firecracker-main.stderr"
+    rm -f "${main_stdout}" "${main_stderr}" /tmp/firecracker-exec.stderr
+
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime firecracker \
+        --sandbox-id sbox-e2e-firecracker \
+        --rootfs "${EROFS_ROOTFS}" \
+        --cwd / \
+        --env E2E_MARKER=firecracker-env-ok \
+        --mount "${HOST_MOUNT}/input.txt:/mnt/host/input.txt:bind:ro" \
+        --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs:erofs:ro" \
+        --mount "tmpfs:/mnt/ram:tmpfs:rw,nosuid,nodev,noexec,size=1m,mode=0755" \
+        --stdout "${main_stdout}" \
+        --stderr "${main_stderr}" \
+        --cpu-millicores 1500 \
+        --memory-mb 256 \
+        /bin/sh -c 'echo "$E2E_MARKER" > /var/start-env; echo firecracker-main-stdout; sleep 300')"
+    [ -n "${SANDBOX_ID}" ] || fail "Firecracker start returned empty sandbox id"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+
+    local cached_tap
+    cached_tap="$(wait_for_leased_tap)"
+    if ! ip -o link show "${cached_tap}" | grep -q '<[^>]*UP'; then
+        fail "leased Firecracker TAP ${cached_tap} is not administratively up"
+    fi
+
+    local cache_cgroup
+    cache_cgroup="$(wait_for_cgroup_child)"
+    assert_cgroup_limits "${cache_cgroup}" 1500 256
+
+    local got
+    wait_for_exec_output "${SANDBOX_ID}" "firecracker-env-ok" /bin/cat /var/start-env
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo firecracker-write-ok > /var/firecracker-write && cat /var/firecracker-write')"
+    assert_eq "${got}" "firecracker-write-ok" "Firecracker writable overlay"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo tmpfs-ok > /mnt/ram/check && cat /mnt/ram/check')"
+    assert_eq "${got}" "tmpfs-ok" "Firecracker private tmpfs mount"
+    sbox_cmd exec "${SANDBOX_ID}" /bin/mount | grep -Fq " on /mnt/ram type tmpfs "
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/nproc)"
+    assert_eq "${got}" "2" "Firecracker guest vCPU count"
+
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/host/input.txt)"
+    assert_eq "${got}" "host-mount-ok" "Firecracker read-only file injection"
+    if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo changed > /mnt/host/input.txt' >/tmp/firecracker-bind-write.log 2>&1; then
+        cat /tmp/firecracker-bind-write.log >&2
+        fail "Firecracker read-only injected file was writable"
+    fi
+    assert_eq "$(cat "${HOST_MOUNT}/input.txt")" "host-mount-ok" "Firecracker host file unchanged"
+
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/erofs/input.txt)"
+    assert_eq "${got}" "erofs-mount-ok" "Firecracker EROFS mount"
+    wait_for_exec_output "${SANDBOX_ID}" "sandboxd-network-ok" \
+        /bin/wget -qO- \
+        "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt"
+    run_network_acl_checks "Firecracker" firecracker
+
+    sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" || \
+        fail "Firecracker stats output missing memory usage"
+
+    local exec_status=0
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo firecracker-exec-stdout; echo firecracker-exec-stderr >&2; exit 19' \
+        2>/tmp/firecracker-exec.stderr)" || exec_status=$?
+    assert_eq "${exec_status}" "19" "Firecracker exec exit status"
+    assert_eq "${got}" "firecracker-exec-stdout" "Firecracker exec stdout"
+    assert_eq "$(tr -d '\r\n' < /tmp/firecracker-exec.stderr)" \
+        "firecracker-exec-stderr" "Firecracker exec stderr"
+
+    local tty_status=0
+    printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh >/dev/null || tty_status=$?
+    assert_eq "${tty_status}" "7" "Firecracker TTY exit status"
+
+    wait_for_file_text "${main_stdout}" "firecracker-main-stdout"
+
+    local overlay="${FILESTORE}/.firecracker/${SANDBOX_ID}/overlay.ext4"
+    [ -f "${overlay}" ] || fail "Firecracker writable layer is missing from the filestore"
+    assert_eq "$(stat -c %s "${overlay}")" "${FIRECRACKER_OVERLAY_BYTES}" \
+        "Firecracker default writable-layer size"
+
+    set_network_policy "${SANDBOX_ID}" allow-http \
+        --peer-address "${GATEWAY_IP}" \
+        --peer-port "${HTTP_PORT}"
+    sleep 6
+    crash_and_restart_sandboxd
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/firecracker-write)"
+    assert_eq "${got}" "firecracker-write-ok" "Firecracker exec after sandboxd restart"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- \
+        "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
+    assert_eq "${got}" "sandboxd-network-ok" \
+        "Firecracker active ACL after sandboxd restart"
+    set_network_policy "${SANDBOX_ID}" deny-all
+    if sbox_cmd exec "${SANDBOX_ID}" /bin/timeout 2 /bin/wget -qO- \
+        "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt" \
+        >/tmp/firecracker-acl-restored-deny.log 2>&1; then
+        cat /tmp/firecracker-acl-restored-deny.log >&2
+        fail "Firecracker recovered ACL accepted a denied flow"
+    fi
+
+    local deleted_id="${SANDBOX_ID}"
+    sbox_cmd delete "${deleted_id}"
+    SANDBOX_ID=""
+    [ ! -e "${FILESTORE}/.firecracker/${deleted_id}" ] || \
+        fail "Firecracker writable layer leaked after delete"
+    [ ! -e "${SANDBOXD_ROOT}/containers/${deleted_id}/firecracker" ] || \
+        fail "Firecracker runtime artifacts leaked after delete"
+    sbox_cmd delete "${deleted_id}"
+    if ip -o link show "${cached_tap}" | grep -q '<[^>]*UP'; then
+        fail "recycled Firecracker TAP ${cached_tap} remained administratively up"
+    fi
+
+    log "testing Firecracker rejects directory rootfs and mounts"
+    local rejected_id
+    if rejected_id="$(sbox_cmd start \
+        --quiet \
+        --runtime firecracker \
+        --sandbox-id sbox-e2e-firecracker-directory-root \
+        --rootfs "${ROOTFS}" \
+        --cpu-millicores 100 \
+        --memory-mb 256 \
+        /bin/true 2>/tmp/firecracker-directory-root.log)"; then
+        sbox_cmd delete "${rejected_id}" || true
+        fail "Firecracker accepted a directory rootfs"
+    fi
+    if rejected_id="$(sbox_cmd start \
+        --quiet \
+        --runtime firecracker \
+        --sandbox-id sbox-e2e-firecracker-directory-mount \
+        --rootfs "${EROFS_ROOTFS}" \
+        --mount "${EROFS_MOUNT_ROOT}:/mnt/dir:bind:ro" \
+        --cpu-millicores 100 \
+        --memory-mb 256 \
+        /bin/true 2>/tmp/firecracker-directory-mount.log)"; then
+        sbox_cmd delete "${rejected_id}" || true
+        fail "Firecracker accepted a directory mount"
+    fi
+
+    local cached_taps_before
+    cached_taps_before="$(list_cached_taps)"
+    log "testing Firecracker read-only EROFS root"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime firecracker \
+        --sandbox-id sbox-e2e-firecracker-readonly \
+        --rootfs "${EROFS_ROOTFS}" \
+        --rootfs-readonly \
+        --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs-readonly:erofs:ro" \
+        --cpu-millicores 100 \
+        --memory-mb 256 \
+        /bin/sleep 300)"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    local reused_tap
+    reused_tap="$(wait_for_leased_tap)"
+    local cached_taps_after
+    cached_taps_after="$(list_cached_taps)"
+    assert_eq "${cached_taps_after}" "${cached_taps_before}" \
+        "Firecracker TAP cache did not allocate a new interface"
+    if ! printf '%s\n' "${cached_taps_before}" | grep -Fxq "${reused_tap}"; then
+        fail "Firecracker leased uncached TAP ${reused_tap}"
+    fi
+    if ! ip -o link show "${reused_tap}" | grep -q '<[^>]*UP'; then
+        fail "reused Firecracker TAP ${reused_tap} is not administratively up"
+    fi
+    if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo unexpected > /var/read-only-check' >/tmp/firecracker-readonly.log 2>&1; then
+        cat /tmp/firecracker-readonly.log >&2
+        fail "Firecracker read-only root accepted a write"
+    fi
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo tmpfs-ok > /tmp/read-only-check && cat /tmp/read-only-check')"
+    assert_eq "${got}" "tmpfs-ok" "Firecracker read-only root runtime tmpfs"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/erofs-readonly/input.txt)"
+    assert_eq "${got}" "erofs-mount-ok" "Firecracker read-only EROFS mount"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- \
+        "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
+    assert_eq "${got}" "sandboxd-network-ok" \
+        "Firecracker recycled TAP has no stale ACL"
+    local readonly_root_id="${SANDBOX_ID}"
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+    [ ! -e "${FILESTORE}/.firecracker/${readonly_root_id}" ] || \
+        fail "Firecracker read-only writable layer leaked after delete"
+
+    log "testing Firecracker natural exit while sandboxd is unavailable"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime firecracker \
+        --sandbox-id sbox-e2e-firecracker-exit \
+        --rootfs "${EROFS_ROOTFS}" \
+        --cpu-millicores 100 \
+        --memory-mb 256 \
+        /bin/sh -c 'sleep 2; exit 23')"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    local exit_cgroup
+    exit_cgroup="$(wait_for_cgroup_child)"
+    local exit_vmm_pid
+    exit_vmm_pid="$(head -1 "${exit_cgroup}/cgroup.procs")"
+    [ -n "${exit_vmm_pid}" ] || fail "Firecracker VMM PID is missing"
+    crash_sandboxd
+    sleep 3
+    start_sandboxd
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED" 300
+    wait_for_exit_code_log "${SANDBOX_ID}" 23
+    wait_for_process_exit "${exit_vmm_pid}" "exited Firecracker VMM"
+    if sbox_cmd exec "${SANDBOX_ID}" /bin/true >/tmp/firecracker-exited-exec.log 2>&1; then
+        cat /tmp/firecracker-exited-exec.log >&2
+        fail "Firecracker accepted exec after the sandbox process exited"
+    fi
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+
+    run_dnat_check firecracker "Firecracker" "${EROFS_ROOTFS}" 256
+
+    run_storage_quota_check firecracker "${EROFS_ROOTFS}"
+    run_stress_checks firecracker "${EROFS_ROOTFS}"
 }
 
 run_runsc_checks() {
@@ -754,6 +1376,7 @@ run_runsc_checks() {
 
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${got}" "sandboxd-network-ok" "sandbox network"
+    run_network_acl_checks "runsc" runsc
 
     sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" || fail "stats output missing memory usage"
 
@@ -766,6 +1389,7 @@ run_runsc_checks() {
         fail "sandbox still inspectable after delete"
     fi
 
+    run_dnat_check runsc "runsc" "${ROOTFS}" 128
     run_storage_quota_check
 
     log "starting immediate OOM sandbox"
@@ -774,7 +1398,7 @@ run_runsc_checks() {
         --runtime runsc \
         --sandbox-id sbox-e2e-oom \
         --rootfs "${ROOTFS}" \
-        --cpu-millicores 100 \
+        --cpu-millicores 1000 \
         --memory-mb 128 \
         /bin/oom-hog)"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED" 600
@@ -818,7 +1442,7 @@ run_runsc_checks() {
         --sandbox-id sbox-e2e-recovery \
         --rootfs "${ROOTFS}" \
         --mount "${HOST_MOUNT}:/mnt/host" \
-        --cpu-millicores 100 \
+        --cpu-millicores 1000 \
         --memory-mb 128 \
         /bin/oom-hog --wait-file /mnt/host/oom-trigger)"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
@@ -882,6 +1506,8 @@ run_e2e() {
                 ;;
             runsc) run_runsc_checks ;;
             runc) run_runc_checks ;;
+            kata) run_kata_checks ;;
+            firecracker) run_firecracker_checks ;;
         esac
     fi
     log "e2e passed"
