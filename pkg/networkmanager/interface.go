@@ -35,7 +35,6 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
-	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 type InterfaceManager struct {
@@ -69,7 +68,7 @@ type InterfaceManager struct {
 	// total = usingInterfaces.Count() + interfaces.Length() + in-flight
 	// creates. Authoritative count checked against size. Guarded by mu.
 	total int
-	// deviceMu serializes kernel veth create/destroy operations. The maintenance
+	// deviceMu serializes kernel TAP/veth create and destroy operations. The maintenance
 	// goroutine owns normal pool resizing, while Discard may synchronously
 	// destroy a poisoned lease from a request rollback.
 	deviceMu sync.Mutex
@@ -322,11 +321,36 @@ func (m *InterfaceManager) shrink() {
 	}
 }
 
-// doCreate builds one veth pair and returns the serialized NetResource.
+// doCreate builds one persistent TAP endpoint for the reusable pool.
 // deviceMu serializes the maintenance worker and synchronous ephemeral
-// allocations. The peer returned by createDevice avoids an expensive
-// net.Interfaces() full dump.
+// allocations.
 func (m *InterfaceManager) doCreate() (string, error) {
+	m.deviceMu.Lock()
+	defer m.deviceMu.Unlock()
+
+	ip := m.idleIp.Pop()
+	if ip == "" {
+		return "", fmt.Errorf("no idle ip available")
+	}
+	tapLink, err := m.createTapDevice(ip)
+	if err != nil {
+		m.idleIp.Push(ip)
+		return "", err
+	}
+	netResource, err := m.tapResource(tapLink, net.ParseIP(ip))
+	if err != nil {
+		_ = netlink.LinkDel(tapLink)
+		m.idleIp.Push(ip)
+		return "", err
+	}
+	logrus.Debugf("add network interface %v", netResource.ToString())
+	return netResource.ToString(), nil
+}
+
+// doCreateEphemeral builds the veth endpoint used exclusively by runc. Unlike
+// pooled TAPs, its peer is moved into a named network namespace and destroyed
+// when the sandbox is released.
+func (m *InterfaceManager) doCreateEphemeral() (string, error) {
 	m.deviceMu.Lock()
 	defer m.deviceMu.Unlock()
 
@@ -341,23 +365,26 @@ func (m *InterfaceManager) doCreate() (string, error) {
 	}
 	attrs := peerLink.Attrs()
 	netResource := &NetResource{
+		SchemaVersion: NetResourceSchemaVersion,
+		EndpointType:  EndpointTypeVeth,
+		GuestMAC:      append(net.HardwareAddr(nil), attrs.HardwareAddr...),
 		Interface: &net.Interface{
 			Index:        attrs.Index,
 			MTU:          attrs.MTU,
 			Name:         attrs.Name,
-			HardwareAddr: attrs.HardwareAddr,
+			HardwareAddr: append(net.HardwareAddr(nil), attrs.HardwareAddr...),
 			Flags:        attrs.Flags,
 		},
-		Ip:      net.ParseIP(ip),
-		Mask:    m.mask,
-		Gateway: m.BridgeIp,
+		Ip:      append(net.IP(nil), net.ParseIP(ip)...),
+		Mask:    append(net.IPMask(nil), m.mask...),
+		Gateway: append(net.IP(nil), m.BridgeIp...),
 		Type:    "bridge",
 	}
 	logrus.Debugf("add network interface %v", netResource.ToString())
 	return netResource.ToString(), nil
 }
 
-// doDestroy tears down one veth pair and returns its ip to the idle ip pool on
+// doDestroy tears down one TAP or veth endpoint and returns its IP to the pool on
 // success. deviceMu serializes calls from the maintenance goroutine and
 // synchronous Discard operations. On error nothing is mutated (the ip is not
 // returned), so the caller can safely roll back: the veth is still live and
@@ -382,7 +409,7 @@ func (m *InterfaceManager) cacheNum() int {
 	return m.interfaces.Length()
 }
 
-// Allocate hands out an idle veth/IP pair as a fully serialised NetResource
+// Allocate hands out an idle TAP/IP pair as a fully serialised NetResource
 // blob. The string form is what sandbox.OccupiedResource carries around and
 // what eventually lands in the OCI spec annotations, so callers should
 // preserve it verbatim through Recycle.
@@ -444,7 +471,7 @@ func (m *InterfaceManager) AllocateEphemeral(sandboxID string) (string, error) {
 		}
 	}
 
-	created, err := m.doCreate()
+	created, err := m.doCreateEphemeral()
 	if err != nil {
 		m.releaseReservedSlot()
 		return "", err
@@ -523,6 +550,13 @@ func (m *InterfaceManager) markUsing(netResourceStr string) (string, error) {
 	if netResource.Interface == nil {
 		return "", fmt.Errorf("interface is nil for resource %s, this indicates a creation failure", netResourceStr)
 	}
+	if err := m.setTapState(netResource, true); err != nil {
+		// Keep a malformed or externally modified endpoint quarantined and
+		// counted. It must never go back to the reusable queue.
+		m.usingInterfaces.Set(netResource.ToString(), struct{}{})
+		m.storeMark.Store(true)
+		return "", err
+	}
 	m.usingInterfaces.Set(netResource.ToString(), struct{}{})
 	m.storeMark.Store(true)
 	return netResource.ToString(), nil
@@ -537,18 +571,47 @@ func (m *InterfaceManager) Recycle(id string) error {
 	m.leaseMu.Lock()
 	defer m.leaseMu.Unlock()
 
-	if _, active := m.usingInterfaces.Pop(id); !active {
+	if !m.usingInterfaces.Has(id) {
 		return nil
 	}
-	netResource := &NetResource{}
-	if err := netResource.FromString(id); err == nil {
-		logrus.Infof("parse interface when recycle: %s ", netResource.ToString())
-	} else {
-		logrus.Errorf("parse net resource failed: %v", err)
+	netResource, err := NewNetResource(id)
+	if err != nil {
+		return fmt.Errorf("parse net resource for recycle: %w", err)
 	}
+	if err := m.setTapState(netResource, false); err != nil {
+		return err
+	}
+	m.usingInterfaces.Pop(id)
+	logrus.Infof("parse interface when recycle: %s ", netResource.ToString())
 	// using -> idle, total unchanged.
 	m.interfaces.Push(id)
 	m.storeMark.Store(true)
+
+	return nil
+}
+
+// Deactivate disconnects a leased pooled TAP without returning it to the idle
+// queue. Delete paths call this after the runtime closes its TAP FD and before
+// ACL state is removed, eliminating any reuse window with stale policy.
+func (m *InterfaceManager) Deactivate(id string) error {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	if m.closed {
+		return errord.ErrUnavailable
+	}
+	m.leaseMu.Lock()
+	defer m.leaseMu.Unlock()
+
+	if !m.usingInterfaces.Has(id) {
+		return nil
+	}
+	resource, err := NewNetResource(id)
+	if err != nil {
+		return fmt.Errorf("parse net resource for deactivation: %w", err)
+	}
+	if err := m.setTapState(resource, false); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -591,8 +654,8 @@ func (m *InterfaceManager) releaseEphemeral(id string, resource *NetResource) er
 }
 
 // Discard destroys an active interface instead of returning it to the idle
-// pool. It is used when ACL cleanup failed: deleting the veth removes any TC
-// attachment with it and prevents a later sandbox from inheriting that link.
+// pool. It is used when ACL cleanup failed: deleting the endpoint removes any
+// TC attachment with it and prevents a later sandbox from inheriting that link.
 // A failed destroy leaves the resource leased and therefore quarantined.
 func (m *InterfaceManager) Discard(id string) error {
 	resource, err := NewNetResource(id)
@@ -687,7 +750,7 @@ func (m *InterfaceManager) store() error {
 	return nil
 }
 
-// cleanup removes both idle and still-leased veth pairs. The server normally
+// cleanup removes both idle and still-leased TAP/veth endpoints. The server normally
 // releases all sandbox leases before this method runs, but including the using
 // set keeps a failed sandbox deletion from leaking sandbox network interfaces.
 func (m *InterfaceManager) cleanup() error {
@@ -861,6 +924,12 @@ func NewInterfaceManager(
 	}
 
 	if err = manager.load(ips); err != nil {
+		// Never tear down endpoints owned by running sandboxes merely because
+		// recovery or a schema migration failed. The operator must drain or fix
+		// those sandboxes before startup can continue.
+		if manager.usingInterfaces.Count() != 0 {
+			return nil, err
+		}
 		cleanupErr := errors.Join(manager.cleanup(), manager.cleanupNetworkInfrastructure())
 		if cleanupErr != nil {
 			return nil, errors.Join(err, fmt.Errorf("rollback network initialization: %w", cleanupErr))
@@ -871,165 +940,6 @@ func NewInterfaceManager(
 	manager.keepStoring()
 	go manager.run()
 	return manager, nil
-}
-
-func (m *InterfaceManager) load(ips sets.Set[string]) error {
-	_, ipv4Net, err := net.ParseCIDR(m.IpRange)
-	if err != nil {
-		return err
-	}
-
-	// The only place we need a full enumeration of host links: reattaching veths
-	// that survived a sandboxd restart. The hot create path never does this.
-	devs, err := m.interfacesOnHost()
-	if err != nil {
-		return err
-	}
-
-	hostIPs := sets.New[string]()
-	peerByIP := make(map[string]net.Interface)
-	for _, dev := range devs {
-		if strings.HasPrefix(dev.Name, config.HostVethPrefix) {
-			ip := util.VethToIp(dev.Name)
-			if ip.To4() != nil && ipv4Net.Contains(ip) {
-				hostIPs.Insert(ip.String())
-			}
-			continue
-		}
-		if strings.HasPrefix(dev.Name, config.PeerVethPrefix) {
-			ip := util.VethToIp(dev.Name)
-			if ip.To4() != nil && ipv4Net.Contains(ip) {
-				peerByIP[ip.String()] = dev
-			}
-		}
-	}
-
-	// Ephemeral peers live in named namespaces, so host net.Interfaces cannot
-	// see them. Reconcile their durable leases against the host end, which stays
-	// visible and whose deterministic name encodes the allocated IP.
-	ephemeralByIP := make(map[string]string)
-	knownNetNS := sets.New[string]()
-	for _, id := range m.usingInterfaces.Keys() {
-		resource, parseErr := NewNetResource(id)
-		if parseErr != nil || resource.Lifecycle != InterfaceLifecycleEphemeral {
-			continue
-		}
-		ip := resource.Ip.String()
-		if !hostIPs.Has(ip) {
-			m.usingInterfaces.Pop(id)
-			m.storeMark.Store(true)
-			if deleteErr := m.deleteEphemeral(resource.NetNSPath); deleteErr != nil {
-				logrus.Warnf("drop stale ephemeral lease %s: %v", id, deleteErr)
-			}
-			continue
-		}
-		if m.sandboxRoot != "" {
-			sandboxID, idErr := sandboxIDFromEphemeralNetNSPath(resource.NetNSPath)
-			if idErr != nil {
-				ips.Delete(ip)
-				logrus.Warnf("retain invalid ephemeral lease %s: %v", id, idErr)
-				continue
-			}
-			metadataPath := filepath.Join(m.sandboxRoot, sandboxID, config.SandboxMetaFile)
-			if _, statErr := os.Stat(metadataPath); os.IsNotExist(statErr) {
-				if destroyErr := m.destroyDevice(*resource.Interface); destroyErr != nil {
-					ips.Delete(ip)
-					logrus.Warnf("retain orphaned ephemeral lease %s: %v", id, destroyErr)
-					continue
-				}
-				hostIPs.Delete(ip)
-				m.usingInterfaces.Pop(id)
-				m.storeMark.Store(true)
-				if deleteErr := m.deleteEphemeral(resource.NetNSPath); deleteErr != nil {
-					logrus.Warnf("delete orphaned ephemeral namespace %s: %v", resource.NetNSPath, deleteErr)
-				}
-				continue
-			} else if statErr != nil {
-				ips.Delete(ip)
-				logrus.Warnf("retain ephemeral lease %s after metadata check failed: %v", id, statErr)
-				continue
-			}
-		}
-		ephemeralByIP[ip] = id
-		knownNetNS.Insert(filepath.Clean(resource.NetNSPath))
-		ips.Delete(ip)
-	}
-
-	existingInterfaces := sets.New[string]()
-	for ip, dev := range peerByIP {
-		if hostIPs.Has(ip) {
-			// set peer veth up
-			link, err := netlink.LinkByName(dev.Name)
-			if err != nil {
-				logrus.Errorf("get link by name %v failed: %v", dev.Name, err)
-				continue
-			}
-			if err := netlink.LinkSetUp(link); err != nil {
-				logrus.Errorf("set link %v up failed: %v", dev.Name, err)
-				continue
-			}
-			if err := m.disablePeerForwarding(dev.Name); err != nil {
-				return err
-			}
-			resource := &NetResource{
-				Interface: &dev,
-				Ip:        net.ParseIP(ip),
-				Mask:      m.mask,
-				Gateway:   m.BridgeIp,
-				Type:      "bridge",
-			}
-			existingInterfaces.Insert(resource.ToString())
-			if !m.usingInterfaces.Has(resource.ToString()) {
-				m.interfaces.Push(resource.ToString())
-			}
-			ips.Delete(ip)
-		}
-	}
-
-	// A host end without a host peer or a durable ephemeral lease can only be
-	// left by an interrupted ephemeral allocation. Delete it rather than either
-	// leaking it or making its still-connected IP allocatable.
-	for ip := range hostIPs {
-		if _, pooled := peerByIP[ip]; pooled {
-			continue
-		}
-		if _, active := ephemeralByIP[ip]; active {
-			continue
-		}
-		_, peerName := util.IpToVeth(ip)
-		if err := m.destroyDevice(net.Interface{Name: peerName}); err != nil {
-			ips.Delete(ip)
-			logrus.Warnf("retain orphaned host veth for %s after cleanup failure: %v", ip, err)
-		} else {
-			logrus.Warnf("deleted orphaned ephemeral host veth for %s", ip)
-		}
-	}
-
-	entries, readErr := m.ephemeralNamespaces()
-	if readErr != nil && !os.IsNotExist(readErr) {
-		return readErr
-	}
-	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), ephemeralNetNSPrefix) {
-			continue
-		}
-		path := filepath.Join(ephemeralNetNSRoot, entry.Name())
-		if knownNetNS.Has(path) {
-			continue
-		}
-		if err := m.deleteEphemeral(path); err != nil {
-			logrus.Warnf("delete orphaned ephemeral namespace %s: %v", path, err)
-		}
-	}
-
-	for _, ip := range ips.UnsortedList() {
-		if ipv4Net.Contains(net.ParseIP(ip)) {
-			m.idleIp.Push(ip)
-		}
-	}
-
-	logrus.Debugf("load network interface idle num: %v, using num: %v, idle ip: %v", m.interfaces.Length(), m.usingInterfaces.Count(), m.idleIp.Length())
-	return nil
 }
 
 func validateIPRangeNoOverlap(ipRange string, devices []deviceIPNet) error {
@@ -1243,6 +1153,22 @@ func (m *InterfaceManager) createDevice(ip string) (netlink.Link, error) {
 }
 
 func (m *InterfaceManager) destroyDevice(dev net.Interface) error {
+	if strings.HasPrefix(dev.Name, config.TapPrefix) {
+		tap, err := m.links().LinkByName(dev.Name)
+		if err != nil {
+			var notFound netlink.LinkNotFoundError
+			if errors.As(err, &notFound) {
+				return nil
+			}
+			return fmt.Errorf("get TAP device %s failed: %w", dev.Name, err)
+		}
+		if tap != nil {
+			if err := m.links().LinkDel(tap); err != nil {
+				return fmt.Errorf("delete TAP device %s: %w", dev.Name, err)
+			}
+		}
+		return nil
+	}
 	ip := util.VethToIp(dev.Name)
 	hostVethName, _ := util.IpToVeth(ip.String())
 	/*
@@ -1270,13 +1196,16 @@ func (m *InterfaceManager) destroyDevice(dev net.Interface) error {
 }
 
 type NetResource struct {
-	Interface *net.Interface `json:"interface" protobuf:"bytes,0,opt,name=interface"`
-	Ip        net.IP         `json:"ip" protobuf:"bytes,1,opt,name=ip"`
-	Mask      net.IPMask     `json:"mask" protobuf:"bytes,2,opt,name=mask"`
-	Gateway   net.IP         `json:"gateway" protobuf:"bytes,3,opt,name=gateway"`
-	Type      string         `json:"type" protobuf:"bytes,4,opt,name=type"`
-	NetNSPath string         `json:"netnsPath,omitempty" protobuf:"bytes,5,opt,name=netnsPath"`
-	Lifecycle string         `json:"lifecycle,omitempty" protobuf:"bytes,6,opt,name=lifecycle"`
+	SchemaVersion int              `json:"schemaVersion,omitempty" protobuf:"varint,7,opt,name=schemaVersion"`
+	EndpointType  string           `json:"endpointType,omitempty" protobuf:"bytes,8,opt,name=endpointType"`
+	GuestMAC      net.HardwareAddr `json:"guestMAC,omitempty" protobuf:"bytes,9,opt,name=guestMAC"`
+	Interface     *net.Interface   `json:"interface" protobuf:"bytes,0,opt,name=interface"`
+	Ip            net.IP           `json:"ip" protobuf:"bytes,1,opt,name=ip"`
+	Mask          net.IPMask       `json:"mask" protobuf:"bytes,2,opt,name=mask"`
+	Gateway       net.IP           `json:"gateway" protobuf:"bytes,3,opt,name=gateway"`
+	Type          string           `json:"type" protobuf:"bytes,4,opt,name=type"`
+	NetNSPath     string           `json:"netnsPath,omitempty" protobuf:"bytes,5,opt,name=netnsPath"`
+	Lifecycle     string           `json:"lifecycle,omitempty" protobuf:"bytes,6,opt,name=lifecycle"`
 }
 
 func (n *NetResource) ToString() string {

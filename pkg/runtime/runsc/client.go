@@ -32,9 +32,9 @@ import (
 )
 
 const (
-	contMgrCreateLinksAndRoutes = "containerManager.CreateLinksAndRoutes"
-	contMgrRootContainerStart   = "containerManager.StartRoot"
-	contMgrWait                 = "containerManager.Wait"
+	contMgrSetNetworkArgs     = "containerManager.SetNetworkArgs"
+	contMgrRootContainerStart = "containerManager.StartRoot"
+	contMgrWait               = "containerManager.Wait"
 )
 
 // Client is sandboxd's narrow adapter over upstream gVisor runsc. It avoids
@@ -192,7 +192,7 @@ func readOutputSnippet(path string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// Start configures external networking with a raw socket FD and starts the root
+// Start configures external networking with a cached TAP FD and starts the root
 // container through gVisor's existing control RPCs.
 func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	logrus.Debugf("runsc start rpc flow started, id: %s", args.ID)
@@ -202,15 +202,15 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	}
 	logrus.Debugf("runsc start loaded state, id: %s, control_socket: %s", args.ID, state.Sandbox.ControlSocketPath)
 
-	logrus.Debugf("runsc start opening raw socket, id: %s, interface: %+v", args.ID, args.Network.Interface)
-	rawSocket, err := OpenRawSocket(*args.Network.Interface)
+	logrus.Debugf("runsc start opening TAP, id: %s, interface: %+v", args.ID, args.Network.Interface)
+	tap, err := OpenTAP(*args.Network.Interface)
 	if err != nil {
 		return err
 	}
-	defer rawSocket.Close()
-	logrus.Debugf("runsc start opened raw socket, id: %s", args.ID)
+	defer tap.Close()
+	logrus.Debugf("runsc start opened TAP, id: %s", args.ID)
 
-	networkArgs, err := BuildNetworkArgs(args.Network, rawSocket)
+	networkArgs, err := BuildNetworkArgs(args.Network, tap)
 	if err != nil {
 		return err
 	}
@@ -224,8 +224,8 @@ func (c *Client) Start(ctx context.Context, args StartArgs) error {
 	defer conn.Close()
 	logrus.Debugf("runsc start connected control socket, id: %s", args.ID)
 
-	if err := callContextWithTimeout(ctx, conn, contMgrCreateLinksAndRoutes, networkArgs, nil, 30*time.Second); err != nil {
-		return fmt.Errorf("create links and routes for %s: %w", args.ID, err)
+	if err := callContextWithTimeout(ctx, conn, contMgrSetNetworkArgs, networkArgs, nil, 30*time.Second); err != nil {
+		return fmt.Errorf("set network arguments for %s: %w", args.ID, err)
 	}
 	if err := callContextWithTimeout(ctx, conn, contMgrRootContainerStart, &args.ID, nil, 30*time.Second); err != nil {
 		return fmt.Errorf("start root container %s: %w", args.ID, err)

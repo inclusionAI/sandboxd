@@ -6,7 +6,8 @@
 
 - Start, wait for, inspect, measure, and delete sandboxes.
 - Prepare local, OCI, Nydus, and S3-backed rootfs and mounts.
-- Allocate cgroups and veth interfaces and configure iptables or eBPF for NAT.
+- Allocate cgroups and pooled TAP or ephemeral veth endpoints, and configure
+  iptables or eBPF for NAT.
 - Discover, validate, and lease scheduler-selected accelerator devices.
 
 ## Architecture
@@ -134,7 +135,7 @@ configs/             AKernel integration configuration templates
 internal/server/     gRPC service and daemon orchestration
 pkg/runtime/         sandbox runtime abstraction and runtime adapters
 pkg/imagemanager/    rootfs and mount integration
-pkg/networkmanager/  veth, iptables, and eBPF NAT integration
+pkg/networkmanager/  TAP/veth, iptables, and eBPF network integration
 pkg/cgroupmanager/   transparent cgroup v1/v2 integration and cache
 pkg/xpumanager/      accelerator discovery, inventory, and local leases
 test/e2e/            privileged runtime E2E

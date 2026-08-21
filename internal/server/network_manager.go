@@ -98,6 +98,16 @@ func (m *networkManager) Prepare(runtimeName, sandboxID string) (*preparedNetwor
 	}, nil
 }
 
+func (m *networkManager) Deactivate(resource string) error {
+	if resource == "" {
+		return nil
+	}
+	if m.iface == nil {
+		return fmt.Errorf("interface manager not configured")
+	}
+	return m.iface.Deactivate(resource)
+}
+
 func (m *networkManager) Release(resource string) error {
 	if resource == "" {
 		return nil

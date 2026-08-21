@@ -728,20 +728,22 @@ func TestPrepareKataResourceSpecUsesQuotaForVCPUs(t *testing.T) {
 		t.Fatal("restored spec did not retain CPU quota")
 	}
 }
-
 func TestWriteKataDANConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sandbox.json")
 	resource := &networkmanager.NetResource{
+		SchemaVersion: networkmanager.NetResourceSchemaVersion,
+		EndpointType:  networkmanager.EndpointTypeTap,
+		GuestMAC:      net.HardwareAddr{0x02, 0xfc, 0x0a, 0x58, 0x00, 0x02},
 		Interface: &net.Interface{
-			Name:         "pv.test",
+			Name:         "tap.0a580002",
 			MTU:          1500,
-			HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+			HardwareAddr: net.HardwareAddr{0x02, 0xfd, 0x0a, 0x58, 0x00, 0x02},
 		},
 		Ip:      net.ParseIP("10.88.0.2"),
 		Mask:    net.CIDRMask(16, 32),
 		Gateway: net.ParseIP("10.88.0.1"),
 	}
-	if err := writeKataDANConfig(path, "ktap-test", resource); err != nil {
+	if err := writeKataDANConfig(path, resource.Interface.Name, resource); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)
@@ -756,11 +758,11 @@ func TestWriteKataDANConfig(t *testing.T) {
 		t.Fatalf("DAN config = %+v", config)
 	}
 	device := config.Devices[0]
-	if device.Device.QueueNum != 1 || device.Device.TapName != "ktap-test" {
+	if device.Device.QueueNum != 1 || device.Device.TapName != "tap.0a580002" {
 		t.Fatalf("DAN device = %+v", device.Device)
 	}
-	if len(kataTapName("sbox-id-with-unusual length")) > 15 {
-		t.Fatal("generated TAP name exceeds IFNAMSIZ")
+	if device.GuestMAC != "02:fc:0a:58:00:02" {
+		t.Fatalf("DAN guest MAC = %q", device.GuestMAC)
 	}
 }
 

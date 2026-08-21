@@ -45,7 +45,7 @@ The `bpfnat` backend instead requires:
 - a writable, mounted bpffs at `/sys/fs/bpf`, or permission for sandboxd to
   mount it there; and
 - permission for sandboxd to load BPF programs, pin maps, and manage TC
-  filters on its host veth devices.
+  filters on sandbox host endpoints.
 
 The selected NAT backend keeps its own prerequisites. In particular, a
 `bpfnat` host setup must provide `net.ipv4.ip_forward=1` and, when local DNAT
@@ -163,7 +163,7 @@ bpfnat keys connection and fragment state by policy generation.
 With bpfnat, eBPF maps are pinned under
 `/sys/fs/bpf/sandboxd/networkacl`, and TC keeps program references across an
 unexpected sandboxd exit. On restart, sandboxd reopens the maps, reconciles
-each active sandbox with its current host veth, and replaces the filters. The
+each active sandbox with its current host endpoint, and replaces the filters. The
 iptables backend rebuilds its per-sandbox chains from the same persisted
 policy before making them active. Both paths avoid a fail-open recovery
 window.
@@ -176,10 +176,10 @@ rules, or TC filters. Kernel cleanup is idempotent and targets only sandboxd's
 map keys, rule keys, and reserved TC filter identifiers. If removing the orphan
 from durable state fails, the cleanup intent remains and recovery retries it.
 Recovery resolves active sandbox ownership first and refuses orphan cleanup when
-an active sandbox owns the same ifindex. A veth involved in a failed Start
-rollback is destroyed instead of being returned to the interface pool; if
-destruction also fails, the lease remains quarantined and cannot be allocated
-to another sandbox.
+an active sandbox owns the same ifindex. A pooled TAP involved in a failed
+Start rollback is destroyed instead of being returned to the interface pool;
+if destruction also fails, the lease remains quarantined and cannot be
+allocated to another sandbox.
 
 ## Verification
 

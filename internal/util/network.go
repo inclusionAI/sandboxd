@@ -60,6 +60,12 @@ func IpToVeth(ip string) (host, peer string) {
 	return config.HostVethPrefix + ipInHex, config.PeerVethPrefix + ipInHex
 }
 
+func IpToTap(ip string) string {
+	parsedIP := net.ParseIP(ip)
+	ipInHex := hex.EncodeToString(parsedIP.To4())
+	return config.TapPrefix + ipInHex
+}
+
 func VethToIp(veth string) net.IP {
 	if strings.HasPrefix(veth, config.HostVethPrefix) {
 		veth = veth[len(config.HostVethPrefix):]
@@ -67,5 +73,13 @@ func VethToIp(veth string) net.IP {
 		veth = veth[len(config.PeerVethPrefix):]
 	}
 	ip, _ := hex.DecodeString(veth)
+	return ip
+}
+
+func TapToIp(tap string) net.IP {
+	if strings.HasPrefix(tap, config.TapPrefix) {
+		tap = tap[len(config.TapPrefix):]
+	}
+	ip, _ := hex.DecodeString(tap)
 	return ip
 }

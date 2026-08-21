@@ -143,10 +143,11 @@ func (r *RunscHandler) Start(ctx context.Context, config StartConfig) error {
 		UserStderr:  config.Stderr,
 		RootOverlay: rootOverlay,
 		Network: runscapi.NetworkConfig{
-			Interface: config.Network.Interface,
-			IP:        config.Network.Ip,
-			Mask:      config.Network.Mask,
-			Gateway:   config.Network.Gateway,
+			Interface:   config.Network.Interface,
+			LinkAddress: config.Network.GuestHardwareAddr(),
+			IP:          config.Network.Ip,
+			Mask:        config.Network.Mask,
+			Gateway:     config.Network.Gateway,
 		},
 	}
 	start := time.Now()

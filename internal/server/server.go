@@ -261,6 +261,10 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		h.xpuMgr.Release(sandboxID)
 	}
 
+	if err := h.deactivateStartNetwork(resource); err != nil {
+		return err
+	}
+
 	if err := h.fsMgr.Release(sandboxID); err != nil {
 		return err
 	}
@@ -872,6 +876,9 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 		if current == nil || current.Metadata == nil {
 			continue
 		}
+		if current.Metadata.RuntimeHandler == config.RuntimeNameRunc {
+			continue
+		}
 		sandboxID := current.Metadata.ID
 		resources, err := h.sandboxManager.CollectResourceByID(sandboxID)
 		if err != nil {
@@ -885,11 +892,13 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 		if err != nil {
 			return nil, fmt.Errorf("decode network resource for sandbox %s: %w", sandboxID, err)
 		}
-		hostVeth, _ := util.IpToVeth(network.Ip.String())
+		if network.Interface == nil || network.Interface.Name == "" {
+			return nil, fmt.Errorf("sandbox %s network endpoint is missing", sandboxID)
+		}
 		bindings[sandboxID] = networkacl.Binding{
 			SandboxID: sandboxID,
 			IP:        network.Ip,
-			HostVeth:  hostVeth,
+			HostVeth:  network.Interface.Name,
 		}
 	}
 	return bindings, nil
@@ -932,6 +941,12 @@ func (h *sandboxService) SetNetworkPolicy(
 	current, err := h.sandboxManager.Get(request.SandboxID)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
+	}
+	if current.Metadata != nil && current.Metadata.RuntimeHandler == config.RuntimeNameRunc {
+		return nil, errord.ToGRPC(fmt.Errorf(
+			"network ACL is not supported by runtime runc: %w",
+			errord.ErrFailedPrecondition,
+		))
 	}
 	if current.Status == nil || current.Status.Get().State() != runtime.SandboxState_SANDBOX_STATE_RUNNING {
 		return nil, errord.ToGRPC(fmt.Errorf("sandbox %s is not running: %w", request.SandboxID, errord.ErrFailedPrecondition))
@@ -1020,17 +1035,26 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
+	if startReq.Runtime == "" {
+		startReq.Runtime = config.RuntimeNameRunsc
+	}
 	networkPolicy, err := networkacl.NormalizePolicy(startReq.NetworkPolicy)
 	if err != nil {
 		wrapped := errord.ToGRPC(fmt.Errorf("invalid network policy: %v: %w", err, errord.ErrInvalidArgument))
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, wrapped
+	}
+	if startReq.Runtime == config.RuntimeNameRunc && !networkPolicy.Empty() {
+		err := errors.New("network ACL is not supported by runtime runc")
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrFailedPrecondition))
 	}
 	if !networkPolicy.Empty() && h.aclMgr == nil {
 		err := errors.New("network ACL is disabled")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrFailedPrecondition))
 	}
-	if h.aclMgr != nil {
+	aclEnabled := h.aclMgr != nil && startReq.Runtime != config.RuntimeNameRunc
+	if aclEnabled {
 		if err := validateManagedResolverMounts(startReq.Mounts); err != nil {
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
 				errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
@@ -1051,9 +1075,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 				errord.ToGRPC(errord.ErrInvalidArgument)
 		}
 		startReq.WritableLayerLimitBytes = rootfsLimit
-	}
-	if startReq.Runtime == "" {
-		startReq.Runtime = config.RuntimeNameRunsc
 	}
 	if startReq.Cwd == "" {
 		startReq.Cwd = "/"
@@ -1173,6 +1194,11 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		if dnatConfigured {
 			h.networkMgr.cleanupDnatRules(sandboxID)
 		}
+		if preparedResources != nil {
+			if err := h.deactivateStartNetwork(preparedResources.OccupiedResource); err != nil {
+				logrus.Warnf("deactivate network endpoint while rolling back sandbox %s: %v", sandboxID, err)
+			}
+		}
 		aclCleanupFailed := aclAttempted && !aclRegistered
 		if aclAttempted && h.aclMgr != nil {
 			h.aclMu.Lock()
@@ -1184,7 +1210,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		if aclCleanupFailed && preparedResources != nil {
 			resource := preparedResources.Resources[config.ResourceNameInterface]
-			// Never return a veth whose ACL registration or cleanup failed
+			// Never return an endpoint whose ACL registration or cleanup failed
 			// to the idle pool. A successful discard destroys its TC
 			// attachments; a failed discard leaves the lease quarantined in
 			// the interface manager for restart recovery.
@@ -1304,14 +1330,21 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			defaults = provider.SandboxDefaults()
 		}
 	}
-	if h.aclMgr != nil {
-		hostVeth, _ := util.IpToVeth(preparedResources.sandboxIP)
+	if aclEnabled {
+		if preparedResources.network == nil ||
+			preparedResources.network.Interface == nil ||
+			preparedResources.network.Interface.Name == "" {
+			err = errors.New("allocated network policy endpoint is missing")
+			return &runtime.StartResponse{
+				Code: -1, Message: err.Error(),
+			}, err
+		}
 		h.aclMu.Lock()
 		aclAttempted = true
 		err = h.aclMgr.Register(networkacl.Binding{
 			SandboxID: sandboxID,
 			IP:        preparedResources.network.Ip,
-			HostVeth:  hostVeth,
+			HostVeth:  preparedResources.network.Interface.Name,
 		}, networkPolicy)
 		h.aclMu.Unlock()
 		if err != nil {

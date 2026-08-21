@@ -23,19 +23,18 @@ import (
 )
 
 const (
-	containerLoName  = "lo"
-	rawSocketBufSize = 4 << 20 // 4 MiB.
-	vethGSOMaxSize   = 65536
-	qDiscFIFO        = 1
+	containerLoName = "lo"
+	qDiscFIFO       = 1
 )
 
-// NetworkConfig contains the host-side veth peer and the in-sandbox network
-// configuration that should be installed through gVisor's control RPC.
+// NetworkConfig contains the host-side TAP and the in-sandbox network
+// configuration installed through gVisor's control RPC.
 type NetworkConfig struct {
-	Interface *net.Interface
-	IP        net.IP
-	Mask      net.IPMask
-	Gateway   net.IP
+	Interface   *net.Interface
+	LinkAddress net.HardwareAddr
+	IP          net.IP
+	Mask        net.IPMask
+	Gateway     net.IP
 }
 
 type ipWithPrefix struct {
@@ -110,55 +109,46 @@ func (a *createLinksAndRoutesArgs) setFilePayload(files []*os.File) {
 	a.payload.Files = files
 }
 
-// OpenRawSocket opens an AF_PACKET raw socket bound to iface. The returned file
-// is ready to be passed to gVisor through urpc.FilePayload.
-func OpenRawSocket(iface net.Interface) (_ *os.File, retErr error) {
-	const protocol = 0x0300 // htons(ETH_P_ALL)
-
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, 0)
+// OpenTAP attaches one non-blocking queue to a cached persistent TAP. gVisor
+// consumes ordinary Ethernet frames, so this FD deliberately omits IFF_VNET_HDR;
+// Kata and Firecracker request vnet headers on their own TAP queues.
+func OpenTAP(iface net.Interface) (_ *os.File, retErr error) {
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("create raw socket for %s: %w", iface.Name, err)
+		return nil, fmt.Errorf("open /dev/net/tun for %s: %w", iface.Name, err)
 	}
-	file := os.NewFile(uintptr(fd), "runsc-raw-device-fd")
+	file := os.NewFile(uintptr(fd), "runsc-tap-device-fd")
 	defer func() {
 		if retErr != nil {
 			_ = file.Close()
 		}
 	}()
 
-	if err := unix.Bind(fd, &unix.SockaddrLinklayer{
-		Protocol: protocol,
-		Ifindex:  iface.Index,
-		Pkttype:  unix.PACKET_OTHERHOST,
-	}); err != nil {
-		return nil, fmt.Errorf("bind raw socket to %s(index=%d): %w", iface.Name, iface.Index, err)
+	ifreq, err := unix.NewIfreq(iface.Name)
+	if err != nil {
+		return nil, fmt.Errorf("build TAP request for %s: %w", iface.Name, err)
 	}
-
-	if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_VNET_HDR, 1); err != nil {
-		return nil, fmt.Errorf("enable PACKET_VNET_HDR on %s(index=%d): %w", iface.Name, iface.Index, err)
+	ifreq.SetUint16(uint16(unix.IFF_TAP | unix.IFF_NO_PI))
+	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifreq); err != nil {
+		return nil, fmt.Errorf("attach runsc to TAP %s: %w", iface.Name, err)
 	}
-
-	setSocketBuffer(fd, unix.SO_RCVBUFFORCE, unix.SO_RCVBUF)
-	setSocketBuffer(fd, unix.SO_SNDBUFFORCE, unix.SO_SNDBUF)
-
+	if err := unix.SetNonblock(fd, true); err != nil {
+		return nil, fmt.Errorf("set runsc TAP %s non-blocking: %w", iface.Name, err)
+	}
 	return file, nil
 }
 
-func setSocketBuffer(fd, forceOpt, fallbackOpt int) {
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, forceOpt, rawSocketBufSize); err == nil {
-		return
-	}
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, fallbackOpt, rawSocketBufSize)
-}
-
-// BuildNetworkArgs converts sandboxd's bridge/veth allocation into the
-// upstream gVisor CreateLinksAndRoutes RPC payload.
-func BuildNetworkArgs(network NetworkConfig, rawSocket *os.File) (*createLinksAndRoutesArgs, error) {
+// BuildNetworkArgs converts sandboxd's bridge/TAP allocation into the
+// upstream gVisor SetNetworkArgs RPC payload.
+func BuildNetworkArgs(network NetworkConfig, tap *os.File) (*createLinksAndRoutesArgs, error) {
 	if network.Interface == nil {
 		return nil, fmt.Errorf("network interface is nil")
 	}
-	if rawSocket == nil {
-		return nil, fmt.Errorf("raw socket is nil")
+	if tap == nil {
+		return nil, fmt.Errorf("TAP file is nil")
+	}
+	if len(network.LinkAddress) == 0 {
+		return nil, fmt.Errorf("guest link MAC is empty")
 	}
 	ip4 := network.IP.To4()
 	if ip4 == nil {
@@ -187,7 +177,7 @@ func BuildNetworkArgs(network NetworkConfig, rawSocket *os.File) (*createLinksAn
 
 	return &createLinksAndRoutesArgs{
 		payload: filePayload{
-			Files: []*os.File{rawSocket},
+			Files: []*os.File{tap},
 		},
 		LoopbackLinks: []loopbackLink{
 			{
@@ -202,17 +192,15 @@ func BuildNetworkArgs(network NetworkConfig, rawSocket *os.File) (*createLinksAn
 			{
 				Name:        network.Interface.Name,
 				MTU:         network.Interface.MTU,
-				LinkAddress: network.Interface.HardwareAddr,
+				LinkAddress: network.LinkAddress,
 				Addresses: []ipWithPrefix{
 					{Address: ip4, PrefixLen: prefixLen},
 				},
 				Routes: []route{
 					{Destination: subnet},
 				},
-				GSOMaxSize:        vethGSOMaxSize,
-				QDisc:             qDiscFIFO,
-				RXChecksumOffload: true,
-				NumChannels:       1,
+				QDisc:       qDiscFIFO,
+				NumChannels: 1,
 			},
 		},
 		Defaultv4Gateway: defaultRoute{

@@ -102,7 +102,7 @@ func (r *kataExecRunner) Run(request execRequest) error {
 	}
 	defer streams.Close()
 	defer cancelIO()
-	streams.Copy()
+	streams.CopyOutput()
 
 	execID := fmt.Sprintf("sbox-exec-%d-%d", os.Getpid(), time.Now().UnixNano())
 	execRequest := &taskv2.ExecProcessRequest{
@@ -138,6 +138,12 @@ func (r *kataExecRunner) Run(request execRequest) error {
 		deleteCancel()
 		return fmt.Errorf("kata exec: start process: %w", err)
 	}
+
+	inputDone := streams.CopyInput()
+	go func() {
+		<-inputDone
+		closeKataExecStdin(client, request.sandboxID, execID)
+	}()
 
 	resizeDone := make(chan struct{})
 	processDone := make(chan struct{})
@@ -216,6 +222,24 @@ func (r *kataExecRunner) Run(request execRequest) error {
 		return cli.NewExitError("", int(result.response.ExitStatus))
 	}
 	return nil
+}
+
+func closeKataExecStdin(
+	client *ttrpc.Client,
+	sandboxID,
+	execID string,
+) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Call(
+		ctx,
+		kataExecTaskService,
+		"CloseIO",
+		&taskv2.CloseIORequest{ID: sandboxID, ExecID: execID, Stdin: true},
+		&emptypb.Empty{},
+	); err != nil {
+		logrus.Warnf("kata exec: close stdin: %v", err)
+	}
 }
 
 func kataExecProcess(bundlePath string, request execRequest) (*specs.Process, error) {
@@ -366,12 +390,7 @@ func openKataExecIO(
 	return streams, nil
 }
 
-func (s *kataExecIO) Copy() {
-	go func() {
-		_, _ = io.Copy(s.stdin, os.Stdin)
-		s.CloseStdin()
-	}()
-
+func (s *kataExecIO) CopyOutput() {
 	s.outputs.Add(1)
 	go func() {
 		defer s.outputs.Done()
@@ -386,6 +405,16 @@ func (s *kataExecIO) Copy() {
 			_ = s.stderr.Close()
 		}()
 	}
+}
+
+func (s *kataExecIO) CopyInput() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(s.stdin, os.Stdin)
+		s.CloseStdin()
+	}()
+	return done
 }
 
 func (s *kataExecIO) CloseStdin() {

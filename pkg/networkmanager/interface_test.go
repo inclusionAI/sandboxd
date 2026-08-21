@@ -107,6 +107,68 @@ func TestInterfaceCleanup_IgnoresResourceWithoutInterface(t *testing.T) {
 	})
 }
 
+func TestTapResourcePersistsVersionedIdentity(t *testing.T) {
+	ip := net.ParseIP("10.88.0.2")
+	hostMAC, err := tapHostMAC(ip)
+	require.NoError(t, err)
+	guestMAC, err := tapGuestMAC(ip)
+	require.NoError(t, err)
+	link := &netlink.Tuntap{
+		LinkAttrs: netlink.LinkAttrs{
+			Index:        42,
+			MTU:          1500,
+			Name:         util.IpToTap(ip.String()),
+			HardwareAddr: hostMAC,
+		},
+		Mode: netlink.TUNTAP_MODE_TAP,
+	}
+	manager := &InterfaceManager{
+		BridgeIp: net.ParseIP("10.88.0.1"),
+		mask:     net.CIDRMask(16, 32),
+	}
+
+	resource, err := manager.tapResource(link, ip)
+	require.NoError(t, err)
+	assert.Equal(t, NetResourceSchemaVersion, resource.SchemaVersion)
+	assert.Equal(t, EndpointTypeTap, resource.EndpointType)
+	assert.Equal(t, guestMAC, resource.GuestHardwareAddr())
+	require.NotNil(t, resource.Interface)
+	assert.Equal(t, link.Attrs().Name, resource.Interface.Name)
+	assert.Equal(t, link.Attrs().Index, resource.Interface.Index)
+	assert.Equal(t, hostMAC, resource.Interface.HardwareAddr)
+
+	restored, err := NewNetResource(resource.ToString())
+	require.NoError(t, err)
+	assert.Equal(t, NetResourceSchemaVersion, restored.SchemaVersion)
+	assert.Equal(t, EndpointTypeTap, restored.EndpointType)
+	assert.Equal(t, guestMAC, restored.GuestHardwareAddr())
+	assert.Equal(t, hostMAC, restored.Interface.HardwareAddr)
+}
+
+func TestLoadRejectsActiveLegacyPooledVeth(t *testing.T) {
+	resource := (&NetResource{
+		Interface: &net.Interface{Name: config.PeerVethPrefix + "0a580002"},
+		Ip:        net.ParseIP("10.88.0.2"),
+		Mask:      net.CIDRMask(16, 32),
+		Gateway:   net.ParseIP("10.88.0.1"),
+		Type:      "bridge",
+	}).ToString()
+	manager := &InterfaceManager{
+		IpRange:         "10.88.0.1/16",
+		interfaces:      util.New(""),
+		usingInterfaces: cmap.New[struct{}](),
+		idleIp:          util.New(""),
+		listLinks: func() ([]net.Interface, error) {
+			return nil, nil
+		},
+	}
+	manager.usingInterfaces.Set(resource, struct{}{})
+
+	err := manager.load(sets.New("10.88.0.2"))
+	require.ErrorContains(t, err, "legacy pooled veth lease")
+	require.ErrorContains(t, err, "drain existing sandboxes")
+}
+
 func TestCalcluteCacheSize(t *testing.T) {
 	rawCacheSize := 10000
 	getLocalCpuNumPatches := gomonkey.ApplyFunc(getLocalCpuNum, func() (int, error) {
@@ -468,7 +530,7 @@ func TestAllocateEphemeralCreatesDedicatedLease(t *testing.T) {
 	}
 	createPatch := gomonkey.ApplyPrivateMethod(
 		m,
-		"doCreate",
+		"doCreateEphemeral",
 		func(*InterfaceManager) (string, error) { return base, nil },
 	)
 	defer createPatch.Reset()

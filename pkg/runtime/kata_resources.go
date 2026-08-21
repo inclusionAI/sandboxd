@@ -48,7 +48,8 @@ func HostCgroupResources(
 	runtimeName string,
 	resource *runtime.LinuxSandboxResources,
 ) *runtime.LinuxSandboxResources {
-	if runtimeName == config.RuntimeNameKata {
+	if runtimeName == config.RuntimeNameKata ||
+		runtimeName == config.RuntimeNameFirecracker {
 		return kataHostResources(resource)
 	}
 	return resource

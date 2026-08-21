@@ -113,6 +113,7 @@ const (
 const (
 	HostVethPrefix = "hv."
 	PeerVethPrefix = "pv."
+	TapPrefix      = "tap."
 
 	NatBackendIptables = "iptables"
 	NatBackendBpfnat   = "bpfnat"

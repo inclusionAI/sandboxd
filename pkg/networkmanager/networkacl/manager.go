@@ -319,7 +319,7 @@ func (m *Manager) Restore(active map[string]Binding) error {
 		}
 		link, err := netlink.LinkByName(binding.HostVeth)
 		if err != nil {
-			return fmt.Errorf("restore network ACL for %s: find host veth %s: %w", sandboxID, binding.HostVeth, err)
+			return fmt.Errorf("restore network ACL for %s: find host endpoint %s: %w", sandboxID, binding.HostVeth, err)
 		}
 		oldEntry := entry
 		entry.IP = binding.IP.String()
@@ -376,11 +376,11 @@ func (m *Manager) Register(binding Binding, policy Policy) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if binding.SandboxID == "" || binding.IP.To4() == nil || binding.HostVeth == "" {
-		return fmt.Errorf("network ACL binding requires sandbox ID, IPv4 address, and host veth")
+		return fmt.Errorf("network ACL binding requires sandbox ID, IPv4 address, and host endpoint")
 	}
 	link, err := netlink.LinkByName(binding.HostVeth)
 	if err != nil {
-		return fmt.Errorf("find host veth %s: %w", binding.HostVeth, err)
+		return fmt.Errorf("find host endpoint %s: %w", binding.HostVeth, err)
 	}
 	reconciled := make(map[string]persistedEntry)
 	for sandboxID, existing := range m.entries {
@@ -741,7 +741,7 @@ func (m *Manager) attachLocked(entry persistedEntry) error {
 	}
 	link, err := netlink.LinkByIndex(entry.IfIndex)
 	if err != nil {
-		return fmt.Errorf("find host veth index %d: %w", entry.IfIndex, err)
+		return fmt.Errorf("find host endpoint index %d: %w", entry.IfIndex, err)
 	}
 	if link.Attrs() == nil || link.Attrs().Name != entry.HostVeth {
 		return fmt.Errorf(

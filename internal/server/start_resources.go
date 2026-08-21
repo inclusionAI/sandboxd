@@ -127,6 +127,22 @@ func (h *sandboxService) allocateStartResource(
 	}
 }
 
+// deactivateStartNetwork disconnects a pooled TAP while retaining its lease.
+// Runtime deletion must complete first, and ACL removal must happen afterward.
+func (h *sandboxService) deactivateStartNetwork(resources sandbox.OccupiedResource) error {
+	resource, ok := resources.Resources[config.ResourceNameInterface]
+	if !ok || resource == "" {
+		return nil
+	}
+	if h.networkMgr == nil {
+		return fmt.Errorf("network manager not configured")
+	}
+	if err := h.networkMgr.Deactivate(resource); err != nil {
+		return fmt.Errorf("deactivate sandbox network endpoint: %w", err)
+	}
+	return nil
+}
+
 func (h *sandboxService) releaseStartResources(resources sandbox.OccupiedResource) error {
 	var errs []error
 	for name, value := range resources.Resources {

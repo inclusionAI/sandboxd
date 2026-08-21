@@ -34,9 +34,10 @@ func TestBuildNetworkArgsConfiguresDualStackLoopback(t *testing.T) {
 			Name:         "eth0",
 			HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02},
 		},
-		IP:      net.ParseIP("10.88.0.2"),
-		Mask:    net.CIDRMask(24, 32),
-		Gateway: net.ParseIP("10.88.0.1"),
+		IP:          net.ParseIP("10.88.0.2"),
+		LinkAddress: net.HardwareAddr{0x02, 0xfc, 0x0a, 0x58, 0x00, 0x02},
+		Mask:        net.CIDRMask(24, 32),
+		Gateway:     net.ParseIP("10.88.0.1"),
 	}, rawSocket)
 	if err != nil {
 		t.Fatal(err)
