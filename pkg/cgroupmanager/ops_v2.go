@@ -210,22 +210,58 @@ func (o *cgroupV2) kill(name string) error {
 	if err != nil {
 		return err
 	}
-	if err := group.Kill(); err != nil {
+	processes, err := group.Procs(true)
+	if err != nil {
 		return err
 	}
+	// cgroup.kill is sticky while tasks from the previous sandbox are still
+	// being reaped. Writing it for an already empty cgroup can therefore kill
+	// the first process cloned into a recycled cgroup.
+	if len(processes) > 0 {
+		if err := group.Kill(); err != nil {
+			return err
+		}
+	}
+
 	for deadline := time.Now().Add(cgroupDrainTimeout); ; {
-		processes, err := group.Procs(true)
+		processes, err = group.Procs(true)
 		if err != nil {
 			return err
 		}
-		if len(processes) == 0 {
+		tasks, tracksTasks, err := readV2PidsCurrent(
+			filepath.Join(o.mountpoint, name, "pids.current"),
+		)
+		if err != nil {
+			return err
+		}
+		if len(processes) == 0 && (!tracksTasks || tasks == 0) {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for %d processes to leave cgroup %s", len(processes), name)
+			return fmt.Errorf(
+				"timed out waiting for cgroup %s to drain (%d processes, %d tasks)",
+				name,
+				len(processes),
+				tasks,
+			)
 		}
 		time.Sleep(cgroupDrainPoll)
 	}
+}
+
+func readV2PidsCurrent(filename string) (uint64, bool, error) {
+	data, err := os.ReadFile(filename)
+	if os.IsNotExist(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read %s: %w", filename, err)
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, true, fmt.Errorf("parse %s: %w", filename, err)
+	}
+	return value, true, nil
 }
 
 func (o *cgroupV2) delete(name string) error {

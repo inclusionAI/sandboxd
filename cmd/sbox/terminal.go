@@ -15,6 +15,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -69,6 +70,9 @@ func receiveFD(conn *net.UnixConn) (int, error) {
 
 func setRawMode() (*syscall.Termios, error) {
 	oldState, err := tcgetattr(int(os.Stdin.Fd()))
+	if errors.Is(err, syscall.ENOTTY) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}

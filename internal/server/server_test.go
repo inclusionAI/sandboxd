@@ -204,6 +204,44 @@ func TestStartRejectsWritableLayerLimitForRunc(t *testing.T) {
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
+func TestStartRejectsFirecrackerOCIImageBeforeFilesystemPrepare(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameFirecracker: &svc.FirecrackerHandler{},
+	})
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime: config.RuntimeNameFirecracker,
+		Rootfs: &runtime.RootfsConfig{
+			Type: runtime.RootfsSrcType_IMAGE,
+			Source: &runtime.RootfsConfig_ImageUrl{
+				ImageUrl: "example.invalid/rootfs:latest",
+			},
+		},
+	})
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+	assert.Contains(t, response.Message, "does not support OCI image rootfs")
+}
+
+func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {
+	for _, runtimeName := range []string{
+		config.RuntimeNameRunc,
+		config.RuntimeNameKata,
+		config.RuntimeNameFirecracker,
+	} {
+		t.Run(runtimeName, func(t *testing.T) {
+			s := newTestService(t, map[string]svc.Handler{
+				runtimeName: svc.NewFakeRuntimeHandler(),
+			})
+			response, err := s.Start(context.Background(), &runtime.StartRequest{
+				Runtime:        runtimeName,
+				Rootfs:         &runtime.RootfsConfig{},
+				XpuAllocations: []*runtime.XpuAllocation{{}},
+			})
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+			assert.Contains(t, response.Message, "XPU allocations require runtime")
+		})
+	}
+}
+
 func TestStartRejectsEnableKVMForRunsc(t *testing.T) {
 	s := newTestService(t, map[string]svc.Handler{
 		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
@@ -231,15 +269,22 @@ func TestStartRejectsNetworkStackForRunc(t *testing.T) {
 }
 
 func TestStartRejectsWritableLayerLimitWithoutFilestore(t *testing.T) {
-	s := newTestService(t, map[string]svc.Handler{
-		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
-	})
-	_, err := s.Start(context.Background(), &runtime.StartRequest{
-		Runtime:                 config.RuntimeNameRunsc,
-		Rootfs:                  &runtime.RootfsConfig{},
-		WritableLayerLimitBytes: 1 << 30,
-	})
-	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	for _, runtimeName := range []string{
+		config.RuntimeNameRunsc,
+		config.RuntimeNameFirecracker,
+	} {
+		t.Run(runtimeName, func(t *testing.T) {
+			s := newTestService(t, map[string]svc.Handler{
+				runtimeName: svc.NewFakeRuntimeHandler(),
+			})
+			_, err := s.Start(context.Background(), &runtime.StartRequest{
+				Runtime:                 runtimeName,
+				Rootfs:                  &runtime.RootfsConfig{},
+				WritableLayerLimitBytes: 1 << 30,
+			})
+			assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		})
+	}
 }
 
 func TestStartNormalizesRootfsWritableLayerLimit(t *testing.T) {
@@ -673,6 +718,19 @@ func TestValidateRuntimeFilestore(t *testing.T) {
 	}))
 	assert.NoError(t, validateRuntimeFilestore(config.RuntimeConfig{
 		RuntimeBinary:            map[string]string{config.RuntimeNameKata: "/usr/local/bin/containerd-shim-kata-v2"},
+		FilestoreOvercommitRatio: 1,
+	}))
+	assert.ErrorContains(t, validateRuntimeFilestore(config.RuntimeConfig{
+		RuntimeBinary: map[string]string{
+			config.RuntimeNameFirecracker: "/usr/local/bin/firecracker",
+		},
+		FilestoreOvercommitRatio: 1,
+	}), "plugin.runtime.filestore_dir")
+	assert.NoError(t, validateRuntimeFilestore(config.RuntimeConfig{
+		RuntimeBinary: map[string]string{
+			config.RuntimeNameFirecracker: "/usr/local/bin/firecracker",
+		},
+		FilestoreDir:             "/var/lib/sandboxd/filestore",
 		FilestoreOvercommitRatio: 1,
 	}))
 	assert.ErrorContains(t, validateRuntimeFilestore(config.RuntimeConfig{

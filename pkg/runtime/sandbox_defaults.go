@@ -57,6 +57,10 @@ func (r *RuncHandler) SandboxDefaults() SandboxDefaults {
 	return loaderSandboxDefaults(r.ociLoader)
 }
 
+func (f *FirecrackerHandler) SandboxDefaults() SandboxDefaults {
+	return loaderSandboxDefaults(f.ociLoader)
+}
+
 func loaderSandboxDefaults(loader OciLoader) SandboxDefaults {
 	if provider, ok := loader.(SandboxDefaultsProvider); ok {
 		return provider.SandboxDefaults()

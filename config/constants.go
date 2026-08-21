@@ -23,9 +23,10 @@ import (
 
 // Runtime names supported by sandboxd.
 const (
-	RuntimeNameRunsc = "runsc"
-	RuntimeNameKata  = "kata"
-	RuntimeNameRunc  = "runc"
+	RuntimeNameRunsc       = "runsc"
+	RuntimeNameKata        = "kata"
+	RuntimeNameRunc        = "runc"
+	RuntimeNameFirecracker = "firecracker"
 )
 
 // Sandbox service related constants.
@@ -77,9 +78,10 @@ const (
 // runtime. Server.go consults this when translating a Start RPC into per-pool
 // allocations.
 var RuntimeResources = map[string][]string{
-	RuntimeNameRunsc: {ResourceNameCgroup, ResourceNameInterface},
-	RuntimeNameKata:  {ResourceNameCgroup, ResourceNameInterface},
-	RuntimeNameRunc:  {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameRunsc:       {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameKata:        {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameRunc:        {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameFirecracker: {ResourceNameCgroup, ResourceNameInterface},
 }
 
 const (

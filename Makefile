@@ -63,12 +63,12 @@ BPF_TEST_BUILD_ARGS ?=
 BPF_SOURCE_DIRS := bpf/bpfnat bpf/networkacl
 BPF_C_SOURCES := $(shell find $(BPF_SOURCE_DIRS) -type f \( -name '*.c' -o -name '*.h' \) | sort)
 
-.PHONY: all clean test storage-test e2e release release-binary release-cli runc-shim sandbox-logger protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
+.PHONY: all clean test storage-test e2e release release-binary release-cli runc-shim sandbox-logger firecracker-agent protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
 
-release: release-binary release-cli runc-shim sandbox-logger
+release: release-binary release-cli runc-shim sandbox-logger firecracker-agent
 	@echo "Built $(RELEASE)."
 
 release-binary:
@@ -86,6 +86,10 @@ runc-shim:
 sandbox-logger:
 	@echo "Building output/sandbox-logger"
 	@CGO_ENABLED=0 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) $(GO) build -o output/sandbox-logger ./cmd/sandbox-logger
+
+firecracker-agent:
+	@echo "Building output/firecracker-agent"
+	@CGO_ENABLED=0 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) $(GO) build -o output/firecracker-agent ./cmd/firecracker-agent
 
 test: ## run tests
 	@$(GO) clean -testcache

@@ -1,13 +1,12 @@
 # sandboxd
 
-**sandboxd** is the Linux sandbox lifecycle service used by [AKernel](https://github.com/akernel-dev/akernel). It exposes a small gRPC API, manages sandbox resources, and runs sandboxes with [gVisor](https://github.com/google/gvisor), [Kata Containers](https://github.com/kata-containers/kata-containers), or the optional host-kernel [runc](https://github.com/opencontainers/runc) adapter.
+**sandboxd** is the Linux sandbox lifecycle service used by [AKernel](https://github.com/akernel-dev/akernel). It exposes a small gRPC API, manages sandbox resources, and runs sandboxes with [gVisor](https://github.com/google/gvisor), [Kata Containers](https://github.com/kata-containers/kata-containers), [Firecracker](https://github.com/firecracker-microvm/firecracker), or the optional host-kernel [runc](https://github.com/opencontainers/runc) adapter.
 
 ## Responsibilities
 
 - Start, wait for, inspect, measure, and delete sandboxes.
 - Prepare local, OCI, Nydus, and S3-backed rootfs and mounts.
-- Allocate cgroups and pooled TAP or ephemeral veth endpoints, and configure
-  iptables or eBPF for NAT.
+- Allocate cgroups and pooled TAP or ephemeral veth endpoints, and configure iptables or eBPF for NAT.
 - Discover, validate, and lease scheduler-selected accelerator devices.
 
 ## Architecture
@@ -16,9 +15,9 @@
 gRPC service
     |
 sandbox lifecycle manager
-    ├── sandbox runtime adapter ──> gVisor / Kata Containers / runc
+    ├── sandbox runtime adapter ──> gVisor / Kata / Firecracker / runc
     ├── image manager ────────────> distill-fs / OCI
-    └── resource managers ────────> cgroup v1 or v2 / veth / iptables / eBPF
+    └── resource managers ────────> cgroup / TAP or veth / iptables or eBPF
 ```
 
 ## API / CLI
@@ -101,17 +100,25 @@ stateful TCP, UDP, ICMP and related errors, IPv4 fragments, DNS redirection,
 policy replacement, restart recovery, and policy removal. `bpfnat-test` adds
 backend-specific NAT, map lifecycle, and garbage-collection coverage.
 
-The privileged E2E suite requires Docker, iptables, and the tested runsc and
-runc releases. It validates each adapter independently, plus runsc with the
-cgroup hierarchy mounted read-only:
+The privileged E2E suite covers runsc, runc, Kata Containers, and
+Firecracker. Runsc and runc use the default image; the two VM runtimes are
+selected separately with their KVM artifacts:
 
 ```bash
 RUNSC_BINARY=/usr/local/bin/runsc \
 RUNC_BINARY=/usr/local/bin/runc \
 make e2e
+
+E2E_RUNTIME=firecracker \
+FIRECRACKER_BINARY=/usr/local/bin/firecracker \
+FIRECRACKER_KERNEL=/opt/firecracker/vmlinux \
+FIRECRACKER_INITRD=/opt/firecracker/initrd.img \
+make e2e
 ```
 
-See [test/e2e/README.md](test/e2e/README.md) for the developer test environment. AKernel integration is validated through the all-in-one node image and standalone deployment in the AKernel repository.
+See [test/e2e/README.md](test/e2e/README.md) for all runtime commands and
+coverage. AKernel integration is validated through its all-in-one node image
+and standalone deployment.
 
 ## Protobuf development
 
@@ -144,11 +151,14 @@ tools/               pinned protobuf code-generation image
 
 ## Known limitations
 
-- Kata Containers requires a usable `/dev/kvm` device; nodes without KVM continue to support gVisor.
+- Kata Containers and Firecracker require a usable `/dev/kvm`; nodes without
+  KVM continue to support gVisor. Firecracker additionally requires a compatible
+  guest kernel/initrd, an EROFS root image, and the ext4 image tool.
 - NVIDIA GPU sandboxes require runsc, a directory/lisafs-backed rootfs,
   `nvidia-container-cli`, accessible NVIDIA devices and userspace driver
   libraries, and a host driver supported by the pinned runsc nvproxy. Kata,
-  MIG, fractional GPUs, and regular-file/EROFS rootfs are not supported.
+  Firecracker, runc, MIG, fractional GPUs, and regular-file/EROFS rootfs are
+  not supported.
 - sandboxd detects the local cgroup mode at startup. Legacy and hybrid hosts use cgroup v1; unified hosts use cgroup v2. The gRPC API and resource-cache behavior are identical in both modes.
 - `[plugin.resource].disable_cgroup = true` enables an experimental/debug
   compatibility mode for environments where sandboxd cannot write the

@@ -174,6 +174,10 @@ func newExecRunner(runtimeName string, context *cli.Context) (execRunner, error)
 		return &kataExecRunner{
 			containersRoot: context.String("containers-root"),
 		}, nil
+	case config.RuntimeNameFirecracker:
+		return &firecrackerExecRunner{
+			containersRoot: context.String("containers-root"),
+		}, nil
 	case config.RuntimeNameRunc:
 		return &runcExecRunner{
 			binary: context.String("runc-binary"),

@@ -907,8 +907,10 @@ func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, err
 func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
 	_, runscEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameRunsc]
 	_, runcEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameRunc]
-	if (runscEnabled || runcEnabled) && strings.TrimSpace(runtimeConfig.FilestoreDir) == "" {
-		return errors.New("runsc and runc require plugin.runtime.filestore_dir")
+	_, firecrackerEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameFirecracker]
+	if (runscEnabled || runcEnabled || firecrackerEnabled) &&
+		strings.TrimSpace(runtimeConfig.FilestoreDir) == "" {
+		return errors.New("runsc, runc, and firecracker require plugin.runtime.filestore_dir")
 	}
 	if err := config.ValidateFilestoreOvercommitRatio(runtimeConfig.FilestoreOvercommitRatio); err != nil {
 		return fmt.Errorf("plugin.runtime: %w", err)
@@ -1129,11 +1131,18 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(errord.ErrInvalidArgument)
 	}
+	if len(startReq.XpuAllocations) > 0 && startReq.Runtime != config.RuntimeNameRunsc {
+		err := fmt.Errorf("XPU allocations require runtime %q", config.RuntimeNameRunsc)
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(errord.ErrInvalidArgument)
+	}
 	if startReq.WritableLayerLimitBytes > 0 {
-		if startReq.Runtime != config.RuntimeNameRunsc {
+		if startReq.Runtime != config.RuntimeNameRunsc &&
+			startReq.Runtime != config.RuntimeNameFirecracker {
 			err := fmt.Errorf(
-				"writable layer limits require runtime %q; runtime %q is unsupported",
+				"writable layer limits require runtime %q or %q; runtime %q is unsupported",
 				config.RuntimeNameRunsc,
+				config.RuntimeNameFirecracker,
 				startReq.Runtime,
 			)
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
@@ -1156,6 +1165,14 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			Code:    -1,
 			Message: fmt.Sprintf("runtime %q is not available: %v", startReq.Runtime, err),
 		}, err
+	}
+	if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
+		if validator, ok := handler.(svc.StartRequestValidator); ok {
+			if err := validator.ValidateStartRequest(startReq); err != nil {
+				return &runtime.StartResponse{Code: -1, Message: err.Error()},
+					errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
+			}
+		}
 	}
 
 	sandboxID, err := h.sandboxManager.ReserveID(startReq.SandboxID)
@@ -1269,11 +1286,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	}
 	var specUpdates *svc.SpecUpdates
 	if len(startReq.XpuAllocations) > 0 {
-		if startReq.Runtime != config.RuntimeNameRunsc {
-			err := fmt.Errorf("XPU allocations require runtime %q", config.RuntimeNameRunsc)
-			return &runtime.StartResponse{Code: -1, Message: err.Error()},
-				errord.ToGRPC(errord.ErrInvalidArgument)
-		}
 		if h.xpuMgr == nil {
 			err := errors.New("XPU manager is not configured")
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},

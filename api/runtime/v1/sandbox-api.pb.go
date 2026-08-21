@@ -480,7 +480,7 @@ func (x *TrafficRule) GetSandboxPort() uint32 {
 	return 0
 }
 
-// TrafficPolicy controls IPv4 packets crossing a sandbox's host veth.
+// TrafficPolicy controls IPv4 packets crossing a sandbox's host endpoint.
 type TrafficPolicy struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	DefaultAction NetworkPolicyAction    `protobuf:"varint,1,opt,name=default_action,json=defaultAction,proto3,enum=runtime.v1.NetworkPolicyAction" json:"default_action,omitempty"`

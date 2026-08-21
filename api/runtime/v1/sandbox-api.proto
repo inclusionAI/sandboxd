@@ -88,7 +88,7 @@ message TrafficRule {
   uint32 sandbox_port = 5;
 }
 
-// TrafficPolicy controls IPv4 packets crossing a sandbox's host veth.
+// TrafficPolicy controls IPv4 packets crossing a sandbox's host endpoint.
 message TrafficPolicy {
   NetworkPolicyAction default_action = 1;
   repeated TrafficRule rules         = 2;

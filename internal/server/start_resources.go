@@ -81,7 +81,7 @@ func requiredStartResources(runtimeName string, disableCgroup bool) ([]string, e
 	if configured == nil {
 		return nil, fmt.Errorf("runtime %s is not supported when preparing resources", runtimeName)
 	}
-	if disableCgroup && runtimeName == config.RuntimeNameRunc {
+	if disableCgroup && runtimeName != config.RuntimeNameRunsc {
 		return nil, fmt.Errorf("runtime %s requires cgroup management", runtimeName)
 	}
 	required := make([]string, 0, len(configured))

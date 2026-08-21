@@ -23,6 +23,13 @@ func TestRuncRuntimeResources(t *testing.T) {
 	}
 }
 
+func TestFirecrackerRuntimeResources(t *testing.T) {
+	resources := RuntimeResources[RuntimeNameFirecracker]
+	if len(resources) != 2 || resources[0] != ResourceNameCgroup || resources[1] != ResourceNameInterface {
+		t.Fatalf("unexpected firecracker resources: %v", resources)
+	}
+}
+
 func TestIsValidSandboxID(t *testing.T) {
 	tests := []struct {
 		id    string

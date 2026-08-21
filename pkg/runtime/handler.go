@@ -35,6 +35,12 @@ type Handler interface {
 	Wait(context.Context, string) (Exit, error)
 }
 
+// StartRequestValidator rejects unsupported request sources before sandboxd
+// prepares images and runtime resources.
+type StartRequestValidator interface {
+	ValidateStartRequest(*runtime.StartRequest) error
+}
+
 type StartConfig struct {
 	ID                      string
 	Hostname                string
@@ -103,6 +109,18 @@ func NewHandler(cfg config.Config, bin, runtimeName string) (Handler, error) {
 			return nil, err
 		}
 		return NewRuncHandler(cfg, bin, loader)
+	case config.RuntimeNameFirecracker:
+		if cfg.RuntimeConfig.BasicSpec == nil {
+			cfg.RuntimeConfig.BasicSpec = make(map[string]string)
+		}
+		loader, err := NewBundleLoader(
+			cfg.RuntimeConfig.BasicSpec[config.RuntimeNameFirecracker],
+			sandboxRoot,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return NewFirecrackerHandler(cfg, bin, loader)
 	default:
 		return nil, errord.ErrNotImplemented
 	}

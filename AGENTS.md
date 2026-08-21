@@ -48,3 +48,17 @@ Build a gVisor candidate through the gated workflow in
 sandboxd runtime suite and the AKernel standalone E2E. Promote the candidate
 without rebuilding it. Only after promotion should this repository pin the
 published release URL and its verified SHA-512 digest.
+
+# Firecracker Storage Contract
+
+The Firecracker adapter accepts only local or image-provider-backed regular
+EROFS files for its root filesystem and filesystem image mounts. Do not add
+OCI or Nydus directory conversion, runtime-specific image caching, or shared
+artifact reference counting to sandboxd or its image manager. Produce EROFS
+before sandbox creation and let the existing image provider own distribution,
+lazy loading, and deduplication.
+
+Per-sandbox Firecracker storage is limited to the private ext4 writable layer
+and runtime state. Bounded read-only regular-file injection is a separate
+startup-metadata mechanism used for files such as `resolv.conf`; it must not
+grow into general directory or writable host sharing.

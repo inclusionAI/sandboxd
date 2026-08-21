@@ -33,3 +33,12 @@ func TestRequiredStartResourcesWithCgroup(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, config.RuntimeResources[config.RuntimeNameRunsc], resources)
 }
+
+func TestFirecrackerRequiresCgroup(t *testing.T) {
+	_, err := requiredStartResources(config.RuntimeNameFirecracker, true)
+	require.ErrorContains(t, err, "requires cgroup management")
+
+	resources, err := requiredStartResources(config.RuntimeNameFirecracker, false)
+	require.NoError(t, err)
+	assert.Equal(t, config.RuntimeResources[config.RuntimeNameFirecracker], resources)
+}

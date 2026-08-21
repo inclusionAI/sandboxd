@@ -52,5 +52,13 @@ const (
 	DefaultSandboxLogger  = "/usr/local/bin/sandbox-logger"
 	DefaultKVMDevice      = "/dev/kvm"
 
+	DefaultFirecrackerBinary       = "/usr/local/bin/firecracker"
+	DefaultFirecrackerKernel       = "/opt/firecracker/vmlinux"
+	DefaultFirecrackerInitrd       = "/opt/firecracker/initrd.img"
+	DefaultFirecrackerKernelArgs   = "console=ttyS0 reboot=k panic=1 pci=off init=/init random.trust_cpu=on"
+	DefaultFirecrackerVCPUs        = uint32(1)
+	DefaultFirecrackerMemoryMiB    = uint32(512)
+	DefaultFirecrackerOverlayBytes = uint64(10 << 30)
+
 	DefaultKataDANConfigDir = "/run/kata-containers/dans"
 )

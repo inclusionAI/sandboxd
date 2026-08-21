@@ -52,7 +52,7 @@ var (
 			Namespace: "sandbox",
 			Subsystem: "internal",
 			Name:      "sandbox_resource_gauge",
-			Help:      "Sandbox resource gauge, including netns, veth, cgroup, sandbox, etc.",
+			Help:      "Sandbox resource gauge, including network endpoints, cgroups, and sandboxes.",
 		},
 		[]string{"type"},
 	)

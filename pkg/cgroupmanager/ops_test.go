@@ -18,6 +18,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -59,6 +60,32 @@ func TestNewCgroupOpsSelectsDetectedMode(t *testing.T) {
 		assert.Equal(t, test.version, cgroupVersion(ops.mode()))
 		assert.Equal(t, test.mode, ops.mode())
 	}
+}
+
+func TestReadV2PidsCurrent(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	value, tracked, err := readV2PidsCurrent(missing)
+	require.NoError(t, err)
+	assert.Zero(t, value)
+	assert.False(t, tracked)
+
+	filename := filepath.Join(t.TempDir(), "pids.current")
+	require.NoError(t, os.WriteFile(filename, []byte("17\n"), 0644))
+	value, tracked, err = readV2PidsCurrent(filename)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(17), value)
+	assert.True(t, tracked)
+
+	require.NoError(t, os.WriteFile(filename, []byte("invalid\n"), 0644))
+	_, tracked, err = readV2PidsCurrent(filename)
+	assert.Error(t, err)
+	assert.True(t, tracked)
+
+	require.NoError(t, os.WriteFile(filename, []byte(strconv.FormatUint(^uint64(0), 10)), 0644))
+	value, tracked, err = readV2PidsCurrent(filename)
+	require.NoError(t, err)
+	assert.Equal(t, ^uint64(0), value)
+	assert.True(t, tracked)
 }
 
 func TestSandboxResourcesConvertCoreControls(t *testing.T) {

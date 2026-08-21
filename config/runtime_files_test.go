@@ -30,3 +30,16 @@ func TestDefaultRuncPaths(t *testing.T) {
 		t.Fatalf("unexpected runc defaults: %+v", runc)
 	}
 }
+
+func TestDefaultFirecrackerPaths(t *testing.T) {
+	fc := DefaultConfig().RuntimeConfig.Firecracker
+	if fc.KernelImagePath != DefaultFirecrackerKernel ||
+		fc.InitrdPath != DefaultFirecrackerInitrd ||
+		fc.KernelArgs != DefaultFirecrackerKernelArgs ||
+		fc.KVMDevice != DefaultKVMDevice ||
+		fc.DefaultVCPUCount != DefaultFirecrackerVCPUs ||
+		fc.DefaultMemoryMiB != DefaultFirecrackerMemoryMiB ||
+		fc.DefaultOverlaySizeBytes != DefaultFirecrackerOverlayBytes {
+		t.Fatalf("unexpected firecracker defaults: %+v", fc)
+	}
+}

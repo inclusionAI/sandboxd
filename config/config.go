@@ -96,6 +96,10 @@ type RuntimeConfig struct {
 	// loaded only when runtime_binary contains a "runc" entry.
 	Runc RuncConfig `toml:"runc" json:"runc"`
 
+	// Firecracker configures the optional microVM runtime adapter. It is loaded
+	// only when runtime_binary contains a "firecracker" entry.
+	Firecracker FirecrackerConfig `toml:"firecracker" json:"firecracker"`
+
 	// BasicSpec is the basic spec file for different runtime type.
 	BasicSpec map[string]string `toml:"basic_spec" json:"basicSpec"`
 
@@ -148,6 +152,17 @@ type RuncConfig struct {
 	StateRoot  string `toml:"state_root" json:"stateRoot"`
 	ShimBinary string `toml:"shim_binary" json:"shimBinary"`
 	KVMDevice  string `toml:"kvm_device" json:"kvmDevice"`
+}
+
+// FirecrackerConfig contains immutable guest boot artifacts and VM defaults.
+type FirecrackerConfig struct {
+	KernelImagePath         string `toml:"kernel_image_path" json:"kernelImagePath"`
+	InitrdPath              string `toml:"initrd_path" json:"initrdPath"`
+	KernelArgs              string `toml:"kernel_args" json:"kernelArgs"`
+	KVMDevice               string `toml:"kvm_device" json:"kvmDevice"`
+	DefaultVCPUCount        uint32 `toml:"default_vcpu_count" json:"defaultVCPUCount"`
+	DefaultMemoryMiB        uint32 `toml:"default_memory_mib" json:"defaultMemoryMiB"`
+	DefaultOverlaySizeBytes uint64 `toml:"default_overlay_size_bytes" json:"defaultOverlaySizeBytes"`
 }
 
 type ResourceConfig struct {
@@ -278,6 +293,15 @@ func DefaultConfig() Config {
 					StateRoot:  DefaultRuncStateRoot,
 					ShimBinary: DefaultRuncShimBinary,
 					KVMDevice:  DefaultKVMDevice,
+				},
+				Firecracker: FirecrackerConfig{
+					KernelImagePath:         DefaultFirecrackerKernel,
+					InitrdPath:              DefaultFirecrackerInitrd,
+					KernelArgs:              DefaultFirecrackerKernelArgs,
+					KVMDevice:               DefaultKVMDevice,
+					DefaultVCPUCount:        DefaultFirecrackerVCPUs,
+					DefaultMemoryMiB:        DefaultFirecrackerMemoryMiB,
+					DefaultOverlaySizeBytes: DefaultFirecrackerOverlayBytes,
 				},
 				ImageLibDir:              DefaultImageLibDir,
 				FilestoreDir:             DefaultFilestoreDir,
