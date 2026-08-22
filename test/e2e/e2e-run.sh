@@ -1412,6 +1412,8 @@ run_firecracker_checks() {
     if ! ip -o link show "${reused_tap}" | grep -q '<[^>]*UP'; then
         fail "reused Firecracker TAP ${reused_tap} is not administratively up"
     fi
+    wait_for_exec_output "${SANDBOX_ID}" "firecracker-readonly-ready" \
+        /bin/echo firecracker-readonly-ready
     if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo unexpected > /var/read-only-check' >/tmp/firecracker-readonly.log 2>&1; then
         cat /tmp/firecracker-readonly.log >&2

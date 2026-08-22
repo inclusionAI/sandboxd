@@ -753,10 +753,10 @@ func runPipeExec(connection *os.File, command *exec.Cmd) {
 	inputDone := make(chan struct{})
 	go forwardInput(connection, stdin, command.Process.Pid, nil, inputDone)
 
+	output.Wait()
 	waitErr := command.Wait()
 	close(inputDone)
 	_ = stdin.Close()
-	output.Wait()
 	writeMu.Lock()
 	_ = firecrackerproto.WriteFrame(
 		connection,
