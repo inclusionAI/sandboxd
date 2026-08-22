@@ -129,6 +129,7 @@ SANDBOXD_E2E_IMAGE="${image}" \
     E2E_RUNTIME="${runtime}" \
     E2E_RUNSC_PLATFORM="${platform}" \
     E2E_RUN_CGROUP_DISABLED="${run_cgroup_disabled}" \
+    E2E_NETWORK_SOAK=1 \
     E2E_SKIP_BUILD=1 \
     RUN_UNIT_TESTS=0 \
     bash test/e2e/run.sh

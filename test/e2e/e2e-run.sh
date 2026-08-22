@@ -39,6 +39,15 @@ HTTP_PORT="${E2E_HTTP_PORT:-18080}"
 DNAT_HOST_PORT="${E2E_DNAT_HOST_PORT:-18181}"
 DNAT_GUEST_PORT="${E2E_DNAT_GUEST_PORT:-18180}"
 BRIDGE_NAME="${E2E_BRIDGE_NAME:-sandbox0}"
+NETWORK_SOAK="${E2E_NETWORK_SOAK:-0}"
+REDIS_HOST="${E2E_REDIS_HOST:-}"
+REDIS_ROOTFS_TAR="${E2E_REDIS_ROOTFS_TAR:-/e2e-fixtures/rootfs.tar}"
+REDIS_ROOTFS="${E2E_REDIS_ROOTFS:-/e2e/redis-rootfs}"
+REDIS_EROFS_ROOTFS="${E2E_REDIS_EROFS_ROOTFS:-/e2e/redis-rootfs.erofs}"
+REDIS_DNAT_HOST_PORT="${E2E_REDIS_DNAT_HOST_PORT:-18379}"
+REDIS_GUEST_PORT="${E2E_REDIS_GUEST_PORT:-6379}"
+REDIS_RESULT_KEY="${E2E_REDIS_RESULT_KEY:-}"
+REDIS_BENCHMARK_REQUESTS="${E2E_REDIS_BENCHMARK_REQUESTS:-20000}"
 STRESS_ROUNDS="${E2E_STRESS_ROUNDS:-0}"
 STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
 DISABLE_CGROUP="${E2E_DISABLE_CGROUP:-0}"
@@ -153,6 +162,8 @@ preflight() {
     [[ "${STRESS_ROUNDS}" =~ ^[0-9]+$ ]] || fail "E2E_STRESS_ROUNDS must be a non-negative integer"
     [[ "${STRESS_CONCURRENCY}" =~ ^[1-8]$ ]] || fail "E2E_STRESS_CONCURRENCY must be between 1 and 8"
     [[ "${DISABLE_CGROUP}" =~ ^[01]$ ]] || fail "E2E_DISABLE_CGROUP must be 0 or 1"
+    [[ "${NETWORK_SOAK}" =~ ^[01]$ ]] || fail "E2E_NETWORK_SOAK must be 0 or 1"
+    [[ "${REDIS_BENCHMARK_REQUESTS}" =~ ^[1-9][0-9]*$ ]] || fail "E2E_REDIS_BENCHMARK_REQUESTS must be positive"
     [[ "${CPU_LIMIT_MODE}" =~ ^(shares|quota)$ ]] || fail "E2E_CPU_LIMIT_MODE must be shares or quota"
     case "${E2E_RUNTIME}" in
         all|runsc|runc|kata|firecracker) ;;
@@ -177,6 +188,15 @@ preflight() {
     fi
     if [ "${E2E_RUNTIME}" = "firecracker" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
         fail "Firecracker e2e requires sandbox-managed cgroups"
+    fi
+    if [ "${NETWORK_SOAK}" = "1" ]; then
+        [ "${E2E_RUNTIME}" != "all" ] ||
+            fail "network soak requires one selected runtime"
+        [ -n "${REDIS_HOST}" ] || fail "network soak requires E2E_REDIS_HOST"
+        [ -n "${REDIS_RESULT_KEY}" ] ||
+            fail "network soak requires E2E_REDIS_RESULT_KEY"
+        [ -f "${REDIS_ROOTFS_TAR}" ] ||
+            fail "network soak Redis rootfs tar is missing"
     fi
 
     local bin
@@ -400,8 +420,9 @@ EOF
 }
 
 prepare_rootfs() {
-    rm -rf "${ROOTFS}" "${EROFS_MOUNT_ROOT}" "${HOST_MOUNT}" "${WWW_ROOT}"
-    rm -f "${EROFS_ROOTFS}" "${EROFS_MOUNT_IMAGE}"
+    rm -rf "${ROOTFS}" "${EROFS_MOUNT_ROOT}" "${HOST_MOUNT}" "${WWW_ROOT}" \
+        "${REDIS_ROOTFS}"
+    rm -f "${EROFS_ROOTFS}" "${EROFS_MOUNT_IMAGE}" "${REDIS_EROFS_ROOTFS}"
     mkdir -p \
         "${ROOTFS}/bin" \
         "${ROOTFS}/dev" \
@@ -439,6 +460,15 @@ EOF
     echo "erofs-mount-ok" > "${EROFS_MOUNT_ROOT}/input.txt"
     mkfs.erofs "${EROFS_ROOTFS}" "${ROOTFS}" >/dev/null
     mkfs.erofs "${EROFS_MOUNT_IMAGE}" "${EROFS_MOUNT_ROOT}" >/dev/null
+
+    if [ "${NETWORK_SOAK}" = "1" ]; then
+        mkdir -p "${REDIS_ROOTFS}"
+        tar -xf "${REDIS_ROOTFS_TAR}" -C "${REDIS_ROOTFS}"
+        mkdir -p "${REDIS_ROOTFS}/dev" "${REDIS_ROOTFS}/proc" \
+            "${REDIS_ROOTFS}/sys" "${REDIS_ROOTFS}/tmp"
+        chmod 1777 "${REDIS_ROOTFS}/tmp"
+        mkfs.erofs "${REDIS_EROFS_ROOTFS}" "${REDIS_ROOTFS}" >/dev/null
+    fi
 }
 
 crash_sandboxd() {
@@ -644,6 +674,106 @@ run_dnat_check() {
     fi
     assert_eq "${dnat_response}" "${expected}" \
         "${runtime_name} local DNAT"
+
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+}
+
+run_network_soak() {
+    local runtime="${1}"
+    local rootfs="${REDIS_ROOTFS}"
+    if [ "${runtime}" = "firecracker" ]; then
+        rootfs="${REDIS_EROFS_ROOTFS}"
+    fi
+
+    log "testing ${runtime} Redis traffic over SNAT and DNAT"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime "${runtime}" \
+        --sandbox-id "sbox-e2e-${runtime}-redis" \
+        --rootfs "${rootfs}" \
+        --port "tcp:${REDIS_DNAT_HOST_PORT}:${REDIS_GUEST_PORT}" \
+        --cpu-millicores 500 \
+        --memory-mb 512 \
+        -- \
+        /usr/local/bin/redis-server \
+            --save "" \
+            --appendonly no \
+            --protected-mode no \
+            --bind 0.0.0.0 \
+            --dir /tmp)"
+    [ -n "${SANDBOX_ID}" ] ||
+        fail "${runtime} Redis start returned empty sandbox id"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+
+    local i
+    local got=""
+    for i in $(seq 1 300); do
+        got="$(sbox_cmd exec -- "${SANDBOX_ID}" \
+            /usr/local/bin/redis-cli \
+            -h 127.0.0.1 \
+            -p "${REDIS_GUEST_PORT}" \
+            ping 2>/dev/null || true)"
+        if [ "${got}" = "PONG" ]; then
+            break
+        fi
+        sleep 0.1
+    done
+    assert_eq "${got}" "PONG" "${runtime} guest Redis readiness"
+
+    local egress_ip
+    egress_ip="$(ip -4 route get "${REDIS_HOST}" | awk \
+        '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+    [ -n "${egress_ip}" ] || fail "cannot resolve Redis egress source address"
+    local clients
+    clients="$(sbox_cmd exec -- "${SANDBOX_ID}" \
+        /usr/local/bin/redis-cli \
+        --raw \
+        -h "${REDIS_HOST}" \
+        -p 6379 \
+        CLIENT LIST)"
+    if ! grep -q "addr=${egress_ip}:" <<<"${clients}"; then
+        printf '%s\n' "${clients}" >&2
+        fail "${runtime} Redis did not observe the sandboxd SNAT address ${egress_ip}"
+    fi
+
+    local snat_output
+    snat_output="$(sbox_cmd exec -- "${SANDBOX_ID}" \
+        /usr/local/bin/redis-benchmark \
+        -h "${REDIS_HOST}" \
+        -p 6379 \
+        --csv \
+        -n "${REDIS_BENCHMARK_REQUESTS}" \
+        -c 16 \
+        -P 4 \
+        -t set,get)"
+    printf '%s\n' "${snat_output}"
+    grep -q '^"SET",' <<<"${snat_output}" ||
+        fail "${runtime} Redis SNAT benchmark has no SET result"
+    grep -q '^"GET",' <<<"${snat_output}" ||
+        fail "${runtime} Redis SNAT benchmark has no GET result"
+
+    local dnat_result=""
+    for i in $(seq 1 300); do
+        dnat_result="$(sbox_cmd exec -- "${SANDBOX_ID}" \
+            /usr/local/bin/redis-cli \
+            --raw \
+            -h "${REDIS_HOST}" \
+            -p 6379 \
+            GET "${REDIS_RESULT_KEY}")"
+        if [ "${dnat_result}" != "pending" ] && [ -n "${dnat_result}" ]; then
+            break
+        fi
+        sleep 0.1
+    done
+    assert_eq "${dnat_result}" "pass" "${runtime} Redis DNAT benchmark"
+
+    local dnat_packets
+    dnat_packets="$(iptables -t nat -nvL PREROUTING -x | awk \
+        -v port="${REDIS_DNAT_HOST_PORT}" \
+        '$0 ~ "dpt:" port { packets += $1 } END { print packets + 0 }')"
+    [ "${dnat_packets}" -gt 0 ] ||
+        fail "${runtime} Redis DNAT rule did not count ingress packets"
 
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
@@ -1509,6 +1639,9 @@ run_e2e() {
             kata) run_kata_checks ;;
             firecracker) run_firecracker_checks ;;
         esac
+        if [ "${NETWORK_SOAK}" = "1" ]; then
+            run_network_soak "${E2E_RUNTIME}"
+        fi
     fi
     log "e2e passed"
 }

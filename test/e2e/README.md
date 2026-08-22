@@ -31,6 +31,11 @@ The flow:
     local DNAT, network ACL and managed DNS replacement, crash recovery,
     stale-policy removal, exit-code recovery when the daemon is unavailable,
     and reuse of the same TAP without policy leakage.
+12. runs concurrent Redis SET/GET traffic from every runtime to a sibling
+    Redis container through SNAT and from that container to the sandbox's
+    published port through DNAT. The test verifies the translated source
+    address and the DNAT packet counter instead of treating connectivity alone
+    as proof that NAT was exercised.
 
 The checksum-pinned versions are maintained in
 `third_party/runtime-versions.env`. AKernel consumes the same manifest and
@@ -120,6 +125,11 @@ matching `firecracker-agent` as `/init`.
 Set `RUN_UNIT_TESTS=0` to skip unit tests while rerunning a privileged
 scenario. Set `E2E_STRESS_ROUNDS` to a positive number and
 `E2E_STRESS_CONCURRENCY` to 1 through 8 to run concurrent lifecycle rounds.
+Targeted runtime cases enable the Redis network soak by default. Set
+`E2E_NETWORK_SOAK=1` with one selected `E2E_RUNTIME` to enable it for a
+direct `make e2e` invocation. The harness uses a digest-pinned Redis image;
+`E2E_REDIS_IMAGE` can point at a preloaded equivalent when Docker Hub is not
+reachable.
 `E2E_RUNTIME=all` means runsc plus runc; Kata and Firecracker stay explicit
 for targeted images. `E2E_SKIP_BUILD=1` reuses
 `SANDBOXD_E2E_IMAGE`, and `E2E_RUN_CGROUP_DISABLED=0` suppresses the second

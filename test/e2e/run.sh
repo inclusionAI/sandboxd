@@ -37,6 +37,15 @@ E2E_RUNC_ONLY="${E2E_RUNC_ONLY:-0}"
 E2E_RUNSC_PLATFORM="${E2E_RUNSC_PLATFORM:-systrap}"
 E2E_RUN_CGROUP_DISABLED="${E2E_RUN_CGROUP_DISABLED:-1}"
 E2E_SKIP_BUILD="${E2E_SKIP_BUILD:-0}"
+E2E_NETWORK_SOAK="${E2E_NETWORK_SOAK:-0}"
+REDIS_IMAGE="${E2E_REDIS_IMAGE:-docker.io/library/redis@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf}"
+REDIS_DNAT_HOST_PORT="${E2E_REDIS_DNAT_HOST_PORT:-18379}"
+REDIS_CONTAINER="${CONTAINER}-redis"
+REDIS_ROOTFS_CONTAINER="${CONTAINER}-redis-rootfs"
+REDIS_NETWORK="${CONTAINER}-network"
+REDIS_RESULT_KEY="sandboxd-e2e:${CONTAINER}:dnat"
+REDIS_FIXTURE_DIR=""
+REDIS_HOST=""
 
 log() {
     printf '[e2e-run] %s\n' "$*"
@@ -49,14 +58,112 @@ fail() {
 
 cleanup_container() {
     local name
-    for name in "${CONTAINER}" "${DISABLED_CONTAINER}"; do
+    for name in \
+        "${CONTAINER}" \
+        "${DISABLED_CONTAINER}" \
+        "${REDIS_CONTAINER}" \
+        "${REDIS_ROOTFS_CONTAINER}"; do
         if "${DOCKER}" ps -a --format '{{.Names}}' | grep -qx "${name}"; then
             "${DOCKER}" rm -f "${name}" >/dev/null 2>&1 || true
         fi
     done
+    "${DOCKER}" network rm "${REDIS_NETWORK}" >/dev/null 2>&1 || true
+    if [ -n "${REDIS_FIXTURE_DIR}" ]; then
+        rm -rf -- "${REDIS_FIXTURE_DIR}"
+        REDIS_FIXTURE_DIR=""
+    fi
     if [ "${E2E_SKIP_BUILD}" = "0" ] && [ "${E2E_RUNTIME}" = "kata" ]; then
         rm -rf -- "${ROOT_DIR}/output/kata"
     fi
+}
+
+prepare_network_soak() {
+    if [ "${E2E_NETWORK_SOAK}" = "0" ]; then
+        return
+    fi
+
+    log "preparing Redis network soak fixture"
+    REDIS_FIXTURE_DIR="$(mktemp -d)"
+    "${DOCKER}" create \
+        --name "${REDIS_ROOTFS_CONTAINER}" \
+        "${REDIS_IMAGE}" >/dev/null
+    "${DOCKER}" export \
+        --output "${REDIS_FIXTURE_DIR}/rootfs.tar" \
+        "${REDIS_ROOTFS_CONTAINER}"
+    "${DOCKER}" rm "${REDIS_ROOTFS_CONTAINER}" >/dev/null
+
+    "${DOCKER}" network create "${REDIS_NETWORK}" >/dev/null
+    "${DOCKER}" run -d \
+        --name "${REDIS_CONTAINER}" \
+        --network "${REDIS_NETWORK}" \
+        "${REDIS_IMAGE}" \
+        redis-server --save "" --appendonly no >/dev/null
+
+    local i
+    for i in $(seq 1 100); do
+        if "${DOCKER}" exec "${REDIS_CONTAINER}" \
+            redis-cli ping 2>/dev/null | grep -qx PONG; then
+            break
+        fi
+        sleep 0.1
+    done
+    "${DOCKER}" exec "${REDIS_CONTAINER}" redis-cli ping |
+        grep -qx PONG || fail "external Redis did not become ready"
+    REDIS_HOST="$("${DOCKER}" inspect \
+        --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+        "${REDIS_CONTAINER}")"
+    [ -n "${REDIS_HOST}" ] || fail "external Redis has no container IP"
+    "${DOCKER}" exec "${REDIS_CONTAINER}" \
+        redis-cli set "${REDIS_RESULT_KEY}" pending >/dev/null
+}
+
+run_redis_dnat_benchmark() {
+    local seen_container=0
+    local redis_ready=0
+    local i
+    for i in $(seq 1 600); do
+        if "${DOCKER}" inspect "${CONTAINER}" >/dev/null 2>&1; then
+            seen_container=1
+            if [ "$("${DOCKER}" inspect \
+                --format '{{.State.Running}}' "${CONTAINER}")" != "true" ]; then
+                return 1
+            fi
+        fi
+        if "${DOCKER}" exec "${REDIS_CONTAINER}" \
+            redis-cli -h "${CONTAINER}" -p "${REDIS_DNAT_HOST_PORT}" ping \
+            2>/dev/null | grep -qx PONG; then
+            redis_ready=1
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "${seen_container}" = "0" ] || [ "${redis_ready}" = "0" ]; then
+        "${DOCKER}" exec "${REDIS_CONTAINER}" \
+            redis-cli set "${REDIS_RESULT_KEY}" fail >/dev/null || true
+        return 1
+    fi
+
+    local output=""
+    local result=fail
+    local status=1
+    if output="$("${DOCKER}" exec "${REDIS_CONTAINER}" \
+        redis-benchmark \
+        -h "${CONTAINER}" \
+        -p "${REDIS_DNAT_HOST_PORT}" \
+        --csv \
+        -n 20000 \
+        -c 16 \
+        -P 4 \
+        -t set,get)" &&
+        grep -q '^"SET",' <<<"${output}" &&
+        grep -q '^"GET",' <<<"${output}"; then
+        result=pass
+        status=0
+    fi
+    printf '%s\n' "${output}"
+    "${DOCKER}" exec "${REDIS_CONTAINER}" \
+        redis-cli set "${REDIS_RESULT_KEY}" "${result}" >/dev/null
+    return "${status}"
 }
 trap cleanup_container EXIT
 
@@ -78,6 +185,13 @@ case "${E2E_SKIP_BUILD}" in
     0|1) ;;
     *) fail "E2E_SKIP_BUILD must be 0 or 1" ;;
 esac
+case "${E2E_NETWORK_SOAK}" in
+    0|1) ;;
+    *) fail "E2E_NETWORK_SOAK must be 0 or 1" ;;
+esac
+if [ "${E2E_NETWORK_SOAK}" = "1" ] && [ "${E2E_RUNTIME}" = "all" ]; then
+    fail "E2E_NETWORK_SOAK requires one selected runtime"
+fi
 case "${E2E_RUNC_ONLY}" in
     0) ;;
     1)
@@ -209,6 +323,20 @@ else
 fi
 
 cleanup_container
+prepare_network_soak
+
+container_network_args=(--net bridge)
+network_soak_args=(-e E2E_NETWORK_SOAK=0)
+if [ "${E2E_NETWORK_SOAK}" = "1" ]; then
+    container_network_args=(--network "${REDIS_NETWORK}")
+    network_soak_args=(
+        -e E2E_NETWORK_SOAK=1
+        -e "E2E_REDIS_HOST=${REDIS_HOST}"
+        -e "E2E_REDIS_DNAT_HOST_PORT=${REDIS_DNAT_HOST_PORT}"
+        -e "E2E_REDIS_RESULT_KEY=${REDIS_RESULT_KEY}"
+        -v "${REDIS_FIXTURE_DIR}:/e2e-fixtures:ro"
+    )
+fi
 
 log "running e2e container ${CONTAINER}"
 set +e
@@ -217,18 +345,31 @@ set +e
     --init \
     --privileged \
     --cgroupns=host \
-    --net bridge \
+    "${container_network_args[@]}" \
     -e "E2E_STRESS_ROUNDS=${E2E_STRESS_ROUNDS}" \
     -e "E2E_STRESS_CONCURRENCY=${E2E_STRESS_CONCURRENCY}" \
     -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
     -e "E2E_RUNTIME=${E2E_RUNTIME}" \
     -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
+    "${network_soak_args[@]}" \
     --tmpfs /home/akernel:rw,exec,size=2g \
     --tmpfs /e2e:rw,exec,size=512m \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    "${IMAGE}"
+    "${IMAGE}" &
+container_run_pid=$!
+set -e
+
+soak_status=0
+if [ "${E2E_NETWORK_SOAK}" = "1" ]; then
+    run_redis_dnat_benchmark || soak_status=$?
+fi
+set +e
+wait "${container_run_pid}"
 status=$?
 set -e
+if [ "${status}" -eq 0 ] && [ "${soak_status}" -ne 0 ]; then
+    status="${soak_status}"
+fi
 
 if [ "${status}" -ne 0 ]; then
     log "container logs"
