@@ -15,6 +15,8 @@
 package networkmanager
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -550,6 +552,15 @@ func (m *InterfaceManager) markUsing(netResourceStr string) (string, error) {
 	if netResource.Interface == nil {
 		return "", fmt.Errorf("interface is nil for resource %s, this indicates a creation failure", netResourceStr)
 	}
+	endpointGeneration, err := newEndpointGeneration()
+	if err != nil {
+		// A lease without a generation must never be returned to the idle pool:
+		// a stale data-plane route could otherwise target its next owner.
+		m.usingInterfaces.Set(netResource.ToString(), struct{}{})
+		m.storeMark.Store(true)
+		return "", fmt.Errorf("allocate endpoint generation: %w", err)
+	}
+	netResource.EndpointGeneration = endpointGeneration
 	if err := m.setTapState(netResource, true); err != nil {
 		// Keep a malformed or externally modified endpoint quarantined and
 		// counted. It must never go back to the reusable queue.
@@ -560,6 +571,18 @@ func (m *InterfaceManager) markUsing(netResourceStr string) (string, error) {
 	m.usingInterfaces.Set(netResource.ToString(), struct{}{})
 	m.storeMark.Store(true)
 	return netResource.ToString(), nil
+}
+
+func newEndpointGeneration() (uint64, error) {
+	var bytes [8]byte
+	for {
+		if _, err := rand.Read(bytes[:]); err != nil {
+			return 0, err
+		}
+		if generation := binary.LittleEndian.Uint64(bytes[:]); generation != 0 {
+			return generation, nil
+		}
+	}
 }
 
 func (m *InterfaceManager) Recycle(id string) error {
@@ -1196,16 +1219,17 @@ func (m *InterfaceManager) destroyDevice(dev net.Interface) error {
 }
 
 type NetResource struct {
-	SchemaVersion int              `json:"schemaVersion,omitempty" protobuf:"varint,7,opt,name=schemaVersion"`
-	EndpointType  string           `json:"endpointType,omitempty" protobuf:"bytes,8,opt,name=endpointType"`
-	GuestMAC      net.HardwareAddr `json:"guestMAC,omitempty" protobuf:"bytes,9,opt,name=guestMAC"`
-	Interface     *net.Interface   `json:"interface" protobuf:"bytes,0,opt,name=interface"`
-	Ip            net.IP           `json:"ip" protobuf:"bytes,1,opt,name=ip"`
-	Mask          net.IPMask       `json:"mask" protobuf:"bytes,2,opt,name=mask"`
-	Gateway       net.IP           `json:"gateway" protobuf:"bytes,3,opt,name=gateway"`
-	Type          string           `json:"type" protobuf:"bytes,4,opt,name=type"`
-	NetNSPath     string           `json:"netnsPath,omitempty" protobuf:"bytes,5,opt,name=netnsPath"`
-	Lifecycle     string           `json:"lifecycle,omitempty" protobuf:"bytes,6,opt,name=lifecycle"`
+	SchemaVersion      int              `json:"schemaVersion,omitempty" protobuf:"varint,7,opt,name=schemaVersion"`
+	EndpointType       string           `json:"endpointType,omitempty" protobuf:"bytes,8,opt,name=endpointType"`
+	GuestMAC           net.HardwareAddr `json:"guestMAC,omitempty" protobuf:"bytes,9,opt,name=guestMAC"`
+	Interface          *net.Interface   `json:"interface" protobuf:"bytes,0,opt,name=interface"`
+	Ip                 net.IP           `json:"ip" protobuf:"bytes,1,opt,name=ip"`
+	Mask               net.IPMask       `json:"mask" protobuf:"bytes,2,opt,name=mask"`
+	Gateway            net.IP           `json:"gateway" protobuf:"bytes,3,opt,name=gateway"`
+	Type               string           `json:"type" protobuf:"bytes,4,opt,name=type"`
+	NetNSPath          string           `json:"netnsPath,omitempty" protobuf:"bytes,5,opt,name=netnsPath"`
+	Lifecycle          string           `json:"lifecycle,omitempty" protobuf:"bytes,6,opt,name=lifecycle"`
+	EndpointGeneration uint64           `json:"endpointGeneration,omitempty"`
 }
 
 func (n *NetResource) ToString() string {

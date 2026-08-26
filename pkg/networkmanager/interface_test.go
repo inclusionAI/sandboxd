@@ -704,6 +704,14 @@ func TestValidateIPRangeNoOverlapRejectsInvalidRange(t *testing.T) {
 	assert.Contains(t, err.Error(), "parse ip_range")
 }
 
+func TestNewEndpointGenerationIsNonZero(t *testing.T) {
+	for range 64 {
+		generation, err := newEndpointGeneration()
+		require.NoError(t, err)
+		assert.NotZero(t, generation)
+	}
+}
+
 func deviceCIDR(ip string, ones int) *net.IPNet {
 	return &net.IPNet{
 		IP:   net.ParseIP(ip),

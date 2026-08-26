@@ -1468,9 +1468,15 @@ type StartResponse struct {
 	// Message contains details about the start result.
 	Message string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
 	// ID is the unique sandbox ID.
-	ID            string `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ID string `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
+	// Ports contains the concrete host/container mappings committed by sandboxd.
+	Ports []string `protobuf:"bytes,4,rep,name=ports,proto3" json:"ports,omitempty"`
+	// BridgeIP is the node-local sandbox address used by the data-plane gateway.
+	BridgeIp string `protobuf:"bytes,5,opt,name=bridge_ip,json=bridgeIp,proto3" json:"bridge_ip,omitempty"`
+	// EndpointGeneration is a non-zero opaque identity for this network lease.
+	EndpointGeneration uint64 `protobuf:"varint,6,opt,name=endpoint_generation,json=endpointGeneration,proto3" json:"endpoint_generation,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *StartResponse) Reset() {
@@ -1522,6 +1528,27 @@ func (x *StartResponse) GetID() string {
 		return x.ID
 	}
 	return ""
+}
+
+func (x *StartResponse) GetPorts() []string {
+	if x != nil {
+		return x.Ports
+	}
+	return nil
+}
+
+func (x *StartResponse) GetBridgeIp() string {
+	if x != nil {
+		return x.BridgeIp
+	}
+	return ""
+}
+
+func (x *StartResponse) GetEndpointGeneration() uint64 {
+	if x != nil {
+		return x.EndpointGeneration
+	}
+	return 0
 }
 
 // CheckpointRequest describes a synchronous checkpoint operation.
@@ -2813,11 +2840,14 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a?\n" +
 	"\x11MetricLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"M\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb1\x01\n" +
 	"\rStartResponse\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x0e\n" +
-	"\x02id\x18\x03 \x01(\tR\x02id\"\xb4\x01\n" +
+	"\x02id\x18\x03 \x01(\tR\x02id\x12\x14\n" +
+	"\x05ports\x18\x04 \x03(\tR\x05ports\x12\x1b\n" +
+	"\tbridge_ip\x18\x05 \x01(\tR\bbridgeIp\x12/\n" +
+	"\x13endpoint_generation\x18\x06 \x01(\x04R\x12endpointGeneration\"\xb4\x01\n" +
 	"\x11CheckpointRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
 	"\x0echeckpoint_dir\x18\x02 \x01(\tR\rcheckpointDir\x12'\n" +

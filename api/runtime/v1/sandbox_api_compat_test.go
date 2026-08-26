@@ -33,7 +33,7 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	const want = "f4ab97439feb72a68410e6243296a0c00c7856e7cbeae9870b9cebdffa060f0d"
+	const want = "207ecdc3dae0f843212db1d1ccb863562ce21b4cd8cb2eae14b7ecfa84162664"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}
