@@ -50,6 +50,7 @@ type checkpointHandoff struct {
 	environmentPath string
 	mu              sync.Mutex
 	reader          chan string
+	pendingRestore  bool
 	closed          bool
 	stop            chan struct{}
 	done            chan struct{}
@@ -415,12 +416,22 @@ func (handoff *checkpointHandoff) serve() {
 	defer close(handoff.done)
 	retry := time.NewTicker(10 * time.Millisecond)
 	defer retry.Stop()
+	lastOpenError := ""
 	for {
 		file, generation, err := handoff.openWriter()
 		if err != nil {
-			log.Printf("open checkpoint handoff: %v", err)
-			return
+			if message := err.Error(); message != lastOpenError {
+				log.Printf("open checkpoint handoff: %v", err)
+				lastOpenError = message
+			}
+			select {
+			case <-handoff.stop:
+				return
+			case <-retry.C:
+				continue
+			}
 		}
+		lastOpenError = ""
 		if file == nil {
 			select {
 			case <-handoff.stop:
@@ -467,11 +478,22 @@ func (handoff *checkpointHandoff) openWriter() (*os.File, chan string, error) {
 	if errors.Is(err, unix.ENXIO) || errors.Is(err, unix.EINTR) {
 		return nil, nil, nil
 	}
+	if errors.Is(err, unix.ENOENT) {
+		if err := replaceCheckpointFIFO(handoff.fifoPath); err != nil {
+			return nil, nil, fmt.Errorf("recreate checkpoint handoff: %w", err)
+		}
+		return nil, nil, nil
+	}
 	if err != nil {
 		return nil, nil, err
 	}
 	generation := make(chan string, 1)
-	handoff.reader = generation
+	if handoff.pendingRestore {
+		handoff.pendingRestore = false
+		generation <- "restore"
+	} else {
+		handoff.reader = generation
+	}
 	return os.NewFile(uintptr(fd), handoff.fifoPath), generation, nil
 }
 
@@ -486,7 +508,16 @@ func (handoff *checkpointHandoff) clearReader(generation chan string) {
 func (handoff *checkpointHandoff) signal(outcome string) error {
 	handoff.mu.Lock()
 	defer handoff.mu.Unlock()
-	if handoff.closed || handoff.reader == nil {
+	if handoff.closed {
+		log.Printf("drop checkpoint handoff outcome %q: handoff is closed", outcome)
+		return nil
+	}
+	if handoff.reader == nil {
+		if outcome == "restore" {
+			handoff.pendingRestore = true
+			log.Printf("defer checkpoint handoff outcome %q until a reader registers", outcome)
+			return nil
+		}
 		log.Printf("drop checkpoint handoff outcome %q: no reader registered", outcome)
 		return nil
 	}

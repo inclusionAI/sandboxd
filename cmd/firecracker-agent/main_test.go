@@ -175,7 +175,7 @@ func TestCheckpointHandoff(t *testing.T) {
 		}
 	}
 
-	for _, outcome := range []string{"resume", "error", "restore", "resume"} {
+	for _, outcome := range []string{"resume", "error", "resume", "resume"} {
 		if err := handoff.signal(outcome); err != nil {
 			t.Fatalf("signal without reader: %v", err)
 		}
@@ -221,6 +221,99 @@ func TestCheckpointHandoff(t *testing.T) {
 	if !bytes.Contains(data, []byte("RUNTIME_ID=restore\x00")) ||
 		bytes.Contains(data, []byte("RUNTIME_ID=source")) {
 		t.Fatalf("restored environment = %q", data)
+	}
+}
+
+func TestCheckpointHandoffDeliversRestoreAfterReaderReopens(t *testing.T) {
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handoff.close()
+
+	type readResult struct {
+		value string
+		err   error
+	}
+	read := func() <-chan readResult {
+		result := make(chan readResult, 1)
+		go func() {
+			data, err := os.ReadFile(handoff.fifoPath)
+			result <- readResult{value: string(data), err: err}
+		}()
+		return result
+	}
+
+	result := read()
+	waitForCheckpointReader(t, handoff)
+	if err := handoff.signal("resume"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil || got.value != "resume\n" {
+			t.Fatalf("initial handoff = %q, %v", got.value, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial handoff timed out")
+	}
+
+	if err := handoff.signal("restore"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-read():
+		if got.err != nil || got.value != "restore\n" {
+			t.Fatalf("pending restore handoff = %q, %v", got.value, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("restore was not delivered after the FIFO reader reopened")
+	}
+}
+
+func TestCheckpointHandoffRecreatesRemovedFIFO(t *testing.T) {
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handoff.close()
+	if err := os.Remove(handoff.fifoPath); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		info, statErr := os.Stat(handoff.fifoPath)
+		if statErr == nil && info.Mode()&os.ModeNamedPipe != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("checkpoint FIFO was not recreated: %v", statErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	result := make(chan struct {
+		value string
+		err   error
+	}, 1)
+	go func() {
+		data, err := os.ReadFile(handoff.fifoPath)
+		result <- struct {
+			value string
+			err   error
+		}{value: string(data), err: err}
+	}()
+	waitForCheckpointReader(t, handoff)
+	if err := handoff.signal("resume"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case read := <-result:
+		if read.err != nil || read.value != "resume\n" {
+			t.Fatalf("recreated checkpoint handoff = %q, %v", read.value, read.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recreated checkpoint handoff timed out")
 	}
 }
 

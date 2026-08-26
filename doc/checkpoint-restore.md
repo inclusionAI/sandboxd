@@ -78,6 +78,11 @@ Any recovery failure is returned together with the original checkpoint error.
 Because recovery is not guaranteed, the caller must still inspect and decide
 how to handle the source sandbox.
 
+The `error` outcome means that the end-to-end checkpoint interaction failed.
+It does not mean that the runtime produced no artifact bytes before the
+failure; sandboxd still removes that uncommitted output before returning the
+error.
+
 sandboxd cleans partial checkpoint output: it removes a leaf directory it
 created, or empties a caller-provided leaf directory while preserving it.
 
@@ -122,8 +127,10 @@ The runsc handoff requires gVisor `release-20260817.0-akernel.1` or a compatible
 newer build. That release always exposes both read-only files and binds each
 open checkpoint descriptor to the next checkpoint generation. Firecracker
 matches that generation-scoped behavior: a workload must open its FIFO before
-the checkpoint, and sandboxd drops an outcome when no reader subscribed to
-that generation. The bundled and E2E-tested runsc version is defined by
+the checkpoint. Firecracker drops `resume` and `error` when no reader subscribed
+to that generation, but retains one pending `restore` until the workload
+reopens the FIFO so a restore cannot be lost in the generation transition. The
+bundled and E2E-tested runsc version is defined by
 `third_party/runtime-versions.env`; replacing it with an older binary violates
 the advertised capability contract.
 
