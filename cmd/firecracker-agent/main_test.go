@@ -192,8 +192,9 @@ func TestCheckpointHandoff(t *testing.T) {
 		}()
 		select {
 		case read := <-result:
-			if read.err != nil || read.value != outcome {
-				t.Fatalf("handoff = %q, %v, want %q", read.value, read.err, outcome)
+			want := outcome + "\n"
+			if read.err != nil || read.value != want {
+				t.Fatalf("handoff = %q, %v, want %q", read.value, read.err, want)
 			}
 		case <-time.After(time.Second):
 			t.Fatal("checkpoint handoff timed out")

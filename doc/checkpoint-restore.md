@@ -64,9 +64,15 @@ After a successful checkpoint with `leave_running=false`, the caller still
 deletes the source through the normal sandbox API to release its metadata and
 resources.
 
-On failure, sandboxd returns an error and does not force-delete, stop, or
-resume the source. The caller decides how to handle the source sandbox.
-sandboxd only cleans partial checkpoint output: it removes a leaf directory it
+On failure, sandboxd returns an error and does not force-delete or stop the
+source. A runtime may make a best-effort attempt to recover a source it paused
+during checkpoint. Firecracker attempts to resume its VM and publishes an
+`error` handoff so a cooperative workload can leave the checkpoint barrier.
+Any recovery failure is returned together with the original checkpoint error.
+Because recovery is not guaranteed, the caller must still inspect and decide
+how to handle the source sandbox.
+
+sandboxd cleans partial checkpoint output: it removes a leaf directory it
 created, or empties a caller-provided leaf directory while preserving it.
 
 ## Restore through Start
@@ -103,7 +109,8 @@ runsc advertises `/proc/gvisor/checkpoint` as its checkpoint handoff and
 the equivalent guest-agent endpoints at `/run/sandboxd/checkpoint` and
 `/run/sandboxd/restore-environ`. These paths are runtime-neutral transport
 metadata: sandboxd does not inject or interpret application-specific
-environment variables.
+environment variables. Both checkpoint handoff endpoints return a
+newline-terminated `resume`, `restore`, or `error` outcome.
 
 Unsupported runtimes return `Unimplemented`.
 
@@ -113,5 +120,5 @@ Compression changes only the runtime-specific artifact encoding; it does not
 make an artifact portable.
 
 Incremental checkpoints, deterministic replay, migration orchestration, and
-automatic recovery of a source after checkpoint failure are outside this
+guaranteed recovery of a source after checkpoint failure are outside this
 design.

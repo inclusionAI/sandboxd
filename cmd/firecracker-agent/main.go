@@ -424,7 +424,7 @@ func (handoff *checkpointHandoff) serve() {
 				_ = file.Close()
 				return
 			}
-			if _, err := io.WriteString(file, outcome); err != nil {
+			if _, err := io.WriteString(file, outcome+"\n"); err != nil {
 				log.Printf("write checkpoint handoff: %v", err)
 			}
 			if err := file.Close(); err != nil {
