@@ -56,6 +56,7 @@ func (handler *Handler) Checkpoint(
 	if err := api.pause(ctx); err != nil {
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
+	sourcePaused := true
 	handoffReleased := false
 	defer func() {
 		if retErr == nil || handoffReleased ||
@@ -67,12 +68,15 @@ func (handler *Handler) Checkpoint(
 			firecrackerAgentTimeout,
 		)
 		defer cancel()
-		if err := api.resume(cleanupCtx); err != nil {
-			retErr = errors.Join(
-				retErr,
-				fmt.Errorf("resume Firecracker sandbox %s after checkpoint failure: %w", sandboxID, err),
-			)
-			return
+		if sourcePaused {
+			if err := api.resume(cleanupCtx); err != nil {
+				retErr = errors.Join(
+					retErr,
+					fmt.Errorf("resume Firecracker sandbox %s after checkpoint failure: %w", sandboxID, err),
+				)
+				return
+			}
+			sourcePaused = false
 		}
 		if err := requestFirecrackerAgent(
 			cleanupCtx,
@@ -115,6 +119,7 @@ func (handler *Handler) Checkpoint(
 		if err := api.resume(ctx); err != nil {
 			return fmt.Errorf("resume Firecracker sandbox %s: %w", sandboxID, err)
 		}
+		sourcePaused = false
 		if err := requestFirecrackerAgent(
 			ctx,
 			state.VsockPath,

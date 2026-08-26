@@ -15,8 +15,10 @@
 package firecracker
 
 import (
+	"archive/tar"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,6 +115,104 @@ func TestFirecrackerCheckpointArchiveCancellationRemovesOutput(t *testing.T) {
 	}
 }
 
+func TestFirecrackerCheckpointArchiveReadsLegacyDenseFormat(t *testing.T) {
+	root := t.TempDir()
+	image := filepath.Join(root, "legacy-checkpoint.img")
+	file, err := os.OpenFile(image, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := tar.NewWriter(file)
+	contents := map[string]string{
+		firecrackerCheckpointStateName:   "legacy-state",
+		firecrackerCheckpointMemoryName:  "legacy-memory",
+		firecrackerCheckpointOverlayName: "legacy-overlay",
+	}
+	for _, name := range []string{
+		firecrackerCheckpointStateName,
+		firecrackerCheckpointMemoryName,
+		firecrackerCheckpointOverlayName,
+	} {
+		content := contents[name]
+		if err := archive.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0600,
+			Size: int64(len(content)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(archive, content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := errors.Join(archive.Close(), file.Close()); err != nil {
+		t.Fatal(err)
+	}
+
+	destination := firecrackerCheckpointFiles{
+		State:   filepath.Join(root, "state"),
+		Memory:  filepath.Join(root, "memory"),
+		Overlay: filepath.Join(root, "overlay"),
+	}
+	if err := extractFirecrackerCheckpointArchive(
+		context.Background(), image, destination,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		firecrackerCheckpointStateName:   destination.State,
+		firecrackerCheckpointMemoryName:  destination.Memory,
+		firecrackerCheckpointOverlayName: destination.Overlay,
+	} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != contents[name] {
+			t.Fatalf("legacy %s = %q", name, data)
+		}
+	}
+}
+
+func TestFirecrackerCheckpointArchiveRejectsUnversionedPrivateMetadata(t *testing.T) {
+	root := t.TempDir()
+	image := filepath.Join(root, "unversioned-checkpoint.img")
+	file, err := os.OpenFile(image, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := tar.NewWriter(file)
+	if err := archive.WriteHeader(&tar.Header{
+		Name: firecrackerCheckpointStateName,
+		Mode: 0600,
+		Size: 1,
+		PAXRecords: map[string]string{
+			firecrackerSparseSizePAX: "2",
+			firecrackerSparseMapPAX:  "0:1",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(archive, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(archive.Close(), file.Close()); err != nil {
+		t.Fatal(err)
+	}
+	err = extractFirecrackerCheckpointArchive(
+		context.Background(),
+		image,
+		firecrackerCheckpointFiles{
+			State:   filepath.Join(root, "state"),
+			Memory:  filepath.Join(root, "memory"),
+			Overlay: filepath.Join(root, "overlay"),
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid Firecracker checkpoint entry") {
+		t.Fatalf("unversioned private metadata error = %v", err)
+	}
+}
+
 func TestFirecrackerCheckpointArchivePreservesSparseFiles(t *testing.T) {
 	root := t.TempDir()
 	files := firecrackerCheckpointFiles{
@@ -155,6 +255,22 @@ func TestFirecrackerCheckpointArchivePreservesSparseFiles(t *testing.T) {
 	}
 	if info.Size() > 1<<20 {
 		t.Fatalf("sparse checkpoint archive size = %d", info.Size())
+	}
+	archiveFile, err := os.Open(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := tar.NewReader(archiveFile).Next()
+	if err != nil {
+		_ = archiveFile.Close()
+		t.Fatal(err)
+	}
+	if header.Name != firecrackerCheckpointFormatName {
+		_ = archiveFile.Close()
+		t.Fatalf("first checkpoint entry = %q", header.Name)
+	}
+	if err := archiveFile.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	destinationRoot := filepath.Join(root, "destination")

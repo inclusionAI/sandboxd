@@ -32,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	"github.com/vishvananda/netlink"
@@ -47,8 +48,11 @@ const (
 type checkpointHandoff struct {
 	fifoPath        string
 	environmentPath string
-	outcomes        chan string
+	mu              sync.Mutex
+	reader          chan string
+	closed          bool
 	stop            chan struct{}
+	done            chan struct{}
 	stopOnce        sync.Once
 }
 
@@ -364,8 +368,8 @@ func prepareCheckpointHandoff(
 	handoff := &checkpointHandoff{
 		fifoPath:        fifoPath,
 		environmentPath: environmentPath,
-		outcomes:        make(chan string, 2),
 		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
 	}
 	go handoff.serve()
 	return handoff, nil
@@ -408,14 +412,25 @@ func writeCheckpointEnvironment(path string, environment []string) error {
 }
 
 func (handoff *checkpointHandoff) serve() {
+	defer close(handoff.done)
+	retry := time.NewTicker(10 * time.Millisecond)
+	defer retry.Stop()
 	for {
-		file, err := os.OpenFile(handoff.fifoPath, os.O_WRONLY, 0)
+		file, generation, err := handoff.openWriter()
 		if err != nil {
 			log.Printf("open checkpoint handoff: %v", err)
 			return
 		}
+		if file == nil {
+			select {
+			case <-handoff.stop:
+				return
+			case <-retry.C:
+				continue
+			}
+		}
 		select {
-		case outcome := <-handoff.outcomes:
+		case outcome := <-generation:
 			// Publish the next FIFO inode before completing this generation.
 			// New readers cannot attach to the old inode while its current
 			// reader is consuming the outcome and waiting for EOF.
@@ -431,23 +446,64 @@ func (handoff *checkpointHandoff) serve() {
 				log.Printf("close checkpoint handoff: %v", err)
 			}
 		case <-handoff.stop:
+			handoff.clearReader(generation)
 			_ = file.Close()
 			return
 		}
 	}
 }
 
-func (handoff *checkpointHandoff) signal(outcome string) error {
-	select {
-	case handoff.outcomes <- outcome:
-		return nil
-	default:
-		return errors.New("checkpoint handoff queue is full")
+func (handoff *checkpointHandoff) openWriter() (*os.File, chan string, error) {
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	if handoff.closed {
+		return nil, nil, nil
+	}
+	fd, err := unix.Open(
+		handoff.fifoPath,
+		unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC,
+		0,
+	)
+	if errors.Is(err, unix.ENXIO) || errors.Is(err, unix.EINTR) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	generation := make(chan string, 1)
+	handoff.reader = generation
+	return os.NewFile(uintptr(fd), handoff.fifoPath), generation, nil
+}
+
+func (handoff *checkpointHandoff) clearReader(generation chan string) {
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	if handoff.reader == generation {
+		handoff.reader = nil
 	}
 }
 
+func (handoff *checkpointHandoff) signal(outcome string) error {
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	if handoff.closed || handoff.reader == nil {
+		log.Printf("drop checkpoint handoff outcome %q: no reader registered", outcome)
+		return nil
+	}
+	generation := handoff.reader
+	handoff.reader = nil
+	generation <- outcome
+	return nil
+}
+
 func (handoff *checkpointHandoff) close() {
-	handoff.stopOnce.Do(func() { close(handoff.stop) })
+	handoff.stopOnce.Do(func() {
+		handoff.mu.Lock()
+		handoff.closed = true
+		close(handoff.stop)
+		handoff.mu.Unlock()
+	})
+	<-handoff.done
 }
 
 func releaseCheckpoint(request firecrackerproto.CheckpointRequest) error {

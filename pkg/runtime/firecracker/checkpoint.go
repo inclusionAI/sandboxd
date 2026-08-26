@@ -34,9 +34,12 @@ const (
 	firecrackerCheckpointStateName    = "vmstate"
 	firecrackerCheckpointMemoryName   = "memory"
 	firecrackerCheckpointOverlayName  = "overlay.ext4"
+	firecrackerCheckpointFormatName   = ".sandboxd-checkpoint-format"
+	firecrackerCheckpointFormat       = "1\n"
 	firecrackerCheckpointMaxComponent = int64(16 << 40)
 	firecrackerCheckpointMaxExtents   = 1 << 20
 
+	firecrackerPAXPrefix     = "AKERNEL.sandboxd."
 	firecrackerSparseSizePAX = "AKERNEL.sandboxd.sparse.size"
 	firecrackerSparseMapPAX  = "AKERNEL.sandboxd.sparse.map"
 )
@@ -79,7 +82,7 @@ func createFirecrackerCheckpointArchive(
 		archiveOutput = compressor
 	}
 	archive := tar.NewWriter(archiveOutput)
-	var writeErr error
+	writeErr := writeFirecrackerCheckpointFormat(archive)
 	for _, component := range []struct {
 		name string
 		path string
@@ -88,6 +91,9 @@ func createFirecrackerCheckpointArchive(
 		{name: firecrackerCheckpointMemoryName, path: files.Memory},
 		{name: firecrackerCheckpointOverlayName, path: files.Overlay},
 	} {
+		if writeErr != nil {
+			break
+		}
 		writeErr = writeFirecrackerCheckpointFile(
 			ctx,
 			archive,
@@ -108,6 +114,19 @@ func createFirecrackerCheckpointArchive(
 	}
 	complete = true
 	return nil
+}
+
+func writeFirecrackerCheckpointFormat(archive *tar.Writer) error {
+	if err := archive.WriteHeader(&tar.Header{
+		Name:     firecrackerCheckpointFormatName,
+		Mode:     0400,
+		Size:     int64(len(firecrackerCheckpointFormat)),
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		return err
+	}
+	_, err := io.WriteString(archive, firecrackerCheckpointFormat)
+	return err
 }
 
 func writeFirecrackerCheckpointFile(
@@ -278,6 +297,7 @@ func extractFirecrackerCheckpointArchive(
 		}
 	}()
 	seen := make(map[string]bool, len(outputs))
+	formatSeen := false
 	archive := tar.NewReader(archiveInput)
 	for {
 		header, nextErr := archive.Next()
@@ -287,9 +307,23 @@ func extractFirecrackerCheckpointArchive(
 		if nextErr != nil {
 			return fmt.Errorf("read Firecracker checkpoint archive: %w", nextErr)
 		}
+		if header.Name == firecrackerCheckpointFormatName {
+			if formatSeen || len(seen) != 0 || header.Typeflag != tar.TypeReg ||
+				header.Size != int64(len(firecrackerCheckpointFormat)) {
+				return errors.New("invalid Firecracker checkpoint format marker")
+			}
+			content, readErr := io.ReadAll(archive)
+			if readErr != nil || string(content) != firecrackerCheckpointFormat {
+				return errors.New("unsupported Firecracker checkpoint format")
+			}
+			formatSeen = true
+			continue
+		}
 		path, ok := outputs[header.Name]
+		metadataErr := validateFirecrackerCheckpointMetadata(header, formatSeen)
 		logicalSize, extents, sparse, sparseErr := parseFirecrackerSparseHeader(header)
-		if !ok || seen[header.Name] || header.Typeflag != tar.TypeReg || sparseErr != nil ||
+		if !ok || seen[header.Name] || header.Typeflag != tar.TypeReg ||
+			metadataErr != nil || sparseErr != nil ||
 			logicalSize <= 0 || logicalSize > firecrackerCheckpointMaxComponent {
 			return fmt.Errorf("invalid Firecracker checkpoint entry %q", header.Name)
 		}
@@ -336,6 +370,23 @@ func extractFirecrackerCheckpointArchive(
 		if !seen[name] {
 			return fmt.Errorf("Firecracker checkpoint component %s is missing", name)
 		}
+	}
+	return nil
+}
+
+func validateFirecrackerCheckpointMetadata(header *tar.Header, formatSeen bool) error {
+	hasPrivateMetadata := false
+	for key := range header.PAXRecords {
+		if !strings.HasPrefix(key, firecrackerPAXPrefix) {
+			continue
+		}
+		hasPrivateMetadata = true
+		if key != firecrackerSparseSizePAX && key != firecrackerSparseMapPAX {
+			return fmt.Errorf("unsupported private PAX record %q", key)
+		}
+	}
+	if hasPrivateMetadata && !formatSeen {
+		return errors.New("private PAX records require a checkpoint format marker")
 	}
 	return nil
 }

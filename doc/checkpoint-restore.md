@@ -50,6 +50,12 @@ never overwrites a non-empty directory.
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
 
+Firecracker checkpoints use a sandboxd-owned, versioned tar container. Sparse
+components carry private PAX metadata and are not safely extractable with stock
+tar tools. The version marker makes pre-format sandboxd readers reject new
+archives instead of silently materializing truncated files; current readers
+continue to accept legacy dense archives.
+
 ## Source and failure semantics
 
 `leave_running` defines only the successful result:
@@ -111,6 +117,15 @@ the equivalent guest-agent endpoints at `/run/sandboxd/checkpoint` and
 metadata: sandboxd does not inject or interpret application-specific
 environment variables. Both checkpoint handoff endpoints return a
 newline-terminated `resume`, `restore`, or `error` outcome.
+
+The runsc handoff requires gVisor `release-20260817.0-akernel.1` or a compatible
+newer build. That release always exposes both read-only files and binds each
+open checkpoint descriptor to the next checkpoint generation. Firecracker
+matches that generation-scoped behavior: a workload must open its FIFO before
+the checkpoint, and sandboxd drops an outcome when no reader subscribed to
+that generation. The bundled and E2E-tested runsc version is defined by
+`third_party/runtime-versions.env`; replacing it with an older binary violates
+the advertised capability contract.
 
 Unsupported runtimes return `Unimplemented`.
 

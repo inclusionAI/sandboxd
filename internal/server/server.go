@@ -417,7 +417,15 @@ func (h *sandboxService) ListAvailableRuntimes(
 	runtimes := make([]*runtime.RuntimeInfo, 0, len(runtimeClasses))
 	for _, runtimeClass := range runtimeClasses {
 		info := &runtime.RuntimeInfo{RuntimeClass: runtimeClass}
-		handler, _ := h.serviceHandler.Get(runtimeClass)
+		handler, ok := h.serviceHandler.Get(runtimeClass)
+		if !ok {
+			logrus.Debugf(
+				"runtime handler %q disappeared while listing capabilities",
+				runtimeClass,
+			)
+			runtimes = append(runtimes, info)
+			continue
+		}
 		if _, ok := handler.(svc.CheckpointHandler); ok {
 			info.SupportsCheckpointRestore = true
 		}

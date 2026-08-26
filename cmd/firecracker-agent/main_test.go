@@ -175,10 +175,13 @@ func TestCheckpointHandoff(t *testing.T) {
 		}
 	}
 
-	for _, outcome := range []string{"resume", "restore"} {
+	for _, outcome := range []string{"resume", "error", "restore", "resume"} {
 		if err := handoff.signal(outcome); err != nil {
-			t.Fatal(err)
+			t.Fatalf("signal without reader: %v", err)
 		}
+	}
+
+	for _, outcome := range []string{"resume", "restore"} {
 		result := make(chan struct {
 			value string
 			err   error
@@ -190,6 +193,10 @@ func TestCheckpointHandoff(t *testing.T) {
 				err   error
 			}{string(data), err}
 		}()
+		waitForCheckpointReader(t, handoff)
+		if err := handoff.signal(outcome); err != nil {
+			t.Fatal(err)
+		}
 		select {
 		case read := <-result:
 			want := outcome + "\n"
@@ -215,6 +222,41 @@ func TestCheckpointHandoff(t *testing.T) {
 		bytes.Contains(data, []byte("RUNTIME_ID=source")) {
 		t.Fatalf("restored environment = %q", data)
 	}
+}
+
+func TestCheckpointHandoffCloseWithoutReader(t *testing.T) {
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		handoff.close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint handoff close blocked without a reader")
+	}
+	if err := handoff.signal("resume"); err != nil {
+		t.Fatalf("signal closed handoff: %v", err)
+	}
+}
+
+func waitForCheckpointReader(t *testing.T, handoff *checkpointHandoff) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		handoff.mu.Lock()
+		ready := handoff.reader != nil
+		handoff.mu.Unlock()
+		if ready {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("checkpoint handoff reader did not register")
 }
 
 type recordingWriteCloser struct {
