@@ -694,15 +694,18 @@ run_checkpoint_restore_check() {
     local target_id="sbox-e2e-${suffix}-cr-target"
     local request_file="/tmp/${suffix}-checkpoint-request.json"
     local checkpoint_parent="${SANDBOXD_HOME}/e2e-checkpoints"
-    local checkpoint_dir="${checkpoint_parent}/${suffix}"
+    local checkpoint_root="${checkpoint_parent}/${suffix}"
+    local checkpoint_dir=""
+    local checkpoint_count=10
     local memory_mb=128
     if [ "${runtime}" = "firecracker" ]; then
         memory_mb=256
     fi
 
-    log "testing ${suffix} checkpoint/restore with a new sandbox ID"
+    log "testing ${suffix} ${checkpoint_count} consecutive checkpoints and restoring the last"
     mkdir -p "${checkpoint_parent}"
-    rm -rf -- "${checkpoint_dir}"
+    rm -rf -- "${checkpoint_root}"
+    mkdir -p "${checkpoint_root}"
     rm -f -- "${request_file}"
     SANDBOX_ID="$(checkpoint-restore \
         --action start \
@@ -731,29 +734,48 @@ run_checkpoint_restore_check() {
     [[ "${before}" =~ ^[0-9]+$ ]] && [ "${before}" -gt 2 ] ||
         fail "${suffix} checkpoint source counter is invalid: ${before@Q}"
 
-    checkpoint-restore \
-        --action checkpoint \
-        --socket "${SOCKET}" \
-        --sandbox-id "${source_id}" \
-        --request-file "${request_file}" \
-        --checkpoint-dir "${checkpoint_dir}" \
-        --checkpoint-timeout-seconds 180 \
-        --compress=true \
-        --leave-running=true
-    [ -s "${checkpoint_dir}/checkpoint.img" ] ||
-        fail "${suffix} checkpoint artifact is missing or empty"
-
+    local checkpoint_index
+    local previous_checkpoint_dir=""
+    local restore_floor=""
     local source_after=""
-    for attempt in $(seq 1 100); do
-        source_after="$(sbox_cmd exec "${SANDBOX_ID}" \
-            /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
-        if [[ "${source_after}" =~ ^[0-9]+$ ]] && [ "${source_after}" -gt "${before}" ]; then
-            break
+    for checkpoint_index in $(seq 1 "${checkpoint_count}"); do
+        checkpoint_dir="${checkpoint_root}/${checkpoint_index}"
+        sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            "printf '%s\\n' '${checkpoint_index}' > /var/checkpoint-generation"
+        restore_floor="${before}"
+        log "checkpointing ${suffix} source ${checkpoint_index}/${checkpoint_count}"
+        checkpoint-restore \
+            --action checkpoint \
+            --socket "${SOCKET}" \
+            --sandbox-id "${source_id}" \
+            --request-file "${request_file}" \
+            --checkpoint-dir "${checkpoint_dir}" \
+            --checkpoint-timeout-seconds 180 \
+            --compress=true \
+            --leave-running=true
+        [ -s "${checkpoint_dir}/checkpoint.img" ] ||
+            fail "${suffix} checkpoint ${checkpoint_index} artifact is missing or empty"
+
+        source_after=""
+        for attempt in $(seq 1 100); do
+            source_after="$(sbox_cmd exec "${SANDBOX_ID}" \
+                /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
+            if [[ "${source_after}" =~ ^[0-9]+$ ]] &&
+                [ "${source_after}" -gt "${before}" ]; then
+                break
+            fi
+            sleep 0.1
+        done
+        [[ "${source_after}" =~ ^[0-9]+$ ]] &&
+            [ "${source_after}" -gt "${before}" ] ||
+            fail "${suffix} source stopped after checkpoint ${checkpoint_index}"
+        before="${source_after}"
+
+        if [ -n "${previous_checkpoint_dir}" ]; then
+            rm -rf -- "${previous_checkpoint_dir}"
         fi
-        sleep 0.1
+        previous_checkpoint_dir="${checkpoint_dir}"
     done
-    [[ "${source_after}" =~ ^[0-9]+$ ]] && [ "${source_after}" -gt "${before}" ] ||
-        fail "${suffix} source did not continue after leave_running checkpoint"
     local source_network
     source_network="$(sbox_cmd exec "${SANDBOX_ID}" \
         /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
@@ -774,6 +796,11 @@ run_checkpoint_restore_check() {
     local persisted
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" "${suffix} restored writable state"
+    local restored_generation
+    restored_generation="$(sbox_cmd exec "${SANDBOX_ID}" \
+        /bin/cat /var/checkpoint-generation)"
+    assert_eq "${restored_generation}" "${checkpoint_count}" \
+        "${suffix} restored the final checkpoint"
     if ! sbox_cmd exec "${SANDBOX_ID}" \
         /bin/sh -c 'test ! -e /var/checkpoint-restarted'; then
         fail "${suffix} restore re-executed the sandbox entrypoint"
@@ -782,13 +809,15 @@ run_checkpoint_restore_check() {
     for attempt in $(seq 1 100); do
         restored="$(sbox_cmd exec "${SANDBOX_ID}" \
             /bin/cat /var/checkpoint-counter 2>/dev/null || true)"
-        if [[ "${restored}" =~ ^[0-9]+$ ]] && [ "${restored}" -ge "${before}" ]; then
+        if [[ "${restored}" =~ ^[0-9]+$ ]] &&
+            [ "${restored}" -ge "${restore_floor}" ]; then
             break
         fi
         sleep 0.1
     done
-    [[ "${restored}" =~ ^[0-9]+$ ]] && [ "${restored}" -ge "${before}" ] ||
-        fail "${suffix} restored counter lost checkpoint state: before=${before} restored=${restored}"
+    [[ "${restored}" =~ ^[0-9]+$ ]] &&
+        [ "${restored}" -ge "${restore_floor}" ] ||
+        fail "${suffix} restored counter lost final checkpoint state: before=${restore_floor} restored=${restored}"
     sleep 0.3
     local advanced
     advanced="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-counter)"
@@ -799,8 +828,8 @@ run_checkpoint_restore_check() {
         /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${restored_network}" "sandboxd-network-ok" "${suffix} restored network"
 
-    rm -rf -- "${checkpoint_dir}"
-    [ ! -e "${checkpoint_dir}" ] || fail "${suffix} caller cleanup retained checkpoint"
+    rm -rf -- "${checkpoint_root}"
+    [ ! -e "${checkpoint_root}" ] || fail "${suffix} caller cleanup retained checkpoint"
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" \
         "${suffix} target independent of checkpoint directory"
