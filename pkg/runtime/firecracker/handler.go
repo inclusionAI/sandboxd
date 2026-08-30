@@ -242,6 +242,11 @@ type Handler struct {
 	// see FirecrackerConfig.ShrinkBeforeCheckpoint for why it is off by
 	// default.
 	shrinkBeforeCheckpoint bool
+
+	// checkpointWriteback starts background writeback for completed memory
+	// artifacts so a later XFS reflink does not inherit the previous
+	// generation's buffered-I/O debt.
+	checkpointWriteback *checkpointWritebackScheduler
 }
 
 var _ runtimecore.Handler = &Handler{}
@@ -337,6 +342,7 @@ func NewHandler(
 		defaultMem:             firecrackerConfig.DefaultMemoryMiB,
 		shrinkBeforeCheckpoint: firecrackerConfig.ShrinkBeforeCheckpoint,
 		checkpointMode:         firecrackerConfig.CheckpointMode,
+		checkpointWriteback:    newCheckpointWritebackScheduler(),
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
 		instances:              make(map[string]*firecrackerInstance),

@@ -316,6 +316,12 @@ func (handler *Handler) Checkpoint(
 			sandboxID, err,
 		)
 	}
+	if !handler.checkpointWriteback.schedule(files.Memory) {
+		logrus.Warnf(
+			"firecracker: checkpoint memory writeback queue is full; skip %s",
+			files.Memory,
+		)
+	}
 
 	// Pause window = pause..resume (snapshot + overlay clone); layout and
 	// sealing are host-side work outside it by design.

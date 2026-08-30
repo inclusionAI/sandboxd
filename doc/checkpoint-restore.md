@@ -76,12 +76,14 @@ space a generation costs.
 For the low-latency path, put the live Firecracker writable layer and the
 checkpoint root on the same native XFS filesystem with reflink enabled. A
 cross-filesystem or non-reflink layout falls back to copying large files. A
-`Full` baseline also dirties one guest-memory-sized file; an immediately
-following generation can make XFS wait for that file's background writeback
-before it can reflink the baseline. Normal periodic checkpointing lets that
-writeback drain between generations. Do not add an fsync to the checkpoint RPC
-to hide this cost, because that only moves the same wait into the guest pause
-path.
+`Full` baseline also dirties one guest-memory-sized file. After committing a
+generation, sandboxd asynchronously asks Linux to start writeback for its
+memory file without waiting for completion. Normal periodic checkpointing lets
+that I/O overlap the interval between generations, so a later XFS reflink does
+not usually inherit the previous checkpoint's buffered-I/O debt. An immediately
+following generation can still catch writeback in progress and wait. Do not add
+an fsync to the checkpoint RPC to hide this cost, because that only moves the
+same wait into the request path.
 
 Consecutive generations must use distinct `checkpoint_dir` values — sandboxd
 refuses to overwrite a directory that already holds a checkpoint. The
@@ -93,8 +95,11 @@ rules below); deleting older generations is always safe.
 Checkpoint completion deliberately uses host page-cache semantics. Every
 Firecracker snapshot request carries `deferred_sync: true`: Firecracker returns
 after buffered writes, and sandboxd does not fsync the memory, state, overlay,
-manifest, or checkpoint directory. The Linux kernel may write dirty pages back
-later under its normal dirty-page policy.
+manifest, or checkpoint directory. After the manifest is committed and the
+incremental base is adopted, a bounded sandboxd worker issues
+`sync_file_range(SYNC_FILE_RANGE_WRITE)` for the memory file. This starts Linux
+writeback but does not wait for I/O completion and does not strengthen the
+artifact's durability contract.
 
 On cgroup v2, sandboxd keeps snapshot page-cache charges out of the sandbox
 cgroup without changing its memory limit. A container's cgroup namespace root
