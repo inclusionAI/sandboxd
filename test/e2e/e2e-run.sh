@@ -30,6 +30,7 @@ EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
 FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
+OCI_ROOTFS_IMAGE="${E2E_OCI_ROOTFS_IMAGE:-docker.io/library/redis:7-alpine}"
 FIRECRACKER_OVERLAY_BYTES="${E2E_FIRECRACKER_OVERLAY_BYTES:-134217728}"
 HOST_MOUNT="${E2E_HOST_MOUNT:-/e2e/host-mount}"
 WWW_ROOT="${E2E_WWW_ROOT:-/e2e/www}"
@@ -434,6 +435,8 @@ kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 256
 default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
+oci_rootfs_enabled = true
+mkfs_erofs_path = "/usr/bin/mkfs.erofs"
 ${e2e_fc_checkpoint_mode_cfg}
 
 [plugin.runtime.basic_spec]
@@ -1748,6 +1751,26 @@ run_firecracker_checks() {
         sbox_cmd delete "${rejected_id}" || true
         fail "Firecracker accepted a directory mount"
     fi
+
+    log "testing Firecracker OCI rootfs conversion"
+    local oci_root_id="sbox-e2e-firecracker-oci-root"
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime firecracker \
+        --sandbox-id "${oci_root_id}" \
+        --image-url "${OCI_ROOTFS_IMAGE}" \
+        --cpu-millicores 100 \
+        --memory-mb 256 \
+        /bin/sh -c 'echo firecracker-oci-ready > /var/oci-rootfs; sleep 300')"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    wait_for_exec_output "${SANDBOX_ID}" "firecracker-oci-ready" \
+        /bin/cat /var/oci-rootfs
+    local redis_version
+    redis_version="$(sbox_cmd exec "${SANDBOX_ID}" redis-server --version)"
+    [[ "${redis_version}" == *"Redis server v="* ]] || \
+        fail "Firecracker OCI rootfs did not preserve image content: ${redis_version@Q}"
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
 
     local cached_taps_before
     cached_taps_before="$(list_cached_taps)"

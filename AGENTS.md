@@ -80,11 +80,13 @@ stays synchronized with the implementation.
 # Firecracker Storage Contract
 
 The Firecracker adapter accepts only local or image-provider-backed regular
-EROFS files for its root filesystem and filesystem image mounts. Do not add
-OCI or Nydus directory conversion, runtime-specific image caching, or shared
-artifact reference counting to sandboxd or its image manager. Produce EROFS
-before sandbox creation and let the existing image provider own distribution,
-lazy loading, and deduplication.
+EROFS files for its root filesystem and filesystem image mounts. An operator
+may opt into OCI/Nydus rootfs materialization with
+`plugin.runtime.firecracker.oci_rootfs_enabled`. Keep derived EROFS files
+content-addressed and inside storage owned by the source image manager: OCI
+artifacts follow final-chain GC, while Nydus artifacts follow daemon/bootstrap
+GC. Do not create an independent tag-keyed cache or artifact reference count.
+OCI image mounts remain unsupported by Firecracker.
 
 Per-sandbox Firecracker storage is limited to the private ext4 writable layer
 and runtime state. Bounded read-only regular-file injection is a separate

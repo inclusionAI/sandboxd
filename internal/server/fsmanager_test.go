@@ -53,6 +53,10 @@ func (s *fsTestImageService) MountOCI(req *imageapi.OCIMountRequest) (*imageapi.
 	return &imageapi.OCIMountResponse{MountPath: "/mnt/oci/" + req.ImageURL}, nil
 }
 
+func (s *fsTestImageService) RootfsMaterialization(string) (*imageapi.RootfsMaterialization, error) {
+	return &imageapi.RootfsMaterialization{}, nil
+}
+
 func (s *fsTestImageService) UmountOCI(req *imageapi.OCIUmountRequest) error {
 	s.mu.Lock()
 	s.ociUmountCalls[req.ImageURL]++

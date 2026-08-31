@@ -283,6 +283,17 @@ func (d *Daemon) Env() []string {
 	return d.meta.Env
 }
 
+// BootstrapPath returns the local Nydus bootstrap that defines the mounted
+// filesystem content. Callers use it only after Mount has completed.
+func (d *Daemon) BootstrapPath() string {
+	return d.meta.BootstrapPath
+}
+
+// ArtifactDir returns storage owned by this daemon's existing lifecycle.
+func (d *Daemon) ArtifactDir() string {
+	return d.meta.DaemonDir
+}
+
 func (d *Daemon) Name() string {
 	return d.meta.Name
 }

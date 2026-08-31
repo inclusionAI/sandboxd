@@ -98,7 +98,7 @@ func TestFirecrackerMachineSize(t *testing.T) {
 	}
 }
 
-func TestFirecrackerValidateStartRequestRejectsOCIImages(t *testing.T) {
+func TestFirecrackerValidateStartRequestRejectsOCIImagesByDefault(t *testing.T) {
 	handler := &Handler{}
 	tests := []struct {
 		name    string
@@ -141,6 +141,19 @@ func TestFirecrackerValidateStartRequestRejectsOCIImages(t *testing.T) {
 				t.Fatalf("ValidateStartRequest() error = %v, want %q", err, test.message)
 			}
 		})
+	}
+}
+
+func TestFirecrackerValidateStartRequestAllowsEnabledOCIRootfs(t *testing.T) {
+	handler := &Handler{ociRootfsEnabled: true}
+	request := &runtimeapi.StartRequest{Rootfs: &runtimeapi.RootfsConfig{
+		Type: runtimeapi.RootfsSrcType_IMAGE,
+		Source: &runtimeapi.RootfsConfig_ImageUrl{
+			ImageUrl: "example.invalid/rootfs:latest",
+		},
+	}}
+	if err := handler.ValidateStartRequest(request); err != nil {
+		t.Fatalf("ValidateStartRequest() error = %v", err)
 	}
 }
 

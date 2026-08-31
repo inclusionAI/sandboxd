@@ -220,6 +220,9 @@ type Handler struct {
 	defaultMem   uint32
 	defaultDisk  uint64
 	ociLoader    runtimecore.OciLoader
+	// ociRootfsEnabled allows the server-side image preparation path to
+	// materialize an OCI rootfs directory as EROFS before Start is called.
+	ociRootfsEnabled bool
 
 	mu        sync.RWMutex
 	instances map[string]*firecrackerInstance
@@ -266,7 +269,11 @@ func (handler *Handler) ValidateStartRequest(
 	if rootfs := request.GetRootfs(); rootfs != nil &&
 		(rootfs.GetType() == runtimeapi.RootfsSrcType_IMAGE ||
 			rootfs.GetImageUrl() != "") {
-		return errors.New("Firecracker does not support OCI image rootfs")
+		if !handler.ociRootfsEnabled {
+			return errors.New(
+				"Firecracker does not support OCI image rootfs unless conversion is enabled",
+			)
+		}
 	}
 	for _, mount := range request.GetMounts() {
 		if mount == nil {
@@ -318,6 +325,18 @@ func NewHandler(
 	if _, err := exec.LookPath("mkfs.ext4"); err != nil {
 		return nil, fmt.Errorf("Firecracker requires mkfs.ext4: %w", err)
 	}
+	if firecrackerConfig.OCIRootfsEnabled {
+		mkfsEROFS := strings.TrimSpace(firecrackerConfig.MkfsEROFSPath)
+		if mkfsEROFS == "" {
+			mkfsEROFS = config.DefaultFirecrackerMkfsEROFS
+		}
+		if _, err := exec.LookPath(mkfsEROFS); err != nil {
+			return nil, fmt.Errorf(
+				"Firecracker OCI rootfs conversion requires mkfs.erofs: %w",
+				err,
+			)
+		}
+	}
 	sandboxRoot := filepath.Join(cfg.RootDir, "containers")
 	storageRoot := filepath.Join(cfg.RuntimeConfig.FilestoreDir, ".firecracker")
 	for path, mode := range map[string]os.FileMode{
@@ -345,6 +364,7 @@ func NewHandler(
 		checkpointWriteback:    newCheckpointWritebackScheduler(),
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
+		ociRootfsEnabled:       firecrackerConfig.OCIRootfsEnabled,
 		instances:              make(map[string]*firecrackerInstance),
 	}
 	handler.recoverInstances()

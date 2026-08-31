@@ -652,6 +652,36 @@ func (m *Manager) ListMountedDetails() ([]OciMountRecord, error) {
 	return details, nil
 }
 
+// RootfsMaterialization identifies the immutable chain backing a mounted OCI
+// image and a directory owned by that chain's existing GC lifecycle. Derived
+// artifacts placed there are removed with the chain instead of requiring a
+// separate cache and reference counter.
+func (m *Manager) RootfsMaterialization(imageURL string) (contentID, artifactDir string, err error) {
+	if imageURL == "" {
+		return "", "", fmt.Errorf("imageURL is required")
+	}
+
+	unlockImage := m.acquireImageLock(imageURL)
+	defer unlockImage()
+
+	info := m.getContainer(imageURL)
+	if info == nil || len(info.ChainIDs) == 0 {
+		return "", "", fmt.Errorf("OCI image %s is not mounted", imageURL)
+	}
+	chainID := info.ChainIDs[len(info.ChainIDs)-1]
+
+	unlockChain := m.acquireChainLock(chainID)
+	defer unlockChain()
+	chain, err := m.store.getChain(chainID)
+	if err != nil {
+		return "", "", fmt.Errorf("query OCI chain %s: %w", chainID, err)
+	}
+	if chain == nil || chain.Path == "" || !pathExists(chain.Path) {
+		return "", "", fmt.Errorf("OCI chain %s is unavailable", chainID)
+	}
+	return chainID, filepath.Dir(chain.Path), nil
+}
+
 // UnmountImageWithContext unmounts an OCI overlay mount and updates layer references.
 func (m *Manager) UnmountImageWithContext(ctx context.Context, imageURL string) (retErr error) {
 	timing, _ := StartOCITimedOperation(ctx, "oci.UnmountImage", imageURL)

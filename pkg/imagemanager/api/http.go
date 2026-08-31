@@ -550,6 +550,76 @@ func (w *HttpWorker) MountOCI(req *OCIMountRequest) (*OCIMountResponse, error) {
 	return &OCIMountResponse{MountPath: mountPoint, Env: envVars}, nil
 }
 
+// RootfsMaterialization resolves content-addressed storage owned by the
+// currently mounted OCI or Nydus image. It is intentionally separate from
+// MountOCI so ordinary directory-backed runtimes do not hash Nydus metadata.
+func (w *HttpWorker) RootfsMaterialization(imageURL string) (*RootfsMaterialization, error) {
+	if imageURL == "" {
+		return nil, fmt.Errorf("image_url is required")
+	}
+
+	var record *MountRecord
+	if w.mountStore != nil {
+		var err error
+		record, err = w.mountStore.Get(imageURL)
+		if err != nil {
+			return nil, fmt.Errorf("read image mount record for %s: %w", imageURL, err)
+		}
+	}
+	if record == nil || record.MountType == "oci" {
+		if w.ociMgr == nil {
+			return nil, fmt.Errorf("oci manager is not initialized")
+		}
+		contentID, artifactDir, err := w.ociMgr.RootfsMaterialization(imageURL)
+		if err == nil {
+			return &RootfsMaterialization{
+				ContentID:   contentID,
+				ArtifactDir: artifactDir,
+			}, nil
+		}
+		if record == nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("resolve OCI rootfs materialization for %s: %w", imageURL, err)
+	}
+	if record.MountType != "nydus" {
+		return nil, fmt.Errorf("unsupported image mount type %q for %s", record.MountType, imageURL)
+	}
+	if w.mgr == nil {
+		return nil, fmt.Errorf("Nydus manager is not initialized")
+	}
+
+	nydusImageURL := record.NydusImageURL
+	if nydusImageURL == "" {
+		nydusImageURL = imageURL
+	}
+	daemon := w.mgr.GetDaemon(generateNydusID(nydusImageURL))
+	if daemon == nil {
+		return nil, fmt.Errorf("Nydus daemon for %s is unavailable", nydusImageURL)
+	}
+	bootstrap := daemon.BootstrapPath()
+	if bootstrap == "" {
+		return nil, fmt.Errorf("Nydus daemon for %s has no bootstrap", nydusImageURL)
+	}
+	file, err := os.Open(bootstrap)
+	if err != nil {
+		return nil, fmt.Errorf("open Nydus bootstrap %s: %w", bootstrap, err)
+	}
+	digester := sha256.New()
+	_, copyErr := io.Copy(digester, file)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return nil, fmt.Errorf("hash Nydus bootstrap %s: %w", bootstrap, copyErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close Nydus bootstrap %s: %w", bootstrap, closeErr)
+	}
+	return &RootfsMaterialization{
+		ContentID:   "sha256:" + hex.EncodeToString(digester.Sum(nil)),
+		ArtifactDir: daemon.ArtifactDir(),
+	}, nil
+}
+
 // recordMount persists a mount record. Errors are logged but not propagated.
 func (w *HttpWorker) recordMount(imageURL, mountType, nydusImageURL, mountPoint string) {
 	if w.mountStore == nil {

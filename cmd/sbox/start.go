@@ -43,6 +43,10 @@ var StartCmd = cli.Command{
 			Name:  "rootfs",
 			Usage: "local rootfs path",
 		},
+		cli.StringFlag{
+			Name:  "image-url",
+			Usage: "OCI image reference used as the rootfs",
+		},
 		cli.BoolFlag{
 			Name:  "rootfs-readonly",
 			Usage: "mark rootfs readonly in the Start request",
@@ -98,8 +102,13 @@ var StartCmd = cli.Command{
 		},
 	},
 	Action: func(context *cli.Context) error {
-		if context.String("rootfs") == "" {
-			return fmt.Errorf("--rootfs is required")
+		rootfs, err := startRootfs(
+			context.String("rootfs"),
+			context.String("image-url"),
+			context.Bool("rootfs-readonly"),
+		)
+		if err != nil {
+			return err
 		}
 		requestedID := context.String("sandbox-id")
 		if requestedID != "" && !config.IsValidSandboxID(requestedID) {
@@ -150,15 +159,9 @@ var StartCmd = cli.Command{
 		defer client.Close()
 
 		resp, err := client.StartSandbox(&runtime.StartRequest{
-			SandboxID: requestedID,
-			Runtime:   context.String("runtime"),
-			Rootfs: &runtime.RootfsConfig{
-				Readonly: context.Bool("rootfs-readonly"),
-				Type:     runtime.RootfsSrcType_LOCAL,
-				Source: &runtime.RootfsConfig_Path{
-					Path: context.String("rootfs"),
-				},
-			},
+			SandboxID:               requestedID,
+			Runtime:                 context.String("runtime"),
+			Rootfs:                  rootfs,
 			Command:                 command,
 			Cwd:                     context.String("cwd"),
 			Envs:                    envs,
@@ -186,6 +189,24 @@ var StartCmd = cli.Command{
 		fmt.Printf("Started sandbox %s\n", resp.ID)
 		return nil
 	},
+}
+
+func startRootfs(localPath, imageURL string, readonly bool) (*runtime.RootfsConfig, error) {
+	if localPath == "" && imageURL == "" {
+		return nil, fmt.Errorf("exactly one of --rootfs or --image-url is required")
+	}
+	if localPath != "" && imageURL != "" {
+		return nil, fmt.Errorf("--rootfs and --image-url are mutually exclusive")
+	}
+	rootfs := &runtime.RootfsConfig{Readonly: readonly}
+	if imageURL != "" {
+		rootfs.Type = runtime.RootfsSrcType_IMAGE
+		rootfs.Source = &runtime.RootfsConfig_ImageUrl{ImageUrl: imageURL}
+		return rootfs, nil
+	}
+	rootfs.Type = runtime.RootfsSrcType_LOCAL
+	rootfs.Source = &runtime.RootfsConfig_Path{Path: localPath}
+	return rootfs, nil
 }
 
 func startExtraConfig(enableKVM bool) (string, error) {

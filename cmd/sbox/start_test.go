@@ -70,3 +70,21 @@ func TestStartExtraConfig(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"enableKVM":true}`, value)
 }
+
+func TestStartRootfs(t *testing.T) {
+	local, err := startRootfs("/rootfs", "", false)
+	require.NoError(t, err)
+	assert.Equal(t, runtime.RootfsSrcType_LOCAL, local.Type)
+	assert.Equal(t, "/rootfs", local.GetPath())
+
+	image, err := startRootfs("", "registry.example/image:tag", true)
+	require.NoError(t, err)
+	assert.Equal(t, runtime.RootfsSrcType_IMAGE, image.Type)
+	assert.Equal(t, "registry.example/image:tag", image.GetImageUrl())
+	assert.True(t, image.Readonly)
+
+	_, err = startRootfs("", "", false)
+	require.ErrorContains(t, err, "exactly one")
+	_, err = startRootfs("/rootfs", "registry.example/image:tag", false)
+	require.ErrorContains(t, err, "mutually exclusive")
+}

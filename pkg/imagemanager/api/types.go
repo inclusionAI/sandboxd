@@ -51,6 +51,13 @@ type OCIMountResponse struct {
 	Env       []string `json:"env,omitempty"`
 }
 
+// RootfsMaterialization locates content-addressed, image-owned storage for a
+// derived root filesystem artifact.
+type RootfsMaterialization struct {
+	ContentID   string
+	ArtifactDir string
+}
+
 // OCIMountRequest is used to request mounting an OCI image
 type OCIMountRequest struct {
 	ImageURL string `json:"image_url"` // Image URL, e.g., "library/alpine:latest"

@@ -500,6 +500,38 @@ func TestReconcileState_FixesChainRefsForRecoveredMount(t *testing.T) {
 	}
 }
 
+func TestRootfsMaterializationUsesFinalChainLifecycle(t *testing.T) {
+	mgr := newTestManager(t)
+	defer mgr.store.close()
+
+	chainPath := filepath.Join(mgr.chainsDir, "content-chain", "fs")
+	if err := os.MkdirAll(chainPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putChain(&ChainRecord{
+		ChainID:  "sha256:final-chain",
+		Path:     chainPath,
+		RefCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mgr.setContainer("registry.example/image:tag", &ContainerInfo{
+		ImageURL: "registry.example/image:tag",
+		ChainIDs: []string{"sha256:base-chain", "sha256:final-chain"},
+	})
+
+	contentID, artifactDir, err := mgr.RootfsMaterialization("registry.example/image:tag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contentID != "sha256:final-chain" {
+		t.Fatalf("content ID = %q, want final chain", contentID)
+	}
+	if artifactDir != filepath.Dir(chainPath) {
+		t.Fatalf("artifact directory = %q, want %q", artifactDir, filepath.Dir(chainPath))
+	}
+}
+
 func TestReconcileState_DropsPersistedMountWhenMountMissing(t *testing.T) {
 	mgr := newTestManager(t)
 	defer mgr.store.close()

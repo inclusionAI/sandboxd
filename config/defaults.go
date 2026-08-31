@@ -59,6 +59,7 @@ const (
 	DefaultFirecrackerVCPUs        = uint32(1)
 	DefaultFirecrackerMemoryMiB    = uint32(512)
 	DefaultFirecrackerOverlayBytes = uint64(10 << 30)
+	DefaultFirecrackerMkfsEROFS    = "mkfs.erofs"
 
 	DefaultKataDANConfigDir = "/run/kata-containers/dans"
 )

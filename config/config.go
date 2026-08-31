@@ -175,6 +175,12 @@ type FirecrackerConfig struct {
 	// generation as a Full snapshot. "incremental" enables the three-tier
 	// chain against a VMM that supports Incremental and SoftDirty snapshots.
 	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
+	// OCIRootfsEnabled permits an OCI image rootfs to be materialized as a
+	// local EROFS image before the Firecracker VM starts. It is opt-in because
+	// conversion eagerly reads the complete merged image.
+	OCIRootfsEnabled bool `toml:"oci_rootfs_enabled" json:"ociRootfsEnabled"`
+	// MkfsEROFSPath selects the mkfs.erofs executable used for materialization.
+	MkfsEROFSPath string `toml:"mkfs_erofs_path" json:"mkfsEROFSPath"`
 }
 
 type ResourceConfig struct {
