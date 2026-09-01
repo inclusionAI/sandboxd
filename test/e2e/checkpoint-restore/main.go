@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
@@ -48,6 +49,18 @@ type options struct {
 	leaveRunning             bool
 	snapshotType             string
 	workloadCmd              string
+	mounts                   stringList
+}
+
+type stringList []string
+
+func (values *stringList) String() string {
+	return strings.Join(*values, ",")
+}
+
+func (values *stringList) Set(value string) error {
+	*values = append(*values, value)
+	return nil
 }
 
 func main() {
@@ -78,6 +91,8 @@ func main() {
 		"checkpoint flavor: empty (auto), Full, Incremental, or SoftDirty")
 	flag.StringVar(&value.workloadCmd, "workload-cmd", "",
 		"override the built-in start workload command (template warmup hooks)")
+	flag.Var(&value.mounts, "mount",
+		"repeatable mount formatted as host_path:target[:type[:opt1,opt2]]")
 	flag.Parse()
 
 	if err := run(value); err != nil {
@@ -135,6 +150,10 @@ func start(
 	if value.storageMB > ^uint64(0)/(1024*1024) {
 		return errors.New("--storage-mb overflows bytes")
 	}
+	mounts, err := parseMountFlags(value.mounts)
+	if err != nil {
+		return err
+	}
 	request := &runtime.StartRequest{
 		SandboxID: value.sandboxID,
 		Runtime:   value.runtime,
@@ -151,6 +170,7 @@ func start(
 		},
 		Cwd:     "/",
 		Network: "sandbox",
+		Mounts:  mounts,
 		Stdout:  "/var/log/sandboxd/checkpoint-workload.stdout",
 		Stderr:  "/var/log/sandboxd/checkpoint-runtime.stderr",
 		Resources: map[string]float64{
@@ -180,6 +200,36 @@ func start(
 	}
 	fmt.Println(response.ID)
 	return nil
+}
+
+func parseMountFlags(values []string) ([]*runtime.Mount, error) {
+	mounts := make([]*runtime.Mount, 0, len(values))
+	for _, value := range values {
+		parts := strings.SplitN(value, ":", 4)
+		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+			return nil, fmt.Errorf(
+				"invalid mount %q, expected host_path:target[:type[:opt1,opt2]]",
+				value,
+			)
+		}
+		mountType := "bind"
+		if len(parts) >= 3 && parts[2] != "" {
+			mountType = parts[2]
+		}
+		options := []string{"rbind", "rw"}
+		if len(parts) == 4 && parts[3] != "" {
+			options = strings.Split(parts[3], ",")
+		}
+		mounts = append(mounts, &runtime.Mount{
+			Type:    mountType,
+			Target:  parts[1],
+			Options: options,
+			Source: &runtime.Mount_HostPath{
+				HostPath: parts[0],
+			},
+		})
+	}
+	return mounts, nil
 }
 
 // workloadCommand returns the guest workload for a start: an explicit hook

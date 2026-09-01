@@ -46,6 +46,7 @@ const (
 	firecrackerStateFilename   = "state.json"
 	firecrackerAPISocket       = "api.sock"
 	firecrackerVsock           = firecrackerproto.HostAgentSocketName
+	firecrackerVirtioFSSocket  = "virtiofs.sock"
 	firecrackerAgentTimeout    = 15 * time.Second
 	firecrackerShutdownTimeout = 2 * time.Second
 	// Guest flush budget before pausing for a checkpoint. Syncing a heavily
@@ -69,13 +70,14 @@ var (
 )
 
 type firecrackerPersistedState struct {
-	ID          string `json:"id"`
-	PID         int    `json:"pid"`
-	BundlePath  string `json:"bundle_path"`
-	APIPath     string `json:"api_path"`
-	VsockPath   string `json:"vsock_path"`
-	OverlayPath string `json:"overlay_path"`
-	CreatedAt   string `json:"created_at"`
+	ID          string                    `json:"id"`
+	PID         int                       `json:"pid"`
+	BundlePath  string                    `json:"bundle_path"`
+	APIPath     string                    `json:"api_path"`
+	VsockPath   string                    `json:"vsock_path"`
+	OverlayPath string                    `json:"overlay_path"`
+	VirtioFS    *firecrackerVirtioFSState `json:"virtio_fs,omitempty"`
+	CreatedAt   string                    `json:"created_at"`
 	// MemoryMiB is the guest memory size in MiB, recorded so incremental
 	// checkpoints can preallocate or clone a full-size base memory file.
 	MemoryMiB uint32 `json:"memory_mib,omitempty"`
@@ -208,20 +210,23 @@ func (instance *firecrackerInstance) shouldPersist() bool {
 
 // Handler manages the Firecracker microVM lifecycle.
 type Handler struct {
-	binary       string
-	sandboxRoot  string
-	storageRoot  string
-	runtimeRoot  string
-	kernelPath   string
-	initrdPath   string
-	kernelArgs   string
-	kvmDevice    string
-	defaultVCPUs uint32
-	defaultMem   uint32
-	defaultDisk  uint64
-	ociLoader    runtimecore.OciLoader
+	binary          string
+	sandboxRoot     string
+	storageRoot     string
+	runtimeRoot     string
+	kernelPath      string
+	initrdPath      string
+	kernelArgs      string
+	kvmDevice       string
+	defaultVCPUs    uint32
+	defaultMem      uint32
+	defaultDisk     uint64
+	ociLoader       runtimecore.OciLoader
+	virtiofsdPath   string
+	virtioFSEnabled bool
 	// ociRootfsEnabled allows the server-side image preparation path to
 	// materialize an OCI rootfs directory as EROFS before Start is called.
+	// Virtio-fs takes precedence and consumes that directory directly.
 	ociRootfsEnabled bool
 
 	mu        sync.RWMutex
@@ -285,7 +290,7 @@ func (handler *Handler) ValidateStartRequest(
 	if rootfs := request.GetRootfs(); rootfs != nil &&
 		(rootfs.GetType() == runtimeapi.RootfsSrcType_IMAGE ||
 			rootfs.GetImageUrl() != "") {
-		if !handler.ociRootfsEnabled {
+		if !handler.ociRootfsEnabled && !handler.virtioFSEnabled {
 			return errors.New(
 				"Firecracker does not support OCI image rootfs unless conversion is enabled",
 			)
@@ -328,6 +333,15 @@ func NewHandler(
 	if err := validateFirecrackerCheckpointMode(firecrackerConfig.CheckpointMode); err != nil {
 		return nil, err
 	}
+	if firecrackerConfig.VirtioFSEnabled {
+		if err := validateFirecrackerRegularFile(
+			firecrackerConfig.VirtioFSDPath,
+			"virtiofsd binary",
+			true,
+		); err != nil {
+			return nil, err
+		}
+	}
 	if filepath.Clean(firecrackerConfig.KVMDevice) !=
 		filepath.Clean(config.DefaultKVMDevice) {
 		return nil, fmt.Errorf(
@@ -341,7 +355,7 @@ func NewHandler(
 	if _, err := exec.LookPath("mkfs.ext4"); err != nil {
 		return nil, fmt.Errorf("Firecracker requires mkfs.ext4: %w", err)
 	}
-	if firecrackerConfig.OCIRootfsEnabled {
+	if firecrackerConfig.OCIRootfsEnabled && !firecrackerConfig.VirtioFSEnabled {
 		mkfsEROFS := strings.TrimSpace(firecrackerConfig.MkfsEROFSPath)
 		if mkfsEROFS == "" {
 			mkfsEROFS = config.DefaultFirecrackerMkfsEROFS
@@ -380,6 +394,8 @@ func NewHandler(
 		checkpointWriteback:    newCheckpointWritebackScheduler(),
 		defaultDisk:            firecrackerConfig.DefaultOverlaySizeBytes,
 		ociLoader:              loader,
+		virtiofsdPath:          firecrackerConfig.VirtioFSDPath,
+		virtioFSEnabled:        firecrackerConfig.VirtioFSEnabled,
 		ociRootfsEnabled:       firecrackerConfig.OCIRootfsEnabled,
 		instances:              make(map[string]*firecrackerInstance),
 	}
@@ -411,6 +427,9 @@ func applyFirecrackerDefaults(value *config.FirecrackerConfig) {
 	}
 	if value.CheckpointMode == "" {
 		value.CheckpointMode = firecrackerCheckpointModeFull
+	}
+	if value.VirtioFSDPath == "" {
+		value.VirtioFSDPath = config.DefaultFirecrackerVirtioFSD
 	}
 }
 
@@ -497,11 +516,11 @@ func (handler *Handler) Start(
 	if err != nil {
 		return fmt.Errorf("generate Firecracker OCI metadata: %w", err)
 	}
-	plan, err := prepareFirecrackerStorage(spec, startConfig)
+	plan, err := prepareFirecrackerStorage(spec, startConfig, handler.virtioFSEnabled)
 	if err != nil {
 		return err
 	}
-	_, err = createFirecrackerStorageDirectory(
+	storageDir, err := createFirecrackerStorageDirectory(
 		handler.storageRoot,
 		startConfig.ID,
 	)
@@ -566,7 +585,9 @@ func (handler *Handler) Start(
 	runtimeCreated = true
 	apiPath := filepath.Join(runtimeDir, firecrackerAPISocket)
 	vsockPath := filepath.Join(runtimeDir, firecrackerVsock)
-	if len(apiPath) >= 100 || len(vsockPath) >= 100 {
+	virtioFSSocketPath := filepath.Join(runtimeDir, firecrackerVirtioFSSocket)
+	if len(apiPath) >= 100 || len(vsockPath) >= 100 ||
+		len(virtioFSSocketPath) >= 100 {
 		return fmt.Errorf("Firecracker Unix socket path is too long under %s", runtimeDir)
 	}
 	if err := removeFirecrackerSocket(apiPath); err != nil {
@@ -574,6 +595,33 @@ func (handler *Handler) Start(
 	}
 	if err := removeFirecrackerSocket(vsockPath); err != nil {
 		return err
+	}
+	var virtioFSState *firecrackerVirtioFSState
+	var virtioFSCommand *exec.Cmd
+	virtioFSOwned := false
+	if len(plan.virtioFSExports) > 0 {
+		virtioFSState = &firecrackerVirtioFSState{
+			SocketPath: virtioFSSocketPath,
+			SharedDir:  filepath.Join(storageDir, firecrackerVirtioFSSharedDir),
+		}
+		if err := prepareFirecrackerVirtioFSShared(
+			virtioFSState.SharedDir,
+			plan.virtioFSExports,
+		); err != nil {
+			return err
+		}
+		defer func() {
+			if virtioFSOwned {
+				return
+			}
+			retErr = errors.Join(
+				retErr,
+				cleanupFirecrackerVirtioFS(virtioFSState, handler.virtiofsdPath),
+			)
+			if virtioFSCommand != nil {
+				_ = virtioFSCommand.Wait()
+			}
+		}()
 	}
 
 	stdout, err := openFirecrackerOutput(startConfig.Stdout)
@@ -586,6 +634,25 @@ func (handler *Handler) Start(
 		return err
 	}
 	defer stderr.Close()
+	if virtioFSState != nil {
+		virtioFSState, virtioFSCommand, err = startFirecrackerVirtioFS(
+			ctx,
+			handler.virtiofsdPath,
+			virtioFSState.SharedDir,
+			virtioFSState.SocketPath,
+			stdout,
+			stderr,
+		)
+		if err != nil {
+			return err
+		}
+		if err := attachFirecrackerProcess(
+			startConfig.CgroupPath,
+			virtioFSState.PID,
+		); err != nil {
+			return fmt.Errorf("attach virtiofsd to cgroup: %w", err)
+		}
+	}
 
 	command := exec.Command(
 		handler.binary,
@@ -607,6 +674,7 @@ func (handler *Handler) Start(
 			APIPath:     apiPath,
 			VsockPath:   vsockPath,
 			OverlayPath: overlayPath,
+			VirtioFS:    virtioFSState,
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
 		},
 		done: make(chan struct{}),
@@ -615,6 +683,10 @@ func (handler *Handler) Start(
 	handler.instances[startConfig.ID] = instance
 	handler.mu.Unlock()
 	go handler.waitCommand(instance, command)
+	if virtioFSCommand != nil {
+		virtioFSOwned = true
+		go handler.waitVirtioFS(instance, virtioFSCommand)
+	}
 
 	startSucceeded := false
 	defer func() {
@@ -647,14 +719,17 @@ func (handler *Handler) Start(
 	}
 	instance.setMemoryMiB(memoryMiB)
 	instance.setVcpus(vcpus)
-	drives := []firecrackerDrive{
-		plan.rootDrive,
-		{
+	drives := make([]firecrackerDrive, 0, 2+len(plan.mountDrives))
+	if plan.rootDrive.Path != "" {
+		drives = append(drives, plan.rootDrive)
+	}
+	drives = append(drives,
+		firecrackerDrive{
 			ID:       "overlay",
 			Path:     firecrackerCheckpointOverlayName,
 			ReadOnly: false,
 		},
-	}
+	)
 	drives = append(drives, plan.mountDrives...)
 	if err := configureFirecrackerVM(
 		bootCtx,
@@ -667,6 +742,7 @@ func (handler *Handler) Start(
 		startConfig.Network.Interface.Name,
 		startConfig.Network.GuestHardwareAddr().String(),
 		vsockPath,
+		virtioFSSocketPathIfConfigured(virtioFSState),
 		drives,
 	); err != nil {
 		return err
@@ -906,6 +982,10 @@ func (handler *Handler) waitCommand(
 	command *exec.Cmd,
 ) {
 	err := command.Wait()
+	state := instance.snapshot()
+	if cleanupErr := cleanupFirecrackerVirtioFS(state.VirtioFS, handler.virtiofsdPath); cleanupErr != nil {
+		logrus.Warnf("firecracker: clean virtio-fs after VMM exit: %v", cleanupErr)
+	}
 	select {
 	case <-instance.done:
 		return
@@ -917,6 +997,28 @@ func (handler *Handler) waitCommand(
 			logrus.Warnf("firecracker: persist exit state: %v", persistErr)
 		}
 	}
+}
+
+func (handler *Handler) waitVirtioFS(
+	instance *firecrackerInstance,
+	command *exec.Cmd,
+) {
+	err := command.Wait()
+	select {
+	case <-instance.done:
+		return
+	default:
+	}
+	state := instance.snapshot()
+	if !firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
+		return
+	}
+	logrus.Errorf(
+		"firecracker: virtiofsd for sandbox %s exited unexpectedly: %v",
+		state.ID,
+		err,
+	)
+	_ = signalFirecrackerProcess(state, handler.binary, syscall.SIGKILL)
 }
 
 func (handler *Handler) waitGuest(
@@ -965,6 +1067,11 @@ func (handler *Handler) stopInstance(
 	force bool,
 ) {
 	state := instance.snapshot()
+	defer func() {
+		if err := cleanupFirecrackerVirtioFS(state.VirtioFS, handler.virtiofsdPath); err != nil {
+			logrus.Warnf("firecracker: clean virtio-fs for %s: %v", state.ID, err)
+		}
+	}()
 	if !firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: state.ExitCode})
 		return
@@ -1110,6 +1217,19 @@ func (handler *Handler) validatePersistedState(
 			filepath.Join(storageDirectory, "overlay.ext4"),
 		},
 	}
+	if state.VirtioFS != nil {
+		expected["virtio-fs socket"] = [2]string{
+			filepath.Clean(state.VirtioFS.SocketPath),
+			filepath.Join(runtimeDirectory, firecrackerVirtioFSSocket),
+		}
+		expected["virtio-fs shared directory"] = [2]string{
+			filepath.Clean(state.VirtioFS.SharedDir),
+			filepath.Join(storageDirectory, firecrackerVirtioFSSharedDir),
+		}
+		if state.VirtioFS.PID <= 1 {
+			return errors.New("Firecracker state has an invalid virtiofsd PID")
+		}
+	}
 	for description, paths := range expected {
 		if paths[0] != paths[1] {
 			return fmt.Errorf(
@@ -1164,15 +1284,45 @@ func (handler *Handler) recoverState(
 		instance.finish(runtimecore.Exit{ExitedAt: exitTime, ExitCode: state.ExitCode})
 		if firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 			go handler.stopInstance(instance, true)
+		} else if err := cleanupFirecrackerVirtioFS(
+			state.VirtioFS,
+			handler.virtiofsdPath,
+		); err != nil {
+			logrus.Warnf("firecracker: clean exited virtio-fs for %s: %v", state.ID, err)
 		}
 		return instance
 	}
 	if !firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
+		if err := cleanupFirecrackerVirtioFS(
+			state.VirtioFS,
+			handler.virtiofsdPath,
+		); err != nil {
+			logrus.Warnf("firecracker: clean orphaned virtio-fs for %s: %v", state.ID, err)
+		}
 		exitTime, _ := time.Parse(time.RFC3339Nano, state.ExitedAt)
 		if exitTime.IsZero() {
 			exitTime = time.Now()
 		}
 		instance.finish(runtimecore.Exit{ExitedAt: exitTime, ExitCode: 255})
+		return instance
+	}
+	if state.VirtioFS != nil &&
+		!firecrackerVirtioFSProcessMatches(state.VirtioFS, handler.virtiofsdPath) {
+		logrus.Warnf(
+			"firecracker: terminate sandbox %s because virtiofsd is unavailable",
+			state.ID,
+		)
+		_ = signalFirecrackerProcess(state, handler.binary, syscall.SIGKILL)
+		if err := cleanupFirecrackerVirtioFS(
+			state.VirtioFS,
+			handler.virtiofsdPath,
+		); err != nil {
+			logrus.Warnf("firecracker: clean missing virtio-fs for %s: %v", state.ID, err)
+		}
+		instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: 255})
+		if err := handler.persistInstance(instance); err != nil {
+			logrus.Warnf("firecracker: persist missing virtiofsd state: %v", err)
+		}
 		return instance
 	}
 	if !state.Configured {
@@ -1182,6 +1332,12 @@ func (handler *Handler) recoverState(
 			state.PID,
 		)
 		_ = signalFirecrackerProcess(state, handler.binary, syscall.SIGKILL)
+		if err := cleanupFirecrackerVirtioFS(
+			state.VirtioFS,
+			handler.virtiofsdPath,
+		); err != nil {
+			logrus.Warnf("firecracker: clean incomplete virtio-fs for %s: %v", state.ID, err)
+		}
 		instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: 255})
 		if err := handler.persistInstance(instance); err != nil {
 			logrus.Warnf("firecracker: persist incomplete state: %v", err)
@@ -1218,6 +1374,10 @@ func (handler *Handler) monitorRecovered(
 	defer ticker.Stop()
 	for range ticker.C {
 		state := instance.snapshot()
+		if state.VirtioFS != nil &&
+			!firecrackerVirtioFSProcessMatches(state.VirtioFS, handler.virtiofsdPath) {
+			_ = signalFirecrackerProcess(state, handler.binary, syscall.SIGKILL)
+		}
 		if firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 			continue
 		}
@@ -1226,6 +1386,12 @@ func (handler *Handler) monitorRecovered(
 			if err := handler.persistInstance(instance); err != nil {
 				logrus.Warnf("firecracker: persist recovered exit state: %v", err)
 			}
+		}
+		if err := cleanupFirecrackerVirtioFS(
+			state.VirtioFS,
+			handler.virtiofsdPath,
+		); err != nil {
+			logrus.Warnf("firecracker: clean recovered virtio-fs for %s: %v", state.ID, err)
 		}
 		return
 	}

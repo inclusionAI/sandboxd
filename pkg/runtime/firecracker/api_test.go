@@ -77,6 +77,7 @@ func TestConfigureFirecrackerVM(t *testing.T) {
 		"tap-test",
 		"02:fc:0a:2a:00:02",
 		"/run/firecracker/vsock",
+		"",
 		[]firecrackerDrive{
 			{ID: "rootfs", Path: "/images/root.erofs", ReadOnly: true},
 			{ID: "overlay", Path: "/storage/overlay.ext4"},
@@ -171,6 +172,7 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 		ctx,
 		"/tmp/vmstate",
 		"/tmp/memory",
+		"",
 		firecrackerSnapshotTypeFull,
 	); err != nil {
 		t.Fatal(err)
@@ -182,15 +184,39 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 		ctx,
 		"/tmp/vmstate",
 		"/tmp/memory",
+		"",
 		"tap-restored",
 		"/run/firecracker/restored.vsock",
+		"",
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.createSnapshot(
+		ctx,
+		"/checkpoint/vmstate",
+		"/checkpoint/memory",
+		"/checkpoint/virtiofs.state",
+		firecrackerSnapshotTypeIncremental,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.loadSnapshot(
+		ctx,
+		"/checkpoint/vmstate",
+		"/checkpoint/memory",
+		"/storage/memory.live",
+		"tap-virtiofs",
+		"/run/firecracker/virtiofs.vsock",
+		"/run/firecracker/virtiofs.sock",
+		"/checkpoint/virtiofs.state",
 	); err != nil {
 		t.Fatal(err)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(calls) != 4 {
+	if len(calls) != 6 {
 		t.Fatalf("snapshot API calls = %+v", calls)
 	}
 	if calls[0].method != http.MethodPatch || calls[0].path != "/vm" ||
@@ -221,6 +247,25 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
 	vsock := calls[3].payload["vsock_override"].(map[string]any)
 	if vsock["uds_path"] != "/run/firecracker/restored.vsock" {
 		t.Fatalf("vsock override = %+v", vsock)
+	}
+	memory := calls[3].payload["mem_backend"].(map[string]any)
+	if memory["backend_type"] != "File" || memory["backend_path"] != "/tmp/memory" {
+		t.Fatalf("memory backend = %+v", memory)
+	}
+	if calls[4].payload["fs_state_path"] != "/checkpoint/virtiofs.state" {
+		t.Fatalf("virtio-fs snapshot create = %+v", calls[4])
+	}
+	sharedMemory := calls[5].payload["mem_backend"].(map[string]any)
+	if sharedMemory["backend_type"] != "SharedFile" ||
+		sharedMemory["backend_path"] != "/storage/memory.live" ||
+		sharedMemory["source_path"] != "/checkpoint/memory" {
+		t.Fatalf("shared memory backend = %+v", sharedMemory)
+	}
+	fsOverride := calls[5].payload["fs_override"].(map[string]any)
+	if fsOverride["fs_id"] != "root" ||
+		fsOverride["socket_path"] != "/run/firecracker/virtiofs.sock" ||
+		fsOverride["state_path"] != "/checkpoint/virtiofs.state" {
+		t.Fatalf("virtio-fs override = %+v", fsOverride)
 	}
 }
 

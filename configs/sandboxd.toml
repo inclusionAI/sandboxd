@@ -98,9 +98,15 @@ runsc = ""
 # behavior where every generation is a Full snapshot; "incremental" enables
 # the three-tier incremental chain and requires a fork VMM that supports it.
 #checkpoint_mode = "full"
+# Opt-in support for directory-backed root filesystems and explicitly read-only
+# host directory mounts through one sandbox-scoped virtiofsd. This requires
+# the migration-capable Firecracker build and a guest kernel with virtio-fs.
+#virtiofs_enabled = false
+#virtiofsd_path = "/usr/local/bin/virtiofsd"
 # Opt-in support for materializing an OCI or Nydus image-manager rootfs mount
 # as an immutable EROFS file before starting a Firecracker VM. The generated
-# file follows the source image cache lifecycle.
+# file follows the source image cache lifecycle. virtiofs_enabled takes
+# precedence when both options are set.
 #oci_rootfs_enabled = false
 #mkfs_erofs_path = "/usr/bin/mkfs.erofs"
 

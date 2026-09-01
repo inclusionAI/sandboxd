@@ -39,7 +39,8 @@ func TestDefaultFirecrackerPaths(t *testing.T) {
 		fc.KVMDevice != DefaultKVMDevice ||
 		fc.DefaultVCPUCount != DefaultFirecrackerVCPUs ||
 		fc.DefaultMemoryMiB != DefaultFirecrackerMemoryMiB ||
-		fc.DefaultOverlaySizeBytes != DefaultFirecrackerOverlayBytes {
+		fc.DefaultOverlaySizeBytes != DefaultFirecrackerOverlayBytes ||
+		fc.VirtioFSDPath != DefaultFirecrackerVirtioFSD {
 		t.Fatalf("unexpected firecracker defaults: %+v", fc)
 	}
 }

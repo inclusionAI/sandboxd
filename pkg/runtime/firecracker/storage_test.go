@@ -68,7 +68,7 @@ func TestPrepareFirecrackerStorage(t *testing.T) {
 		Network: firecrackerTestNetwork(),
 		ExtraConfig: `{"nativeWritableMounts":[` +
 			`{"target":"/var/lib/docker"}]}`,
-	})
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +130,7 @@ func TestPrepareFirecrackerStorageRejectsNativeWritableMountOverlap(t *testing.T
 			ExtraConfig: `{"nativeWritableMounts":[` +
 				`{"target":"/var/lib/docker"}]}`,
 		},
+		false,
 	)
 	if err == nil || !strings.Contains(err.Error(), "overlaps mount target") {
 		t.Fatalf("overlap error = %v", err)
@@ -167,6 +168,7 @@ func TestPrepareFirecrackerStorageUsesLastMountForTarget(t *testing.T) {
 	plan, err := prepareFirecrackerStorage(
 		spec,
 		runtimecore.StartConfig{Network: firecrackerTestNetwork()},
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -199,6 +201,7 @@ func TestPrepareFirecrackerStorageRejectsWritableBind(t *testing.T) {
 			}},
 		},
 		runtimecore.StartConfig{Network: firecrackerTestNetwork()},
+		false,
 	)
 	if err == nil || !strings.Contains(err.Error(), "explicitly read-only") {
 		t.Fatalf("writable bind error = %v", err)
@@ -212,9 +215,53 @@ func TestPrepareFirecrackerStorageRejectsDirectoryRoot(t *testing.T) {
 			Process: &runtimecore.Process{Args: []string{"/bin/true"}},
 		},
 		runtimecore.StartConfig{Network: firecrackerTestNetwork()},
+		false,
 	)
 	if err == nil || !strings.Contains(err.Error(), "not a regular EROFS image") {
 		t.Fatalf("directory root error = %v", err)
+	}
+}
+
+func TestPrepareFirecrackerStorageWithVirtioFSDirectories(t *testing.T) {
+	root := t.TempDir()
+	mounted := t.TempDir()
+	plan, err := prepareFirecrackerStorage(
+		&runtimecore.Spec{
+			Root:    &runtimecore.Root{Path: root},
+			Process: &runtimecore.Process{Args: []string{"/bin/true"}},
+			Mounts: []runtimecore.Mount{{
+				Type:        "bind",
+				Source:      mounted,
+				Destination: "/opt/runtime",
+				Options:     []string{"rbind", "ro", "noexec", "nosuid"},
+			}},
+		},
+		runtimecore.StartConfig{Network: firecrackerTestNetwork()},
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.rootDrive.Path != "" || plan.configure.RootDevice != "" ||
+		plan.configure.RootFSType != "virtiofs" ||
+		plan.configure.RootSource != "rootfs" ||
+		plan.configure.OverlayDevice != "/dev/vda" ||
+		plan.configure.VirtioFSTag != firecrackerVirtioFSTag {
+		t.Fatalf("virtio-fs root plan = %+v", plan)
+	}
+	if len(plan.virtioFSExports) != 2 ||
+		plan.virtioFSExports[0].Source != root ||
+		plan.virtioFSExports[0].RelativePath != "rootfs" ||
+		plan.virtioFSExports[1].Source != mounted ||
+		plan.virtioFSExports[1].RelativePath != "mounts/0001" {
+		t.Fatalf("virtio-fs exports = %+v", plan.virtioFSExports)
+	}
+	if len(plan.configure.Mounts) != 1 ||
+		plan.configure.Mounts[0].FSType != "virtiofs" ||
+		plan.configure.Mounts[0].Source != "mounts/0001" ||
+		plan.configure.Mounts[0].Target != "/opt/runtime" ||
+		strings.Join(plan.configure.Mounts[0].Options, ",") != "ro,noexec,nosuid" {
+		t.Fatalf("virtio-fs guest mounts = %+v", plan.configure.Mounts)
 	}
 }
 
@@ -231,6 +278,7 @@ func TestPrepareFirecrackerStorageRejectsDirectoryBind(t *testing.T) {
 			}},
 		},
 		runtimecore.StartConfig{Network: firecrackerTestNetwork()},
+		false,
 	)
 	if err == nil || !strings.Contains(err.Error(), "regular-file") {
 		t.Fatalf("directory bind error = %v", err)
@@ -250,6 +298,7 @@ func TestPrepareFirecrackerStorageRejectsUnsafeTmpfsOption(t *testing.T) {
 			}},
 		},
 		runtimecore.StartConfig{Network: firecrackerTestNetwork()},
+		false,
 	)
 	if err == nil || !strings.Contains(err.Error(), "unsupported tmpfs option") {
 		t.Fatalf("unsafe tmpfs error = %v", err)

@@ -60,6 +60,7 @@ const (
 	DefaultFirecrackerMemoryMiB    = uint32(512)
 	DefaultFirecrackerOverlayBytes = uint64(10 << 30)
 	DefaultFirecrackerMkfsEROFS    = "mkfs.erofs"
+	DefaultFirecrackerVirtioFSD    = "/usr/local/bin/virtiofsd"
 
 	DefaultKataDANConfigDir = "/run/kata-containers/dans"
 )

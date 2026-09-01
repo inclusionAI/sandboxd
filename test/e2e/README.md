@@ -119,6 +119,31 @@ FIRECRACKER_INITRD=/opt/firecracker/initrd.img \
 make e2e
 ```
 
+Validate an unpublished migration-capable Firecracker and virtiofsd together
+without changing `third_party/runtime-versions.env`:
+
+```bash
+TMPDIR=/xfs/build-tmp make firecracker-initrd
+
+E2E_RUNTIME=firecracker \
+E2E_FIRECRACKER_VIRTIOFS=1 \
+E2E_HOME_FIXTURE_PARENT=/xfs/test-tmp \
+E2E_KEEP_HOME_FIXTURE=1 \
+RUN_UNIT_TESTS=0 \
+FIRECRACKER_BINARY=/path/to/candidate/firecracker \
+FIRECRACKER_KERNEL=/path/to/candidate/vmlinux \
+FIRECRACKER_INITRD="${PWD}/output/initrd.img" \
+FIRECRACKER_VIRTIOFSD=/path/to/virtiofsd \
+make e2e
+```
+
+The virtio-fs mode uses a directory rootfs and a read-only directory mount in
+the main lifecycle and checkpoint/restore paths. It also checks the
+`virtiofs.state` sidecar and compatibility digest. Point
+`E2E_HOME_FIXTURE_PARENT` at XFS to exercise reflinked checkpoint memory and
+filestore data there. The keep flag retains that fixture and prints its exact
+path; the default remains automatic cleanup.
+
 `KATA_ROOT` must contain the runtime-rs shim, Dragonball configuration,
 guest kernel, and guest image at their upstream archive paths. The sandbox
 logger is built with sandboxd. The Firecracker kernel must provide the facilities listed in

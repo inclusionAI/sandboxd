@@ -29,6 +29,7 @@ EROFS_MOUNT_ROOT="${E2E_EROFS_MOUNT_ROOT:-/e2e/erofs-mount-root}"
 EROFS_MOUNT_IMAGE="${E2E_EROFS_MOUNT_IMAGE:-/e2e/data.erofs}"
 FIRECRACKER_KERNEL="${E2E_FIRECRACKER_KERNEL:-/opt/firecracker/vmlinux}"
 FIRECRACKER_CHECKPOINT_MODE="${E2E_FIRECRACKER_CHECKPOINT_MODE:-}"
+FIRECRACKER_VIRTIOFS="${E2E_FIRECRACKER_VIRTIOFS:-0}"
 FIRECRACKER_INITRD="${E2E_FIRECRACKER_INITRD:-/opt/firecracker/initrd.img}"
 OCI_ROOTFS_IMAGE="${E2E_OCI_ROOTFS_IMAGE:-docker.io/library/redis:7-alpine}"
 FIRECRACKER_OVERLAY_BYTES="${E2E_FIRECRACKER_OVERLAY_BYTES:-134217728}"
@@ -190,6 +191,8 @@ preflight() {
     [[ "${STRESS_CONCURRENCY}" =~ ^[1-8]$ ]] || fail "E2E_STRESS_CONCURRENCY must be between 1 and 8"
     [[ "${DISABLE_CGROUP}" =~ ^[01]$ ]] || fail "E2E_DISABLE_CGROUP must be 0 or 1"
     [[ "${NETWORK_SOAK}" =~ ^[01]$ ]] || fail "E2E_NETWORK_SOAK must be 0 or 1"
+    [[ "${FIRECRACKER_VIRTIOFS}" =~ ^[01]$ ]] ||
+        fail "E2E_FIRECRACKER_VIRTIOFS must be 0 or 1"
     [[ "${REDIS_BENCHMARK_REQUESTS}" =~ ^[1-9][0-9]*$ ]] || fail "E2E_REDIS_BENCHMARK_REQUESTS must be positive"
     [[ "${CPU_LIMIT_MODE}" =~ ^(shares|quota)$ ]] || fail "E2E_CPU_LIMIT_MODE must be shares or quota"
     case "${E2E_RUNTIME}" in
@@ -215,6 +218,10 @@ preflight() {
     fi
     if [ "${E2E_RUNTIME}" = "firecracker" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
         fail "Firecracker e2e requires sandbox-managed cgroups"
+    fi
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ] &&
+        [ "${E2E_RUNTIME}" != "firecracker" ]; then
+        fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker"
     fi
     if [ "${NETWORK_SOAK}" = "1" ]; then
         [ "${E2E_RUNTIME}" != "all" ] ||
@@ -256,6 +263,10 @@ preflight() {
         firecracker)
             command -v firecracker >/dev/null 2>&1 || fail "missing command: firecracker"
             command -v mkfs.ext4 >/dev/null 2>&1 || fail "missing command: mkfs.ext4"
+            if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+                command -v virtiofsd >/dev/null 2>&1 ||
+                    fail "missing command: virtiofsd"
+            fi
             [ -c /dev/kvm ] || fail "Firecracker e2e requires /dev/kvm"
             [ -f "${FIRECRACKER_KERNEL}" ] || fail "missing Firecracker kernel"
             [ -f "${FIRECRACKER_INITRD}" ] || fail "missing Firecracker initrd"
@@ -383,6 +394,10 @@ EOF
         e2e_fc_checkpoint_mode_cfg="$(printf 'checkpoint_mode = "%s"' \
             "${FIRECRACKER_CHECKPOINT_MODE}")"
     fi
+    local e2e_fc_virtiofs_cfg=""
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        e2e_fc_virtiofs_cfg=$'virtiofs_enabled = true\nvirtiofsd_path = "/usr/local/bin/virtiofsd"'
+    fi
     cat > "${CONFIG_FILE}" <<EOF
 rootDir = "${SANDBOXD_ROOT}"
 storeDir = "${SANDBOXD_STORE}"
@@ -437,6 +452,7 @@ default_memory_mib = 256
 default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
 oci_rootfs_enabled = true
 mkfs_erofs_path = "/usr/bin/mkfs.erofs"
+${e2e_fc_virtiofs_cfg}
 ${e2e_fc_checkpoint_mode_cfg}
 
 [plugin.runtime.basic_spec]
@@ -732,17 +748,23 @@ run_checkpoint_restore_check() {
     local request_file="/tmp/${suffix}-checkpoint-request.json"
     local checkpoint_parent="${SANDBOXD_HOME}/e2e-checkpoints"
     local checkpoint_root="${checkpoint_parent}/${suffix}"
-    local checkpoint_dir=""
-    local checkpoint_count=10
-    local memory_mb=128
-    local extra_config_args=()
-    if [ "${runtime}" = "firecracker" ]; then
-        memory_mb=256
-        extra_config_args=(
-            --extra-config
-            '{"nativeWritableMounts":[{"target":"/var/lib/native-checkpoint"}]}'
-        )
-    fi
+	local checkpoint_dir=""
+	local checkpoint_count=10
+	local memory_mb=128
+	local extra_config_args=()
+	local checkpoint_mount_args=()
+	if [ "${runtime}" = "firecracker" ]; then
+		memory_mb=256
+		extra_config_args=(
+			--extra-config
+			'{"nativeWritableMounts":[{"target":"/var/lib/native-checkpoint"}]}'
+		)
+		if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+			checkpoint_mount_args=(
+				--mount "${HOST_MOUNT}:/mnt/host:bind:ro"
+			)
+		fi
+	fi
 
     log "testing ${suffix} ${checkpoint_count} consecutive checkpoints and restoring the last"
     mkdir -p "${checkpoint_parent}"
@@ -755,12 +777,26 @@ run_checkpoint_restore_check() {
         --runtime "${runtime}" \
         --rootfs "${rootfs}" \
         --sandbox-id "${source_id}" \
-        --request-file "${request_file}" \
-        --memory-mb "${memory_mb}" \
-        --storage-mb 64 \
-        "${extra_config_args[@]}")"
+		--request-file "${request_file}" \
+		--memory-mb "${memory_mb}" \
+		--storage-mb 64 \
+		"${extra_config_args[@]}" \
+		"${checkpoint_mount_args[@]}")"
     assert_eq "${SANDBOX_ID}" "${source_id}" "${suffix} checkpoint source ID"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+    if [ "${runtime}" = "firecracker" ] &&
+        [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        local mounted
+        mounted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/host/input.txt)"
+        assert_eq "${mounted}" "host-mount-ok" \
+            "${suffix} checkpoint source virtio-fs mount"
+        if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'echo unexpected > /mnt/host/checkpoint-write' \
+            >/tmp/firecracker-checkpoint-mount-write.log 2>&1; then
+            cat /tmp/firecracker-checkpoint-mount-write.log >&2
+            fail "${suffix} checkpoint source virtio-fs mount was writable"
+        fi
+    fi
     sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo checkpoint-state-ok > /var/checkpoint-persist'
     if [ "${runtime}" = "firecracker" ]; then
@@ -827,6 +863,18 @@ run_checkpoint_restore_check() {
                 assert_snapshot_type "${checkpoint_dir}" "Full" \
                     "${suffix} baseline checkpoint ${checkpoint_index}"
             fi
+            if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+                [ -s "${checkpoint_dir}/virtiofs.state" ] ||
+                    fail "${suffix} checkpoint ${checkpoint_index} lacks virtiofs.state"
+                jq -e '
+                    .virtio_fs == true and
+                    (.digests["virtiofs.state"] |
+                        test("^[0-9a-f]{64}$")) and
+                    (.compat.virtiofsd |
+                        test("^[0-9a-f]{64}$"))
+                ' "${checkpoint_dir}/manifest.json" >/dev/null ||
+                    fail "${suffix} checkpoint ${checkpoint_index} lacks virtio-fs metadata"
+            fi
         fi
 
         source_after=""
@@ -869,6 +917,20 @@ run_checkpoint_restore_check() {
     local persisted
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" "${suffix} restored writable state"
+    if [ "${runtime}" = "firecracker" ] &&
+        [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        local restored_mount
+        restored_mount="$(sbox_cmd exec "${SANDBOX_ID}" \
+            /bin/cat /mnt/host/input.txt)"
+        assert_eq "${restored_mount}" "host-mount-ok" \
+            "${suffix} restored virtio-fs mount"
+        if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'echo unexpected > /mnt/host/restored-write' \
+            >/tmp/firecracker-restored-mount-write.log 2>&1; then
+            cat /tmp/firecracker-restored-mount-write.log >&2
+            fail "${suffix} restored virtio-fs mount was writable"
+        fi
+    fi
     if [ "${runtime}" = "firecracker" ]; then
         local restored_init
         restored_init="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
@@ -1054,7 +1116,8 @@ run_firecracker_post_restore_chain() {
 run_network_soak() {
     local runtime="${1}"
     local rootfs="${REDIS_ROOTFS}"
-    if [ "${runtime}" = "firecracker" ]; then
+    if [ "${runtime}" = "firecracker" ] &&
+        [ "${FIRECRACKER_VIRTIOFS}" != "1" ]; then
         rootfs="${REDIS_EROFS_ROOTFS}"
     fi
 
@@ -1633,7 +1696,15 @@ run_kata_checks() {
 }
 
 run_firecracker_checks() {
-    log "testing Firecracker EROFS root, writable layer, exec, and network"
+    local rootfs="${EROFS_ROOTFS}"
+    local host_mount="${HOST_MOUNT}/input.txt:/mnt/host/input.txt:bind:ro"
+    local root_description="EROFS"
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        rootfs="${ROOTFS}"
+        host_mount="${HOST_MOUNT}:/mnt/host:bind:ro"
+        root_description="virtio-fs directory"
+    fi
+    log "testing Firecracker ${root_description} root, writable layer, exec, and network"
     local main_stdout="/tmp/firecracker-main.stdout"
     local main_stderr="/tmp/firecracker-main.stderr"
     rm -f "${main_stdout}" "${main_stderr}" /tmp/firecracker-exec.stderr
@@ -1642,10 +1713,10 @@ run_firecracker_checks() {
         --quiet \
         --runtime firecracker \
         --sandbox-id sbox-e2e-firecracker \
-        --rootfs "${EROFS_ROOTFS}" \
+        --rootfs "${rootfs}" \
         --cwd / \
         --env E2E_MARKER=firecracker-env-ok \
-        --mount "${HOST_MOUNT}/input.txt:/mnt/host/input.txt:bind:ro" \
+        --mount "${host_mount}" \
         --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs:erofs:ro" \
         --mount "tmpfs:/mnt/ram:tmpfs:rw,nosuid,nodev,noexec,size=1m,mode=0755" \
         --extra-config \
@@ -1697,6 +1768,16 @@ run_firecracker_checks() {
         fail "Firecracker read-only injected file was writable"
     fi
     assert_eq "$(cat "${HOST_MOUNT}/input.txt")" "host-mount-ok" "Firecracker host file unchanged"
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        if sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'echo changed > /mnt/host/new-file' \
+            >/tmp/firecracker-directory-write.log 2>&1; then
+            cat /tmp/firecracker-directory-write.log >&2
+            fail "Firecracker read-only directory mount accepted a new file"
+        fi
+        [ ! -e "${HOST_MOUNT}/new-file" ] ||
+            fail "Firecracker directory mount write escaped to the host"
+    fi
 
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/erofs/input.txt)"
     assert_eq "${got}" "erofs-mount-ok" "Firecracker EROFS mount"
@@ -1760,33 +1841,35 @@ run_firecracker_checks() {
         fail "recycled Firecracker TAP ${cached_tap} remained administratively up"
     fi
 
-    log "testing Firecracker rejects directory rootfs and mounts"
-    local rejected_id
-    if rejected_id="$(sbox_cmd start \
-        --quiet \
-        --runtime firecracker \
-        --sandbox-id sbox-e2e-firecracker-directory-root \
-        --rootfs "${ROOTFS}" \
-        --cpu-millicores 100 \
-        --memory-mb 256 \
-        /bin/true 2>/tmp/firecracker-directory-root.log)"; then
-        sbox_cmd delete "${rejected_id}" || true
-        fail "Firecracker accepted a directory rootfs"
-    fi
-    if rejected_id="$(sbox_cmd start \
-        --quiet \
-        --runtime firecracker \
-        --sandbox-id sbox-e2e-firecracker-directory-mount \
-        --rootfs "${EROFS_ROOTFS}" \
-        --mount "${EROFS_MOUNT_ROOT}:/mnt/dir:bind:ro" \
-        --cpu-millicores 100 \
-        --memory-mb 256 \
-        /bin/true 2>/tmp/firecracker-directory-mount.log)"; then
-        sbox_cmd delete "${rejected_id}" || true
-        fail "Firecracker accepted a directory mount"
+    if [ "${FIRECRACKER_VIRTIOFS}" != "1" ]; then
+        log "testing Firecracker rejects directory rootfs and mounts"
+        local rejected_id
+        if rejected_id="$(sbox_cmd start \
+            --quiet \
+            --runtime firecracker \
+            --sandbox-id sbox-e2e-firecracker-directory-root \
+            --rootfs "${ROOTFS}" \
+            --cpu-millicores 100 \
+            --memory-mb 256 \
+            /bin/true 2>/tmp/firecracker-directory-root.log)"; then
+            sbox_cmd delete "${rejected_id}" || true
+            fail "Firecracker accepted a directory rootfs"
+        fi
+        if rejected_id="$(sbox_cmd start \
+            --quiet \
+            --runtime firecracker \
+            --sandbox-id sbox-e2e-firecracker-directory-mount \
+            --rootfs "${EROFS_ROOTFS}" \
+            --mount "${EROFS_MOUNT_ROOT}:/mnt/dir:bind:ro" \
+            --cpu-millicores 100 \
+            --memory-mb 256 \
+            /bin/true 2>/tmp/firecracker-directory-mount.log)"; then
+            sbox_cmd delete "${rejected_id}" || true
+            fail "Firecracker accepted a directory mount"
+        fi
     fi
 
-    log "testing Firecracker OCI rootfs conversion"
+    log "testing Firecracker OCI rootfs materialization"
     local oci_root_id="sbox-e2e-firecracker-oci-root"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
@@ -1808,12 +1891,12 @@ run_firecracker_checks() {
 
     local cached_taps_before
     cached_taps_before="$(list_cached_taps)"
-    log "testing Firecracker read-only EROFS root"
+    log "testing Firecracker read-only ${root_description} root"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
         --runtime firecracker \
         --sandbox-id sbox-e2e-firecracker-readonly \
-        --rootfs "${EROFS_ROOTFS}" \
+        --rootfs "${rootfs}" \
         --rootfs-readonly \
         --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs-readonly:erofs:ro" \
         --cpu-millicores 100 \
@@ -1859,7 +1942,7 @@ run_firecracker_checks() {
         --quiet \
         --runtime firecracker \
         --sandbox-id sbox-e2e-firecracker-exit \
-        --rootfs "${EROFS_ROOTFS}" \
+        --rootfs "${rootfs}" \
         --cpu-millicores 100 \
         --memory-mb 256 \
         /bin/sh -c 'sleep 2; exit 23')"
@@ -1882,11 +1965,11 @@ run_firecracker_checks() {
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
 
-    run_dnat_check firecracker "Firecracker" "${EROFS_ROOTFS}" 256
+    run_dnat_check firecracker "Firecracker" "${rootfs}" 256
 
-    run_checkpoint_restore_check firecracker "${EROFS_ROOTFS}"
-    run_storage_quota_check firecracker "${EROFS_ROOTFS}"
-    run_stress_checks firecracker "${EROFS_ROOTFS}"
+    run_checkpoint_restore_check firecracker "${rootfs}"
+    run_storage_quota_check firecracker "${rootfs}"
+    run_stress_checks firecracker "${rootfs}"
 }
 
 run_runsc_checks() {

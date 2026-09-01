@@ -390,6 +390,42 @@ func TestFirecrackerTmpfsParameters(t *testing.T) {
 	}
 }
 
+func TestSharedVirtioFSDirectory(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "mounts", "0001")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := sharedVirtioFSDirectoryUnder(root, "mounts/0001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != nested {
+		t.Fatalf("resolved virtio-fs directory = %q, want %q", resolved, nested)
+	}
+	for _, invalid := range []string{"", ".", "..", "../escape", "/absolute"} {
+		if _, err := sharedVirtioFSDirectoryUnder(root, invalid); err == nil {
+			t.Fatalf("accepted virtio-fs source %q", invalid)
+		}
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sharedVirtioFSDirectoryUnder(root, "escape/subdir"); err == nil ||
+		!strings.Contains(err.Error(), "traverses symlink") {
+		t.Fatalf("symlink virtio-fs source error = %v", err)
+	}
+	file := filepath.Join(root, "file")
+	if err := os.WriteFile(file, []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sharedVirtioFSDirectoryUnder(root, "file"); err == nil ||
+		!strings.Contains(err.Error(), "non-directory") {
+		t.Fatalf("file virtio-fs source error = %v", err)
+	}
+}
+
 func TestCheckpointHandoff(t *testing.T) {
 	root := t.TempDir()
 	environment := []string{

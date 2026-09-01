@@ -68,6 +68,11 @@ func (handler *Handler) Checkpoint(
 		!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		return fmt.Errorf("Firecracker sandbox %s is not running", sandboxID)
 	}
+	if state.VirtioFS != nil &&
+		!firecrackerVirtioFSProcessMatches(state.VirtioFS, handler.virtiofsdPath) {
+		return fmt.Errorf("Firecracker sandbox %s virtiofsd is not running", sandboxID)
+	}
+	hasVirtioFS := state.VirtioFS != nil
 
 	api := newFirecrackerAPI(state.APIPath)
 	requestedType, err := resolveRequestedSnapshotType(
@@ -89,7 +94,7 @@ func (handler *Handler) Checkpoint(
 	// Hashing the VMM binary and the guest kernel happens before the pause:
 	// the first checkpoint after a daemon start pays it once, later ones
 	// read the cache.
-	compat, err := handler.buildCheckpointCompat(state.Vcpus)
+	compat, err := handler.buildCheckpointCompat(state.Vcpus, hasVirtioFS)
 	if err != nil {
 		return err
 	}
@@ -98,6 +103,12 @@ func (handler *Handler) Checkpoint(
 	// work the guest should not wait for. A tier-1/2 layout failure degrades
 	// to a Full snapshot; anything else is unrecoverable.
 	files, err := prepareFirecrackerCheckpointV2(config.Directory, base, layoutMemorySize)
+	if hasVirtioFS {
+		files.VirtioFSState = filepath.Join(
+			config.Directory,
+			firecrackerCheckpointVirtioFSName,
+		)
+	}
 	if err != nil {
 		if base == "" || layoutMemorySize <= 0 {
 			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
@@ -116,6 +127,12 @@ func (handler *Handler) Checkpoint(
 		snapshotType = firecrackerSnapshotTypeFull
 		if files, err = prepareFirecrackerCheckpointV2(config.Directory, "", 0); err != nil {
 			return fmt.Errorf("lay out Firecracker checkpoint for %s: %w", sandboxID, err)
+		}
+		if hasVirtioFS {
+			files.VirtioFSState = filepath.Join(
+				config.Directory,
+				firecrackerCheckpointVirtioFSName,
+			)
 		}
 	}
 	tPrepared := time.Now()
@@ -225,7 +242,7 @@ func (handler *Handler) Checkpoint(
 		func() error {
 			snapshotAttempted = true
 			return api.createSnapshot(
-				ctx, files.State, files.Memory, snapshotType,
+				ctx, files.State, files.Memory, files.VirtioFSState, snapshotType,
 			)
 		},
 	)
@@ -292,6 +309,7 @@ func (handler *Handler) Checkpoint(
 	manifest := &firecrackerCheckpointManifest{
 		SnapshotType: snapshotType,
 		MemorySize:   memoryInfo.Size(),
+		VirtioFS:     hasVirtioFS,
 		Compat:       compat,
 	}
 	if base != "" {
@@ -464,7 +482,10 @@ func selectFirecrackerSnapshotTier(
 // buildCheckpointCompat assembles the compatibility tuple for a guest with
 // the given vCPU count, digesting the VMM binary, guest kernel, and initrd
 // once per handler and caching the results.
-func (handler *Handler) buildCheckpointCompat(vcpus uint32) (*firecrackerCheckpointCompat, error) {
+func (handler *Handler) buildCheckpointCompat(
+	vcpus uint32,
+	withVirtioFS bool,
+) (*firecrackerCheckpointCompat, error) {
 	handler.compatMu.Lock()
 	defer handler.compatMu.Unlock()
 	if handler.compatDigests == nil {
@@ -483,7 +504,17 @@ func (handler *Handler) buildCheckpointCompat(vcpus uint32) (*firecrackerCheckpo
 		}
 		handler.compatDigests = compat
 	}
+	if withVirtioFS && handler.compatDigests.VirtioFSD == "" {
+		digest, err := digestFirecrackerStackFile(handler.virtiofsdPath)
+		if err != nil {
+			return nil, fmt.Errorf("digest virtiofsd binary: %w", err)
+		}
+		handler.compatDigests.VirtioFSD = digest
+	}
 	compat := *handler.compatDigests
+	if !withVirtioFS {
+		compat.VirtioFSD = ""
+	}
 	compat.Vcpus = vcpus
 	compat.KernelArgs = handler.kernelArgs
 	return &compat, nil
@@ -504,7 +535,10 @@ func (handler *Handler) verifyCheckpointCompat(
 	if recorded == nil {
 		return nil
 	}
-	local, err := handler.buildCheckpointCompat(recorded.Vcpus)
+	local, err := handler.buildCheckpointCompat(
+		recorded.Vcpus,
+		artifact.Manifest.VirtioFS || recorded.VirtioFSD != "",
+	)
 	if err != nil {
 		return err
 	}
@@ -512,6 +546,7 @@ func (handler *Handler) verifyCheckpointCompat(
 	for _, field := range []struct{ name, recorded, local string }{
 		{"arch", recorded.Arch, local.Arch},
 		{"firecracker", recorded.Firecracker, local.Firecracker},
+		{"virtiofsd", recorded.VirtioFSD, local.VirtioFSD},
 		{"kernel", recorded.Kernel, local.Kernel},
 		{"initrd", recorded.Initrd, local.Initrd},
 		{"kernel_args", recorded.KernelArgs, local.KernelArgs},
@@ -553,7 +588,12 @@ func firecrackerBaseMemoryUsable(path string, memorySize int64) bool {
 // discardUnsealedFirecrackerCheckpoint removes the components of a checkpoint
 // directory that never reached a manifest; sealed artifacts are left alone.
 func discardUnsealedFirecrackerCheckpoint(files firecrackerCheckpointFiles) {
-	for _, path := range []string{files.State, files.Memory, files.Overlay} {
+	for _, path := range []string{
+		files.State,
+		files.Memory,
+		files.Overlay,
+		files.VirtioFSState,
+	} {
 		if path != "" {
 			_ = os.Remove(path)
 		}
@@ -589,10 +629,10 @@ func adoptCheckpointMemory(
 // instantiateFirecrackerCheckpoint materializes the runtime-side pieces of an
 // opened checkpoint for a restore and reports the guest memory size it
 // carries. v1 archives are unpacked into the sandbox state directory; v2
-// directories are restored in place — Firecracker mmaps the artifact's memory
-// file, so the caller must keep the checkpoint directory intact for the
-// lifetime of the restored sandbox — and only the writable layer is cloned
-// into sandbox-owned storage, because the restored VM writes to it.
+// directories keep their committed components in place. A conventional VM
+// maps the artifact memory privately; a virtio-fs VM asks Firecracker to clone
+// it into a sandbox-owned shared live file. The writable layer is always
+// cloned into sandbox-owned storage.
 func instantiateFirecrackerCheckpoint(
 	ctx context.Context,
 	artifact *firecrackerCheckpointArtifact,
@@ -628,6 +668,7 @@ func instantiateFirecrackerCheckpoint(
 		}
 		files.State = artifact.Files.State
 		files.Memory = artifact.Files.Memory
+		files.VirtioFSState = artifact.Files.VirtioFSState
 		// The cloned overlay is a live runtime file, not a durable artifact.
 		// FICLONE makes it immediately usable by Firecracker; syncing here can
 		// force unrelated deferred checkpoint writeback onto restore latency.
@@ -665,6 +706,12 @@ func (handler *Handler) Restore(
 			startConfig.CheckpointDir, err,
 		)
 	}
+	if artifact.Manifest != nil && artifact.Manifest.VirtioFS &&
+		!handler.virtioFSEnabled {
+		return errors.New(
+			"Firecracker checkpoint contains virtio-fs but virtiofs_enabled is false",
+		)
+	}
 	if err := handler.verifyCheckpointCompat(artifact); err != nil {
 		return fmt.Errorf(
 			"refuse Firecracker restore from %s: %w",
@@ -699,9 +746,16 @@ func (handler *Handler) Restore(
 	if err != nil {
 		return fmt.Errorf("generate Firecracker restore OCI metadata: %w", err)
 	}
-	plan, err := prepareFirecrackerStorage(spec, startConfig)
+	plan, err := prepareFirecrackerStorage(spec, startConfig, handler.virtioFSEnabled)
 	if err != nil {
 		return err
+	}
+	checkpointHasVirtioFS := artifact.Manifest != nil && artifact.Manifest.VirtioFS
+	requestedVirtioFS := len(plan.virtioFSExports) > 0
+	if checkpointHasVirtioFS != requestedVirtioFS {
+		return fmt.Errorf(
+			"Firecracker checkpoint virtio-fs layout does not match the restore rootfs and mounts",
+		)
 	}
 	storageDir, err := createFirecrackerStorageDirectory(handler.storageRoot, startConfig.ID)
 	if err != nil {
@@ -744,7 +798,9 @@ func (handler *Handler) Restore(
 	runtimeCreated = true
 	apiPath := filepath.Join(runtimeDir, firecrackerAPISocket)
 	vsockPath := filepath.Join(runtimeDir, firecrackerVsock)
-	if len(apiPath) >= 100 || len(vsockPath) >= 100 {
+	virtioFSSocketPath := filepath.Join(runtimeDir, firecrackerVirtioFSSocket)
+	if len(apiPath) >= 100 || len(vsockPath) >= 100 ||
+		len(virtioFSSocketPath) >= 100 {
 		return fmt.Errorf("Firecracker Unix socket path is too long under %s", runtimeDir)
 	}
 	if err := removeFirecrackerSocket(apiPath); err != nil {
@@ -753,12 +809,38 @@ func (handler *Handler) Restore(
 	if err := removeFirecrackerSocket(vsockPath); err != nil {
 		return err
 	}
+	var virtioFSState *firecrackerVirtioFSState
+	var virtioFSCommand *exec.Cmd
+	virtioFSOwned := false
+	if requestedVirtioFS {
+		virtioFSState = &firecrackerVirtioFSState{
+			SocketPath: virtioFSSocketPath,
+			SharedDir:  filepath.Join(storageDir, firecrackerVirtioFSSharedDir),
+		}
+		if err := prepareFirecrackerVirtioFSShared(
+			virtioFSState.SharedDir,
+			plan.virtioFSExports,
+		); err != nil {
+			return err
+		}
+		defer func() {
+			if virtioFSOwned {
+				return
+			}
+			retErr = errors.Join(
+				retErr,
+				cleanupFirecrackerVirtioFS(virtioFSState, handler.virtiofsdPath),
+			)
+			if virtioFSCommand != nil {
+				_ = virtioFSCommand.Wait()
+			}
+		}()
+	}
 
-	// v1 archives are unpacked into the sandbox state directory; v2
-	// directories are restored in place — Firecracker mmaps the artifact's
-	// memory file, so the caller must keep the checkpoint directory intact
-	// for the lifetime of the restored sandbox. Only the writable layer is
-	// instantiated into sandbox-owned storage (the restored VM writes to it).
+	// v1 archives are unpacked into the sandbox state directory. v2 committed
+	// components stay in the caller-owned directory; virtio-fs restore clones
+	// memory into sandbox-owned shared live storage, while other restores map
+	// it privately. The writable layer is always sandbox-owned.
 	tPrepared := time.Now()
 	checkpointFiles, memorySize, err := instantiateFirecrackerCheckpoint(
 		ctx,
@@ -788,6 +870,25 @@ func (handler *Handler) Restore(
 		return err
 	}
 	defer stderr.Close()
+	if virtioFSState != nil {
+		virtioFSState, virtioFSCommand, err = startFirecrackerVirtioFS(
+			ctx,
+			handler.virtiofsdPath,
+			virtioFSState.SharedDir,
+			virtioFSState.SocketPath,
+			stdout,
+			stderr,
+		)
+		if err != nil {
+			return err
+		}
+		if err := attachFirecrackerProcess(
+			startConfig.CgroupPath,
+			virtioFSState.PID,
+		); err != nil {
+			return fmt.Errorf("attach restored virtiofsd to cgroup: %w", err)
+		}
+	}
 	command := exec.Command(
 		handler.binary,
 		"--api-sock", apiPath,
@@ -814,6 +915,7 @@ func (handler *Handler) Restore(
 			APIPath:     apiPath,
 			VsockPath:   vsockPath,
 			OverlayPath: checkpointFiles.Overlay,
+			VirtioFS:    virtioFSState,
 			MemoryMiB:   uint32(memorySize >> 20),
 			Vcpus:       restoredVcpus,
 			CreatedAt:   time.Now().Format(time.RFC3339Nano),
@@ -824,6 +926,10 @@ func (handler *Handler) Restore(
 	handler.instances[startConfig.ID] = instance
 	handler.mu.Unlock()
 	go handler.waitCommand(instance, command)
+	if virtioFSCommand != nil {
+		virtioFSOwned = true
+		go handler.waitVirtioFS(instance, virtioFSCommand)
+	}
 
 	restoreSucceeded := false
 	defer func() {
@@ -855,8 +961,11 @@ func (handler *Handler) Restore(
 		ctx,
 		checkpointFiles.State,
 		checkpointFiles.Memory,
+		filepath.Join(storageDir, firecrackerVirtioFSMemory),
 		startConfig.Network.Interface.Name,
 		vsockPath,
+		virtioFSSocketPathIfConfigured(virtioFSState),
+		checkpointFiles.VirtioFSState,
 	); err != nil {
 		return fmt.Errorf("load Firecracker checkpoint for %s: %w", startConfig.ID, err)
 	}

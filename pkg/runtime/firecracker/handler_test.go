@@ -181,6 +181,31 @@ func TestFirecrackerValidateStartRequestRejectsNativeWritableMountOverlap(t *tes
 	}
 }
 
+func TestFirecrackerValidateStartRequestAllowsVirtioFSRootfsButRejectsImageMount(t *testing.T) {
+	handler := &Handler{virtioFSEnabled: true}
+	request := &runtimeapi.StartRequest{
+		Rootfs: &runtimeapi.RootfsConfig{
+			Type: runtimeapi.RootfsSrcType_IMAGE,
+			Source: &runtimeapi.RootfsConfig_ImageUrl{
+				ImageUrl: "example.invalid/rootfs:latest",
+			},
+		},
+	}
+	if err := handler.ValidateStartRequest(request); err != nil {
+		t.Fatalf("ValidateStartRequest() error = %v", err)
+	}
+	request.Mounts = []*runtimeapi.Mount{{
+		Target: "/mnt/image",
+		Source: &runtimeapi.Mount_ImageUrl{
+			ImageUrl: "example.invalid/data:latest",
+		},
+	}}
+	if err := handler.ValidateStartRequest(request); err == nil ||
+		!strings.Contains(err.Error(), "does not support OCI image mount") {
+		t.Fatalf("ValidateStartRequest() image mount error = %v", err)
+	}
+}
+
 func TestFirecrackerRuntimeDirectoryIsStableAndBounded(t *testing.T) {
 	handler := &Handler{runtimeRoot: "/run/sandboxd/firecracker"}
 	sandboxID := "sbox-" + strings.Repeat("a", 120)
@@ -195,6 +220,7 @@ func TestFirecrackerRuntimeDirectoryIsStableAndBounded(t *testing.T) {
 	for _, socket := range []string{
 		filepath.Join(first, firecrackerAPISocket),
 		filepath.Join(first, firecrackerVsock),
+		filepath.Join(first, firecrackerVirtioFSSocket),
 	} {
 		if len(socket) >= 100 {
 			t.Fatalf("socket path is too long: %d bytes: %s", len(socket), socket)
@@ -230,6 +256,42 @@ func TestValidateFirecrackerPersistedState(t *testing.T) {
 	}
 	if err := handler.validatePersistedState(sandboxID, bundlePath, valid); err != nil {
 		t.Fatalf("valid state rejected: %v", err)
+	}
+	withVirtioFS := valid
+	withVirtioFS.VirtioFS = &firecrackerVirtioFSState{
+		PID:        1234,
+		SocketPath: filepath.Join(runtimePath, firecrackerVirtioFSSocket),
+		SharedDir:  filepath.Join(storagePath, firecrackerVirtioFSSharedDir),
+	}
+	if err := handler.validatePersistedState(
+		sandboxID,
+		bundlePath,
+		withVirtioFS,
+	); err != nil {
+		t.Fatalf("valid virtio-fs state rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*firecrackerVirtioFSState){
+		"PID": func(state *firecrackerVirtioFSState) { state.PID = 1 },
+		"socket": func(state *firecrackerVirtioFSState) {
+			state.SocketPath = filepath.Join(root, "other.sock")
+		},
+		"shared directory": func(state *firecrackerVirtioFSState) {
+			state.SharedDir = filepath.Join(root, "other")
+		},
+	} {
+		t.Run("virtio-fs "+name, func(t *testing.T) {
+			state := withVirtioFS
+			virtioFS := *withVirtioFS.VirtioFS
+			state.VirtioFS = &virtioFS
+			mutate(state.VirtioFS)
+			if err := handler.validatePersistedState(
+				sandboxID,
+				bundlePath,
+				state,
+			); err == nil {
+				t.Fatalf("accepted inconsistent virtio-fs %s state: %+v", name, state)
+			}
+		})
 	}
 
 	tests := []struct {

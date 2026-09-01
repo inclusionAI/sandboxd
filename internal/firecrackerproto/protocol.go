@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	Version   = uint16(1)
+	Version   = uint16(2)
 	AgentPort = uint32(52)
 
 	maxMessageSize = 16 << 20
@@ -99,6 +99,7 @@ type NetworkSpec struct {
 
 type MountSpec struct {
 	Device  string   `json:"device"`
+	Source  string   `json:"source,omitempty"`
 	Target  string   `json:"target"`
 	FSType  string   `json:"fs_type"`
 	Options []string `json:"options,omitempty"`
@@ -120,6 +121,9 @@ type FileSpec struct {
 type ConfigureRequest struct {
 	Hostname             string                    `json:"hostname"`
 	RootDevice           string                    `json:"root_device"`
+	RootFSType           string                    `json:"root_fs_type,omitempty"`
+	RootSource           string                    `json:"root_source,omitempty"`
+	VirtioFSTag          string                    `json:"virtio_fs_tag,omitempty"`
 	OverlayDevice        string                    `json:"overlay_device"`
 	RootReadonly         bool                      `json:"root_readonly,omitempty"`
 	Process              ProcessSpec               `json:"process"`

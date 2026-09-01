@@ -124,6 +124,7 @@ func (api *firecrackerAPI) createSnapshot(
 	ctx context.Context,
 	statePath,
 	memoryPath,
+	fsStatePath,
 	snapshotType string,
 ) error {
 	body := map[string]any{
@@ -131,6 +132,9 @@ func (api *firecrackerAPI) createSnapshot(
 		"snapshot_path": statePath,
 		"mem_file_path": memoryPath,
 		"deferred_sync": true,
+	}
+	if fsStatePath != "" {
+		body["fs_state_path"] = fsStatePath
 	}
 	// Checkpoint artifacts deliberately remain in the host page cache. The
 	// caller accepts that success does not imply immediate power-loss
@@ -142,15 +146,26 @@ func (api *firecrackerAPI) loadSnapshot(
 	ctx context.Context,
 	statePath,
 	memoryPath,
+	liveMemoryPath,
 	tapName,
-	vsockPath string,
+	vsockPath,
+	virtioFSSocketPath,
+	virtioFSStatePath string,
 ) error {
-	return api.put(ctx, "/snapshot/load", map[string]any{
-		"snapshot_path": statePath,
-		"mem_backend": map[string]string{
-			"backend_type": "File",
-			"backend_path": memoryPath,
-		},
+	backend := map[string]string{
+		"backend_type": "File",
+		"backend_path": memoryPath,
+	}
+	if virtioFSSocketPath != "" {
+		backend = map[string]string{
+			"backend_type": "SharedFile",
+			"backend_path": liveMemoryPath,
+			"source_path":  memoryPath,
+		}
+	}
+	body := map[string]any{
+		"snapshot_path":     statePath,
+		"mem_backend":       backend,
 		"track_dirty_pages": true,
 		"resume_vm":         true,
 		"network_overrides": []map[string]string{{
@@ -160,7 +175,15 @@ func (api *firecrackerAPI) loadSnapshot(
 		"vsock_override": map[string]string{
 			"uds_path": vsockPath,
 		},
-	})
+	}
+	if virtioFSSocketPath != "" {
+		body["fs_override"] = map[string]string{
+			"fs_id":       "root",
+			"socket_path": virtioFSSocketPath,
+			"state_path":  virtioFSStatePath,
+		}
+	}
+	return api.put(ctx, "/snapshot/load", body)
 }
 
 func firecrackerDrivePath(id string) string {
@@ -178,6 +201,7 @@ func configureFirecrackerVM(
 	tapName,
 	guestMAC,
 	vsockPath string,
+	virtioFSSocketPath string,
 	drives []firecrackerDrive,
 ) error {
 	if err := api.put(ctx, "/boot-source", map[string]any{
@@ -194,6 +218,15 @@ func configureFirecrackerVM(
 		"track_dirty_pages": true,
 	}); err != nil {
 		return err
+	}
+	if virtioFSSocketPath != "" {
+		if err := api.put(ctx, "/fs/root", map[string]any{
+			"fs_id":       "root",
+			"socket_path": virtioFSSocketPath,
+			"tag":         firecrackerVirtioFSTag,
+		}); err != nil {
+			return err
+		}
 	}
 	for _, drive := range drives {
 		if err := api.put(ctx, firecrackerDrivePath(drive.ID), map[string]any{

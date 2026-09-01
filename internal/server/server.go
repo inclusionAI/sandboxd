@@ -802,7 +802,8 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			}
 		}
 	}()
-	if cfg.RuntimeConfig.Firecracker.OCIRootfsEnabled {
+	if cfg.RuntimeConfig.Firecracker.OCIRootfsEnabled &&
+		!cfg.RuntimeConfig.Firecracker.VirtioFSEnabled {
 		mkfsEROFS := strings.TrimSpace(
 			cfg.RuntimeConfig.Firecracker.MkfsEROFSPath,
 		)
@@ -1404,7 +1405,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	}
 	runtimeRootfs := preparedFilesystem.RootfsPath()
 	if startReq.Runtime == config.RuntimeNameFirecracker &&
-		startReq.Rootfs.GetType() == runtime.RootfsSrcType_IMAGE {
+		startReq.Rootfs.GetType() == runtime.RootfsSrcType_IMAGE &&
+		!h.config.RuntimeConfig.Firecracker.VirtioFSEnabled {
 		if h.firecrackerOCIConverter == nil {
 			err := errors.New(
 				"Firecracker OCI image rootfs conversion is not configured",

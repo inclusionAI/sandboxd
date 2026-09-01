@@ -34,6 +34,7 @@ const (
 	firecrackerCheckpointStateName    = "vmstate"
 	firecrackerCheckpointMemoryName   = "memory"
 	firecrackerCheckpointOverlayName  = "overlay.ext4"
+	firecrackerCheckpointVirtioFSName = "virtiofs.state"
 	firecrackerCheckpointFormatName   = ".sandboxd-checkpoint-format"
 	firecrackerCheckpointFormat       = "1\n"
 	firecrackerCheckpointMaxComponent = int64(16 << 40)
@@ -50,9 +51,10 @@ type firecrackerSparseExtent struct {
 }
 
 type firecrackerCheckpointFiles struct {
-	State   string
-	Memory  string
-	Overlay string
+	State         string
+	Memory        string
+	Overlay       string
+	VirtioFSState string
 }
 
 func createFirecrackerCheckpointArchive(

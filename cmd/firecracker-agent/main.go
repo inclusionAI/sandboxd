@@ -45,6 +45,7 @@ const (
 	containerLower     = "/container/lower"
 	containerOverlay   = "/container/overlay"
 	containerNative    = "/container/overlay/native"
+	containerShared    = "/container/shared"
 	sandboxInitMode    = "sandbox-init"
 	sandboxConfigFD    = 3
 	sandboxStatusFD    = 4
@@ -296,8 +297,8 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 	if state.configured {
 		return errors.New("sandbox is already configured")
 	}
-	if request.RootDevice == "" || request.OverlayDevice == "" {
-		return errors.New("root and overlay block devices are required")
+	if request.OverlayDevice == "" {
+		return errors.New("overlay block device is required")
 	}
 	if len(request.Process.Args) == 0 {
 		return errors.New("sandbox command is empty")
@@ -306,6 +307,7 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 		containerRoot,
 		containerLower,
 		containerOverlay,
+		containerShared,
 		filepath.Join(containerOverlay, "upper"),
 		filepath.Join(containerOverlay, "work"),
 	} {
@@ -313,14 +315,41 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 			return err
 		}
 	}
-	if err := unix.Mount(
-		request.RootDevice,
-		containerLower,
-		"erofs",
-		unix.MS_RDONLY|unix.MS_NODEV,
-		"",
-	); err != nil {
-		return fmt.Errorf("mount root EROFS %s: %w", request.RootDevice, err)
+	rootFSType := request.RootFSType
+	if rootFSType == "" {
+		rootFSType = "erofs"
+	}
+	if request.VirtioFSTag != "" {
+		if err := mountSharedVirtioFS(request.VirtioFSTag); err != nil {
+			return err
+		}
+	}
+	lowerDir := containerLower
+	switch rootFSType {
+	case "erofs":
+		if request.RootDevice == "" {
+			return errors.New("EROFS root block device is required")
+		}
+		if err := unix.Mount(
+			request.RootDevice,
+			containerLower,
+			"erofs",
+			unix.MS_RDONLY|unix.MS_NODEV,
+			"",
+		); err != nil {
+			return fmt.Errorf("mount root EROFS %s: %w", request.RootDevice, err)
+		}
+	case "virtiofs":
+		if request.VirtioFSTag == "" {
+			return errors.New("virtio-fs root requires a mount tag")
+		}
+		var err error
+		lowerDir, err = sharedVirtioFSDirectory(request.RootSource)
+		if err != nil {
+			return fmt.Errorf("resolve virtio-fs root %q: %w", request.RootSource, err)
+		}
+	default:
+		return fmt.Errorf("unsupported root filesystem %q", rootFSType)
 	}
 	if err := unix.Mount(
 		request.OverlayDevice,
@@ -341,7 +370,7 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 	}
 	overlayData := fmt.Sprintf(
 		"lowerdir=%s,upperdir=%s,workdir=%s",
-		containerLower,
+		lowerDir,
 		upper,
 		work,
 	)
@@ -895,6 +924,8 @@ func mountGuestFilesystem(mount firecrackerproto.MountSpec) error {
 	switch mount.FSType {
 	case "erofs":
 		return mountGuestEROFS(mount)
+	case "virtiofs":
+		return mountGuestVirtioFS(mount)
 	case "tmpfs":
 		return mountGuestTmpfs(mount)
 	default:
@@ -946,6 +977,91 @@ func mountNativeWritableUnder(
 		)
 	}
 	return nil
+}
+
+func mountSharedVirtioFS(tag string) error {
+	if tag == "" {
+		return errors.New("virtio-fs mount tag is empty")
+	}
+	if err := unix.Mount(
+		tag,
+		containerShared,
+		"virtiofs",
+		unix.MS_RDONLY|unix.MS_NODEV,
+		"",
+	); err != nil {
+		return fmt.Errorf("mount shared virtio-fs %s: %w", tag, err)
+	}
+	return nil
+}
+
+func mountGuestVirtioFS(mount firecrackerproto.MountSpec) error {
+	if mount.Source == "" {
+		return errors.New("virtio-fs guest mount source is empty")
+	}
+	source, err := sharedVirtioFSDirectory(mount.Source)
+	if err != nil {
+		return err
+	}
+	target, err := ensureContainerDirectory(mount.Target)
+	if err != nil {
+		return err
+	}
+	if err := unix.Mount(source, target, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+		return fmt.Errorf(
+			"bind virtio-fs source %s at %s: %w",
+			mount.Source,
+			mount.Target,
+			err,
+		)
+	}
+	flags := uintptr(unix.MS_BIND | unix.MS_REMOUNT | unix.MS_RDONLY | unix.MS_NODEV)
+	for _, option := range mount.Options {
+		switch option {
+		case "ro":
+		case "nodev":
+			flags |= unix.MS_NODEV
+		case "noexec":
+			flags |= unix.MS_NOEXEC
+		case "nosuid":
+			flags |= unix.MS_NOSUID
+		default:
+			return fmt.Errorf("unsupported virtio-fs mount option %q", option)
+		}
+	}
+	if err := unix.Mount("", target, "", flags, ""); err != nil {
+		return fmt.Errorf("remount virtio-fs target %s read-only: %w", mount.Target, err)
+	}
+	return nil
+}
+
+func sharedVirtioFSDirectory(relative string) (string, error) {
+	return sharedVirtioFSDirectoryUnder(containerShared, relative)
+}
+
+func sharedVirtioFSDirectoryUnder(root, relative string) (string, error) {
+	if relative == "" || filepath.IsAbs(relative) {
+		return "", fmt.Errorf("virtio-fs source %q is not a relative path", relative)
+	}
+	clean := filepath.Clean(relative)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("virtio-fs source %q escapes the shared root", relative)
+	}
+	current := root
+	for _, component := range strings.Split(clean, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("virtio-fs source %q traverses symlink %s", relative, current)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("virtio-fs source %q contains non-directory %s", relative, current)
+		}
+	}
+	return current, nil
 }
 
 func mountGuestEROFS(mount firecrackerproto.MountSpec) error {

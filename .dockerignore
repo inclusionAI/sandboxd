@@ -15,6 +15,7 @@ output/*
 !output/checkpoint-restore
 !output/firecracker-agent
 !output/firecracker
+!output/virtiofsd
 !output/firecracker-vmlinux
 !output/firecracker-initrd.img
 !output/kata/

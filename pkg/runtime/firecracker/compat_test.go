@@ -30,27 +30,30 @@ func stackFixture(t *testing.T) *Handler {
 	binary := filepath.Join(dir, "firecracker")
 	kernel := filepath.Join(dir, "vmlinux")
 	initrd := filepath.Join(dir, "initrd.img")
+	virtiofsd := filepath.Join(dir, "virtiofsd")
 	for path, content := range map[string]string{
-		binary: "vmm-binary",
-		kernel: "guest-kernel",
-		initrd: "guest-initrd",
+		binary:    "vmm-binary",
+		kernel:    "guest-kernel",
+		initrd:    "guest-initrd",
+		virtiofsd: "virtiofsd-binary",
 	} {
 		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 			t.Fatalf("write stack file %s: %v", path, err)
 		}
 	}
 	return &Handler{
-		binary:     binary,
-		kernelPath: kernel,
-		initrdPath: initrd,
-		kernelArgs: "console=ttyS0",
+		binary:        binary,
+		kernelPath:    kernel,
+		initrdPath:    initrd,
+		virtiofsdPath: virtiofsd,
+		kernelArgs:    "console=ttyS0",
 	}
 }
 
 func TestBuildCheckpointCompatDigestsAndCaches(t *testing.T) {
 	handler := stackFixture(t)
 
-	first, err := handler.buildCheckpointCompat(2)
+	first, err := handler.buildCheckpointCompat(2, false)
 	if err != nil {
 		t.Fatalf("build compat: %v", err)
 	}
@@ -63,7 +66,7 @@ func TestBuildCheckpointCompatDigestsAndCaches(t *testing.T) {
 	if err := os.WriteFile(handler.kernelPath, []byte("mutated"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	second, err := handler.buildCheckpointCompat(4)
+	second, err := handler.buildCheckpointCompat(4, true)
 	if err != nil {
 		t.Fatalf("rebuild compat: %v", err)
 	}
@@ -72,6 +75,16 @@ func TestBuildCheckpointCompatDigestsAndCaches(t *testing.T) {
 	}
 	if second.Vcpus != 4 {
 		t.Fatalf("vcpu count %d not carried per checkpoint", second.Vcpus)
+	}
+	if len(second.VirtioFSD) != 64 {
+		t.Fatalf("virtiofsd digest missing: %+v", second)
+	}
+	third, err := handler.buildCheckpointCompat(1, false)
+	if err != nil {
+		t.Fatalf("rebuild non-virtio-fs compat: %v", err)
+	}
+	if third.VirtioFSD != "" {
+		t.Fatalf("virtiofsd digest leaked into non-virtio-fs tuple: %+v", third)
 	}
 }
 
@@ -106,7 +119,7 @@ func TestVerifyCheckpointCompat(t *testing.T) {
 		t.Fatalf("tuple-less artifact rejected: %v", err)
 	}
 
-	matching, err := handler.buildCheckpointCompat(1)
+	matching, err := handler.buildCheckpointCompat(1, false)
 	if err != nil {
 		t.Fatalf("build compat: %v", err)
 	}

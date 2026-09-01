@@ -32,6 +32,7 @@ import (
 
 const (
 	firecrackerEROFSMagic        = uint32(0xe0f5e1e2)
+	firecrackerVirtioFSTag       = "sandboxfs"
 	firecrackerMaxInjectedFile   = 1 << 20
 	firecrackerMaxInjectedTotal  = 4 << 20
 	firecrackerMinimumOverlay    = 16 << 20
@@ -45,21 +46,24 @@ type firecrackerDrive struct {
 }
 
 type firecrackerStoragePlan struct {
-	rootDrive   firecrackerDrive
-	mountDrives []firecrackerDrive
-	configure   firecrackerproto.ConfigureRequest
+	rootDrive       firecrackerDrive
+	mountDrives     []firecrackerDrive
+	virtioFSExports []firecrackerVirtioFSExport
+	configure       firecrackerproto.ConfigureRequest
+}
+
+type firecrackerVirtioFSExport struct {
+	Source       string
+	RelativePath string
 }
 
 func prepareFirecrackerStorage(
 	spec *runtimecore.Spec,
 	startConfig runtimecore.StartConfig,
+	virtioFSEnabled bool,
 ) (*firecrackerStoragePlan, error) {
 	if spec == nil || spec.Root == nil || spec.Root.Path == "" {
 		return nil, errors.New("Firecracker rootfs is missing")
-	}
-	rootPath, err := validateEROFSImage(spec.Root.Path)
-	if err != nil {
-		return nil, fmt.Errorf("validate Firecracker rootfs: %w", err)
 	}
 	if spec.Process == nil || len(spec.Process.Args) == 0 {
 		return nil, errors.New("Firecracker sandbox process is missing")
@@ -105,16 +109,9 @@ func prepareFirecrackerStorage(
 		return nil, err
 	}
 	plan := &firecrackerStoragePlan{
-		rootDrive: firecrackerDrive{
-			ID:       "rootfs",
-			Path:     rootPath,
-			ReadOnly: true,
-		},
 		configure: firecrackerproto.ConfigureRequest{
-			Hostname:      spec.Hostname,
-			RootDevice:    "/dev/vda",
-			OverlayDevice: "/dev/vdb",
-			RootReadonly:  spec.Root.Readonly,
+			Hostname:     spec.Hostname,
+			RootReadonly: spec.Root.Readonly,
 			Process: firecrackerproto.ProcessSpec{
 				Args:           append([]string(nil), spec.Process.Args...),
 				Env:            append([]string(nil), spec.Process.Env...),
@@ -138,6 +135,41 @@ func prepareFirecrackerStorage(
 			firecrackerproto.NativeWritableMountSpec{Target: mount.Target},
 		)
 	}
+	nextDrive := 0
+	rootInfo, err := os.Stat(spec.Root.Path)
+	if err != nil {
+		return nil, fmt.Errorf("validate Firecracker rootfs: %w", err)
+	}
+	if rootInfo.IsDir() {
+		if !virtioFSEnabled {
+			return nil, fmt.Errorf(
+				"validate Firecracker rootfs: %s is not a regular EROFS image",
+				spec.Root.Path,
+			)
+		}
+		rootPath, err := validateFirecrackerDirectory(spec.Root.Path)
+		if err != nil {
+			return nil, fmt.Errorf("validate Firecracker rootfs: %w", err)
+		}
+		plan.virtioFSExports = append(plan.virtioFSExports, firecrackerVirtioFSExport{
+			Source: rootPath, RelativePath: "rootfs",
+		})
+		plan.configure.RootFSType = "virtiofs"
+		plan.configure.RootSource = "rootfs"
+	} else {
+		rootPath, err := validateEROFSImage(spec.Root.Path)
+		if err != nil {
+			return nil, fmt.Errorf("validate Firecracker rootfs: %w", err)
+		}
+		plan.rootDrive = firecrackerDrive{
+			ID: "rootfs", Path: rootPath, ReadOnly: true,
+		}
+		plan.configure.RootFSType = "erofs"
+		plan.configure.RootDevice = firecrackerGuestBlockDevice(nextDrive)
+		nextDrive++
+	}
+	plan.configure.OverlayDevice = firecrackerGuestBlockDevice(nextDrive)
+	nextDrive++
 
 	injectedBytes := 0
 	for _, mount := range mounts {
@@ -165,6 +197,42 @@ func prepareFirecrackerStorage(
 				},
 			)
 		case "bind":
+			if err := validateFirecrackerReadOnlyBind(mount); err != nil {
+				return nil, err
+			}
+			info, err := os.Stat(mount.Source)
+			if err != nil {
+				return nil, err
+			}
+			if info.IsDir() {
+				if !virtioFSEnabled {
+					return nil, fmt.Errorf(
+						"Firecracker only supports regular-file bind injection, got %s",
+						mount.Source,
+					)
+				}
+				source, err := validateFirecrackerDirectory(mount.Source)
+				if err != nil {
+					return nil, err
+				}
+				options, err := firecrackerVirtioFSMountOptions(mount.Options)
+				if err != nil {
+					return nil, fmt.Errorf("validate Firecracker mount %s: %w", target, err)
+				}
+				relative := fmt.Sprintf("mounts/%04d", len(plan.virtioFSExports))
+				plan.virtioFSExports = append(
+					plan.virtioFSExports,
+					firecrackerVirtioFSExport{Source: source, RelativePath: relative},
+				)
+				plan.configure.Mounts = append(
+					plan.configure.Mounts,
+					firecrackerproto.MountSpec{
+						Source: relative, Target: target,
+						FSType: "virtiofs", Options: options,
+					},
+				)
+				break
+			}
 			file, size, err := firecrackerInjectedFile(mount)
 			if err != nil {
 				return nil, err
@@ -187,7 +255,7 @@ func prepareFirecrackerStorage(
 				)
 			}
 			index := len(plan.mountDrives)
-			if index+2 >= firecrackerMaximumDriveCount {
+			if nextDrive >= firecrackerMaximumDriveCount {
 				return nil, fmt.Errorf(
 					"Firecracker supports at most %d attached drives",
 					firecrackerMaximumDriveCount,
@@ -201,12 +269,13 @@ func prepareFirecrackerStorage(
 			plan.configure.Mounts = append(
 				plan.configure.Mounts,
 				firecrackerproto.MountSpec{
-					Device:  firecrackerGuestBlockDevice(index + 2),
+					Device:  firecrackerGuestBlockDevice(nextDrive),
 					Target:  target,
 					FSType:  "erofs",
 					Options: firecrackerMountOptions(mount.Options),
 				},
 			)
+			nextDrive++
 		default:
 			return nil, fmt.Errorf(
 				"Firecracker does not support mount type %q at %s",
@@ -214,6 +283,9 @@ func prepareFirecrackerStorage(
 				target,
 			)
 		}
+	}
+	if len(plan.virtioFSExports) > 0 {
+		plan.configure.VirtioFSTag = firecrackerVirtioFSTag
 	}
 	return plan, nil
 }
@@ -278,18 +350,8 @@ func validateFirecrackerTmpfsOptions(options []string) ([]string, error) {
 }
 
 func firecrackerInjectedFile(mount runtimecore.Mount) (firecrackerproto.FileSpec, int, error) {
-	if mount.Source == "" {
-		return firecrackerproto.FileSpec{}, 0, fmt.Errorf(
-			"Firecracker bind mount %s has no source",
-			mount.Destination,
-		)
-	}
-	if !slices.Contains(mount.Options, "ro") ||
-		slices.Contains(mount.Options, "rw") {
-		return firecrackerproto.FileSpec{}, 0, fmt.Errorf(
-			"Firecracker bind mount %s must be explicitly read-only",
-			mount.Destination,
-		)
+	if err := validateFirecrackerReadOnlyBind(mount); err != nil {
+		return firecrackerproto.FileSpec{}, 0, err
 	}
 	info, err := os.Stat(mount.Source)
 	if err != nil {
@@ -320,6 +382,60 @@ func firecrackerInjectedFile(mount runtimecore.Mount) (firecrackerproto.FileSpec
 	}, len(content), nil
 }
 
+func validateFirecrackerReadOnlyBind(mount runtimecore.Mount) error {
+	if mount.Source == "" {
+		return fmt.Errorf(
+			"Firecracker bind mount %s has no source",
+			mount.Destination,
+		)
+	}
+	if !slices.Contains(mount.Options, "ro") ||
+		slices.Contains(mount.Options, "rw") {
+		return fmt.Errorf(
+			"Firecracker bind mount %s must be explicitly read-only",
+			mount.Destination,
+		)
+	}
+	return nil
+}
+
+func validateFirecrackerDirectory(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", resolved)
+	}
+	return resolved, nil
+}
+
+func firecrackerVirtioFSMountOptions(options []string) ([]string, error) {
+	result := []string{"ro"}
+	for _, option := range options {
+		switch option {
+		case "ro", "bind", "rbind", "private", "rprivate":
+		case "nodev", "noexec", "nosuid":
+			if !slices.Contains(result, option) {
+				result = append(result, option)
+			}
+		case "rw":
+			return nil, errors.New("virtio-fs directory mount cannot be writable")
+		default:
+			return nil, fmt.Errorf("unsupported virtio-fs mount option %q", option)
+		}
+	}
+	return result, nil
+}
+
 func firecrackerMountOptions(options []string) []string {
 	result := make([]string, 0, len(options)+1)
 	for _, option := range options {
@@ -342,7 +458,8 @@ func firecrackerMountOptions(options []string) []string {
 
 func firecrackerGuestBlockDevice(index int) string {
 	// Firecracker's virtio-mmio block devices are enumerated in API insertion
-	// order. The root image is vda and the writable layer is vdb.
+	// order. With an EROFS root the root image is vda and the writable layer is
+	// vdb; with a virtio-fs root the writable layer is the first drive, vda.
 	return fmt.Sprintf("/dev/vd%c", 'a'+index)
 }
 

@@ -175,6 +175,13 @@ type FirecrackerConfig struct {
 	// generation as a Full snapshot. "incremental" enables the three-tier
 	// chain against a VMM that supports Incremental and SoftDirty snapshots.
 	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
+	// VirtioFSEnabled allows directory-backed root filesystems and read-only
+	// directory mounts to be exported through one sandbox-scoped virtiofsd.
+	// It requires the migration-capable Firecracker build and guest kernel.
+	VirtioFSEnabled bool `toml:"virtiofs_enabled" json:"virtiofsEnabled"`
+	// VirtioFSDPath selects the upstream virtiofsd executable. The runtime
+	// requires vhost-user DEVICE_STATE and LOG_SHMFD support.
+	VirtioFSDPath string `toml:"virtiofsd_path" json:"virtiofsdPath"`
 	// OCIRootfsEnabled permits an OCI image rootfs to be materialized as a
 	// local EROFS image before the Firecracker VM starts. It is opt-in because
 	// conversion eagerly reads the complete merged image.
@@ -320,6 +327,7 @@ func DefaultConfig() Config {
 					DefaultVCPUCount:        DefaultFirecrackerVCPUs,
 					DefaultMemoryMiB:        DefaultFirecrackerMemoryMiB,
 					DefaultOverlaySizeBytes: DefaultFirecrackerOverlayBytes,
+					VirtioFSDPath:           DefaultFirecrackerVirtioFSD,
 				},
 				ImageLibDir:              DefaultImageLibDir,
 				FilestoreDir:             DefaultFilestoreDir,

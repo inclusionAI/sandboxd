@@ -391,3 +391,64 @@ func TestFinalizeCheckpointV2SkipsLargeComponentDigests(t *testing.T) {
 		t.Fatalf("verify Full artifact digests: %v", err)
 	}
 }
+
+func TestCheckpointV2CarriesVirtioFSState(t *testing.T) {
+	dir := t.TempDir()
+	files := sealArtifactFixture(t, dir)
+	files.VirtioFSState = filepath.Join(dir, firecrackerCheckpointVirtioFSName)
+	writeArtifactComponent(t, files.VirtioFSState, 4<<10)
+	manifest := &firecrackerCheckpointManifest{
+		SnapshotType: firecrackerSnapshotTypeSoftDirty,
+		MemorySize:   64 << 10,
+		VirtioFS:     true,
+	}
+	if err := finalizeFirecrackerCheckpointV2(
+		context.Background(),
+		files,
+		manifest,
+	); err != nil {
+		t.Fatalf("finalize virtio-fs checkpoint: %v", err)
+	}
+	if _, recorded := manifest.Digests[firecrackerCheckpointVirtioFSName]; !recorded {
+		t.Fatal("virtio-fs state digest was not recorded")
+	}
+	artifact, err := openFirecrackerCheckpoint(dir)
+	if err != nil {
+		t.Fatalf("open virtio-fs checkpoint: %v", err)
+	}
+	if !artifact.Manifest.VirtioFS || artifact.Files.VirtioFSState != files.VirtioFSState {
+		t.Fatalf("virtio-fs artifact = %+v", artifact)
+	}
+	var cache checkpointDigestCache
+	if err := cache.verifyFirecrackerCheckpointDigests(
+		context.Background(),
+		artifact,
+	); err != nil {
+		t.Fatalf("verify virtio-fs checkpoint: %v", err)
+	}
+	if err := os.WriteFile(files.VirtioFSState, []byte("changed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.verifyFirecrackerCheckpointDigests(
+		context.Background(),
+		artifact,
+	); err == nil {
+		t.Fatal("accepted changed virtio-fs state")
+	}
+}
+
+func TestFinalizeCheckpointV2RejectsVirtioFSMismatch(t *testing.T) {
+	dir := t.TempDir()
+	files := sealArtifactFixture(t, dir)
+	if err := finalizeFirecrackerCheckpointV2(
+		context.Background(),
+		files,
+		&firecrackerCheckpointManifest{
+			SnapshotType: firecrackerSnapshotTypeFull,
+			MemorySize:   64 << 10,
+			VirtioFS:     true,
+		},
+	); err == nil {
+		t.Fatal("sealed a virtio-fs manifest without device state")
+	}
+}

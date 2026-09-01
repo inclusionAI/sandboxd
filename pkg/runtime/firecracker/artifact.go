@@ -48,6 +48,7 @@ const (
 type firecrackerCheckpointCompat struct {
 	Arch        string `json:"arch,omitempty"`
 	Firecracker string `json:"firecracker,omitempty"`
+	VirtioFSD   string `json:"virtiofsd,omitempty"`
 	Kernel      string `json:"kernel,omitempty"`
 	Initrd      string `json:"initrd,omitempty"`
 	Vcpus       uint32 `json:"vcpus,omitempty"`
@@ -62,6 +63,7 @@ type firecrackerCheckpointManifest struct {
 	SnapshotType string                       `json:"snapshot_type"`
 	MemorySize   int64                        `json:"memory_size"`
 	BaseMemory   string                       `json:"base_memory,omitempty"`
+	VirtioFS     bool                         `json:"virtio_fs,omitempty"`
 	Compat       *firecrackerCheckpointCompat `json:"compat,omitempty"`
 	CreatedAt    time.Time                    `json:"created_at"`
 	Digests      map[string]string            `json:"digests"`
@@ -179,6 +181,9 @@ func finalizeFirecrackerCheckpointV2(
 ) (retErr error) {
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
+	if manifest.VirtioFS != (files.VirtioFSState != "") {
+		return errors.New("Firecracker checkpoint virtio-fs manifest does not match its components")
+	}
 	if manifest.MemorySize <= 0 {
 		// Full snapshots discover the guest memory size from the file
 		// Firecracker just wrote.
@@ -188,11 +193,11 @@ func finalizeFirecrackerCheckpointV2(
 		}
 		manifest.MemorySize = info.Size()
 	}
-	// Only the small state component is digested. Hashing guest memory or the
-	// writable overlay costs seconds per GiB of CPU and cache reads, which can
-	// dominate checkpoint latency. Their integrity rests on the local reflink
-	// copy-on-write and Firecracker's own writes.
-	manifest.Digests = make(map[string]string, 1)
+	// Only the small VM and optional virtio-fs state components are digested.
+	// Hashing guest memory or the writable overlay costs seconds per GiB of CPU
+	// and cache reads, which can dominate checkpoint latency. Their integrity
+	// rests on local reflink copy-on-write and Firecracker's own writes.
+	manifest.Digests = make(map[string]string, 2)
 	for _, component := range firecrackerCheckpointComponents(files) {
 		if component.name == firecrackerCheckpointMemoryName ||
 			component.name == firecrackerCheckpointOverlayName {
@@ -261,6 +266,12 @@ func openFirecrackerCheckpoint(dir string) (*firecrackerCheckpointArtifact, erro
 			Overlay: filepath.Join(dir, firecrackerCheckpointOverlayName),
 		},
 	}
+	if manifest.VirtioFS {
+		artifact.Files.VirtioFSState = filepath.Join(
+			dir,
+			firecrackerCheckpointVirtioFSName,
+		)
+	}
 	for _, component := range firecrackerCheckpointComponents(artifact.Files) {
 		info, err := os.Lstat(component.path)
 		if err != nil {
@@ -327,6 +338,7 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 	if manifest.Compat != nil {
 		for name, digest := range map[string]string{
 			"firecracker": manifest.Compat.Firecracker,
+			"virtiofsd":   manifest.Compat.VirtioFSD,
 			"kernel":      manifest.Compat.Kernel,
 			"initrd":      manifest.Compat.Initrd,
 		} {
@@ -454,11 +466,18 @@ func (cache *checkpointDigestCache) remember(
 func firecrackerCheckpointComponents(
 	files firecrackerCheckpointFiles,
 ) []struct{ name, path string } {
-	return []struct{ name, path string }{
+	components := []struct{ name, path string }{
 		{name: firecrackerCheckpointStateName, path: files.State},
 		{name: firecrackerCheckpointMemoryName, path: files.Memory},
 		{name: firecrackerCheckpointOverlayName, path: files.Overlay},
 	}
+	if files.VirtioFSState != "" {
+		components = append(components, struct{ name, path string }{
+			name: firecrackerCheckpointVirtioFSName,
+			path: files.VirtioFSState,
+		})
+	}
+	return components
 }
 
 func digestFirecrackerCheckpointComponent(

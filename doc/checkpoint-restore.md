@@ -55,7 +55,8 @@ to the runtime that created them.
 
 The Firecracker runtime writes *uncompressed* checkpoint directories (layout
 version 2): `manifest.json` plus the `vmstate`, `memory`, and `overlay.ext4`
-components. The manifest is written last as the logical commit marker: under
+components. A VM with virtio-fs also carries `virtiofs.state`. The manifest is
+written last as the logical commit marker: under
 normal same-boot operation, a directory that shows a manifest is complete; a
 directory without one is partial output that sandboxd cleans up. The memory
 file stays a plain file that Firecracker
@@ -183,7 +184,8 @@ restart always marks the lineage lost for surviving sandboxes: the restart
 cannot tell which generation the surviving VMM is armed against, so the
 cheapest provably-safe recovery is one `Full` checkpoint per sandbox.
 
-The manifest digests only the small VM state component. Hashing the memory file
+The manifest digests the small VM state and optional virtiofsd state
+components. Hashing the memory file
 or `overlay.ext4` is skipped because it costs seconds of CPU and page-cache
 reads per GiB and would dominate checkpoint latency. Their local integrity
 rests on reflink copy-on-write and Firecracker's own writes. Restores skip
@@ -198,21 +200,34 @@ timestamp granularity goes undetected — the same granularity the nydus
 bootstrap cache accepts.
 
 The manifest also records a `compat` tuple — sha256 digests of the Firecracker
-binary, guest kernel, and initrd, plus architecture and kernel arguments —
+binary, guest kernel, and initrd, plus architecture and kernel arguments. A
+virtio-fs checkpoint additionally records the virtiofsd digest. Values are
 computed once per sandboxd process. A restore compares the tuple against its
 own stack and refuses on a mismatch, naming the conflicting field. Manifests
-without a tuple (artifacts from before the tuple existed) restore without
-stack verification.
+without a tuple (artifacts from before the tuple existed) restore without stack
+verification.
 
 ### Storage layout for high-performance Firecracker checkpoints
 
 Firecracker memory and the writable block image are separate checkpoint
 components. Firecracker writes or patches `memory`; sandboxd snapshots the
-live `overlay.ext4` into the artifact. Restore maps the artifact's `memory`
-file in place and clones `overlay.ext4` into a new sandbox-owned writable
-image. The artifact overlay must not be used as the restored VM's writable
-image: checkpoint generations are immutable, the source may keep running, and
-concurrent restores require independent writable layers.
+live `overlay.ext4` into the artifact. A conventional restore maps the
+artifact's `memory` file privately. A virtio-fs restore first reflink-clones it
+to a sandbox-owned `memory.live` file (or copies it when reflink is unavailable)
+and maps only that live file writable and shared, because virtiofsd must write
+guest buffers directly. The committed checkpoint memory is never mapped
+writable. Restore also clones `overlay.ext4` into a new sandbox-owned writable
+image. Checkpoint components must not become live writable state: the source
+may keep running, and concurrent restores require independent layers.
+
+For a virtio-fs checkpoint, Firecracker keeps `VHOST_F_LOG_ALL` armed for the
+device lifetime. While the VM is paused it stops and drains both queues,
+serializes virtiofsd into `virtiofs.state`, collects the shared vhost dirty
+bitmap, and includes those guest-memory ranges in every snapshot flavor before
+re-enabling the queues. Restore requires the same virtio-fs/non-virtio-fs
+storage layout, starts a replacement virtiofsd over the newly prepared
+read-only exports, loads its sidecar before enabling queues, and resumes the
+guest only after the device and memory state agree.
 
 Firecracker native writable mounts do not add checkpoint components. Their
 directories reside in the same `overlay.ext4` as the root overlay's upper and
@@ -351,11 +366,11 @@ If restore fails, sandboxd rolls back the partially created target. It does not
 modify the source or delete the checkpoint input.
 
 After `Start` succeeds, the target no longer depends on the checkpoint
-directory — with one exception: restoring a Firecracker v2 directory keeps the
-artifact's `memory` file mapped into the restored VM, so the caller must keep
-the checkpoint directory intact until the restored sandbox exits. The next
-checkpoint of the restored sandbox also diffs against that memory file
-(the tier-2 base below).
+directory — with one exception: a Firecracker v2 restore keeps the artifact's
+`memory` file as its tier-2 incremental base. A conventional restore also maps
+that file privately; a virtio-fs restore maps an independent shared live clone.
+The caller must keep the checkpoint directory intact until the restored
+sandbox exits or establishes a later complete checkpoint generation.
 
 ## Runtime support and compatibility
 
