@@ -64,6 +64,33 @@ func TestMessageRoundTripWithShortWrites(t *testing.T) {
 	}
 }
 
+func TestConfigureRequestRoundTripIncludesNativeWritableMounts(t *testing.T) {
+	var encoded bytes.Buffer
+	request := ConfigureRequest{
+		NativeWritableMounts: []NativeWritableMountSpec{{
+			Target: "/var/lib/docker",
+		}},
+	}
+	if err := WriteMessage(&encoded, MessageConfigure, request); err != nil {
+		t.Fatal(err)
+	}
+	messageType, payload, err := ReadMessage(&encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageType != MessageConfigure {
+		t.Fatalf("message type = %d, want %d", messageType, MessageConfigure)
+	}
+	var decoded ConfigureRequest
+	if err := Decode(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.NativeWritableMounts) != 1 ||
+		decoded.NativeWritableMounts[0].Target != "/var/lib/docker" {
+		t.Fatalf("decoded request = %+v", decoded)
+	}
+}
+
 func TestDecodeRejectsUnknownFields(t *testing.T) {
 	var request ExecRequest
 	if err := Decode([]byte(`{"command":"true","unexpected":1}`), &request); err == nil {

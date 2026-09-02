@@ -43,6 +43,7 @@ type options struct {
 	memoryMB                 float64
 	cpu                      int
 	storageMB                uint64
+	extraConfig              string
 	compress                 bool
 	leaveRunning             bool
 	snapshotType             string
@@ -69,6 +70,8 @@ func main() {
 	flag.Float64Var(&value.memoryMB, "memory-mb", 128, "sandbox memory in MiB")
 	flag.IntVar(&value.cpu, "cpu", 500, "CPU quota (milli-CPU)")
 	flag.Uint64Var(&value.storageMB, "storage-mb", 64, "writable layer in MiB")
+	flag.StringVar(&value.extraConfig, "extra-config", "",
+		"runtime-specific configuration as a JSON object")
 	flag.BoolVar(&value.compress, "compress", true, "compress checkpoint artifacts")
 	flag.BoolVar(&value.leaveRunning, "leave-running", true, "leave source running")
 	flag.StringVar(&value.snapshotType, "snapshot-type", "",
@@ -155,6 +158,7 @@ func start(
 			"Memory": value.memoryMB,
 		},
 		WritableLayerLimitBytes: value.storageMB * 1024 * 1024,
+		ExtraConfig:             value.extraConfig,
 	}
 	data, err := protojson.MarshalOptions{
 		Indent:          "  ",

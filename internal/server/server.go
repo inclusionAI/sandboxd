@@ -1545,6 +1545,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		DisableCgroup:           h.config.DisableCgroup,
 		SpecUpdates:             specUpdates,
 		WritableLayerLimitBytes: startReq.WritableLayerLimitBytes,
+		ExtraConfig:             startReq.ExtraConfig,
 		EnableKVM:               extraConfig.EnableKVM,
 		CheckpointDir:           checkpointDir,
 	}

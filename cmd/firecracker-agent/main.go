@@ -44,6 +44,7 @@ const (
 	containerMountRoot = "/container/root"
 	containerLower     = "/container/lower"
 	containerOverlay   = "/container/overlay"
+	containerNative    = "/container/overlay/native"
 	sandboxInitMode    = "sandbox-init"
 	sandboxConfigFD    = 3
 	sandboxStatusFD    = 4
@@ -359,6 +360,15 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 			return fmt.Errorf("create mount target %s: %w", mount.Target, err)
 		}
 	}
+	for _, mount := range request.NativeWritableMounts {
+		if _, err := ensureContainerDirectory(mount.Target); err != nil {
+			return fmt.Errorf(
+				"create native writable mount target %s: %w",
+				mount.Target,
+				err,
+			)
+		}
+	}
 	for _, file := range request.Files {
 		if err := injectFile(file); err != nil {
 			return err
@@ -369,6 +379,11 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 	}
 	for _, mount := range request.Mounts {
 		if err := mountGuestFilesystem(mount); err != nil {
+			return err
+		}
+	}
+	for index, mount := range request.NativeWritableMounts {
+		if err := mountNativeWritable(index, mount); err != nil {
 			return err
 		}
 	}
@@ -889,6 +904,48 @@ func mountGuestFilesystem(mount firecrackerproto.MountSpec) error {
 			mount.FSType,
 		)
 	}
+}
+
+func mountNativeWritable(
+	index int,
+	mount firecrackerproto.NativeWritableMountSpec,
+) error {
+	return mountNativeWritableUnder(
+		containerNative,
+		containerRoot,
+		index,
+		mount,
+		unix.Mount,
+	)
+}
+
+func mountNativeWritableUnder(
+	sourceRoot,
+	root string,
+	index int,
+	mount firecrackerproto.NativeWritableMountSpec,
+	mountFn func(string, string, string, uintptr, string) error,
+) error {
+	if index < 0 {
+		return fmt.Errorf("native writable mount index %d is negative", index)
+	}
+	source := filepath.Join(sourceRoot, strconv.Itoa(index))
+	if err := os.MkdirAll(source, 0755); err != nil {
+		return fmt.Errorf("create native writable mount source %s: %w", source, err)
+	}
+	target, err := ensureContainerDirectoryUnder(root, mount.Target)
+	if err != nil {
+		return err
+	}
+	if err := mountFn(source, target, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf(
+			"bind native writable mount %s at %s: %w",
+			source,
+			mount.Target,
+			err,
+		)
+	}
+	return nil
 }
 
 func mountGuestEROFS(mount firecrackerproto.MountSpec) error {

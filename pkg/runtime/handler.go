@@ -98,6 +98,7 @@ type StartConfig struct {
 	DisableCgroup           bool
 	SpecUpdates             *SpecUpdates
 	WritableLayerLimitBytes uint64
+	ExtraConfig             string
 	EnableKVM               bool
 	CheckpointDir           string
 }

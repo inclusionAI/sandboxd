@@ -102,6 +102,28 @@ and mount setup. An explicit writable-layer limit sizes this image, with a
 16 MiB minimum. Without an explicit limit, `default_overlay_size_bytes`
 applies and defaults to 10 GiB. The image is removed on sandbox deletion.
 
+A Firecracker start may expose directories from that same private ext4 image
+at selected guest paths. This is useful for workloads such as Docker that need
+a native filesystem instead of placing their own overlay on sandboxd's root
+OverlayFS. Configure the paths through the runtime-specific start configuration:
+
+```json
+{
+  "nativeWritableMounts": [
+    {"target": "/var/lib/docker"}
+  ]
+}
+```
+
+Each target is backed by a distinct, root-owned directory next to the root
+overlay's `upper` and `work` directories and is bind-mounted into the guest.
+It is not a host bind mount or an additional Firecracker drive. The root
+overlay and every native writable mount therefore share the single ext4 image
+and its writable-layer quota. Targets must be canonical absolute directory
+paths, may not overlap each other, an ordinary mount, or the guest's `/dev`,
+`/proc`, `/run`, `/sys`, and `/tmp` system mounts. At most 16 targets may be
+requested.
+
 EROFS and `rofs` mounts must also name regular EROFS image files and are
 attached as read-only drives. Read-only regular files are injected into the
 guest, limited to 1 MiB per file and 4 MiB in total; this narrow path supports
@@ -113,6 +135,6 @@ instead of being silently weakened.
 Private tmpfs mounts are supported with a bounded set of standard security,
 ownership, mode, inode, and size options.
 
-The private ext4 image remains in the filestore across sandboxd restart so the
-handler can recover the running VMM. It is cleaned by normal or idempotent
-sandbox deletion.
+The private ext4 image, including native writable mount data, remains in the
+filestore across sandboxd restart so the handler can recover the running VMM.
+It is cleaned by normal or idempotent sandbox deletion.

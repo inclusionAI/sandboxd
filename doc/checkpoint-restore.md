@@ -214,6 +214,13 @@ image. The artifact overlay must not be used as the restored VM's writable
 image: checkpoint generations are immutable, the source may keep running, and
 concurrent restores require independent writable layers.
 
+Firecracker native writable mounts do not add checkpoint components. Their
+directories reside in the same `overlay.ext4` as the root overlay's upper and
+work directories, while the VM snapshot preserves the guest bind mounts. A
+checkpoint and restore therefore carries their data and mount state through
+the existing `overlay.ext4`, `memory`, and `vmstate` artifacts and applies the
+same quota, clone, durability, and storage-placement behavior.
+
 sandboxd uses `FICLONE` for these copies when possible:
 
 - the live writable image under

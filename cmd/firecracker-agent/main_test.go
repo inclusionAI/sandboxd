@@ -231,6 +231,68 @@ func TestEnsureContainerDirectoryRejectsSymlink(t *testing.T) {
 	}
 }
 
+func TestMountNativeWritableUnder(t *testing.T) {
+	sourceRoot := filepath.Join(t.TempDir(), "native")
+	root := t.TempDir()
+	var source, target string
+	var flags uintptr
+	err := mountNativeWritableUnder(
+		sourceRoot,
+		root,
+		2,
+		firecrackerproto.NativeWritableMountSpec{Target: "/var/lib/docker"},
+		func(gotSource, gotTarget, fsType string, gotFlags uintptr, data string) error {
+			source = gotSource
+			target = gotTarget
+			flags = gotFlags
+			if fsType != "" || data != "" {
+				t.Fatalf("bind mount arguments = %q, %q", fsType, data)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source != filepath.Join(sourceRoot, "2") ||
+		target != filepath.Join(root, "var/lib/docker") ||
+		flags != unix.MS_BIND {
+		t.Fatalf("bind mount = %q, %q, %#x", source, target, flags)
+	}
+	for _, path := range []string{source, target} {
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("native writable directory %q = %+v, %v", path, info, err)
+		}
+	}
+}
+
+func TestMountNativeWritableUnderRejectsSymlinkTarget(t *testing.T) {
+	sourceRoot := filepath.Join(t.TempDir(), "native")
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "var")); err != nil {
+		t.Fatal(err)
+	}
+	mounted := false
+	err := mountNativeWritableUnder(
+		sourceRoot,
+		root,
+		0,
+		firecrackerproto.NativeWritableMountSpec{Target: "/var/lib/docker"},
+		func(string, string, string, uintptr, string) error {
+			mounted = true
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "traverses symlink") {
+		t.Fatalf("symlink error = %v", err)
+	}
+	if mounted {
+		t.Fatal("native writable mount was attempted for a symlink target")
+	}
+}
+
 func TestPrepareContainerFileReplacesFinalSymlink(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "etc"), 0755); err != nil {

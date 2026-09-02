@@ -56,6 +56,10 @@ var StartCmd = cli.Command{
 			Usage: "expose the configured KVM device in a runc sandbox",
 		},
 		cli.StringFlag{
+			Name:  "extra-config",
+			Usage: "runtime-specific configuration as a JSON object",
+		},
+		cli.StringFlag{
 			Name:  "cwd",
 			Usage: "working directory inside the sandbox",
 			Value: "/",
@@ -139,7 +143,10 @@ var StartCmd = cli.Command{
 		if err != nil {
 			return err
 		}
-		extraConfig, err := startExtraConfig(context.Bool("enable-kvm"))
+		extraConfig, err := startExtraConfig(
+			context.String("extra-config"),
+			context.Bool("enable-kvm"),
+		)
 		if err != nil {
 			return err
 		}
@@ -209,13 +216,23 @@ func startRootfs(localPath, imageURL string, readonly bool) (*runtime.RootfsConf
 	return rootfs, nil
 }
 
-func startExtraConfig(enableKVM bool) (string, error) {
-	if !enableKVM {
+func startExtraConfig(raw string, enableKVM bool) (string, error) {
+	if strings.TrimSpace(raw) == "" && !enableKVM {
 		return "", nil
 	}
-	data, err := json.Marshal(struct {
-		EnableKVM bool `json:"enableKVM"`
-	}{EnableKVM: true})
+	config := make(map[string]json.RawMessage)
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &config); err != nil {
+			return "", fmt.Errorf("decode --extra-config: %w", err)
+		}
+		if config == nil {
+			return "", fmt.Errorf("--extra-config must be a JSON object")
+		}
+	}
+	if enableKVM {
+		config["enableKVM"] = json.RawMessage("true")
+	}
+	data, err := json.Marshal(config)
 	if err != nil {
 		return "", err
 	}

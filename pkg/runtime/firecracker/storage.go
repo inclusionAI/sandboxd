@@ -90,6 +90,20 @@ func prepareFirecrackerStorage(
 	if err != nil {
 		return nil, err
 	}
+	extraConfig, err := parseFirecrackerExtraConfig(startConfig.ExtraConfig)
+	if err != nil {
+		return nil, err
+	}
+	mountTargets := make([]string, 0, len(mounts))
+	for _, mount := range mounts {
+		mountTargets = append(mountTargets, mount.Destination)
+	}
+	if err := validateFirecrackerNativeWritableMounts(
+		extraConfig.NativeWritableMounts,
+		mountTargets,
+	); err != nil {
+		return nil, err
+	}
 	plan := &firecrackerStoragePlan{
 		rootDrive: firecrackerDrive{
 			ID:       "rootfs",
@@ -117,6 +131,12 @@ func prepareFirecrackerStorage(
 				Gateway:   gateway.String(),
 			},
 		},
+	}
+	for _, mount := range extraConfig.NativeWritableMounts {
+		plan.configure.NativeWritableMounts = append(
+			plan.configure.NativeWritableMounts,
+			firecrackerproto.NativeWritableMountSpec{Target: mount.Target},
+		)
 	}
 
 	injectedBytes := 0

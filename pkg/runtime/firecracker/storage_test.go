@@ -66,6 +66,8 @@ func TestPrepareFirecrackerStorage(t *testing.T) {
 	}
 	plan, err := prepareFirecrackerStorage(spec, runtimecore.StartConfig{
 		Network: firecrackerTestNetwork(),
+		ExtraConfig: `{"nativeWritableMounts":[` +
+			`{"target":"/var/lib/docker"}]}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +89,13 @@ func TestPrepareFirecrackerStorage(t *testing.T) {
 		plan.configure.Mounts[1].Target != "/opt/runtime" {
 		t.Fatalf("guest mounts = %+v", plan.configure.Mounts)
 	}
+	if len(plan.configure.NativeWritableMounts) != 1 ||
+		plan.configure.NativeWritableMounts[0].Target != "/var/lib/docker" {
+		t.Fatalf(
+			"native writable mounts = %+v",
+			plan.configure.NativeWritableMounts,
+		)
+	}
 	if len(plan.configure.Files) != 1 ||
 		!plan.configure.Files[0].Readonly ||
 		string(plan.configure.Files[0].Content) != "nameserver 1.1.1.1\n" ||
@@ -102,6 +111,28 @@ func TestPrepareFirecrackerStorage(t *testing.T) {
 	if plan.configure.Process.UID != 1000 ||
 		plan.configure.Process.GID != 1001 {
 		t.Fatalf("guest process = %+v", plan.configure.Process)
+	}
+}
+
+func TestPrepareFirecrackerStorageRejectsNativeWritableMountOverlap(t *testing.T) {
+	_, err := prepareFirecrackerStorage(
+		&runtimecore.Spec{
+			Root:    &runtimecore.Root{Path: fakeEROFSImage(t, "root.erofs")},
+			Process: &runtimecore.Process{Args: []string{"/bin/true"}},
+			Mounts: []runtimecore.Mount{{
+				Type:        "tmpfs",
+				Source:      "tmpfs",
+				Destination: "/var/lib/docker/cache",
+			}},
+		},
+		runtimecore.StartConfig{
+			Network: firecrackerTestNetwork(),
+			ExtraConfig: `{"nativeWritableMounts":[` +
+				`{"target":"/var/lib/docker"}]}`,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "overlaps mount target") {
+		t.Fatalf("overlap error = %v", err)
 	}
 }
 

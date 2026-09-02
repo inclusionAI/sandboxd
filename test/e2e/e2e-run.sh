@@ -735,8 +735,13 @@ run_checkpoint_restore_check() {
     local checkpoint_dir=""
     local checkpoint_count=10
     local memory_mb=128
+    local extra_config_args=()
     if [ "${runtime}" = "firecracker" ]; then
         memory_mb=256
+        extra_config_args=(
+            --extra-config
+            '{"nativeWritableMounts":[{"target":"/var/lib/native-checkpoint"}]}'
+        )
     fi
 
     log "testing ${suffix} ${checkpoint_count} consecutive checkpoints and restoring the last"
@@ -752,11 +757,21 @@ run_checkpoint_restore_check() {
         --sandbox-id "${source_id}" \
         --request-file "${request_file}" \
         --memory-mb "${memory_mb}" \
-        --storage-mb 64)"
+        --storage-mb 64 \
+        "${extra_config_args[@]}")"
     assert_eq "${SANDBOX_ID}" "${source_id}" "${suffix} checkpoint source ID"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
     sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo checkpoint-state-ok > /var/checkpoint-persist'
+    if [ "${runtime}" = "firecracker" ]; then
+        local native_fstype
+        native_fstype="$(sbox_cmd exec "${SANDBOX_ID}" /bin/awk \
+            '$2 == "/var/lib/native-checkpoint" { print $3 }' /proc/mounts)"
+        assert_eq "${native_fstype}" "ext4" \
+            "${suffix} native writable mount filesystem"
+        sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'echo native-checkpoint-ok > /var/lib/native-checkpoint/state'
+    fi
 
     local before=""
     local attempt
@@ -860,6 +875,11 @@ run_checkpoint_restore_check() {
             'for namespace in mnt pid uts ipc; do test "$(readlink /proc/self/ns/$namespace)" = "$(readlink /proc/1/ns/$namespace)" || exit 1; done; test "$(hostname)" = akernel; cat /proc/1/comm')"
         assert_eq "${restored_init}" "sh" \
             "${suffix} restored exec joined sandbox namespaces"
+        local restored_native
+        restored_native="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat \
+            /var/lib/native-checkpoint/state)"
+        assert_eq "${restored_native}" "native-checkpoint-ok" \
+            "${suffix} restored native writable mount"
     fi
     local restored_generation
     restored_generation="$(sbox_cmd exec "${SANDBOX_ID}" \
@@ -903,6 +923,12 @@ run_checkpoint_restore_check() {
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" \
         "${suffix} target independent of checkpoint directory"
+    if [ "${runtime}" = "firecracker" ]; then
+        persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat \
+            /var/lib/native-checkpoint/state)"
+        assert_eq "${persisted}" "native-checkpoint-ok" \
+            "${suffix} native mount independent of checkpoint directory"
+    fi
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
 }
@@ -1622,6 +1648,8 @@ run_firecracker_checks() {
         --mount "${HOST_MOUNT}/input.txt:/mnt/host/input.txt:bind:ro" \
         --mount "${EROFS_MOUNT_IMAGE}:/mnt/erofs:erofs:ro" \
         --mount "tmpfs:/mnt/ram:tmpfs:rw,nosuid,nodev,noexec,size=1m,mode=0755" \
+        --extra-config \
+        '{"nativeWritableMounts":[{"target":"/var/lib/docker"}]}' \
         --stdout "${main_stdout}" \
         --stderr "${main_stderr}" \
         --cpu-millicores 1500 \
@@ -1648,6 +1676,12 @@ run_firecracker_checks() {
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo firecracker-write-ok > /var/firecracker-write && cat /var/firecracker-write')"
     assert_eq "${got}" "firecracker-write-ok" "Firecracker writable overlay"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/awk \
+        '$2 == "/var/lib/docker" { print $3 }' /proc/mounts)"
+    assert_eq "${got}" "ext4" "Firecracker native writable mount filesystem"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+        'echo native-write-ok > /var/lib/docker/check && cat /var/lib/docker/check')"
+    assert_eq "${got}" "native-write-ok" "Firecracker native writable mount"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo tmpfs-ok > /mnt/ram/check && cat /mnt/ram/check')"
     assert_eq "${got}" "tmpfs-ok" "Firecracker private tmpfs mount"

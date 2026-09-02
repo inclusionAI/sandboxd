@@ -157,6 +157,30 @@ func TestFirecrackerValidateStartRequestAllowsEnabledOCIRootfs(t *testing.T) {
 	}
 }
 
+func TestFirecrackerValidateStartRequestAcceptsNativeWritableMount(t *testing.T) {
+	handler := &Handler{}
+	request := &runtimeapi.StartRequest{
+		ExtraConfig: `{"nativeWritableMounts":[` +
+			`{"target":"/var/lib/docker"}]}`,
+	}
+	if err := handler.ValidateStartRequest(request); err != nil {
+		t.Fatalf("ValidateStartRequest() error = %v", err)
+	}
+}
+
+func TestFirecrackerValidateStartRequestRejectsNativeWritableMountOverlap(t *testing.T) {
+	handler := &Handler{}
+	request := &runtimeapi.StartRequest{
+		ExtraConfig: `{"nativeWritableMounts":[` +
+			`{"target":"/var/lib/docker"}]}`,
+		Mounts: []*runtimeapi.Mount{{Target: "/var/lib"}},
+	}
+	err := handler.ValidateStartRequest(request)
+	if err == nil || !strings.Contains(err.Error(), "overlaps mount target") {
+		t.Fatalf("ValidateStartRequest() error = %v", err)
+	}
+}
+
 func TestFirecrackerRuntimeDirectoryIsStableAndBounded(t *testing.T) {
 	handler := &Handler{runtimeRoot: "/run/sandboxd/firecracker"}
 	sandboxID := "sbox-" + strings.Repeat("a", 120)

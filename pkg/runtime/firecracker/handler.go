@@ -266,6 +266,22 @@ func (handler *Handler) CheckpointRestoreCapabilities() runtimecore.CheckpointRe
 func (handler *Handler) ValidateStartRequest(
 	request *runtimeapi.StartRequest,
 ) error {
+	extraConfig, err := parseFirecrackerExtraConfig(request.GetExtraConfig())
+	if err != nil {
+		return err
+	}
+	mountTargets := make([]string, 0, len(request.GetMounts()))
+	for _, mount := range request.GetMounts() {
+		if mount != nil {
+			mountTargets = append(mountTargets, mount.GetTarget())
+		}
+	}
+	if err := validateFirecrackerNativeWritableMounts(
+		extraConfig.NativeWritableMounts,
+		mountTargets,
+	); err != nil {
+		return err
+	}
 	if rootfs := request.GetRootfs(); rootfs != nil &&
 		(rootfs.GetType() == runtimeapi.RootfsSrcType_IMAGE ||
 			rootfs.GetImageUrl() != "") {

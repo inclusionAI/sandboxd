@@ -29,11 +29,11 @@ The flow:
 11. checkpoints the same runsc or Firecracker sandbox ten consecutive times,
     verifies it keeps running, and restores the tenth artifact;
 12. verifies Firecracker's EROFS root and mount contract, OCI-to-EROFS rootfs
-    conversion, private ext4 overlay, quota exhaustion, guest exec/TTY
-    protocol, direct service access, local DNAT, network ACL and managed DNS
-    replacement, crash recovery, stale-policy removal, exit-code recovery when
-    the daemon is unavailable, and reuse of the same TAP without policy
-    leakage; and
+    conversion, private ext4 overlay, native writable ext4 mounts (including
+    checkpoint/restore), quota exhaustion, guest exec/TTY protocol, direct
+    service access, local DNAT, network ACL and managed DNS replacement, crash
+    recovery, stale-policy removal, exit-code recovery when the daemon is
+    unavailable, and reuse of the same TAP without policy leakage; and
 13. runs concurrent Redis SET/GET traffic from every runtime to a sibling
     Redis container through SNAT and from that container to the sandbox's
     published port through DNAT. The test verifies the translated source

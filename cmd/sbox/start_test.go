@@ -62,13 +62,38 @@ func TestStorageMBToBytes(t *testing.T) {
 }
 
 func TestStartExtraConfig(t *testing.T) {
-	value, err := startExtraConfig(false)
+	value, err := startExtraConfig("", false)
 	require.NoError(t, err)
 	assert.Empty(t, value)
 
-	value, err = startExtraConfig(true)
+	value, err = startExtraConfig("", true)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"enableKVM":true}`, value)
+
+	value, err = startExtraConfig(
+		`{"nativeWritableMounts":[{"target":"/var/lib/docker"}]}`,
+		false,
+	)
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"nativeWritableMounts":[{"target":"/var/lib/docker"}]}`,
+		value,
+	)
+
+	value, err = startExtraConfig(
+		`{"enableKVM":false,"runtimeOption":"kept"}`,
+		true,
+	)
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"enableKVM":true,"runtimeOption":"kept"}`,
+		value,
+	)
+
+	for _, invalid := range []string{"null", "[]", "not-json"} {
+		_, err = startExtraConfig(invalid, false)
+		require.Error(t, err)
+	}
 }
 
 func TestStartRootfs(t *testing.T) {

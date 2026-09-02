@@ -104,6 +104,12 @@ type MountSpec struct {
 	Options []string `json:"options,omitempty"`
 }
 
+// NativeWritableMountSpec exposes a directory from the sandbox's private
+// ext4 writable layer at a distinct path inside the guest root filesystem.
+type NativeWritableMountSpec struct {
+	Target string `json:"target"`
+}
+
 type FileSpec struct {
 	Target   string `json:"target"`
 	Content  []byte `json:"content"`
@@ -112,14 +118,15 @@ type FileSpec struct {
 }
 
 type ConfigureRequest struct {
-	Hostname      string      `json:"hostname"`
-	RootDevice    string      `json:"root_device"`
-	OverlayDevice string      `json:"overlay_device"`
-	RootReadonly  bool        `json:"root_readonly,omitempty"`
-	Process       ProcessSpec `json:"process"`
-	Network       NetworkSpec `json:"network"`
-	Mounts        []MountSpec `json:"mounts,omitempty"`
-	Files         []FileSpec  `json:"files,omitempty"`
+	Hostname             string                    `json:"hostname"`
+	RootDevice           string                    `json:"root_device"`
+	OverlayDevice        string                    `json:"overlay_device"`
+	RootReadonly         bool                      `json:"root_readonly,omitempty"`
+	Process              ProcessSpec               `json:"process"`
+	Network              NetworkSpec               `json:"network"`
+	Mounts               []MountSpec               `json:"mounts,omitempty"`
+	NativeWritableMounts []NativeWritableMountSpec `json:"native_writable_mounts,omitempty"`
+	Files                []FileSpec                `json:"files,omitempty"`
 }
 
 type ExecRequest struct {
