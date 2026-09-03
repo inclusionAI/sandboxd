@@ -58,10 +58,6 @@ func (s *fsTestImageService) ImageProcess(string) (*imageconfig.Process, error) 
 	return &imageconfig.Process{}, nil
 }
 
-func (s *fsTestImageService) RootfsMaterialization(string) (*imageapi.RootfsMaterialization, error) {
-	return &imageapi.RootfsMaterialization{}, nil
-}
-
 func (s *fsTestImageService) UmountOCI(req *imageapi.OCIUmountRequest) error {
 	s.mu.Lock()
 	s.ociUmountCalls[req.ImageURL]++

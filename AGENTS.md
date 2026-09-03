@@ -85,17 +85,7 @@ stays synchronized with the implementation.
 
 # Firecracker Storage Contract
 
-The Firecracker adapter uses local or image-provider-backed regular EROFS
-files by default. An operator may instead enable the migration-capable,
-read-only virtio-fs path with `plugin.runtime.firecracker.virtiofs_enabled`;
-that path accepts directory root filesystems and explicitly read-only host
-directory mounts and exports them through one sandbox-scoped virtiofsd. The
-older `oci_rootfs_enabled` option eagerly materializes only an OCI/Nydus rootfs
-as EROFS and is ignored when virtio-fs is enabled. Keep derived EROFS files
-content-addressed and inside storage owned by the source image manager: OCI
-artifacts follow final-chain GC, while Nydus artifacts follow daemon/bootstrap
-GC. Do not create an independent tag-keyed cache or artifact reference count.
-OCI image mounts remain unsupported by Firecracker.
+The Firecracker adapter uses local or image-provider-backed regular EROFS files by default. An operator may instead enable the migration-capable, read-only virtio-fs path with `plugin.runtime.firecracker.virtiofs_enabled`; that path accepts directory root filesystems and explicitly read-only host directory mounts and exports them through one sandbox-scoped virtiofsd. OCI and Nydus root filesystems require virtio-fs and are consumed directly from the directory mounted by the image manager; never eagerly materialize those directories as EROFS. OCI image mounts remain unsupported by Firecracker.
 
 Per-sandbox Firecracker storage is limited to the private ext4 writable layer,
 virtio-fs staging and restored live-memory files, and runtime state. Every

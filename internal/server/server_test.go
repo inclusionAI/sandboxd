@@ -279,7 +279,7 @@ func TestStartRejectsFirecrackerOCIImageBeforeFilesystemPrepare(t *testing.T) {
 		},
 	})
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
-	assert.Contains(t, response.Message, "does not support OCI image rootfs")
+	assert.Contains(t, response.Message, "OCI image rootfs requires virtio-fs")
 }
 
 func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {

@@ -450,8 +450,6 @@ kvm_device = "/dev/kvm"
 default_vcpu_count = 1
 default_memory_mib = 256
 default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
-oci_rootfs_enabled = true
-mkfs_erofs_path = "/usr/bin/mkfs.erofs"
 ${e2e_fc_virtiofs_cfg}
 ${e2e_fc_checkpoint_mode_cfg}
 
@@ -1869,25 +1867,27 @@ run_firecracker_checks() {
         fi
     fi
 
-    log "testing Firecracker OCI rootfs materialization"
-    local oci_root_id="sbox-e2e-firecracker-oci-root"
-    SANDBOX_ID="$(sbox_cmd start \
-        --quiet \
-        --runtime firecracker \
-        --sandbox-id "${oci_root_id}" \
-        --image-url "${OCI_ROOTFS_IMAGE}" \
-        --cpu-millicores 100 \
-        --memory-mb 256 \
-        /bin/sh -c 'echo firecracker-oci-ready > /var/oci-rootfs; sleep 300')"
-    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
-    wait_for_exec_output "${SANDBOX_ID}" "firecracker-oci-ready" \
-        /bin/cat /var/oci-rootfs
-    local redis_version
-    redis_version="$(sbox_cmd exec "${SANDBOX_ID}" redis-server --version)"
-    [[ "${redis_version}" == *"Redis server v="* ]] || \
-        fail "Firecracker OCI rootfs did not preserve image content: ${redis_version@Q}"
-    sbox_cmd delete "${SANDBOX_ID}"
-    SANDBOX_ID=""
+    if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        log "testing Firecracker OCI/Nydus directory rootfs through virtio-fs"
+        local oci_root_id="sbox-e2e-firecracker-oci-root"
+        SANDBOX_ID="$(sbox_cmd start \
+            --quiet \
+            --runtime firecracker \
+            --sandbox-id "${oci_root_id}" \
+            --image-url "${OCI_ROOTFS_IMAGE}" \
+            --cpu-millicores 100 \
+            --memory-mb 256 \
+            /bin/sh -c 'echo firecracker-oci-ready > /var/oci-rootfs; sleep 300')"
+        wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+        wait_for_exec_output "${SANDBOX_ID}" "firecracker-oci-ready" \
+            /bin/cat /var/oci-rootfs
+        local redis_version
+        redis_version="$(sbox_cmd exec "${SANDBOX_ID}" redis-server --version)"
+        [[ "${redis_version}" == *"Redis server v="* ]] || \
+            fail "Firecracker OCI/Nydus rootfs did not preserve image content: ${redis_version@Q}"
+        sbox_cmd delete "${SANDBOX_ID}"
+        SANDBOX_ID=""
+    fi
 
     local cached_taps_before
     cached_taps_before="$(list_cached_taps)"

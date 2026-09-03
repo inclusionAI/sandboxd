@@ -103,12 +103,6 @@ runsc = ""
 # the migration-capable Firecracker build and a guest kernel with virtio-fs.
 #virtiofs_enabled = false
 #virtiofsd_path = "/usr/local/bin/virtiofsd"
-# Opt-in support for materializing an OCI or Nydus image-manager rootfs mount
-# as an immutable EROFS file before starting a Firecracker VM. The generated
-# file follows the source image cache lifecycle. virtiofs_enabled takes
-# precedence when both options are set.
-#oci_rootfs_enabled = false
-#mkfs_erofs_path = "/usr/bin/mkfs.erofs"
 
 [plugin.runtime.runtime_binary]
 runsc = "/usr/local/bin/runsc"

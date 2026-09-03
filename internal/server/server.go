@@ -46,7 +46,6 @@ import (
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
-	"github.com/inclusionAI/sandboxd/pkg/runtime/firecracker"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
@@ -91,9 +90,6 @@ type sandboxService struct {
 	xpuMgr       *xpumanager.Manager
 
 	store store.DbStore
-	// firecrackerOCIConverter is present only when the node explicitly enables
-	// eager OCI-to-EROFS materialization for Firecracker root filesystems.
-	firecrackerOCIConverter *firecracker.OCIRootfsConverter
 
 	runtime.UnimplementedSandboxServiceServer
 
@@ -802,26 +798,6 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 			}
 		}
 	}()
-	if cfg.RuntimeConfig.Firecracker.OCIRootfsEnabled &&
-		!cfg.RuntimeConfig.Firecracker.VirtioFSEnabled {
-		mkfsEROFS := strings.TrimSpace(
-			cfg.RuntimeConfig.Firecracker.MkfsEROFSPath,
-		)
-		if mkfsEROFS == "" {
-			mkfsEROFS = config.DefaultFirecrackerMkfsEROFS
-		}
-		converter, converterErr := firecracker.NewOCIRootfsConverter(
-			mkfsEROFS,
-		)
-		if converterErr != nil {
-			return nil, fmt.Errorf(
-				"initialize Firecracker OCI rootfs converter: %w",
-				converterErr,
-			)
-		}
-		s.firecrackerOCIConverter = converter
-	}
-
 	s.loadRuntimeHandlers()
 	if nodeResMod != nil && cfg.RuntimeConfig.FilestoreDir != "" {
 		if _, ok := s.serviceHandler.Get(config.RuntimeNameRunsc); ok {
@@ -1404,52 +1380,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}, err
 	}
 	runtimeRootfs := preparedFilesystem.RootfsPath()
-	if startReq.Runtime == config.RuntimeNameFirecracker &&
-		startReq.Rootfs.GetType() == runtime.RootfsSrcType_IMAGE &&
-		!h.config.RuntimeConfig.Firecracker.VirtioFSEnabled {
-		if h.firecrackerOCIConverter == nil {
-			err := errors.New(
-				"Firecracker OCI image rootfs conversion is not configured",
-			)
-			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
-		}
-		if h.imageSvc == nil {
-			err := errors.New("image manager is unavailable for Firecracker OCI rootfs conversion")
-			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
-		}
-		materialization, materializationErr := h.imageSvc.RootfsMaterialization(
-			startReq.Rootfs.GetImageUrl(),
-		)
-		if materializationErr != nil {
-			return &runtime.StartResponse{
-				Code: -1,
-				Message: fmt.Sprintf(
-					"failed to resolve Firecracker OCI rootfs metadata: %v",
-					materializationErr,
-				),
-			}, materializationErr
-		}
-		if materialization == nil {
-			err := errors.New("image manager returned empty Firecracker OCI rootfs metadata")
-			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
-		}
-		runtimeRootfs, err = h.firecrackerOCIConverter.Convert(
-			ctx,
-			startReq.Rootfs.GetImageUrl(),
-			materialization.ContentID,
-			materialization.ArtifactDir,
-			runtimeRootfs,
-		)
-		if err != nil {
-			return &runtime.StartResponse{
-				Code: -1,
-				Message: fmt.Sprintf(
-					"failed to prepare Firecracker OCI rootfs: %v",
-					err,
-				),
-			}, err
-		}
-	}
 	var specUpdates *svc.SpecUpdates
 	if len(startReq.XpuAllocations) > 0 {
 		if h.xpuMgr == nil {

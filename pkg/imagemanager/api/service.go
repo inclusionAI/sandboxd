@@ -32,7 +32,6 @@ type Service interface {
 	MountOCI(req *OCIMountRequest) (*OCIMountResponse, error)
 	ImageProcess(imageURL string) (*imageconfig.Process, error)
 	UmountOCI(req *OCIUmountRequest) error
-	RootfsMaterialization(imageURL string) (*RootfsMaterialization, error)
 	MountNydus(req *NydusMountRequest) (*MountInfo, error)
 	UmountNydus(req *NydusUmountRequest) error
 	CleanupDaemon(req *CleanupDaemonRequest) error

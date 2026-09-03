@@ -224,10 +224,6 @@ type Handler struct {
 	ociLoader       runtimecore.OciLoader
 	virtiofsdPath   string
 	virtioFSEnabled bool
-	// ociRootfsEnabled allows the server-side image preparation path to
-	// materialize an OCI rootfs directory as EROFS before Start is called.
-	// Virtio-fs takes precedence and consumes that directory directly.
-	ociRootfsEnabled bool
 
 	mu        sync.RWMutex
 	instances map[string]*firecrackerInstance
@@ -290,9 +286,9 @@ func (handler *Handler) ValidateStartRequest(
 	if rootfs := request.GetRootfs(); rootfs != nil &&
 		(rootfs.GetType() == runtimeapi.RootfsSrcType_IMAGE ||
 			rootfs.GetImageUrl() != "") {
-		if !handler.ociRootfsEnabled && !handler.virtioFSEnabled {
+		if !handler.virtioFSEnabled {
 			return errors.New(
-				"Firecracker does not support OCI image rootfs unless conversion is enabled",
+				"Firecracker OCI image rootfs requires virtio-fs",
 			)
 		}
 	}
@@ -355,18 +351,6 @@ func NewHandler(
 	if _, err := exec.LookPath("mkfs.ext4"); err != nil {
 		return nil, fmt.Errorf("Firecracker requires mkfs.ext4: %w", err)
 	}
-	if firecrackerConfig.OCIRootfsEnabled && !firecrackerConfig.VirtioFSEnabled {
-		mkfsEROFS := strings.TrimSpace(firecrackerConfig.MkfsEROFSPath)
-		if mkfsEROFS == "" {
-			mkfsEROFS = config.DefaultFirecrackerMkfsEROFS
-		}
-		if _, err := exec.LookPath(mkfsEROFS); err != nil {
-			return nil, fmt.Errorf(
-				"Firecracker OCI rootfs conversion requires mkfs.erofs: %w",
-				err,
-			)
-		}
-	}
 	sandboxRoot := filepath.Join(cfg.RootDir, "containers")
 	storageRoot := filepath.Join(cfg.RuntimeConfig.FilestoreDir, ".firecracker")
 	for path, mode := range map[string]os.FileMode{
@@ -396,7 +380,6 @@ func NewHandler(
 		ociLoader:              loader,
 		virtiofsdPath:          firecrackerConfig.VirtioFSDPath,
 		virtioFSEnabled:        firecrackerConfig.VirtioFSEnabled,
-		ociRootfsEnabled:       firecrackerConfig.OCIRootfsEnabled,
 		instances:              make(map[string]*firecrackerInstance),
 	}
 	handler.recoverInstances()

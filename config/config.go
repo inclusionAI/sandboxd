@@ -182,12 +182,6 @@ type FirecrackerConfig struct {
 	// VirtioFSDPath selects the upstream virtiofsd executable. The runtime
 	// requires vhost-user DEVICE_STATE and LOG_SHMFD support.
 	VirtioFSDPath string `toml:"virtiofsd_path" json:"virtiofsdPath"`
-	// OCIRootfsEnabled permits an OCI image rootfs to be materialized as a
-	// local EROFS image before the Firecracker VM starts. It is opt-in because
-	// conversion eagerly reads the complete merged image.
-	OCIRootfsEnabled bool `toml:"oci_rootfs_enabled" json:"ociRootfsEnabled"`
-	// MkfsEROFSPath selects the mkfs.erofs executable used for materialization.
-	MkfsEROFSPath string `toml:"mkfs_erofs_path" json:"mkfsEROFSPath"`
 }
 
 type ResourceConfig struct {

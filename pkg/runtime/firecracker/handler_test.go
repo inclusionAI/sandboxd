@@ -113,7 +113,7 @@ func TestFirecrackerValidateStartRequestRejectsOCIImagesByDefault(t *testing.T) 
 					ImageUrl: "example.invalid/rootfs:latest",
 				},
 			}},
-			message: "does not support OCI image rootfs",
+			message: "OCI image rootfs requires virtio-fs",
 		},
 		{
 			name: "mount",
@@ -144,8 +144,8 @@ func TestFirecrackerValidateStartRequestRejectsOCIImagesByDefault(t *testing.T) 
 	}
 }
 
-func TestFirecrackerValidateStartRequestAllowsEnabledOCIRootfs(t *testing.T) {
-	handler := &Handler{ociRootfsEnabled: true}
+func TestFirecrackerValidateStartRequestAllowsVirtioFSOCIRootfs(t *testing.T) {
+	handler := &Handler{virtioFSEnabled: true}
 	request := &runtimeapi.StartRequest{Rootfs: &runtimeapi.RootfsConfig{
 		Type: runtimeapi.RootfsSrcType_IMAGE,
 		Source: &runtimeapi.RootfsConfig_ImageUrl{
