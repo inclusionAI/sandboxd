@@ -23,6 +23,7 @@ RUN apt-get update && \
         e2fsprogs \
         erofs-utils \
         iproute2 \
+        ipset \
         iptables \
         iputils-ping \
         jq \
