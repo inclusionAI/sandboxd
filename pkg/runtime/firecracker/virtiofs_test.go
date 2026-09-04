@@ -15,6 +15,8 @@
 package firecracker
 
 import (
+	"fmt"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -56,5 +58,59 @@ func TestCommandHasOption(t *testing.T) {
 		!commandHasFlag(arguments, "--no-announce-submounts") ||
 		commandHasFlag(arguments, "--inode-file-handles=never") {
 		t.Fatalf("flag matching failed for %q", arguments)
+	}
+}
+
+func TestFirecrackerProcessGroupFromStat(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		stat string
+		want int
+	}{
+		{
+			name: "simple command",
+			stat: "123 (virtiofsd) S 1 123 123 0 -1",
+			want: 123,
+		},
+		{
+			name: "command with parentheses",
+			stat: "456 (virtiofsd (worker)) S 123 456 456 0 -1",
+			want: 456,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := firecrackerProcessGroupFromStat([]byte(test.stat))
+			if err != nil || got != test.want {
+				t.Fatalf("process group = %d, %v; want %d", got, err, test.want)
+			}
+		})
+	}
+	for index, stat := range []string{
+		"",
+		"123 virtiofsd S 1 123",
+		"123 (virtiofsd) S 1",
+		"123 (virtiofsd) S 1 invalid",
+		"123 (virtiofsd) S 1 1",
+	} {
+		t.Run(fmt.Sprintf("invalid-%d", index), func(t *testing.T) {
+			if _, err := firecrackerProcessGroupFromStat([]byte(stat)); err == nil {
+				t.Fatalf("accepted malformed stat %q", stat)
+			}
+		})
+	}
+}
+
+func TestWaitFirecrackerVirtioFSCommandCanBeObservedMoreThanOnce(t *testing.T) {
+	command := exec.Command("/bin/sh", "-c", "exit 23")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	process := waitFirecrackerVirtioFSCommand(command)
+	for index := 0; index < 2; index++ {
+		err := process.wait()
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok || exitErr.ExitCode() != 23 {
+			t.Fatalf("wait %d error = %v, want exit status 23", index, err)
+		}
 	}
 }

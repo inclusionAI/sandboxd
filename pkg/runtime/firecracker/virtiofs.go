@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,6 +41,29 @@ type firecrackerVirtioFSState struct {
 	PID        int    `json:"pid"`
 	SocketPath string `json:"socket_path"`
 	SharedDir  string `json:"shared_dir"`
+}
+
+type firecrackerVirtioFSProcess struct {
+	command *exec.Cmd
+	done    chan struct{}
+	err     error
+}
+
+func waitFirecrackerVirtioFSCommand(command *exec.Cmd) *firecrackerVirtioFSProcess {
+	process := &firecrackerVirtioFSProcess{
+		command: command,
+		done:    make(chan struct{}),
+	}
+	go func() {
+		process.err = command.Wait()
+		close(process.done)
+	}()
+	return process
+}
+
+func (process *firecrackerVirtioFSProcess) wait() error {
+	<-process.done
+	return process.err
 }
 
 func virtioFSSocketPathIfConfigured(state *firecrackerVirtioFSState) string {
@@ -143,7 +167,7 @@ func startFirecrackerVirtioFS(
 	socketPath string,
 	stdout,
 	stderr io.Writer,
-) (*firecrackerVirtioFSState, *exec.Cmd, error) {
+) (*firecrackerVirtioFSState, *firecrackerVirtioFSProcess, error) {
 	if err := removeFirecrackerSocket(socketPath); err != nil {
 		return nil, nil, err
 	}
@@ -164,6 +188,7 @@ func startFirecrackerVirtioFS(
 	if err := command.Start(); err != nil {
 		return nil, nil, fmt.Errorf("start virtiofsd: %w", err)
 	}
+	process := waitFirecrackerVirtioFSCommand(command)
 	waitCtx, cancel := context.WithTimeout(ctx, firecrackerVirtioFSStartup)
 	defer cancel()
 	state := &firecrackerVirtioFSState{
@@ -176,16 +201,24 @@ func startFirecrackerVirtioFS(
 	for {
 		info, err := os.Lstat(socketPath)
 		if err == nil && info.Mode()&os.ModeSocket != 0 {
-			return state, command, nil
-		}
-		if !firecrackerVirtioFSProcessMatches(state, binary) {
-			_ = command.Wait()
-			return nil, nil, errors.New("virtiofsd exited before creating its socket")
+			return state, process, nil
 		}
 		select {
+		case <-process.done:
+			if process.err != nil {
+				return nil, nil, fmt.Errorf(
+					"virtiofsd exited before creating its socket: %w",
+					process.err,
+				)
+			}
+			return nil, nil, errors.New("virtiofsd exited before creating its socket")
 		case <-waitCtx.Done():
-			_ = signalFirecrackerVirtioFS(state, binary, syscall.SIGKILL)
-			_ = command.Wait()
+			if group, err := syscall.Getpgid(state.PID); err == nil && group == state.PID {
+				_ = syscall.Kill(-state.PID, syscall.SIGKILL)
+			} else {
+				_ = command.Process.Kill()
+			}
+			_ = process.wait()
 			return nil, nil, fmt.Errorf("wait for virtiofsd socket: %w", waitCtx.Err())
 		case <-ticker.C:
 		}
@@ -322,4 +355,88 @@ func cleanupFirecrackerVirtioFS(state *firecrackerVirtioFSState, binary string) 
 		removeFirecrackerSocket(state.SocketPath),
 		removeErr,
 	)
+}
+
+func attachFirecrackerVirtioFSProcessGroup(cgroupPath string, leaderPID int) error {
+	// Move the leader first so any later fork inherits the destination cgroup.
+	// Then move children that virtiofsd forked before its socket became ready.
+	if err := attachFirecrackerProcess(cgroupPath, leaderPID); err != nil {
+		return fmt.Errorf("attach virtiofsd leader %d to cgroup: %w", leaderPID, err)
+	}
+	pids, err := firecrackerProcessGroupPIDs(leaderPID)
+	if err != nil {
+		return err
+	}
+	for _, pid := range pids {
+		if pid == leaderPID {
+			continue
+		}
+		if err := attachFirecrackerProcess(cgroupPath, pid); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				continue
+			}
+			return fmt.Errorf("attach virtiofsd process %d to cgroup: %w", pid, err)
+		}
+	}
+	return nil
+}
+
+func firecrackerProcessGroupPIDs(leaderPID int) ([]int, error) {
+	if leaderPID <= 1 {
+		return nil, errors.New("invalid virtiofsd process group leader")
+	}
+	groupID, err := syscall.Getpgid(leaderPID)
+	if err != nil {
+		return nil, fmt.Errorf("get virtiofsd process group: %w", err)
+	}
+	if groupID != leaderPID {
+		return nil, fmt.Errorf(
+			"virtiofsd pid %d is not its process group leader (group %d)",
+			leaderPID,
+			groupID,
+		)
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("read process table: %w", err)
+	}
+	pids := make([]int, 0, 2)
+	leaderFound := false
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 1 {
+			continue
+		}
+		stat, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		processGroup, err := firecrackerProcessGroupFromStat(stat)
+		if err != nil || processGroup != groupID {
+			continue
+		}
+		pids = append(pids, pid)
+		leaderFound = leaderFound || pid == leaderPID
+	}
+	if !leaderFound {
+		return nil, fmt.Errorf("virtiofsd process group leader %d disappeared", leaderPID)
+	}
+	sort.Ints(pids)
+	return pids, nil
+}
+
+func firecrackerProcessGroupFromStat(stat []byte) (int, error) {
+	closeParen := strings.LastIndexByte(string(stat), ')')
+	if closeParen < 0 || len(stat) <= closeParen+2 {
+		return 0, errors.New("malformed process stat")
+	}
+	fields := strings.Fields(string(stat[closeParen+2:]))
+	if len(fields) < 3 {
+		return 0, errors.New("process stat lacks process group")
+	}
+	groupID, err := strconv.Atoi(fields[2])
+	if err != nil || groupID <= 1 {
+		return 0, fmt.Errorf("invalid process group %q", fields[2])
+	}
+	return groupID, nil
 }

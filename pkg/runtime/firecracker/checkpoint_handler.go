@@ -810,7 +810,7 @@ func (handler *Handler) Restore(
 		return err
 	}
 	var virtioFSState *firecrackerVirtioFSState
-	var virtioFSCommand *exec.Cmd
+	var virtioFSProcess *firecrackerVirtioFSProcess
 	virtioFSOwned := false
 	if requestedVirtioFS {
 		virtioFSState = &firecrackerVirtioFSState{
@@ -831,8 +831,8 @@ func (handler *Handler) Restore(
 				retErr,
 				cleanupFirecrackerVirtioFS(virtioFSState, handler.virtiofsdPath),
 			)
-			if virtioFSCommand != nil {
-				_ = virtioFSCommand.Wait()
+			if virtioFSProcess != nil {
+				_ = virtioFSProcess.wait()
 			}
 		}()
 	}
@@ -871,7 +871,7 @@ func (handler *Handler) Restore(
 	}
 	defer stderr.Close()
 	if virtioFSState != nil {
-		virtioFSState, virtioFSCommand, err = startFirecrackerVirtioFS(
+		virtioFSState, virtioFSProcess, err = startFirecrackerVirtioFS(
 			ctx,
 			handler.virtiofsdPath,
 			virtioFSState.SharedDir,
@@ -882,7 +882,7 @@ func (handler *Handler) Restore(
 		if err != nil {
 			return err
 		}
-		if err := attachFirecrackerProcess(
+		if err := attachFirecrackerVirtioFSProcessGroup(
 			startConfig.CgroupPath,
 			virtioFSState.PID,
 		); err != nil {
@@ -926,9 +926,9 @@ func (handler *Handler) Restore(
 	handler.instances[startConfig.ID] = instance
 	handler.mu.Unlock()
 	go handler.waitCommand(instance, command)
-	if virtioFSCommand != nil {
+	if virtioFSProcess != nil {
 		virtioFSOwned = true
-		go handler.waitVirtioFS(instance, virtioFSCommand)
+		go handler.waitVirtioFS(instance, virtioFSProcess)
 	}
 
 	restoreSucceeded := false
