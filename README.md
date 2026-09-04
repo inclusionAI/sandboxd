@@ -161,10 +161,7 @@ tools/               pinned protobuf code-generation image
 
 ## Known limitations
 
-- Kata Containers and Firecracker require a usable `/dev/kvm`; nodes without
-  KVM continue to support gVisor. Firecracker additionally requires a compatible
-  guest kernel/initrd, an EROFS root image, and the ext4 image tool. Nodes that
-  enable OCI/Nydus rootfs materialization also require `mkfs.erofs`.
+- Kata Containers and Firecracker require a usable `/dev/kvm`; nodes without KVM continue to support gVisor. Firecracker additionally requires a compatible guest kernel/initrd and the ext4 image tool. Its root filesystem may be an immutable EROFS image or a directory exported through virtio-fs; directory-backed OCI/Nydus roots require `virtiofs_enabled` and a compatible virtiofsd.
 - NVIDIA GPU sandboxes require runsc, a directory/lisafs-backed rootfs,
   `nvidia-container-cli`, accessible NVIDIA devices and userspace driver
   libraries, and a host driver supported by the pinned runsc nvproxy. Kata,
