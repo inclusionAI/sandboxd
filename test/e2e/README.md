@@ -145,20 +145,11 @@ logger is built with sandboxd. The Firecracker kernel must provide the facilitie
 [the runtime guide](../../doc/runtime.md), and the initrd must contain the
 matching `firecracker-agent` as `/init`.
 
-Set `RUN_UNIT_TESTS=0` to skip unit tests while rerunning a privileged
-scenario. Set `E2E_STRESS_ROUNDS` to a positive number and
-`E2E_STRESS_CONCURRENCY` to 1 through 8 to run concurrent lifecycle rounds.
-Targeted runtime cases enable the Redis network soak by default. Set
-`E2E_NETWORK_SOAK=1` with one selected `E2E_RUNTIME` to enable it for a
-direct `make e2e` invocation. The harness uses a digest-pinned Redis image;
-`E2E_REDIS_IMAGE` can point at a preloaded equivalent when Docker Hub is not
-reachable.
-`E2E_RUNTIME=all` means runsc plus runc; Kata and Firecracker stay explicit
-for targeted images. `E2E_SKIP_BUILD=1` reuses
-`SANDBOXD_E2E_IMAGE`, and `E2E_RUN_CGROUP_DISABLED=0` suppresses the second
-runsc cgroup-disabled container. These controls are used by the runtime-case
-wrapper.
+Set `RUN_UNIT_TESTS=0` to skip unit tests while rerunning a privileged scenario. Set `E2E_STRESS_ROUNDS` to a positive number and `E2E_STRESS_CONCURRENCY` to 1 through 32 to run concurrent lifecycle rounds. Targeted runtime cases enable the Redis network soak by default. Set `E2E_NETWORK_SOAK=1` with one selected `E2E_RUNTIME` to enable it for a direct `make e2e` invocation. The harness uses a digest-pinned Redis image; `E2E_REDIS_IMAGE` can point at a preloaded equivalent when Docker Hub is not reachable.
+`E2E_RUNTIME=all` means runsc plus runc; Kata and Firecracker stay explicit for targeted images. `E2E_SKIP_BUILD=1` reuses `SANDBOXD_E2E_IMAGE`, and `E2E_RUN_CGROUP_DISABLED=0` suppresses the second runsc cgroup-disabled container. These controls are used by the runtime-case wrapper.
 `E2E_RUNC_ONLY=1` remains a deprecated alias for `E2E_RUNTIME=runc`.
+
+For a Firecracker virtio-fs storage soak, set `E2E_STRESS_ROOTFS_HOST` to a host directory that contains executable `/bin/sh`, `/stress-data/large.bin`, `/stress-data/small.master`, and a populated `/stress-data/small` directory. The harness mounts it read-only into the E2E container, continuously verifies and scans it from every concurrent guest, and keeps each guest's writes in its private layer. `E2E_STRESS_CHECKPOINT=1` checkpoints and restores one guest in every round while the remaining guests continue their read workload. The host directory can be a distill-fs Nydus FUSE mount to exercise the complete Nydus-to-virtio-fs data path. Set `E2E_STRESS_ONLY=1` to skip the ordinary runtime cases when iterating on a soak; it requires Firecracker virtio-fs and at least one stress round.
 
 ## Host requirements
 

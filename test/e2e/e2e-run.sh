@@ -53,6 +53,9 @@ REDIS_RESULT_KEY="${E2E_REDIS_RESULT_KEY:-}"
 REDIS_BENCHMARK_REQUESTS="${E2E_REDIS_BENCHMARK_REQUESTS:-20000}"
 STRESS_ROUNDS="${E2E_STRESS_ROUNDS:-0}"
 STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
+STRESS_ROOTFS="${E2E_STRESS_ROOTFS:-}"
+STRESS_CHECKPOINT="${E2E_STRESS_CHECKPOINT:-0}"
+STRESS_ONLY="${E2E_STRESS_ONLY:-0}"
 DISABLE_CGROUP="${E2E_DISABLE_CGROUP:-0}"
 CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
 E2E_RUNTIME="${E2E_RUNTIME:-all}"
@@ -188,7 +191,12 @@ preflight() {
     assert_sandboxd_home_is_disk_backed
     [ "$(id -u)" = "0" ] || fail "e2e container must run as root"
     [[ "${STRESS_ROUNDS}" =~ ^[0-9]+$ ]] || fail "E2E_STRESS_ROUNDS must be a non-negative integer"
-    [[ "${STRESS_CONCURRENCY}" =~ ^[1-8]$ ]] || fail "E2E_STRESS_CONCURRENCY must be between 1 and 8"
+    [[ "${STRESS_CONCURRENCY}" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] ||
+        fail "E2E_STRESS_CONCURRENCY must be between 1 and 32"
+    [[ "${STRESS_CHECKPOINT}" =~ ^[01]$ ]] ||
+        fail "E2E_STRESS_CHECKPOINT must be 0 or 1"
+    [[ "${STRESS_ONLY}" =~ ^[01]$ ]] ||
+        fail "E2E_STRESS_ONLY must be 0 or 1"
     [[ "${DISABLE_CGROUP}" =~ ^[01]$ ]] || fail "E2E_DISABLE_CGROUP must be 0 or 1"
     [[ "${NETWORK_SOAK}" =~ ^[01]$ ]] || fail "E2E_NETWORK_SOAK must be 0 or 1"
     [[ "${FIRECRACKER_VIRTIOFS}" =~ ^[01]$ ]] ||
@@ -222,6 +230,32 @@ preflight() {
     if [ "${FIRECRACKER_VIRTIOFS}" = "1" ] &&
         [ "${E2E_RUNTIME}" != "firecracker" ]; then
         fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker"
+    fi
+    if [ -n "${STRESS_ROOTFS}" ]; then
+        [ "${E2E_RUNTIME}" = "firecracker" ] &&
+            [ "${FIRECRACKER_VIRTIOFS}" = "1" ] ||
+            fail "E2E_STRESS_ROOTFS requires Firecracker virtio-fs"
+        [ -x "${STRESS_ROOTFS}/bin/sh" ] ||
+            fail "E2E_STRESS_ROOTFS lacks executable /bin/sh"
+        [ -f "${STRESS_ROOTFS}/stress-data/large.bin" ] ||
+            fail "E2E_STRESS_ROOTFS lacks /stress-data/large.bin"
+        [ -f "${STRESS_ROOTFS}/stress-data/small.master" ] ||
+            fail "E2E_STRESS_ROOTFS lacks /stress-data/small.master"
+        [ -d "${STRESS_ROOTFS}/stress-data/small" ] ||
+            fail "E2E_STRESS_ROOTFS lacks /stress-data/small"
+    fi
+    if [ "${STRESS_CHECKPOINT}" = "1" ] && {
+        [ "${E2E_RUNTIME}" != "firecracker" ] ||
+            [ "${FIRECRACKER_VIRTIOFS}" != "1" ];
+    }; then
+        fail "E2E_STRESS_CHECKPOINT requires Firecracker virtio-fs"
+    fi
+    if [ "${STRESS_ONLY}" = "1" ] && {
+        [ "${E2E_RUNTIME}" != "firecracker" ] ||
+            [ "${FIRECRACKER_VIRTIOFS}" != "1" ] ||
+            [ "${STRESS_ROUNDS}" = "0" ];
+    }; then
+        fail "E2E_STRESS_ONLY requires Firecracker virtio-fs stress rounds"
     fi
     if [ "${NETWORK_SOAK}" = "1" ]; then
         [ "${E2E_RUNTIME}" != "all" ] ||
@@ -368,6 +402,18 @@ EOF
 
     local runtime_binaries
     local node_resource_config=""
+    local max_instance_num=8
+    local interface_cache_size=1
+    if [ "${STRESS_CONCURRENCY}" -gt "${max_instance_num}" ]; then
+        max_instance_num="${STRESS_CONCURRENCY}"
+    fi
+    if [ "${STRESS_ROUNDS}" -gt 0 ]; then
+        # Keep the full stress working set reusable. The interface manager trims
+        # idle entries every 30 seconds; a cache of one can otherwise destroy
+        # endpoints between back-to-back rounds and make allocation fail before
+        # the storage path is exercised.
+        interface_cache_size="${STRESS_CONCURRENCY}"
+    fi
     case "${E2E_RUNTIME}" in
         all)
             runtime_binaries=$'runsc = "/usr/local/bin/runsc"\nrunc = "/usr/local/bin/runc"'
@@ -412,9 +458,9 @@ enable_network_acl = true
 disable_cgroup = ${disable_cgroup}
 cpu_limit_mode = "${CPU_LIMIT_MODE}"
 cgroup_cache_size = 1
-interface_cache_size = 1
+interface_cache_size = ${interface_cache_size}
 cgroup_root_name = "/${CGROUP_ROOT}"
-max_instance_num = 8
+max_instance_num = ${max_instance_num}
 pids_max = 64
 
 ${node_resource_config}
@@ -1324,6 +1370,24 @@ wait_for_cgroup_count() {
     fail "cgroup child count did not reach ${expected}; last count: ${count}"
 }
 
+assert_virtiofsd_cgroups() {
+    local comm_path
+    local cgroup_path
+    local pid
+    local count=0
+    for comm_path in /proc/[0-9]*/comm; do
+        [ "$(cat "${comm_path}" 2>/dev/null || true)" = "virtiofsd" ] || continue
+        cgroup_path="${comm_path%/comm}/cgroup"
+        pid="${comm_path%/comm}"
+        pid="${pid##*/}"
+        grep -Eq "^[^:]*:[^:]*:/${CGROUP_ROOT}/" "${cgroup_path}" ||
+            fail "virtiofsd pid ${pid} escaped ${CGROUP_ROOT} cgroups"
+        count=$((count + 1))
+    done
+    [ "${count}" -ge "${STRESS_CONCURRENCY}" ] ||
+        fail "found only ${count} virtiofsd processes for ${STRESS_CONCURRENCY} sandboxes"
+}
+
 wait_for_process_exit() {
     local pid="$1"
     local description="$2"
@@ -1429,10 +1493,32 @@ run_stress_checks() {
         return
     fi
 
+    local memory_mb=128
+    local cpu_millicores=100
+    if [ "${runtime}" = "firecracker" ]; then
+        memory_mb=256
+    fi
+    local marker=""
+    local workload="/bin/sleep 300"
+    if [ -n "${STRESS_ROOTFS}" ]; then
+        rootfs="${STRESS_ROOTFS}"
+        cpu_millicores=1000
+        local large_sha
+        local small_sha
+        local small_count
+        large_sha="$(sha256sum "${rootfs}/stress-data/large.bin" | awk '{print $1}')"
+        small_sha="$(sha256sum "${rootfs}/stress-data/small.master" | awk '{print $1}')"
+        small_count="$(find "${rootfs}/stress-data/small" -type f | wc -l)"
+        marker="${large_sha}:${small_sha}:${small_count}"
+        workload='while :; do large="$(sha256sum /stress-data/large.bin)"; large="${large%% *}"; small="$(sha256sum /stress-data/small.master)"; small="${small%% *}"; find /stress-data/small -type f -exec cat {} + >/dev/null; count="$(find /stress-data/small -type f | wc -l)"; printf "%s:%s:%s\n" "$large" "$small" "$count" > /var/virtiofs-stress; done'
+    fi
+
     log "running ${STRESS_ROUNDS} ${runtime} stress rounds at concurrency ${STRESS_CONCURRENCY}"
     local round
     local slot
     local id
+    local request_file
+    local checkpoint_dir
     local -a pids
     for round in $(seq 1 "${STRESS_ROUNDS}"); do
         STRESS_IDS=()
@@ -1440,19 +1526,40 @@ run_stress_checks() {
         for slot in $(seq 1 "${STRESS_CONCURRENCY}"); do
             id="sbox-e2e-stress-${round}-${slot}"
             STRESS_IDS+=("${id}")
-            sbox_cmd start \
-                --quiet \
-                --runtime "${runtime}" \
-                --sandbox-id "${id}" \
-                --rootfs "${rootfs}" \
-                --cpu-millicores 100 \
-                --memory-mb 128 \
-                /bin/sleep 300 >"/tmp/${id}.start.log" 2>&1 &
+            if [ "${STRESS_CHECKPOINT}" = "1" ] && [ "${slot}" = "1" ]; then
+                request_file="${SANDBOXD_HOME}/stress-${round}.request.json"
+                checkpoint-restore \
+                    --action start \
+                    --socket "${SOCKET}" \
+                    --runtime "${runtime}" \
+                    --rootfs "${rootfs}" \
+                    --sandbox-id "${id}" \
+                    --request-file "${request_file}" \
+                    --cpu "${cpu_millicores}" \
+                    --memory-mb "${memory_mb}" \
+                    --storage-mb 64 \
+                    --workload-cmd "${workload}" \
+                    >"/tmp/${id}.start.log" 2>&1 &
+            else
+                sbox_cmd start \
+                    --quiet \
+                    --runtime "${runtime}" \
+                    --sandbox-id "${id}" \
+                    --rootfs "${rootfs}" \
+                    --cpu-millicores "${cpu_millicores}" \
+                    --memory-mb "${memory_mb}" \
+                    /bin/sh -c "${workload}" \
+                    >"/tmp/${id}.start.log" 2>&1 &
+            fi
             pids+=("$!")
         done
         for slot in "${!pids[@]}"; do
             if ! wait "${pids[$slot]}"; then
                 cat "/tmp/${STRESS_IDS[$slot]}.start.log" >&2
+                if [ -f "${LOG_FILE}" ]; then
+                    log "sandboxd log at failed stress start"
+                    tail -300 "${LOG_FILE}" >&2
+                fi
                 fail "stress start failed for ${STRESS_IDS[$slot]}"
             fi
         done
@@ -1460,6 +1567,62 @@ run_stress_checks() {
             wait_for_state "${id}" "SANDBOX_STATE_RUNNING"
         done
         wait_for_cgroup_count "${STRESS_CONCURRENCY}"
+        if [ "${runtime}" = "firecracker" ] && [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+            assert_virtiofsd_cgroups
+        fi
+
+        if [ -n "${marker}" ]; then
+            for id in "${STRESS_IDS[@]}"; do
+                local got=""
+                local attempt
+                for attempt in $(seq 1 1200); do
+                    got="$(sbox_cmd exec "${id}" /bin/cat \
+                        /var/virtiofs-stress 2>/dev/null || true)"
+                    [ "${got}" = "${marker}" ] && break
+                    sleep 0.1
+                done
+                [ "${got}" = "${marker}" ] ||
+                    fail "stress read verification failed for ${id}: ${got@Q}"
+            done
+        fi
+
+        if [ "${STRESS_CHECKPOINT}" = "1" ]; then
+            local source_id="${STRESS_IDS[0]}"
+            local restored_id="${source_id}-restored"
+            checkpoint_dir="${SANDBOXD_HOME}/stress-${round}.checkpoint"
+            checkpoint-restore \
+                --action checkpoint \
+                --socket "${SOCKET}" \
+                --sandbox-id "${source_id}" \
+                --checkpoint-dir "${checkpoint_dir}" \
+                --checkpoint-timeout-seconds 180 \
+                --compress=true \
+                --leave-running=true
+            [ -s "${checkpoint_dir}/virtiofs.state" ] ||
+                fail "stress checkpoint lacks virtiofs.state"
+            sbox_cmd delete "${source_id}"
+            if ! checkpoint-restore \
+                --action restore \
+                --timeout 60s \
+                --socket "${SOCKET}" \
+                --target-id "${restored_id}" \
+                --request-file "${request_file}" \
+                --checkpoint-dir "${checkpoint_dir}" >/dev/null; then
+                if [ -f "${LOG_FILE}" ]; then
+                    log "sandboxd log at failed stress restore"
+                    tail -300 "${LOG_FILE}" >&2
+                fi
+                fail "stress restore failed for ${restored_id}"
+            fi
+            STRESS_IDS[0]="${restored_id}"
+            wait_for_state "${restored_id}" "SANDBOX_STATE_RUNNING" 300
+            if [ -n "${marker}" ]; then
+                wait_for_exec_output "${restored_id}" "${marker}" \
+                    /bin/cat /var/virtiofs-stress
+            fi
+            wait_for_cgroup_count "${STRESS_CONCURRENCY}"
+            assert_virtiofsd_cgroups
+        fi
 
         pids=()
         for id in "${STRESS_IDS[@]}"; do
@@ -1473,6 +1636,10 @@ run_stress_checks() {
             fi
         done
         wait_for_cgroup_count 1
+        if [ "${STRESS_CHECKPOINT}" = "1" ]; then
+            rm -rf -- "${checkpoint_dir}"
+            rm -f -- "${request_file}"
+        fi
         STRESS_IDS=()
     done
     log "stress checks passed"
@@ -2146,6 +2313,11 @@ run_e2e() {
     prepare_rootfs
     start_sandboxd
     start_gateway_httpd
+    if [ "${STRESS_ONLY}" = "1" ]; then
+        run_stress_checks firecracker "${STRESS_ROOTFS:-${ROOTFS}}"
+        log "e2e stress passed"
+        return
+    fi
     if [ "${DISABLE_CGROUP}" = "1" ]; then
         run_cgroup_disabled_checks
     else

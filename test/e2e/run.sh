@@ -32,6 +32,9 @@ FIRECRACKER_VIRTIOFSD="${FIRECRACKER_VIRTIOFSD:-}"
 KATA_ROOT="${KATA_ROOT:-}"
 E2E_STRESS_ROUNDS="${E2E_STRESS_ROUNDS:-0}"
 E2E_STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
+E2E_STRESS_ROOTFS_HOST="${E2E_STRESS_ROOTFS_HOST:-}"
+E2E_STRESS_CHECKPOINT="${E2E_STRESS_CHECKPOINT:-0}"
+E2E_STRESS_ONLY="${E2E_STRESS_ONLY:-0}"
 E2E_CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
 E2E_RUNTIME="${E2E_RUNTIME:-all}"
 E2E_RUNC_ONLY="${E2E_RUNC_ONLY:-0}"
@@ -249,6 +252,14 @@ case "${E2E_FIRECRACKER_VIRTIOFS}" in
     0|1) ;;
     *) fail "E2E_FIRECRACKER_VIRTIOFS must be 0 or 1" ;;
 esac
+case "${E2E_STRESS_CHECKPOINT}" in
+    0|1) ;;
+    *) fail "E2E_STRESS_CHECKPOINT must be 0 or 1" ;;
+esac
+case "${E2E_STRESS_ONLY}" in
+    0|1) ;;
+    *) fail "E2E_STRESS_ONLY must be 0 or 1" ;;
+esac
 case "${E2E_KEEP_HOME_FIXTURE}" in
     0|1) ;;
     *) fail "E2E_KEEP_HOME_FIXTURE must be 0 or 1" ;;
@@ -256,6 +267,26 @@ esac
 if [ "${E2E_FIRECRACKER_VIRTIOFS}" = "1" ] &&
     [ "${E2E_RUNTIME}" != "firecracker" ]; then
     fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker"
+fi
+if [ -n "${E2E_STRESS_ROOTFS_HOST}" ]; then
+    [ -d "${E2E_STRESS_ROOTFS_HOST}" ] ||
+        fail "E2E_STRESS_ROOTFS_HOST is not a directory"
+    [ "${E2E_RUNTIME}" = "firecracker" ] &&
+        [ "${E2E_FIRECRACKER_VIRTIOFS}" = "1" ] ||
+        fail "E2E_STRESS_ROOTFS_HOST requires Firecracker virtio-fs"
+fi
+if [ "${E2E_STRESS_CHECKPOINT}" = "1" ] && {
+    [ "${E2E_RUNTIME}" != "firecracker" ] ||
+        [ "${E2E_FIRECRACKER_VIRTIOFS}" != "1" ];
+}; then
+    fail "E2E_STRESS_CHECKPOINT requires Firecracker virtio-fs"
+fi
+if [ "${E2E_STRESS_ONLY}" = "1" ] && {
+    [ "${E2E_RUNTIME}" != "firecracker" ] ||
+        [ "${E2E_FIRECRACKER_VIRTIOFS}" != "1" ] ||
+        [ "${E2E_STRESS_ROUNDS}" = "0" ];
+}; then
+    fail "E2E_STRESS_ONLY requires Firecracker virtio-fs stress rounds"
 fi
 if [ "${E2E_NETWORK_SOAK}" = "1" ] && [ "${E2E_RUNTIME}" = "all" ]; then
     fail "E2E_NETWORK_SOAK requires one selected runtime"
@@ -416,6 +447,13 @@ SANDBOXD_HOME_FIXTURE_DIR="$(prepare_sandboxd_home_fixture)"
 
 container_network_args=(--net bridge)
 network_soak_args=(-e E2E_NETWORK_SOAK=0)
+stress_rootfs_args=()
+if [ -n "${E2E_STRESS_ROOTFS_HOST}" ]; then
+    stress_rootfs_args=(
+        -e E2E_STRESS_ROOTFS=/e2e-stress-rootfs
+        -v "${E2E_STRESS_ROOTFS_HOST}:/e2e-stress-rootfs:ro"
+    )
+fi
 if [ "${E2E_NETWORK_SOAK}" = "1" ]; then
     container_network_args=(--network "${REDIS_NETWORK}")
     network_soak_args=(
@@ -437,6 +475,8 @@ set +e
     "${container_network_args[@]}" \
     -e "E2E_STRESS_ROUNDS=${E2E_STRESS_ROUNDS}" \
     -e "E2E_STRESS_CONCURRENCY=${E2E_STRESS_CONCURRENCY}" \
+    -e "E2E_STRESS_CHECKPOINT=${E2E_STRESS_CHECKPOINT}" \
+    -e "E2E_STRESS_ONLY=${E2E_STRESS_ONLY}" \
     -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
     -e "E2E_RUNTIME=${E2E_RUNTIME}" \
     -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
@@ -444,6 +484,7 @@ set +e
     -e "E2E_FIRECRACKER_VIRTIOFS=${E2E_FIRECRACKER_VIRTIOFS}" \
     -e "E2E_OCI_ROOTFS_IMAGE=${REDIS_IMAGE}" \
     "${network_soak_args[@]}" \
+    "${stress_rootfs_args[@]}" \
     -v "${SANDBOXD_HOME_FIXTURE_DIR}:/home/akernel:rw" \
     --tmpfs /e2e:rw,exec,size=512m \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
