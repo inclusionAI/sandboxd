@@ -419,12 +419,12 @@ func TestDaemonCreateOpt_OverwriteOSSConfig(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "Missing object prefix",
+			name: "Root object has empty prefix",
 			opts: &DaemonCreateOpt{
 				Endpoint: "oss-cn-hangzhou.aliyuncs.com",
 				Bucket:   "test-bucket",
 			},
-			want: false,
+			want: true,
 		},
 		{
 			name: "All fields empty",

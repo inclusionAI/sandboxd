@@ -53,7 +53,7 @@ type DaemonCreateOpt struct {
 }
 
 func (opts *DaemonCreateOpt) overwriteOSSConfig() bool {
-	return opts.Endpoint != "" && opts.Bucket != "" && opts.ObjectPrefix != ""
+	return opts.Endpoint != "" && opts.Bucket != ""
 }
 
 type Manager interface {
