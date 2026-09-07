@@ -19,11 +19,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,8 +54,33 @@ type DaemonCreateOpt struct {
 	ImageURL     string // For Nydus: image URL to fetch bootstrap from registry
 }
 
+const defaultS3Region = "us-east-1"
+
 func (opts *DaemonCreateOpt) overwriteOSSConfig() bool {
 	return opts.Endpoint != "" && opts.Bucket != ""
+}
+
+func normalizeS3Endpoint(rawEndpoint, defaultScheme string) (string, string, error) {
+	endpoint := strings.TrimSpace(rawEndpoint)
+	scheme := defaultScheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	if !strings.Contains(endpoint, "://") {
+		return scheme, endpoint, nil
+	}
+
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid S3 endpoint %q: %w", rawEndpoint, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", "", fmt.Errorf("invalid S3 endpoint scheme %q", parsed.Scheme)
+	}
+	if parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return "", "", fmt.Errorf("invalid S3 endpoint %q: expected only scheme and host", rawEndpoint)
+	}
+	return parsed.Scheme, parsed.Host, nil
 }
 
 type Manager interface {
@@ -366,36 +393,73 @@ func (mgr *manager) setupOSSDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	}
 	d.meta.MountPoint = opts.MountPoint
 	*d.config = mgr.ossCfgTemplate.DeepCopy()
-
-	// Override OSS config if provided
-	if opts.overwriteOSSConfig() {
-		if d.config.Oss == nil {
-			d.config.Oss = &OssConfig{}
+	if d.config.BackendType == "s3" || d.config.S3 != nil {
+		d.config.BackendType = "s3"
+		d.config.Oss = nil
+		if d.config.S3 == nil {
+			d.config.S3 = &S3Config{}
 		}
-		d.config.Oss.Endpoint = opts.Endpoint
-		d.config.Oss.BucketName = opts.Bucket
-		d.config.Oss.ObjectPrefix = opts.ObjectPrefix
-		logrus.Infof("overwriting OSS config (%s, %s, %s)",
-			d.config.Oss.Endpoint, d.config.Oss.BucketName, d.config.Oss.ObjectPrefix)
-	}
-	if opts.AccessKeyID != "" && d.config.Oss != nil {
-		d.config.Oss.AccessKeyId = opts.AccessKeyID
-	}
-	if opts.AccessKeySecret != "" && d.config.Oss != nil {
-		d.config.Oss.AccessKeySecret = opts.AccessKeySecret
-	}
+		if d.config.S3.Region == "" {
+			d.config.S3.Region = defaultS3Region
+		}
+		if opts.overwriteOSSConfig() {
+			scheme, endpoint, err := normalizeS3Endpoint(opts.Endpoint, d.config.S3.Scheme)
+			if err != nil {
+				return nil, err
+			}
+			d.config.S3.Scheme = scheme
+			d.config.S3.Endpoint = endpoint
+			d.config.S3.BucketName = opts.Bucket
+			d.config.S3.ObjectPrefix = opts.ObjectPrefix
+			logrus.Infof("overwriting S3 config (%s, %s, %s)",
+				d.config.S3.Endpoint, d.config.S3.BucketName, d.config.S3.ObjectPrefix)
+		}
+		if opts.AccessKeyID != "" {
+			d.config.S3.AccessKeyId = opts.AccessKeyID
+		}
+		if opts.AccessKeySecret != "" {
+			d.config.S3.AccessKeySecret = opts.AccessKeySecret
+		}
+		if d.config.S3.AccessKeyId == "" && mgr.ossAuths != nil {
+			lookupKey := d.config.S3.Endpoint + "/" + d.config.S3.BucketName
+			if authEntry, ok := mgr.ossAuths[lookupKey]; ok {
+				d.config.S3.AccessKeyId = authEntry.AccessKeyID
+				d.config.S3.AccessKeySecret = authEntry.AccessKeySecret
+				logrus.Infof("populated S3 auth for %s from auth file", lookupKey)
+			} else {
+				logrus.Debugf("no S3 auth found for %s in auth file", lookupKey)
+			}
+		}
+	} else {
+		d.config.S3 = nil
 
-	// If auth not provided, try to look up from ossAuths by endpoint/bucket
-	if d.config.Oss != nil && d.config.Oss.AccessKeyId == "" && mgr.ossAuths != nil {
-		endpoint := d.config.Oss.Endpoint
-		bucket := d.config.Oss.BucketName
-		lookupKey := endpoint + "/" + bucket
-		if authEntry, ok := mgr.ossAuths[lookupKey]; ok {
-			d.config.Oss.AccessKeyId = authEntry.AccessKeyID
-			d.config.Oss.AccessKeySecret = authEntry.AccessKeySecret
-			logrus.Infof("populated OSS auth for %s from auth file", lookupKey)
-		} else {
-			logrus.Debugf("no OSS auth found for %s in auth file", lookupKey)
+		// Preserve custom legacy OSS templates.
+		if opts.overwriteOSSConfig() {
+			if d.config.Oss == nil {
+				d.config.Oss = &OssConfig{}
+			}
+			d.config.Oss.Endpoint = opts.Endpoint
+			d.config.Oss.BucketName = opts.Bucket
+			d.config.Oss.ObjectPrefix = opts.ObjectPrefix
+			logrus.Infof("overwriting OSS config (%s, %s, %s)",
+				d.config.Oss.Endpoint, d.config.Oss.BucketName, d.config.Oss.ObjectPrefix)
+		}
+		if opts.AccessKeyID != "" && d.config.Oss != nil {
+			d.config.Oss.AccessKeyId = opts.AccessKeyID
+		}
+		if opts.AccessKeySecret != "" && d.config.Oss != nil {
+			d.config.Oss.AccessKeySecret = opts.AccessKeySecret
+		}
+
+		if d.config.Oss != nil && d.config.Oss.AccessKeyId == "" && mgr.ossAuths != nil {
+			lookupKey := d.config.Oss.Endpoint + "/" + d.config.Oss.BucketName
+			if authEntry, ok := mgr.ossAuths[lookupKey]; ok {
+				d.config.Oss.AccessKeyId = authEntry.AccessKeyID
+				d.config.Oss.AccessKeySecret = authEntry.AccessKeySecret
+				logrus.Infof("populated OSS auth for %s from auth file", lookupKey)
+			} else {
+				logrus.Debugf("no OSS auth found for %s in auth file", lookupKey)
+			}
 		}
 	}
 

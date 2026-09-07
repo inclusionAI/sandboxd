@@ -107,6 +107,22 @@ type OssConfig struct {
 	Proxy           *ProxyConfig `json:"proxy,omitempty"`
 }
 
+// S3Config maps to nydus_api::S3Config.
+type S3Config struct {
+	Scheme          string       `json:"scheme,omitempty"`
+	Endpoint        string       `json:"endpoint,omitempty"`
+	Region          string       `json:"region,omitempty"`
+	BucketName      string       `json:"bucket_name,omitempty"`
+	ObjectPrefix    string       `json:"object_prefix,omitempty"`
+	AccessKeyId     string       `json:"access_key_id,omitempty"`
+	AccessKeySecret string       `json:"access_key_secret,omitempty"`
+	SkipVerify      bool         `json:"skip_verify,omitempty"`
+	Timeout         uint32       `json:"timeout,omitempty"`
+	ConnectTimeout  uint32       `json:"connect_timeout,omitempty"`
+	RetryLimit      uint8        `json:"retry_limit,omitempty"`
+	Proxy           *ProxyConfig `json:"proxy,omitempty"`
+}
+
 // RegistryConfig maps to nydus_api::RegistryConfig
 type RegistryConfig struct {
 	Scheme             string       `json:"scheme,omitempty"`
@@ -127,6 +143,7 @@ type RegistryConfig struct {
 type BackendConfig struct {
 	BackendType string          `json:"type"` // "oss", "registry", "localfs", etc.
 	Oss         *OssConfig      `json:"oss,omitempty"`
+	S3          *S3Config       `json:"s3,omitempty"`
 	Registry    *RegistryConfig `json:"registry,omitempty"`
 }
 
@@ -155,6 +172,14 @@ func (cfg *BackendConfig) DeepCopy() BackendConfig {
 			ossCopy.Proxy = &proxyCopy
 		}
 		out.Oss = &ossCopy
+	}
+	if cfg.S3 != nil {
+		s3Copy := *cfg.S3
+		if cfg.S3.Proxy != nil {
+			proxyCopy := *cfg.S3.Proxy
+			s3Copy.Proxy = &proxyCopy
+		}
+		out.S3 = &s3Copy
 	}
 	if cfg.Registry != nil {
 		regCopy := *cfg.Registry

@@ -523,6 +523,57 @@ func TestManager_CreateDaemon_Nydus(t *testing.T) {
 	}
 }
 
+func TestSetupOSSDaemonUsesS3Template(t *testing.T) {
+	mgr := &manager{
+		ctx:     context.Background(),
+		binPath: "/usr/local/bin/distill_fs",
+		root:    t.TempDir(),
+		ossCfgTemplate: BackendConfig{
+			BackendType: "s3",
+			Oss:         &OssConfig{},
+			S3: &S3Config{
+				Scheme: "https",
+				Region: defaultS3Region,
+			},
+		},
+	}
+	opts := &DaemonCreateOpt{
+		ID:              "s3-daemon",
+		Name:            "data.erofs",
+		Endpoint:        "http://minio.example:9000",
+		Bucket:          "images",
+		ObjectPrefix:    "rootfs/",
+		AccessKeyID:     "access",
+		AccessKeySecret: "secret",
+	}
+
+	d, err := mgr.setupOSSDaemon(opts)
+	if err != nil {
+		t.Fatalf("setupOSSDaemon() failed: %v", err)
+	}
+	if d.config.BackendType != "s3" || d.config.S3 == nil {
+		t.Fatalf("backend config = %#v, want S3", d.config)
+	}
+	if d.config.Oss != nil {
+		t.Fatal("legacy OSS config was retained alongside S3 config")
+	}
+	if d.config.S3.Scheme != "http" || d.config.S3.Endpoint != "minio.example:9000" {
+		t.Errorf("S3 endpoint = %s://%s, want http://minio.example:9000", d.config.S3.Scheme, d.config.S3.Endpoint)
+	}
+	if d.config.S3.Region != defaultS3Region || d.config.S3.BucketName != "images" || d.config.S3.ObjectPrefix != "rootfs/" {
+		t.Errorf("S3 location = %#v", d.config.S3)
+	}
+	if d.config.S3.AccessKeyId != "access" || d.config.S3.AccessKeySecret != "secret" {
+		t.Error("S3 request credentials were not applied")
+	}
+}
+
+func TestNormalizeS3EndpointRejectsPath(t *testing.T) {
+	if _, _, err := normalizeS3Endpoint("https://s3.example.com/path", "https"); err == nil {
+		t.Fatal("normalizeS3Endpoint() accepted an endpoint path")
+	}
+}
+
 func TestManager_CreateDaemon_Nydus_DockerAuthsFormat(t *testing.T) {
 	tmpDir := t.TempDir()
 
