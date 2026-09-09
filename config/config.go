@@ -158,6 +158,9 @@ type RuncConfig struct {
 type FirecrackerConfig struct {
 	// WritableIOEngine selects Sync, Async, SyncDirect, or AsyncDirect for
 	// the private ext4 disk. Direct engines require a compatible VMM.
+	// The host must provide STATX_DIOALIGN for direct engines and io_uring
+	// for async engines. Unsupported hosts must explicitly select a supported
+	// engine; there is no automatic buffered fallback.
 	// Empty selects AsyncDirect. WritableCacheType defaults to Writeback.
 	WritableIOEngine        string `toml:"writable_io_engine" json:"writableIOEngine"`
 	WritableCacheType       string `toml:"writable_cache_type" json:"writableCacheType"`
