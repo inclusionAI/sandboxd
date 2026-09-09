@@ -284,7 +284,6 @@ func TestStartRejectsFirecrackerOCIImageBeforeFilesystemPrepare(t *testing.T) {
 
 func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {
 	for _, runtimeName := range []string{
-		config.RuntimeNameRunc,
 		config.RuntimeNameKata,
 		config.RuntimeNameFirecracker,
 	} {
@@ -301,6 +300,19 @@ func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {
 			assert.Contains(t, response.Message, "XPU allocations require runtime")
 		})
 	}
+}
+
+func TestStartRejectsXPUWhenManagerIsUnavailable(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunc: svc.NewFakeRuntimeHandler(),
+	})
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:        config.RuntimeNameRunc,
+		Rootfs:         &runtime.RootfsConfig{},
+		XpuAllocations: []*runtime.XpuAllocation{{Type: "npu"}},
+	})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, response.Message, "XPU manager is not configured")
 }
 
 func TestStartRejectsEnableKVMForRunsc(t *testing.T) {
