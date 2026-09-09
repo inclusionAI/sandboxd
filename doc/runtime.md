@@ -18,12 +18,25 @@ binaries, boot artifacts, and host prerequisites pass validation.
 | Published-port DNAT | Supported | Supported | Supported | Supported |
 | Writable-layer quota | Supported | Not supported | Not supported | Supported |
 | Checkpoint and restore | Supported (systrap and KVM) | Not supported | Not supported | Supported |
-| NVIDIA GPU | Experimental nvproxy support | Not supported | Not supported | Not supported |
+| NVIDIA GPU | Experimental nvproxy support | Experimental NVIDIA OCI-hook support | Not supported | Not supported |
+| Ascend NPU | Not supported | Experimental physical 310P and 910 A2/A3 support | Not supported | Not supported |
 | Cgroup-disabled mode | Experimental | Not supported | Not supported | Not supported |
 | KVM | Optional execution platform; not exposed to the sandbox | Optional guest exposure | Required by the runtime | Required by the runtime; nested KVM is not exposed |
 
 See [Checkpoint and restore](checkpoint-restore.md) for the API design,
 artifact ownership, failure semantics, and compatibility requirements.
+
+The NVIDIA provider owns a single physical-device inventory and exclusive
+lease table shared by runsc and runc. Runsc remains subject to its nvproxy
+driver-compatibility gate, while an unsupported nvproxy driver does not disable
+runc GPU support. Both runtimes consume the provider's UUIDs and OCI environment
+through the NVIDIA prestart hook.
+
+The Ascend provider reports the normalized model name returned by the driver, without a per-model allowlist. Requests must match that reported name exactly; for example, a node reporting `ascend910` uses `npu:ascend910:1`, not an inferred SKU. The adapter independently resolves the driver device family to the supported physical 310P or 910 A2/A3 injection profile. Unsupported families and empty model names are rejected. Allocated devices must share a model and runtime family.
+
+Ascend driver library paths are prepended to the final image/request `LD_LIBRARY_PATH`, preserving application and CANN directories while removing duplicates and empty entries. Provider-owned device visibility variables remain authoritative.
+
+GPU capacity is not qualified by runtime in the scheduler. Deploy GPU nodes with consistent runtime capabilities and select `runtime="runc"` explicitly when their GPUs are available only through runc.
 
 ## Selection and configuration
 

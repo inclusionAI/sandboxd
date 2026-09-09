@@ -65,8 +65,11 @@ RUN set -eux; \
       > /etc/apt/sources.list.d/nvidia-container-toolkit.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
+      "nvidia-container-toolkit=${LIBNVIDIA_CONTAINER_VERSION}" \
       "libnvidia-container1=${LIBNVIDIA_CONTAINER_VERSION}" \
       "libnvidia-container-tools=${LIBNVIDIA_CONTAINER_VERSION}"; \
+    command -v nvidia-container-cli; \
+    test -x /usr/bin/nvidia-container-runtime-hook; \
     rm -rf /var/lib/apt/lists/*
 
 COPY third_party/runtime-versions.env /tmp/runtime-versions.env

@@ -251,7 +251,7 @@ fmt: ## format Go code
 	go fmt ./...
 
 check-fmt: ## verify Go code is gofmt-clean
-	@files="$$(gofmt -l .)" || exit $$?; \
+	@files="$$(gofmt -l $$(git ls-files '*.go'))" || exit $$?; \
 	test -z "$$files" || { printf '%s\n' "$$files" >&2; exit 1; }
 
 vet: ## run go vet
