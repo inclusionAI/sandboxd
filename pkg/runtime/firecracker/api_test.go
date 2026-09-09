@@ -80,7 +80,7 @@ func TestConfigureFirecrackerVM(t *testing.T) {
 		"",
 		[]firecrackerDrive{
 			{ID: "rootfs", Path: "/images/root.erofs", ReadOnly: true},
-			{ID: "overlay", Path: "/storage/overlay.ext4"},
+			{ID: "overlay", Path: "/storage/overlay.ext4", IOEngine: "AsyncDirect", CacheType: "Writeback"},
 		},
 	)
 	if err != nil {
@@ -114,6 +114,15 @@ func TestConfigureFirecrackerVM(t *testing.T) {
 	if payloads[2]["is_read_only"] != true ||
 		payloads[3]["is_read_only"] != false {
 		t.Fatalf("drive configs = %+v %+v", payloads[2], payloads[3])
+	}
+	if payloads[3]["io_engine"] != "AsyncDirect" || payloads[3]["cache_type"] != "Writeback" {
+		t.Fatalf("writable disk policy missing: %+v", payloads[3])
+	}
+	if _, ok := payloads[2]["io_engine"]; ok {
+		t.Fatal("root disk policy changed")
+	}
+	if _, ok := payloads[2]["cache_type"]; ok {
+		t.Fatal("root disk caching changed")
 	}
 	if payloads[4]["host_dev_name"] != "tap-test" ||
 		payloads[4]["guest_mac"] != "02:fc:0a:2a:00:02" {

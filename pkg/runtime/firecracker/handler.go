@@ -210,20 +210,22 @@ func (instance *firecrackerInstance) shouldPersist() bool {
 
 // Handler manages the Firecracker microVM lifecycle.
 type Handler struct {
-	binary          string
-	sandboxRoot     string
-	storageRoot     string
-	runtimeRoot     string
-	kernelPath      string
-	initrdPath      string
-	kernelArgs      string
-	kvmDevice       string
-	defaultVCPUs    uint32
-	defaultMem      uint32
-	defaultDisk     uint64
-	ociLoader       runtimecore.OciLoader
-	virtiofsdPath   string
-	virtioFSEnabled bool
+	writableIOEngine  string
+	writableCacheType string
+	binary            string
+	sandboxRoot       string
+	storageRoot       string
+	runtimeRoot       string
+	kernelPath        string
+	initrdPath        string
+	kernelArgs        string
+	kvmDevice         string
+	defaultVCPUs      uint32
+	defaultMem        uint32
+	defaultDisk       uint64
+	ociLoader         runtimecore.OciLoader
+	virtiofsdPath     string
+	virtioFSEnabled   bool
 
 	mu        sync.RWMutex
 	instances map[string]*firecrackerInstance
@@ -313,6 +315,9 @@ func NewHandler(
 ) (*Handler, error) {
 	firecrackerConfig := cfg.RuntimeConfig.Firecracker
 	applyFirecrackerDefaults(&firecrackerConfig)
+	if err := validateFirecrackerWritablePolicy(firecrackerConfig); err != nil {
+		return nil, err
+	}
 	binary = firecrackerConfigPath(binary)
 	for description, path := range map[string]string{
 		"Firecracker binary": binary,
@@ -367,6 +372,8 @@ func NewHandler(
 		sandboxRoot:            sandboxRoot,
 		storageRoot:            storageRoot,
 		runtimeRoot:            firecrackerproto.HostRuntimeRoot,
+		writableIOEngine:       firecrackerConfig.WritableIOEngine,
+		writableCacheType:      firecrackerConfig.WritableCacheType,
 		kernelPath:             firecrackerConfig.KernelImagePath,
 		initrdPath:             firecrackerConfig.InitrdPath,
 		kernelArgs:             firecrackerConfig.KernelArgs,
@@ -387,6 +394,12 @@ func NewHandler(
 }
 
 func applyFirecrackerDefaults(value *config.FirecrackerConfig) {
+	if value.WritableIOEngine == "" {
+		value.WritableIOEngine = config.DefaultFirecrackerWritableIOEngine
+	}
+	if value.WritableCacheType == "" {
+		value.WritableCacheType = config.DefaultFirecrackerWritableCacheType
+	}
 	if value.KernelImagePath == "" {
 		value.KernelImagePath = config.DefaultFirecrackerKernel
 	}
@@ -414,6 +427,20 @@ func applyFirecrackerDefaults(value *config.FirecrackerConfig) {
 	if value.VirtioFSDPath == "" {
 		value.VirtioFSDPath = config.DefaultFirecrackerVirtioFSD
 	}
+}
+
+func validateFirecrackerWritablePolicy(value config.FirecrackerConfig) error {
+	switch value.WritableIOEngine {
+	case "Sync", "Async", "SyncDirect", "AsyncDirect":
+	default:
+		return fmt.Errorf("unsupported firecracker writable_io_engine %q: want Sync, Async, SyncDirect, or AsyncDirect", value.WritableIOEngine)
+	}
+	switch value.WritableCacheType {
+	case "Unsafe", "Writeback":
+	default:
+		return fmt.Errorf("unsupported firecracker writable_cache_type %q: want Unsafe or Writeback", value.WritableCacheType)
+	}
+	return nil
 }
 
 func validateFirecrackerCheckpointMode(mode string) error {
@@ -708,9 +735,11 @@ func (handler *Handler) Start(
 	}
 	drives = append(drives,
 		firecrackerDrive{
-			ID:       "overlay",
-			Path:     firecrackerCheckpointOverlayName,
-			ReadOnly: false,
+			ID:        "overlay",
+			IOEngine:  handler.writableIOEngine,
+			CacheType: handler.writableCacheType,
+			Path:      firecrackerCheckpointOverlayName,
+			ReadOnly:  false,
 		},
 	)
 	drives = append(drives, plan.mountDrives...)

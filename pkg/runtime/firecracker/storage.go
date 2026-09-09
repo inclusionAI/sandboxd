@@ -40,9 +40,11 @@ const (
 )
 
 type firecrackerDrive struct {
-	ID       string
-	Path     string
-	ReadOnly bool
+	IOEngine  string
+	CacheType string
+	ID        string
+	Path      string
+	ReadOnly  bool
 }
 
 type firecrackerStoragePlan struct {

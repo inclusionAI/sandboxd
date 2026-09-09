@@ -229,12 +229,19 @@ func configureFirecrackerVM(
 		}
 	}
 	for _, drive := range drives {
-		if err := api.put(ctx, firecrackerDrivePath(drive.ID), map[string]any{
+		payload := map[string]any{
 			"drive_id":       drive.ID,
 			"path_on_host":   drive.Path,
 			"is_root_device": false,
 			"is_read_only":   drive.ReadOnly,
-		}); err != nil {
+		}
+		if drive.IOEngine != "" {
+			payload["io_engine"] = drive.IOEngine
+		}
+		if drive.CacheType != "" {
+			payload["cache_type"] = drive.CacheType
+		}
+		if err := api.put(ctx, firecrackerDrivePath(drive.ID), payload); err != nil {
 			return err
 		}
 	}
