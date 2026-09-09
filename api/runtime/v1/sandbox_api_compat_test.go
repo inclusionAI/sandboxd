@@ -36,7 +36,7 @@ func TestV010WireContract(t *testing.T) {
 	// Rolled for StartRequest.inject_entrypoint (field 22), which supplies the
 	// in-sandbox destination for injected OCI image startup configuration.
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "21eb701d4c16828d5f4ac42d6a50d6f644e038b6b967b4c5165a9dd025aed67b"
+	const want = "5cbcd4bbad5035b8c2d5224e0f08944f38ee0188d5116e09ac8f16ef5419fc6b"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}

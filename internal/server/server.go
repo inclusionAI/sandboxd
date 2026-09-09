@@ -1569,10 +1569,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	})
 	startSucceeded = true
 	return &runtime.StartResponse{
-		Code:      0,
-		Message:   "Succeed",
-		ID:        sandboxID,
-		SandboxIp: preparedResources.sandboxIP,
+		Code:    0,
+		Message: "Succeed",
+		ID:      sandboxID,
 	}, nil
 }
 

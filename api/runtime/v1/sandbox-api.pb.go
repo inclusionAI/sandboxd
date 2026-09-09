@@ -1609,9 +1609,7 @@ type StartResponse struct {
 	// Message contains details about the start result.
 	Message string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
 	// ID is the unique sandbox ID.
-	ID string `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
-	// SandboxIP is the address assigned to the sandbox network endpoint.
-	SandboxIp     string `protobuf:"bytes,4,opt,name=sandbox_ip,json=sandboxIp,proto3" json:"sandbox_ip,omitempty"`
+	ID            string `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1663,13 +1661,6 @@ func (x *StartResponse) GetMessage() string {
 func (x *StartResponse) GetID() string {
 	if x != nil {
 		return x.ID
-	}
-	return ""
-}
-
-func (x *StartResponse) GetSandboxIp() string {
-	if x != nil {
-		return x.SandboxIp
 	}
 	return ""
 }
@@ -3071,13 +3062,11 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a?\n" +
 	"\x11MetricLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"l\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"M\n" +
 	"\rStartResponse\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\x05R\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x0e\n" +
-	"\x02id\x18\x03 \x01(\tR\x02id\x12\x1d\n" +
-	"\n" +
-	"sandbox_ip\x18\x04 \x01(\tR\tsandboxIp\"\xd9\x01\n" +
+	"\x02id\x18\x03 \x01(\tR\x02id\"\xd9\x01\n" +
 	"\x11CheckpointRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
 	"\x0echeckpoint_dir\x18\x02 \x01(\tR\rcheckpointDir\x12'\n" +
