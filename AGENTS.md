@@ -92,3 +92,7 @@ virtio-fs staging and restored live-memory files, and runtime state. Every
 virtio-fs export must remain read-only; never extend this path to writable host
 sharing. Bounded read-only regular-file injection remains a separate
 startup-metadata mechanism for files such as `resolv.conf`.
+
+# Accelerator Contract
+
+Ascend is an optional external adapter for physical 310P and 910 A2/A3 devices with runc. Keep driver-reported model normalization separate from runtime-family validation; do not add per-SKU allowlists. The SDK/scheduler matches the normalized reported model. Provider library directories use additive `SpecUpdates.PrependLibraryPaths`, preserving the application environment; device-visibility variables still use authoritative overrides.

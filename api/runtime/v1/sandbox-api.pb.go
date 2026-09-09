@@ -1260,7 +1260,7 @@ func (*Mount_ImageUrl) isMount_Source() {}
 // scheduler on the selected node.
 type XpuAllocation struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Type is the normalized accelerator type, such as gpu.
+	// Type is the normalized accelerator type, such as gpu or npu.
 	Type string `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
 	// DeviceIDs contains node-local physical device IDs selected by the scheduler.
 	DeviceIds     []uint32 `protobuf:"varint,2,rep,packed,name=device_ids,json=deviceIds,proto3" json:"device_ids,omitempty"`

@@ -126,3 +126,10 @@ cgroup_memory_limit = "0"
 # [plugin.node_resource]
 # provider = "kubernetes" # or "cgroup"
 # sock_path = "/run/sandboxd/resource.sock"
+
+# Ascend is optional and fail-closed. Enabling it requires the runc runtime,
+# a root-owned adapter, and a versioned read-only mount profile.
+# [plugin.xpu.ascend]
+# enabled = true
+# adapter = "/usr/local/bin/ascend-oci-adapter"
+# mount_profile = "/etc/akernel/ascend/mounts.json"
