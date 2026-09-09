@@ -16,6 +16,7 @@ package cgroupmanager
 
 import (
 	"errors"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -90,6 +91,49 @@ func TestReadV2PidsCurrent(t *testing.T) {
 	assert.True(t, tracked)
 }
 
+func TestCgroupV2KillRejectsZeroPID(t *testing.T) {
+	const helperEnv = "SANDBOXD_TEST_ZERO_PID_HELPER"
+	if os.Getenv(helperEnv) != "1" {
+		// The old implementation calls kill(0, SIGKILL). Run it only in a
+		// dedicated process group so a regression cannot kill the test runner.
+		cmd := exec.Command(os.Args[0], "-test.run=^TestCgroupV2KillRejectsZeroPID$")
+		cmd.Env = append(os.Environ(), helperEnv+"=1")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, "isolated cleanup helper failed: %s", output)
+		return
+	}
+	group, err := syscall.Getpgid(0)
+	require.NoError(t, err)
+	require.Equal(t, os.Getpid(), group, "unsafe to run outside an isolated process group")
+	mountpoint := t.TempDir()
+	name := "/sandbox/zero-pid"
+	groupPath := filepath.Join(mountpoint, name)
+	require.NoError(t, os.MkdirAll(groupPath, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(groupPath, "cgroup.procs"), []byte("0\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(groupPath, "pids.current"), []byte("1\n"), 0644))
+	ops := &cgroupV2{mountpoint: mountpoint}
+	require.ErrorContains(t, ops.kill(name), "unsafe cgroup PID")
+}
+
+func TestValidateCgroupProcessesRejectsUnsafePIDs(t *testing.T) {
+	for _, pid := range []uint64{0, 1, uint64(os.Getpid()), math.MaxInt32 + 1, math.MaxUint64} {
+		t.Run(strconv.FormatUint(pid, 10), func(t *testing.T) {
+			// Never exercise dangerous kill(2) selectors in the test runner,
+			// even if a future regression removes the validation.
+			require.ErrorContains(t, validateCgroupProcesses([]uint64{pid}), "unsafe cgroup PID")
+		})
+	}
+	require.NoError(t, killCgroupProcesses(nil))
+}
+
+func TestValidateCgroupProcessesChecksEntireSnapshot(t *testing.T) {
+	validPID := uint64(os.Getpid() + 1)
+	err := validateCgroupProcesses([]uint64{validPID, 0})
+	require.ErrorContains(t, err, "unsafe cgroup PID")
+	require.NoError(t, validateCgroupProcesses([]uint64{validPID}))
+}
+
 func TestCgroupV2KillUsesExplicitSignals(t *testing.T) {
 	mountpoint := t.TempDir()
 	name := "/sandbox/test"
@@ -115,7 +159,13 @@ func TestCgroupV2KillUsesExplicitSignals(t *testing.T) {
 	go func() {
 		_ = cmd.Wait()
 		err := os.WriteFile(procsPath, nil, 0644)
-		if pidsErr := os.WriteFile(pidsCurrentPath, []byte("0\n"), 0644); err == nil {
+		// Real cgroup counters are read atomically. Replacing the fixture
+		// avoids a truncate/write window that can expose an empty counter.
+		pidsErr := os.WriteFile(pidsCurrentPath+".next", []byte("0\n"), 0644)
+		if pidsErr == nil {
+			pidsErr = os.Rename(pidsCurrentPath+".next", pidsCurrentPath)
+		}
+		if err == nil {
 			err = pidsErr
 		}
 		drained <- err

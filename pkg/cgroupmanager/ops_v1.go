@@ -20,7 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/config"
@@ -160,10 +159,12 @@ func (*cgroupV1) kill(name string) error {
 	if err != nil {
 		return err
 	}
+	pids := make([]uint64, 0, len(processes))
 	for _, process := range processes {
-		if err := syscall.Kill(process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			return err
-		}
+		pids = append(pids, uint64(process.Pid))
+	}
+	if err := killCgroupProcesses(pids); err != nil {
+		return fmt.Errorf("drain cgroup %s: %w", name, err)
 	}
 	for deadline := time.Now().Add(cgroupDrainTimeout); ; {
 		processes, err = group.Processes(cg.Memory, true)

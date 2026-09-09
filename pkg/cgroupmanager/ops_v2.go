@@ -15,13 +15,11 @@
 package cgroupmanager
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/config"
@@ -221,11 +219,8 @@ func (o *cgroupV2) kill(name string) error {
 	if err != nil {
 		return err
 	}
-	for _, pid := range processes {
-		if err := syscall.Kill(int(pid), syscall.SIGKILL); err != nil &&
-			!errors.Is(err, syscall.ESRCH) {
-			return fmt.Errorf("kill process %d in cgroup %s: %w", pid, name, err)
-		}
+	if err := killCgroupProcesses(processes); err != nil {
+		return fmt.Errorf("drain cgroup %s: %w", name, err)
 	}
 
 	for deadline := time.Now().Add(cgroupDrainTimeout); ; {

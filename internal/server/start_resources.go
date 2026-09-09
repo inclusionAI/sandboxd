@@ -31,6 +31,12 @@ type preparedStartResources struct {
 }
 
 func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*preparedStartResources, error) {
+	h.resourceReuseMu.Lock()
+	defer h.resourceReuseMu.Unlock()
+	if err := h.finishReleasedDeletes(); err != nil {
+		return nil, fmt.Errorf("finish pending resource releases before allocation: %w", err)
+	}
+
 	required, err := requiredStartResources(runtimeName, h.config.DisableCgroup)
 	if err != nil {
 		return nil, err

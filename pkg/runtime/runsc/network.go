@@ -132,6 +132,13 @@ func OpenTAP(iface net.Interface) (_ *os.File, retErr error) {
 	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifreq); err != nil {
 		return nil, fmt.Errorf("attach runsc to TAP %s: %w", iface.Name, err)
 	}
+	// VM runtimes can leave checksum/TSO offloads enabled on this persistent
+	// device. Clearing IFF_VNET_HDR alone does not reset those kernel features.
+	// gVisor consumes complete Ethernet frames without virtio metadata, so
+	// force software checksum/segmentation before handing it the queue.
+	if err := unix.IoctlSetInt(fd, unix.TUNSETOFFLOAD, 0); err != nil {
+		return nil, fmt.Errorf("reset runsc TAP %s offloads: %w", iface.Name, err)
+	}
 	if err := unix.SetNonblock(fd, true); err != nil {
 		return nil, fmt.Errorf("set runsc TAP %s non-blocking: %w", iface.Name, err)
 	}

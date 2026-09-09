@@ -98,6 +98,8 @@ type sandboxService struct {
 	ready                             atomic.Bool
 	recoveryReady                     atomic.Bool
 	deleteGroup                       singleflight.Group
+	deleteJournalMu                   sync.Mutex
+	resourceReuseMu                   sync.Mutex
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]struct{}
@@ -259,35 +261,44 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		}
 	}()
 
-	c, err := h.sandboxManager.Get(sandboxID)
-	if err != nil {
-		if errors.Is(err, errord.ErrNotFound) {
-			return nil
-		}
-		return errord.ToGRPC(err)
-	}
-
-	if h.checkRuntime(c.Metadata.RuntimeHandler) != nil {
-		return errord.ToGRPC(errord.ErrNotImplemented)
-	}
-
-	handler, ok := h.serviceHandler.Get(c.Metadata.RuntimeHandler)
-	if !ok {
-		return errord.ToGRPC(errord.ErrNotImplemented)
-	}
-
-	resource, err := h.sandboxManager.CollectResourceByID(sandboxID)
-	if err != nil {
+	intent, err := h.beginDelete(sandboxID)
+	if err != nil || intent == nil {
 		return err
 	}
+	if intent.Releasing {
+		h.resourceReuseMu.Lock()
+		defer h.resourceReuseMu.Unlock()
+		entries, err := h.loadDeleteIntents()
+		if err != nil {
+			return err
+		}
+		current, exists := entries[sandboxID]
+		if !exists || current.Token != intent.Token {
+			return nil
+		}
+		return h.finishDelete(current)
+	}
+	return h.resumeDelete(ctx, *intent)
+}
 
-	err = handler.Delete(ctx, sandboxID)
+func (h *sandboxService) resumeDelete(ctx context.Context, intent deleteIntent) error {
+	sandboxID := intent.Resource.ID
+	resource := intent.Resource
+	handler, ok := h.serviceHandler.Get(intent.Runtime)
+	if !ok {
+		return fmt.Errorf("delete sandbox %s: runtime %s is unavailable", sandboxID, intent.Runtime)
+	}
+	traceID, _ := trace.GetContextID(ctx)
+	if h.networkMgr != nil {
+		h.networkMgr.cleanupDnatRules(sandboxID)
+	}
+	err := handler.Delete(ctx, sandboxID)
 	if err != nil && !errors.Is(err, errord.ErrNotFound) {
-		metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
+		metrics.RecordRuntimeCallResult("delete", "failed", intent.Runtime)
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler force delete sandbox failed: %v", err)
 		return errord.ToGRPC(err)
 	}
-	metrics.RecordRuntimeCallResult("delete", "success", c.Metadata.RuntimeHandler)
+	metrics.RecordRuntimeCallResult("delete", "success", intent.Runtime)
 	if h.resourceMod != nil {
 		h.resourceMod.ReleaseTransientMemory(
 			firecrackerCheckpointReservationOwner(sandboxID),
@@ -312,12 +323,15 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 			return fmt.Errorf("remove network ACL for sandbox %s: %w", sandboxID, aclErr)
 		}
 	}
-	if err := h.releaseStartResources(resource); err != nil {
+	// Keep recycled leases unavailable to new allocations until the durable
+	// intent is cleared. A failed final write is retried before pool reuse.
+	h.resourceReuseMu.Lock()
+	defer h.resourceReuseMu.Unlock()
+	intent.Releasing = true
+	if err := h.saveDeleteIntent(sandboxID, &intent); err != nil {
 		return err
 	}
-
-	h.sandboxManager.Delete(sandboxID)
-	return nil
+	return h.finishDelete(intent)
 }
 
 // deleteSandbox coalesces concurrent delete requests for the same sandbox.
@@ -328,9 +342,6 @@ func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) er
 	resultCh := h.deleteGroup.DoChan(sandboxID, func() (interface{}, error) {
 		cleanupCtx := context.WithoutCancel(ctx)
 
-		if h.networkMgr != nil {
-			h.networkMgr.cleanupDnatRules(sandboxID)
-		}
 		return nil, h.deleteSandboxRuntime(cleanupCtx, sandboxID)
 	})
 
@@ -852,7 +863,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		metrics.RecordResourceGauge("interface", float64(interfaceMgr.CacheSizeLimit()))
 		defer func() {
 			if retErr != nil {
-				_ = interfaceMgr.ShutDown()
+				if err := interfaceMgr.StopPreservingNetwork(); err != nil {
+					logrus.Warnf("init rollback: stop interface manager failed: %v", err)
+				}
 			}
 		}()
 	}
@@ -903,11 +916,24 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		nodeResMod.SetSandboxMetricsSource(s.sandboxManager)
 		s.sandboxManager.OnSandboxStopped = nodeResMod.MarkSandboxStopped
 	}
+	defer func() {
+		if retErr != nil {
+			s.sandboxManager.Stop()
+		}
+	}()
+	pending, err := s.loadDeleteIntents()
+	if err != nil {
+		return nil, err
+	}
 	if err := s.fsMgr.Restore(func(sandboxID string) bool {
 		_, getErr := s.sandboxManager.Get(sandboxID)
-		return getErr == nil
+		_, deleting := pending[sandboxID]
+		return getErr == nil || deleting
 	}); err != nil {
 		return nil, fmt.Errorf("restore sandbox filesystem state: %w", err)
+	}
+	if err := s.recoverDeletes(context.Background()); err != nil {
+		return nil, fmt.Errorf("recover sandbox deletions: %w", err)
 	}
 	if s.aclMgr != nil {
 		bindings, bindErr := s.activeACLBindings()
@@ -1270,7 +1296,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 	}
 
-	sandboxID, err := h.sandboxManager.ReserveID(startReq.SandboxID)
+	sandboxID, err := h.reserveSandboxID(startReq.SandboxID)
 	if err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,

@@ -313,6 +313,50 @@ func TestInterfaceShutdownCleansSNATAndOwnedBridge(t *testing.T) {
 	assert.Len(t, nat.cleanedRanges, 1)
 }
 
+func TestInterfaceStopPreservesNetworkAfterFailedRecovery(t *testing.T) {
+	const backend = "failed-recovery-test"
+	nat := &cleanupNetworkManager{}
+	NetworkManagers[backend] = nat
+	t.Cleanup(func() { delete(NetworkManagers, backend) })
+	bridge := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName, Index: 42}}
+	links := &fakeLinkOperations{link: bridge}
+	db := store.NewMockStore()
+	m := &InterfaceManager{
+		db: db, interfaces: util.New(""), usingInterfaces: cmap.New[struct{}](),
+		idleIp: util.New(""), createReqs: make(chan *createRequest, 1),
+		bridgeLink: bridge, linkOps: links, natBackend: backend,
+		stopCh: make(chan struct{}), runDoneCh: make(chan struct{}), storeDoneCh: make(chan struct{}),
+	}
+	const lease = `{"interface":{"Name":"tap.ac1100ae"},"ip":"172.17.0.174","type":"tap"}`
+	m.usingInterfaces.Set(lease, struct{}{})
+	var destroyed []string
+	patch := gomonkey.ApplyPrivateMethod(m, "destroyDevice", func(_ *InterfaceManager, device net.Interface) error {
+		destroyed = append(destroyed, device.Name)
+		return nil
+	})
+	defer patch.Reset()
+	m.keepStoring()
+	go m.run()
+	require.NoError(t, m.StopPreservingNetwork())
+	assert.Empty(t, destroyed)
+	assert.Empty(t, nat.cleanedRanges)
+	assert.Nil(t, links.deleted)
+	assert.True(t, m.usingInterfaces.Has(lease))
+	stored, err := db.LoadRaw(config.BridgeIpBucket)
+	require.NoError(t, err)
+	var ids storedInterfaceIDs
+	require.NoError(t, json.Unmarshal(stored, &ids))
+	assert.Equal(t, []string{lease}, ids.Items)
+	_, err = m.Allocate()
+	assert.ErrorIs(t, err, errord.ErrUnavailable)
+	assert.ErrorIs(t, m.Recycle(lease), errord.ErrUnavailable)
+	// A later cleanup call must not undo the preservation decision.
+	require.NoError(t, m.ShutDown())
+	assert.Empty(t, destroyed)
+	assert.Empty(t, nat.cleanedRanges)
+	assert.Nil(t, links.deleted)
+}
+
 func TestInterfaceShutdownWaitsForAllocationHandoff(t *testing.T) {
 	const backend = "shutdown-allocation-test"
 	nat := &cleanupNetworkManager{}
@@ -826,4 +870,25 @@ func deviceCIDR(ip string, ones int) *net.IPNet {
 		IP:   net.ParseIP(ip),
 		Mask: net.CIDRMask(ones, 32),
 	}
+}
+
+func TestRecyclePersistsLeaseRemovalBeforeIdleReuse(t *testing.T) {
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	db := &flakyRawStore{MockStore: store.NewMockStore()}
+	f.manager.db = db
+	lease := activeLeaseWithIfindex(t, 13)
+	f.manager.usingInterfaces.Set(lease, struct{}{})
+	require.NoError(t, f.manager.store())
+	db.rawErr = errors.New("durable release unavailable")
+	require.ErrorContains(t, f.manager.Recycle(lease), "durable release unavailable")
+	require.True(t, f.manager.usingInterfaces.Has(lease))
+	require.Zero(t, f.manager.interfaces.Length(), "a failed durable release must quarantine the TAP")
+	db.rawErr = nil
+	require.NoError(t, f.manager.Recycle(lease))
+	data, err := db.LoadRaw(config.BridgeIpBucket)
+	require.NoError(t, err)
+	var persisted storedInterfaceIDs
+	require.NoError(t, json.Unmarshal(data, &persisted))
+	require.Empty(t, persisted.Items, "the idle worker may now safely destroy the TAP")
+	require.Equal(t, 1, f.manager.interfaces.Length())
 }

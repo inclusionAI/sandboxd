@@ -18,8 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
@@ -33,6 +35,32 @@ const (
 	cgroupDrainTimeout = 2 * time.Second
 	cgroupDrainPoll    = 10 * time.Millisecond
 )
+
+// killCgroupProcesses accepts process IDs, never kill(2) process-group selectors.
+// Validate the complete snapshot before signaling anything. A PID outside our
+// namespace may be reported as zero; a uint64-to-int conversion can also turn
+// a malformed PID into a negative process-group selector. Fail closed instead
+// of killing the caller's process group or recycling a still-populated cgroup.
+func killCgroupProcesses(processes []uint64) error {
+	if err := validateCgroupProcesses(processes); err != nil {
+		return err
+	}
+	for _, pid := range processes {
+		if err := syscall.Kill(int(pid), syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("kill cgroup process %d: %w", pid, err)
+		}
+	}
+	return nil
+}
+
+func validateCgroupProcesses(processes []uint64) error {
+	for _, pid := range processes {
+		if pid <= 1 || pid > math.MaxInt32 || pid == uint64(os.Getpid()) {
+			return fmt.Errorf("unsafe cgroup PID %d: refusing to signal it", pid)
+		}
+	}
+	return nil
+}
 
 // Stats is the version-neutral subset of cgroup accounting exposed by
 // sandboxd. All CPU values are nanoseconds and all memory values are bytes.
