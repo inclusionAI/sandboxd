@@ -214,17 +214,6 @@ type storedInterfaceIDs struct {
 func (m *InterfaceManager) CacheSizeLimit() int { return m.cacheSize }
 
 func (m *InterfaceManager) ShutDown() error {
-	return m.shutDown(true)
-}
-
-// StopPreservingNetwork stops background workers without destroying networking.
-// Use this on failed server initialization: recovered leases may still belong
-// to running sandboxes, even if another sandbox prevents ACL recovery.
-func (m *InterfaceManager) StopPreservingNetwork() error {
-	return m.shutDown(false)
-}
-
-func (m *InterfaceManager) shutDown(destroyNetwork bool) error {
 	m.shutdownOnce.Do(func() {
 		// Wait for allocations and recycles that already entered the manager to
 		// finish before stopping the worker and taking the cleanup snapshot.
@@ -240,12 +229,6 @@ func (m *InterfaceManager) shutDown(destroyNetwork bool) error {
 		}
 		if m.storeDoneCh != nil {
 			<-m.storeDoneCh
-		}
-		if !destroyNetwork {
-			// Persist the last handoff before closing, retaining the using set
-			// and all host links/SNAT for the next recovery attempt.
-			m.shutdownError = m.store()
-			return
 		}
 		cleanupErr := m.cleanup()
 		m.usingInterfaces.Clear()
@@ -668,13 +651,6 @@ func (m *InterfaceManager) Recycle(id string) error {
 		return err
 	}
 	m.usingInterfaces.Pop(id)
-	// Commit the release before the idle worker can destroy this TAP. A
-	// crash must not leave a durable active lease pointing at a missing link.
-	if err := m.store(); err != nil {
-		m.usingInterfaces.Set(id, struct{}{})
-		m.storeMark.Store(true)
-		return fmt.Errorf("persist recycled TAP lease: %w", err)
-	}
 	logrus.Infof("parse interface when recycle: %s ", netResource.ToString())
 	// using -> idle, total unchanged. Queue the serialization refreshed by
 	// setTapState rather than the caller's copy, so the idle lease carries

@@ -820,32 +820,18 @@ func (m *Manager) CleanSandboxRoot(id string) {
 	}
 }
 
-// Delete durably removes metadata before forgetting resource ownership in memory.
-func (m *Manager) Delete(id string) error {
-	sandboxRoot, err := util.JoinWithinRoot(m.root, id)
-	if err != nil {
-		return err
-	}
-	if err := os.RemoveAll(sandboxRoot); err != nil {
-		return fmt.Errorf("remove sandbox metadata %s: %w", id, err)
-	}
-	parent, err := os.Open(m.root)
-	if err != nil {
-		return err
-	}
-	err = parent.Sync()
-	closeErr := parent.Close()
-	if err := errors.Join(err, closeErr); err != nil {
-		return fmt.Errorf("sync sandbox metadata removal %s: %w", id, err)
-	}
+func (m *Manager) Delete(id string) {
 	if sb, ok := m.sandboxes.Get(id); ok {
 		m.notifySandboxStopped(sb)
 	}
 
 	m.ReleaseID(id)
 
+	// clean root file.
+	m.CleanSandboxRoot(id)
+
 	if !m.sandboxes.Has(id) {
-		return nil
+		return
 	}
 
 	m.sandboxes.Remove(id)
@@ -859,7 +845,6 @@ func (m *Manager) Delete(id string) error {
 	if n, ok := m.exitNotifiers.Pop(id); ok {
 		n.close()
 	}
-	return nil
 }
 
 func (m *Manager) stopMonitor(id string) {

@@ -65,7 +65,6 @@ type CgroupManager struct {
 	createReqs chan *createRequest
 
 	db         store.DbStore
-	storeMu    sync.Mutex
 	storeDirty atomic.Bool
 
 	gcQueue *util.Queue[string]
@@ -245,7 +244,9 @@ func (c *CgroupManager) Allocate() (string, error) {
 		return "", errCgroupManagerStopped
 	}
 	if id := c.idleID.Pop(); id != "" {
-		return c.markUsing(id)
+		c.usingID.Set(id, struct{}{})
+		c.storeDirty.Store(true)
+		return id, nil
 	}
 
 	c.mu.Lock()
@@ -271,26 +272,12 @@ func (c *CgroupManager) Allocate() (string, error) {
 		if res.err != nil {
 			return "", res.err
 		}
-		return c.markUsing(res.id)
+		c.usingID.Set(res.id, struct{}{})
+		c.storeDirty.Store(true)
+		return res.id, nil
 	case <-c.stopCh:
 		return "", errCgroupManagerStopped
 	}
-}
-
-// markUsing commits ownership before a runtime can enter this cgroup. Without
-// this barrier, recovery can classify a just-allocated live cgroup as idle and
-// kill its processes before sandbox metadata or ACL recovery even begins.
-func (c *CgroupManager) markUsing(id string) (string, error) {
-	c.usingID.Set(id, struct{}{})
-	c.storeDirty.Store(true)
-	if err := c.store(); err != nil {
-		// The caller has not received the cgroup, so no runtime has entered it.
-		c.usingID.Pop(id)
-		c.idleID.Push(id)
-		c.storeDirty.Store(true)
-		return "", err
-	}
-	return id, nil
 }
 
 func (c *CgroupManager) run() {
@@ -544,10 +531,6 @@ func (c *CgroupManager) keepStoring() {
 }
 
 func (c *CgroupManager) store() error {
-	// Serialize snapshot acquisition as well as the write: an older periodic
-	// snapshot must never overwrite a newly acknowledged allocation.
-	c.storeMu.Lock()
-	defer c.storeMu.Unlock()
 	start := time.Now()
 	defer func() {
 		logrus.Debugf(

@@ -92,9 +92,3 @@ virtio-fs staging and restored live-memory files, and runtime state. Every
 virtio-fs export must remain read-only; never extend this path to writable host
 sharing. Bounded read-only regular-file injection remains a separate
 startup-metadata mechanism for files such as `resolv.conf`.
-
-# Deletion Recovery Contract
-
-Persist deletion intent before destructive cleanup, retry unfinished deletions before restoring active ACL bindings, and retain strict ACL checks for surviving sandboxes. Persist cgroup allocation before returning it to a caller. Do not recycle a TAP before its lease release is durable, or permit allocation and sandbox ID reuse to overtake an unfinished final deletion write. Initialization failure must stop background network work without destroying endpoints, bridge, SNAT, or leases still owned by other sandboxes.
-
-When handing a pooled TAP from a VM runtime to runsc, reset checksum/segmentation offloads as well as the virtio-header mode. Validate `TestOpenTAPResetsVMOffloads` with `SANDBOXD_RUN_TAP_INTEGRATION=1` in an isolated privileged network namespace and probe each new sandbox during mixed runsc/Firecracker reuse tests.
