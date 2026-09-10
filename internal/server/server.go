@@ -695,7 +695,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}
 	xpuMgr := xpumanager.New(
 		cfg.RuntimeConfig.RuntimeBinary[config.RuntimeNameRunsc],
+		cfg.RuntimeConfig.RuntimeBinary[config.RuntimeNameRunc] != "",
 		sandboxRoot,
+		cfg.XPUConfig,
 	)
 
 	// The optional node-resource module comes up first so its external resource
@@ -1215,10 +1217,21 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(errord.ErrInvalidArgument)
 	}
-	if len(startReq.XpuAllocations) > 0 && startReq.Runtime != config.RuntimeNameRunsc {
-		err := fmt.Errorf("XPU allocations require runtime %q", config.RuntimeNameRunsc)
-		return &runtime.StartResponse{Code: -1, Message: err.Error()},
-			errord.ToGRPC(errord.ErrInvalidArgument)
+	if len(startReq.XpuAllocations) > 0 {
+		if startReq.Runtime != config.RuntimeNameRunsc && startReq.Runtime != config.RuntimeNameRunc {
+			err := fmt.Errorf("XPU allocations require runtime %q or %q", config.RuntimeNameRunsc, config.RuntimeNameRunc)
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errord.ToGRPC(errord.ErrInvalidArgument)
+		}
+		if h.xpuMgr == nil {
+			err := errors.New("XPU manager is not configured")
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errord.ToGRPC(errord.ErrFailedPrecondition)
+		}
+		if err := h.xpuMgr.ValidateRuntime(startReq.Runtime, startReq.XpuAllocations); err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errord.ToGRPC(errord.ErrInvalidArgument)
+		}
 	}
 	if startReq.WritableLayerLimitBytes > 0 {
 		if startReq.Runtime != config.RuntimeNameRunsc &&
@@ -1387,7 +1400,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
 				errord.ToGRPC(errord.ErrFailedPrecondition)
 		}
-		specUpdates, err = h.xpuMgr.Acquire(sandboxID, startReq.XpuAllocations)
+		specUpdates, err = h.xpuMgr.Acquire(sandboxID, startReq.Runtime, startReq.XpuAllocations)
 		if err != nil {
 			return &runtime.StartResponse{
 				Code:    -1,
