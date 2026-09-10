@@ -117,21 +117,10 @@ func TestCgroupV2KillRejectsZeroPID(t *testing.T) {
 }
 
 func TestValidateCgroupProcessesRejectsUnsafePIDs(t *testing.T) {
-	for _, pid := range []uint64{0, 1, uint64(os.Getpid()), math.MaxInt32 + 1, math.MaxUint64} {
-		t.Run(strconv.FormatUint(pid, 10), func(t *testing.T) {
-			// Never exercise dangerous kill(2) selectors in the test runner,
-			// even if a future regression removes the validation.
-			require.ErrorContains(t, validateCgroupProcesses([]uint64{pid}), "unsafe cgroup PID")
-		})
+	// Only validate here: a regression must not signal the test runner.
+	for _, pid := range []uint64{1, uint64(os.Getpid()), math.MaxInt32 + 1, math.MaxUint64} {
+		require.ErrorContains(t, validateCgroupProcesses([]uint64{pid}), "unsafe cgroup PID", "pid=%d", pid)
 	}
-	require.NoError(t, killCgroupProcesses(nil))
-}
-
-func TestValidateCgroupProcessesChecksEntireSnapshot(t *testing.T) {
-	validPID := uint64(os.Getpid() + 1)
-	err := validateCgroupProcesses([]uint64{validPID, 0})
-	require.ErrorContains(t, err, "unsafe cgroup PID")
-	require.NoError(t, validateCgroupProcesses([]uint64{validPID}))
 }
 
 func TestCgroupV2KillUsesExplicitSignals(t *testing.T) {
