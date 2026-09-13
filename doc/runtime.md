@@ -16,7 +16,7 @@ binaries, boot artifacts, and host prerequisites pass validation.
 | Exec, interactive TTY, wait, stats, and recovery | Supported | Supported | Supported | Supported |
 | Network ACL and managed DNS | Supported | Not supported | Supported | Supported |
 | Published-port DNAT | Supported | Supported | Supported | Supported |
-| Writable-layer quota | Supported | Not enforced; requests are warned and ignored | Not supported | Supported |
+| Writable-layer quota | Supported | Not supported | Not supported | Supported |
 | Checkpoint and restore | Supported (systrap and KVM) | Not supported | Not supported | Supported |
 | NVIDIA GPU | Experimental nvproxy support | Not supported | Not supported | Not supported |
 | Cgroup-disabled mode | Experimental | Not supported | Not supported | Not supported |

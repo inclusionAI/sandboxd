@@ -1148,17 +1148,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 				errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
 		}
 	}
-	if startReq.Runtime == config.RuntimeNameRunc &&
-		(startReq.WritableLayerLimitBytes > 0 || startReq.Rootfs.WritableLayerSizeBytes > 0) {
-		logrus.Warnf(
-			"runtime runc does not support writable layer limits; ignoring limit_bytes=%d and rootfs_limit_bytes=%d for sandbox %q",
-			startReq.WritableLayerLimitBytes,
-			startReq.Rootfs.WritableLayerSizeBytes,
-			startReq.SandboxID,
-		)
-		startReq.WritableLayerLimitBytes = 0
-		startReq.Rootfs.WritableLayerSizeBytes = 0
-	}
 	if rootfsLimit := startReq.Rootfs.WritableLayerSizeBytes; rootfsLimit > 0 {
 		if startReq.WritableLayerLimitBytes > 0 && startReq.WritableLayerLimitBytes != rootfsLimit {
 			err := fmt.Errorf(
