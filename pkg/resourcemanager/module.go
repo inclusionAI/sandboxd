@@ -130,7 +130,7 @@ func (m *Module) SetXPUProvider(provider xpuProvider) {
 	m.xpu = provider
 }
 
-// SetEphemeralStorageProvider adds gVisor writable-layer capacity and its
+// SetEphemeralStorageProvider adds filestore writable-layer capacity and its
 // capability marker to /resource. The first refresh is synchronous so a
 // scheduler querying immediately after sandboxd startup sees a complete node
 // resource snapshot.

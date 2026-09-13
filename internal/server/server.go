@@ -800,7 +800,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}()
 	s.loadRuntimeHandlers()
 	if nodeResMod != nil && cfg.RuntimeConfig.FilestoreDir != "" {
-		if _, ok := s.serviceHandler.Get(config.RuntimeNameRunsc); ok {
+		_, runscReady := s.serviceHandler.Get(config.RuntimeNameRunsc)
+		_, firecrackerReady := s.serviceHandler.Get(config.RuntimeNameFirecracker)
+		if runscReady || firecrackerReady {
 			nodeResMod.SetEphemeralStorageProvider(s.volumeMgr)
 		}
 	}
