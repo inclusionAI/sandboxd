@@ -65,8 +65,6 @@ The cgroup provider is read-only and works with both cgroup v1 and v2. It does
 not enable controllers or create child cgroups, including when experimental
 cgroup-disabled execution is selected.
 
-With a configured `plugin.runtime.filestore_dir` and an initialized runsc or Firecracker handler, `/resource` also reports available writable-layer `storage` in bytes and the `storage-quota-v1` feature. Capacity follows the filestore's available space and overcommit ratio. Firecracker-only nodes do not need runsc to advertise storage. Nodes with only runc/Kata, or whose quota-capable handlers failed initialization, do not advertise this capability.
-
 See [test/e2e/README.md](test/e2e/README.md#gpu-debug-image) for the validated
 GPU debug image and manual CUDA test.
 

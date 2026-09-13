@@ -253,16 +253,32 @@ func TestStartRejectsImageProcessMountConflict(t *testing.T) {
 	assert.Contains(t, response.Message, "conflicts with managed image process config")
 }
 
-func TestStartRejectsWritableLayerLimitForRunc(t *testing.T) {
-	s := newTestService(t, map[string]svc.Handler{
-		config.RuntimeNameRunc: svc.NewFakeRuntimeHandler(),
-	})
-	_, err := s.Start(context.Background(), &runtime.StartRequest{
-		Runtime:                 config.RuntimeNameRunc,
-		Rootfs:                  &runtime.RootfsConfig{},
-		WritableLayerLimitBytes: 1 << 30,
-	})
-	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+func TestStartIgnoresWritableLayerLimitsForRunc(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		limit      uint64
+		rootfsSize uint64
+	}{
+		{name: "request limit", limit: 1 << 30},
+		{name: "rootfs alias", rootfsSize: 1 << 30},
+		{name: "matching limits", limit: 1 << 30, rootfsSize: 1 << 30},
+		{name: "conflicting limits", limit: 1 << 30, rootfsSize: 2 << 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestService(t, map[string]svc.Handler{
+				config.RuntimeNameRunc: svc.NewFakeRuntimeHandler(),
+			})
+			// Stop after request validation without preparing a filesystem.
+			s.serviceHandler.Remove(config.RuntimeNameRunc)
+			request := &runtime.StartRequest{
+				Runtime:                 config.RuntimeNameRunc,
+				Rootfs:                  &runtime.RootfsConfig{WritableLayerSizeBytes: tc.rootfsSize},
+				WritableLayerLimitBytes: tc.limit,
+			}
+			_, err := s.Start(context.Background(), request)
+			assert.ErrorContains(t, err, `runtime handler "runc" is not supported`)
+		})
+	}
 }
 
 func TestStartRejectsFirecrackerOCIImageBeforeFilesystemPrepare(t *testing.T) {

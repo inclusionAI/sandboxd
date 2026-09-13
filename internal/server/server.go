@@ -800,11 +800,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}()
 	s.loadRuntimeHandlers()
 	if nodeResMod != nil && cfg.RuntimeConfig.FilestoreDir != "" {
-		_, runscReady := s.serviceHandler.Get(config.RuntimeNameRunsc)
-		_, firecrackerReady := s.serviceHandler.Get(config.RuntimeNameFirecracker)
-		if runscReady || firecrackerReady {
-			nodeResMod.SetEphemeralStorageProvider(s.volumeMgr)
-		}
+		nodeResMod.SetEphemeralStorageProvider(s.volumeMgr)
 	}
 
 	// Prepare resource modules directly. Each
@@ -1151,6 +1147,17 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
 				errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
 		}
+	}
+	if startReq.Runtime == config.RuntimeNameRunc &&
+		(startReq.WritableLayerLimitBytes > 0 || startReq.Rootfs.WritableLayerSizeBytes > 0) {
+		logrus.Warnf(
+			"runtime runc does not support writable layer limits; ignoring limit_bytes=%d and rootfs_limit_bytes=%d for sandbox %q",
+			startReq.WritableLayerLimitBytes,
+			startReq.Rootfs.WritableLayerSizeBytes,
+			startReq.SandboxID,
+		)
+		startReq.WritableLayerLimitBytes = 0
+		startReq.Rootfs.WritableLayerSizeBytes = 0
 	}
 	if rootfsLimit := startReq.Rootfs.WritableLayerSizeBytes; rootfsLimit > 0 {
 		if startReq.WritableLayerLimitBytes > 0 && startReq.WritableLayerLimitBytes != rootfsLimit {
