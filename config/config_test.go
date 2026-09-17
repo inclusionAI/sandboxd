@@ -16,6 +16,7 @@ package config
 
 import (
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/pelletier/go-toml"
@@ -65,6 +66,26 @@ func TestRunscPlatformTOML(t *testing.T) {
 	}
 	if got := cfg.RuntimeConfig.Runsc.Platform; got != RunscPlatformKVM {
 		t.Fatalf("configured runsc platform = %q, want %q", got, RunscPlatformKVM)
+	}
+}
+
+func TestRunscExtraArgsTOML(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  []string
+	}{
+		{"", nil},
+		{"extra_args = []", []string{}},
+		{"extra_args = [\"--net-raw\", \"--allow-packet-socket-write\"]", []string{"--net-raw", "--allow-packet-socket-write"}},
+	} {
+		cfg := DefaultConfig()
+		if err := toml.Unmarshal([]byte("[plugin.runtime.runsc]\n"+test.input), &cfg); err != nil {
+			t.Fatal(err)
+		}
+		args := cfg.RuntimeConfig.Runsc.ExtraArgs
+		if !slices.Equal(args, test.want) || (args == nil) != (test.want == nil) {
+			t.Fatalf("input=%q: extra args = %#v, want %#v", test.input, args, test.want)
+		}
 	}
 }
 

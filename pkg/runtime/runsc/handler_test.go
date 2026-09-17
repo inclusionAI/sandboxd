@@ -62,11 +62,13 @@ func TestNewRunscHandlerPropagatesKVMPlatform(t *testing.T) {
 	cfg := config.Config{RootDir: rootDir}
 	cfg.RuntimeConfig.FilestoreDir = filepath.Join(t.TempDir(), "filestore")
 	cfg.RuntimeConfig.Runsc.Platform = config.RunscPlatformKVM
+	cfg.RuntimeConfig.Runsc.ExtraArgs = []string{"--net-raw", "--allow-packet-socket-write"}
 	handler, err := NewHandler(cfg, "/usr/local/bin/runsc", nil)
 	assert.NoError(t, err)
 
 	client := handler.runsc.(*Client)
 	assert.Equal(t, config.RunscPlatformKVM, client.Options.Platform)
+	assert.Equal(t, cfg.RuntimeConfig.Runsc.ExtraArgs, client.Options.ExtraArgs)
 }
 
 func TestNewRunscHandlerRejectsInvalidPlatform(t *testing.T) {

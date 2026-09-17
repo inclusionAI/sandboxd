@@ -137,6 +137,9 @@ type RuntimeConfig struct {
 type RunscConfig struct {
 	// Platform selects gVisor's syscall interception platform.
 	Platform string `toml:"platform" json:"platform"`
+	// ExtraArgs supplies operator-owned runsc flags. Nil preserves --net-raw;
+	// an explicitly empty list disables that default.
+	ExtraArgs []string `toml:"extra_args" json:"extraArgs"`
 }
 
 // KataConfig contains the host paths and storage settings used by Kata.
