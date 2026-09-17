@@ -76,7 +76,7 @@ func TestRunscExtraArgsTOML(t *testing.T) {
 	}{
 		{"", nil},
 		{"extra_args = []", []string{}},
-		{"extra_args = [\"--net-raw\", \"--allow-packet-socket-write\"]", []string{"--net-raw", "--allow-packet-socket-write"}},
+		{"extra_args = [\"--net-raw=true\", \"--allow-packet-socket-write=true\"]", []string{"--net-raw=true", "--allow-packet-socket-write=true"}},
 	} {
 		cfg := DefaultConfig()
 		if err := toml.Unmarshal([]byte("[plugin.runtime.runsc]\n"+test.input), &cfg); err != nil {

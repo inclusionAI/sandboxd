@@ -37,7 +37,7 @@ func TestCreateUsesExactDebugLogPath(t *testing.T) {
 
 	debugLogPath := filepath.Join(tempDir, "logs", "runsc.log")
 	client := NewClientWithOptions(binary, filepath.Join(tempDir, "root"), Options{
-		ExtraArgs:    []string{"--net-raw", "--allow-packet-socket-write"},
+		ExtraArgs:    []string{"--net-raw=true", "--allow-packet-socket-write=true"},
 		DebugLogPath: debugLogPath,
 		FilestoreDir: filepath.Join(tempDir, "filestore"),
 	})
@@ -70,20 +70,20 @@ func TestCreateUsesExactDebugLogPath(t *testing.T) {
 }
 
 func TestExtraArgs(t *testing.T) {
-	for _, args := range [][]string{nil, {}, {"--net-raw=false", "--allow-packet-socket-write"}} {
+	for _, args := range [][]string{nil, {}, {"--net-raw=false", "--allow-packet-socket-write=true"}} {
 		if err := validateExtraArgs(args); err != nil {
 			t.Fatal(err)
 		}
 		client := NewClientWithOptions("runsc", "/run/runsc", Options{ExtraArgs: args})
 		want := args
 		if want == nil {
-			want = []string{"--net-raw"}
+			want = []string{"--net-raw=true"}
 		}
 		if !slices.Equal(client.Options.ExtraArgs, want) {
 			t.Fatalf("extra args = %v, want %v", client.Options.ExtraArgs, want)
 		}
 	}
-	for _, arg := range []string{"", "--", "create", "true", "--root=/other", "--network=host", "--platform=kvm", "--overlay2=none", "--ignore-cgroups", "--debug-log=/other", "--bundle=/other"} {
+	for _, arg := range []string{"", "--", "--log", "--log-format", "--net-raw", "--allow-packet-socket-write", "create", "true", "--root=/other", "--network=host", "--platform=kvm", "--overlay2=none", "--ignore-cgroups=true", "--debug-log=/other", "--bundle=/other"} {
 		if err := validateExtraArgs([]string{arg}); err == nil {
 			t.Errorf("accepted invalid extra arg %q", arg)
 		}

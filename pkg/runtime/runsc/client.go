@@ -83,7 +83,7 @@ func NewClient(binary, rootDir string) *Client {
 
 func NewClientWithOptions(binary, rootDir string, options Options) *Client {
 	if options.ExtraArgs == nil {
-		options.ExtraArgs = []string{"--net-raw"}
+		options.ExtraArgs = []string{"--net-raw=true"}
 	}
 	return &Client{
 		Binary:  binary,
@@ -177,12 +177,12 @@ func RootFileOverlay(dir, size string) string {
 }
 
 // Extra arguments are flags, not shell text or runsc subcommands. Require
-// --name=value for values so a positional argument cannot replace "create".
+// --name=value even for booleans, so a flag cannot consume a managed argument.
 func validateExtraArgs(args []string) error {
 	for _, arg := range args {
-		name, _, _ := strings.Cut(arg, "=")
-		if !strings.HasPrefix(name, "--") || len(name) == 2 || strings.ContainsAny(arg, "\x00\r\n") {
-			return fmt.Errorf("invalid extra_args entry %q: use --name or --name=value", arg)
+		name, _, hasValue := strings.Cut(arg, "=")
+		if !hasValue || !strings.HasPrefix(name, "--") || len(name) == 2 || strings.ContainsAny(arg, "\x00\r\n") {
+			return fmt.Errorf("invalid extra_args entry %q: use --name=value (including booleans)", arg)
 		}
 		switch name {
 		case "--root", "--platform", "--network", "--overlay2", "--ignore-cgroups", "--debug-log", "--bundle":

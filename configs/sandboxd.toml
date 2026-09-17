@@ -68,11 +68,11 @@ overlay_tmpfs_size = "256M"
 # Systrap is the default. Select kvm only when /dev/kvm is usable.
 [plugin.runtime.runsc]
 platform = "systrap"
-# Operator-owned create flags; omit to keep ["--net-raw"], or use [] for none.
-# Use --name=value for values; sandboxd-managed flags cannot be overridden.
+# Operator-owned create flags; omit to keep ["--net-raw=true"], or use [] for none.
+# Use --name=value for every flag, including booleans; sandboxd-managed flags cannot be overridden.
 # Docker 28+ bridge networking also needs --allow-packet-socket-write,
 # which permits workloads to craft raw network packets. Enable only if needed:
-# extra_args = ["--net-raw", "--allow-packet-socket-write"]
+# extra_args = ["--net-raw=true", "--allow-packet-socket-write=true"]
 
 [plugin.runtime.basic_spec]
 # Empty uses sandboxd's built-in OCI base specification.
