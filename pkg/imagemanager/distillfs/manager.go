@@ -66,8 +66,9 @@ type Manager interface {
 }
 
 type manager struct {
-	mu  sync.RWMutex
-	ctx context.Context
+	chunkDBSize string
+	mu          sync.RWMutex
+	ctx         context.Context
 
 	binPath          string
 	root             string
@@ -115,6 +116,7 @@ type ChunkDBStats struct {
 
 // ManagerConfig holds configuration for creating a new Manager
 type ManagerConfig struct {
+	ChunkDBSize       string          // Whole bytes or integer B/KiB/MiB/GiB/TiB; empty preserves defaults.
 	Context           context.Context // Context for tracing and cancellation (optional, defaults to Background)
 	Root              string          // Root working directory
 	OSSCfgPath        string          // Path to OSS config template file
@@ -132,6 +134,11 @@ func NewManager(config *ManagerConfig) (Manager, error) {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 
+	size, err := normalizeChunkDBSize(config.ChunkDBSize)
+	if err != nil {
+		return nil, err
+	}
+
 	// Default to background context if not provided
 	ctx := config.Context
 	if ctx == nil {
@@ -143,6 +150,7 @@ func NewManager(config *ManagerConfig) (Manager, error) {
 		cgroupCtrl = imgcgroup.NewController(config.CgroupMemoryLimit)
 	}
 	mgr := &manager{
+		chunkDBSize:      size,
 		ctx:              ctx,
 		binPath:          config.BinPath,
 		root:             config.Root,
@@ -202,7 +210,7 @@ func (mgr *manager) loadExistedDaemons() error {
 		if !entry.Type().IsRegular() {
 			continue
 		}
-		d := &Daemon{ctx: mgr.ctx, binPath: mgr.binPath, cgroupCtrl: mgr.cgroupCtrl}
+		d := &Daemon{ctx: mgr.ctx, binPath: mgr.binPath, cgroupCtrl: mgr.cgroupCtrl, chunkDBSize: mgr.chunkDBSize}
 		metaFilePath := filepath.Join(daemonConfigDir, entry.Name())
 		if err = d.LoadExisted(metaFilePath); err != nil {
 			logrus.Errorf("failed to load daemon from meta file %s: %v", metaFilePath, err)
@@ -350,9 +358,10 @@ func (mgr *manager) newDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 // setupOSSDaemon creates a daemon for OSS source type
 func (mgr *manager) setupOSSDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	d := &Daemon{
-		ctx:        mgr.ctx,
-		config:     &BackendConfig{},
-		cgroupCtrl: mgr.cgroupCtrl,
+		chunkDBSize: mgr.chunkDBSize,
+		ctx:         mgr.ctx,
+		config:      &BackendConfig{},
+		cgroupCtrl:  mgr.cgroupCtrl,
 	}
 	d.meta.Name = opts.Name
 	d.meta.ID = opts.ID
@@ -424,6 +433,7 @@ func (mgr *manager) setupOSSDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 // setupNydusDaemon creates a daemon for Nydus source type
 func (mgr *manager) setupNydusDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	d := &Daemon{
+		chunkDBSize: mgr.chunkDBSize,
 		ctx:         mgr.ctx,
 		config:      &BackendConfig{},
 		nydusClient: mgr.nydusClient,
@@ -867,7 +877,7 @@ func (mgr *manager) ListDaemons() []DaemonInfo {
 // checkChunkDBStats runs 'distill_fs stats-chunk' and returns the parsed stats
 func (mgr *manager) checkChunkDBStats() (*ChunkDBStats, error) {
 	chunkDBDir := filepath.Join(mgr.root, "chunk_db")
-	cmd := exec.Command(mgr.binPath, "stats-chunk", "--chunk-db-dir", chunkDBDir)
+	cmd := exec.Command(mgr.binPath, chunkDBArgs("stats-chunk", chunkDBDir, mgr.chunkDBSize)...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -930,7 +940,7 @@ func formatChunkDBStats(stats *ChunkDBStats) string {
 // gcChunkDB runs 'distill_fs gc-chunk' to clean up the ChunkDB
 func (mgr *manager) gcChunkDB() error {
 	chunkDBDir := filepath.Join(mgr.root, "chunk_db")
-	cmd := exec.Command(mgr.binPath, "gc-chunk", "--chunk-db-dir", chunkDBDir)
+	cmd := exec.Command(mgr.binPath, chunkDBArgs("gc-chunk", chunkDBDir, mgr.chunkDBSize)...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {

@@ -118,6 +118,9 @@ runsc = "/usr/local/bin/runsc"
 [plugin.image]
 root = "/var/lib/sandboxd/image-manager"
 distill_fs_bin = "/usr/local/bin/distill_fs"
+# Requires a distill-fs release with --chunk-db-size support. Omit to use
+# the distill-fs default. All processes sharing the database must agree.
+# chunk_db_size = "100GiB"
 oss_template = "/etc/sandboxd/oss.json"
 nydus_template = "/etc/sandboxd/registry.json"
 nydus_suffix = "_nydus_v3"

@@ -36,6 +36,7 @@ import (
 
 // Config corresponds to the [plugin.image] sandboxd configuration section.
 type Config struct {
+	ChunkDBSize       string // ChunkDB map capacity; empty uses the distill-fs default.
 	Root              string
 	DistillFsBin      string
 	OSSTemplate       string
@@ -95,6 +96,7 @@ func NewModule(cfg Config) (*Module, error) {
 	}
 
 	mgr, err := distillfs.NewManager(&distillfs.ManagerConfig{
+		ChunkDBSize:       cfg.ChunkDBSize,
 		Context:           context.Background(),
 		Root:              cfg.Root,
 		OSSCfgPath:        cfg.OSSTemplate,

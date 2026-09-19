@@ -15,6 +15,7 @@
 # Go command to use for build
 GO ?= go
 DOCKER ?= docker
+DISTILL_FS_BINARY ?= $(ROOTDIR)output/distill-fs/distill_fs
 
 # Extra flags passed to go commands. Leave empty by default because this
 # repository does not vendor dependencies.
@@ -63,7 +64,7 @@ BPF_TEST_BUILD_ARGS ?=
 BPF_SOURCE_DIRS := bpf/bpfnat bpf/networkacl
 BPF_C_SOURCES := $(shell find $(BPF_SOURCE_DIRS) -type f \( -name '*.c' -o -name '*.h' \) | sort)
 
-.PHONY: all clean test storage-test e2e e2e-runtime-binaries e2e-runtime-case e2e-runtime-suite release release-binary release-cli runc-shim sandbox-logger firecracker-agent firecracker-initrd protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
+.PHONY: all clean test storage-test distillfs-test e2e e2e-runtime-binaries e2e-runtime-case e2e-runtime-suite release release-binary release-cli runc-shim sandbox-logger firecracker-agent firecracker-initrd protobuf-image protos protos-local check-protos bpf-image bpf bpf-local bpf-format bpf-format-local check-bpf-format check-bpf-format-local check-bpf-generated check-bpf bpfnat-test-image bpfnat-test bpfnat-test-local networkacl-test networkacl-test-local tidy vendor fmt check-fmt vet help
 .DEFAULT_GOAL := all
 
 all: release ## build binaries
@@ -118,6 +119,16 @@ storage-test: ## run privileged loop-backed filesystem integration tests
 	sudo env SANDBOXD_RUN_STORAGE_INTEGRATION=1 \
 		"$${tmpdir}/runtime-common.test" \
 		-test.v -test.run '^TestEROFSLoopDeviceDirIntegration$$'
+
+distillfs-test: ## run privileged integration with a distill-fs release binary
+	@mkdir -p output/distill-fs/test-tmp
+	@$(GO) test ${GO_TAGS} -c -o output/distill-fs/distillfs.test ./pkg/imagemanager/distillfs
+	@sudo unshare --mount --propagation private env \
+		SANDBOXD_RUN_DISTILLFS_INTEGRATION=1 \
+		DISTILL_FS_BINARY="$(abspath $(DISTILL_FS_BINARY))" \
+		TMPDIR="$(ROOTDIR)output/distill-fs/test-tmp" \
+		"$(ROOTDIR)output/distill-fs/distillfs.test" \
+		-test.v -test.timeout 120s -test.run '^TestChunkDBCapacityIntegration$$'
 
 e2e: ## run unit tests and the selected privileged runtime e2e flows
 	@bash test/e2e/run.sh

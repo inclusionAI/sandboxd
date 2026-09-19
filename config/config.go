@@ -58,6 +58,7 @@ type PluginConfig struct {
 
 // ImageManagerConfig configures image and mount lifecycle management.
 type ImageManagerConfig struct {
+	ChunkDBSize       string `toml:"chunk_db_size" json:"chunkDbSize"`
 	ImageManagerRoot  string `toml:"root" json:"root"`
 	DistillFsBin      string `toml:"distill_fs_bin" json:"distillFsBin"`
 	OSSTemplate       string `toml:"oss_template" json:"ossTemplate"`

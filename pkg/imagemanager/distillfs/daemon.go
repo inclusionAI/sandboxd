@@ -209,6 +209,7 @@ type DaemonInfo struct {
 }
 
 type Daemon struct {
+	chunkDBSize string // Node configuration, also injected when recovering saved daemons.
 	mu          sync.Mutex
 	ctx         context.Context
 	meta        DaemonMeta
@@ -543,6 +544,9 @@ func (d *Daemon) buildMountArgs() []string {
 		"--image-meta-dir", d.meta.ImageMetaDir,
 	)
 
+	if d.chunkDBSize != "" {
+		args = append(args, "--chunk-db-size", d.chunkDBSize)
+	}
 	return args
 }
 

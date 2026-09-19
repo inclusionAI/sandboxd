@@ -71,16 +71,31 @@ jobs:
       - name: Install filesystem tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y erofs-utils xfsprogs
+          sudo apt-get install -y erofs-utils xfsprogs fuse3
 
       - name: Prepare storage kernel modules
         run: |
           sudo modprobe loop
           sudo modprobe xfs
           sudo modprobe erofs
+          sudo modprobe fuse
+          test -c /dev/fuse
 
       - name: Run privileged storage tests
         run: make storage-test
+
+      - name: Download pinned distill-fs release
+        run: |
+          source third_party/runtime-versions.env
+          mkdir -p output/distill-fs
+          archive=output/distill-fs/release.tar.gz
+          curl --fail --location --retry 3 "$DISTILL_FS_AMD64_URL" -o "$archive"
+          echo "$DISTILL_FS_AMD64_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C output/distill-fs distill_fs
+          test "$(output/distill-fs/distill_fs --version)" = "distill_fs ${DISTILL_FS_RELEASE#v}"
+
+      - name: Run distill-fs integration
+        run: make distillfs-test
 
   runtime-e2e-build:
     name: Runtime E2E binaries
