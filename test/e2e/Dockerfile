@@ -41,6 +41,8 @@ RUN apt-get update && \
 COPY output/sandboxd /usr/local/bin/sandboxd
 COPY output/sbox /usr/local/bin/sbox
 COPY output/runsc /usr/local/bin/runsc
+COPY output/containerd-shim-runsc-v1 /usr/local/bin/containerd-shim-runsc-v1
+COPY output/gvisor-bin/ /usr/local/bin/gvisor-bin/
 COPY output/runc /usr/local/bin/runc
 COPY output/runc-shim /usr/local/bin/runc-shim
 COPY output/oom-hog /usr/local/bin/oom-hog

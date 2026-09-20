@@ -127,7 +127,7 @@ make e2e
 ```
 
 See [test/e2e/README.md](test/e2e/README.md) for all runtime commands and
-coverage. AKernel integration is validated through its all-in-one node image
+coverage, including the complete adjacent gVisor bundle required by `RUNSC_BINARY`. AKernel integration is validated through its all-in-one node image
 and standalone deployment.
 
 ## Protobuf development

@@ -48,6 +48,8 @@ this suite passes.
 
 Run the default runsc and runc suite:
 
+`RUNSC_BINARY` must point to `runsc` from a complete extracted gVisor release, with the matching `containerd-shim-runsc-v1` and all four executable `gvisor-bin/` helpers beside it. The runner validates the layout before building and copies the complete installation into the image; a bare runsc is rejected rather than falling back to embedded helpers. Use `third_party/install-gvisor.sh` with the manifest's archive SHA-512 to prepare a verified installation. Locally built bundles must preserve the same layout and matching source revision; adjacency alone cannot prove binary provenance.
+
 ```bash
 RUNSC_BINARY=/usr/local/bin/runsc \
 RUNC_BINARY=/usr/local/bin/runc \

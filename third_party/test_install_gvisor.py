@@ -83,5 +83,47 @@ class InstallTest(unittest.TestCase):
         self.check_archive(extra=info)
 
 
+class LocalBundleTest(unittest.TestCase):
+    def stage(self, missing=None, same_directory=False, nonexecutable=None):
+        helper = INSTALLER.parent.parent / "test/e2e/gvisor-bundle.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source with spaces"
+            destination = source if same_directory else root / "output"
+            for name in MEMBERS:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if name != missing:
+                    path.write_text(name)
+                    path.chmod(0o644 if name == nonexecutable else 0o755)
+            result = subprocess.run(
+                ["bash", "-ec", '. "$1"; copy_gvisor_bundle "$2" "$3"',
+                 "test", str(helper), str(source / "runsc"), str(destination)],
+                capture_output=True, text=True,
+            )
+            failed = missing is not None or nonexecutable is not None
+            self.assertEqual(result.returncode == 0, not failed, result.stderr)
+            if failed:
+                self.assertFalse(destination.exists())
+            else:
+                for name in MEMBERS:
+                    self.assertEqual((destination / name).read_text(), name)
+                    self.assertTrue(os.access(destination / name, os.X_OK))
+
+    def test_complete_local_bundle(self):
+        self.stage()
+
+    def test_already_staged_bundle(self):
+        self.stage(same_directory=True)
+
+    def test_each_missing_member(self):
+        for member in MEMBERS:
+            with self.subTest(member=member):
+                self.stage(missing=member)
+
+    def test_nonexecutable_helper(self):
+        self.stage(nonexecutable="gvisor-bin/checkpointgofer")
+
+
 if __name__ == "__main__":
     unittest.main()
