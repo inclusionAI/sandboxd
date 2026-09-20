@@ -43,11 +43,9 @@ artifacts used by sandboxd E2E and packaged by AKernel. Keep each release,
 download URL, and checksum synchronized. Do not duplicate runtime versions in
 CI workflow environment variables or Dockerfiles.
 
-The AKernel gVisor release is a temporary compatibility build based on an
-upstream release tag. It currently carries the direct-TAP `readv` seccomp fix
-and the KVM address-width fix for hosts without LA57. When updating gVisor,
-first check whether upstream already includes both fixes and remove downstream
-patches that are no longer required.
+gVisor is installed from the complete `gvisor.tar.bz2` release archive. Its SHA-512 pin covers the archive, not the individual runsc binary. Use `third_party/install-gvisor.sh` to validate and install runsc, the containerd shim and all `gvisor-bin/` sidecars together, preserving the adjacent directory layout. Do not mix sidecars from different releases or fall back to downloading them at runtime.
+
+The AKernel gVisor release is a temporary compatibility build based on an upstream release tag. It carries direct-TAP compatibility fixes, the KVM address-width fix for hosts without LA57, and Docker bridge checkpoint/restore support. When updating gVisor, check which fixes upstream already includes and remove downstream patches that are no longer required. Docker bridge support does not imply support for every Docker networking mode; retain the upstream Docker-in-gVisor constraints.
 
 Build a gVisor candidate through the gated workflow in
 `akernel-dev/gvisor`, then test that exact candidate with the complete

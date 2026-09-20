@@ -40,6 +40,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         busybox-static \
+        bzip2 \
         ca-certificates \
         curl \
         gnupg \
@@ -70,13 +71,14 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 COPY third_party/runtime-versions.env /tmp/runtime-versions.env
+COPY third_party/install-gvisor.sh /usr/local/libexec/install-gvisor.sh
 RUN set -eux; \
     . /tmp/runtime-versions.env; \
-    asset=/tmp/runsc; \
+    asset=/tmp/gvisor.tar.bz2; \
     curl -fSL --retry 10 --retry-delay 2 --retry-all-errors \
       "${GVISOR_AMD64_URL}" -o "${asset}"; \
-    echo "${GVISOR_AMD64_SHA512}  ${asset}" | sha512sum -c -; \
-    install -m 0755 "${asset}" /usr/local/bin/runsc; \
+    bash /usr/local/libexec/install-gvisor.sh "${asset}" \
+      "${GVISOR_AMD64_SHA512}" /usr/local/bin; \
     rm -f "${asset}" /tmp/runtime-versions.env
 
 COPY --from=sandboxd-builder /src/sandboxd/output/sandboxd /usr/local/bin/sandboxd

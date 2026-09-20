@@ -32,6 +32,11 @@ jobs:
       - name: Run unit tests
         run: make test
 
+      - name: Verify gVisor archive installer
+        run: |
+          bash -n third_party/install-gvisor.sh
+          python3 third_party/test_install_gvisor.py -v
+
   vet:
     name: Go vet
     runs-on: ubuntu-latest
