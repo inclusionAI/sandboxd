@@ -17,6 +17,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
@@ -35,15 +36,31 @@ func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*
 	if err != nil {
 		return nil, err
 	}
+	return prepareRequiredStartResources(
+		sandboxID,
+		required,
+		func(name string) (string, *networkmanager.NetResource, error) {
+			return h.allocateStartResource(runtimeName, sandboxID, name)
+		},
+		h.releaseStartResources,
+	)
+}
 
-	resultCh := make(chan resourceResult, len(required))
-	for _, name := range required {
-		name := name
-		go func() {
-			value, network, err := h.allocateStartResource(runtimeName, sandboxID, name)
-			resultCh <- resourceResult{name: name, value: value, network: network, err: err}
-		}()
+func prepareRequiredStartResources(
+	sandboxID string,
+	required []string,
+	allocate func(string) (string, *networkmanager.NetResource, error),
+	release func(sandbox.OccupiedResource) error,
+) (*preparedStartResources, error) {
+	results := make([]resourceResult, len(required))
+	var wg sync.WaitGroup
+	for i, name := range required {
+		wg.Go(func() {
+			value, network, err := allocate(name)
+			results[i] = resourceResult{name: name, value: value, network: network, err: err}
+		})
 	}
+	wg.Wait()
 
 	resources := &preparedStartResources{
 		OccupiedResource: sandbox.OccupiedResource{
@@ -53,8 +70,7 @@ func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*
 	}
 
 	var firstErr error
-	for range required {
-		result := <-resultCh
+	for _, result := range results {
 		if result.err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("allocate resource %s failed: %w", result.name, result.err)
@@ -68,7 +84,7 @@ func (h *sandboxService) prepareStartResources(runtimeName, sandboxID string) (*
 		}
 	}
 	if firstErr != nil {
-		if err := h.releaseStartResources(resources.OccupiedResource); err != nil {
+		if err := release(resources.OccupiedResource); err != nil {
 			logrus.Warnf("rollback start resources for %s failed after allocation error: %v", sandboxID, err)
 		}
 		return nil, firstErr

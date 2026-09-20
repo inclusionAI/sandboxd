@@ -77,9 +77,7 @@ func VethToIp(veth string) net.IP {
 }
 
 func TapToIp(tap string) net.IP {
-	if strings.HasPrefix(tap, config.TapPrefix) {
-		tap = tap[len(config.TapPrefix):]
-	}
+	tap = strings.TrimPrefix(tap, config.TapPrefix)
 	ip, _ := hex.DecodeString(tap)
 	return ip
 }

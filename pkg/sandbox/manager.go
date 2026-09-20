@@ -573,7 +573,7 @@ func (m *Manager) UpdateLabels(id string, labels map[string]string) error {
 	if !ok {
 		return errord.ErrNotFound
 	}
-	if labels == nil || len(labels) == 0 {
+	if len(labels) == 0 {
 		return nil
 	}
 	needUpdate := false
