@@ -17,9 +17,12 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -724,4 +727,73 @@ func TestCleanSandboxRootRejectsPathEscape(t *testing.T) {
 	m.CleanSandboxRoot("../outside")
 
 	assert.True(t, dirExists(outside))
+}
+
+// TestRecycleOrphanWithMountedWritableHosts simulates the crash window the
+// writable-hosts tmpfs opens: a sandbox root that got its hosts-rw tmpfs
+// mounted but never received metadata. After a restart loadSandbox() moves
+// the root into _recycle, and housekeeping must detach the tmpfs before
+// removing the directory instead of leaking the mount. The real mount part
+// requires privileges; without them the test still covers the recycle
+// plumbing with an unmounted directory.
+func TestRecycleOrphanWithMountedWritableHosts(t *testing.T) {
+	root := t.TempDir()
+	handlers := cmap.New[svc.Handler]()
+	healthChan := make(chan bool, 4)
+	mgr, err := NewManager(root, handlers, healthChan, nil, 10)
+	assert.NoError(t, err)
+
+	// Crash window: sandbox-files/hosts-rw exists (optionally with a live
+	// tmpfs on it), meta.pb was never written.
+	orphan := filepath.Join(mgr.root, "sbox-orphan-crash")
+	sandboxFiles := filepath.Join(orphan, "sandbox-files", "hosts-rw")
+	assert.NoError(t, os.MkdirAll(sandboxFiles, 0o755))
+	mounted := false
+	if err := syscall.Mount("tmpfs", sandboxFiles, "tmpfs",
+		syscall.MS_NOSUID|syscall.MS_NODEV, "size=64k,mode=0755"); err == nil {
+		mounted = true
+		t.Cleanup(func() { _ = syscall.Unmount(sandboxFiles, syscall.MNT_DETACH) })
+	} else {
+		t.Logf("mount unavailable (unprivileged): %v — testing recycle plumbing only", err)
+	}
+
+	// Restart: loadSandboxes renames the metadata-less root into _recycle.
+	assert.NoError(t, mgr.loadSandboxes())
+	_, statErr := os.Stat(orphan)
+	assert.True(t, os.IsNotExist(statErr), "orphan root was not recycled")
+	recycled := filepath.Join(mgr.recyclePath, "sbox-orphan-crash")
+	if mounted {
+		// A live tmpfs survives the rename with the directory.
+		assert.True(t, writableHostsDirExists(filepath.Join(recycled, "sandbox-files", "hosts-rw")),
+			"recycled orphan lost its mounted hosts-rw directory")
+	}
+
+	// Housekeeping step 3 recycles it through the same detach-then-remove
+	// path as normal cleanup: the tmpfs is unmounted and the tree removed.
+	detachManagedMountsAndRemove("test recycle "+filepath.Base(recycled), recycled)
+	_, statErr = os.Stat(recycled)
+	assert.True(t, os.IsNotExist(statErr), "recycled orphan directory was not removed")
+	if mounted {
+		// The unmount must have succeeded before RemoveAll; a still-live
+		// mount would keep a pid namespace reference under /tmp.
+		assert.NoError(t, mayBeMounted(sandboxFiles))
+	}
+}
+
+// mayBeMounted returns nil when no tmpfs is mounted at path anymore. A second
+// mount point entry with the same source would appear if the unmount was
+// skipped while the tree was removed.
+func mayBeMounted(path string) error {
+	// MNT_DETACH is asynchronous only for active references; after the
+	// directory is gone check via a fresh stat of /proc/self/mounts.
+	data, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return nil // not Linux: nothing more to assert
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, " "+path+" ") {
+			return fmt.Errorf("tmpfs still mounted at %s", path)
+		}
+	}
+	return nil
 }

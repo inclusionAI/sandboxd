@@ -33,10 +33,11 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	// Rolled for StartRequest.inject_entrypoint (field 22), which supplies the
-	// in-sandbox destination for injected OCI image startup configuration.
+	// Rolled for StartRequest.writable_hosts (field 23), the typed opt-in for
+	// a sandbox-local writable /etc/hosts (AKernel issue #71). Previous roll:
+	// StartRequest.inject_entrypoint (field 22).
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "5cbcd4bbad5035b8c2d5224e0f08944f38ee0188d5116e09ac8f16ef5419fc6b"
+	const want = "65899e955da0c9c5870004b01d3b60eec6afdd8f3fda6975ed730aeb471558f9"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}

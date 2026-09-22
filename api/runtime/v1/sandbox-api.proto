@@ -273,6 +273,13 @@ message StartRequest {
   // rootfs. Empty disables injection. It does not replace the sandbox's own
   // command.
   string inject_entrypoint = 22;
+  // WritableHosts mounts the sandbox-generated /etc/hosts read-write so root
+  // inside the sandbox can append local service aliases at runtime. It is a
+  // typed sandbox policy option, deliberately separate from Envs, which stays
+  // reserved for workload environment variables. Supported by runsc, runc,
+  // and kata; firecracker rejects starts that request it. The
+  // node-level writable_hosts static configuration ORs with this field.
+  bool writable_hosts = 23;
 }
 
 // StartResponse is returned after sandbox start.

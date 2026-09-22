@@ -90,6 +90,16 @@ func TestBuildImageProcessSpecRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+// stubWritableHostsMount replaces the privileged tmpfs mount with a no-op so
+// unit tests exercise the writable-hosts plumbing without host mounts. Tests
+// that verify real capacity live in the privileged runtime E2E.
+func stubWritableHostsMount(t *testing.T) {
+	t.Helper()
+	previous := mountWritableHostsTmpfs
+	mountWritableHostsTmpfs = func(string) error { return nil }
+	t.Cleanup(func() { mountWritableHostsTmpfs = previous })
+}
+
 func TestPrepareSandboxFilesInjectsImageProcessConfig(t *testing.T) {
 	service := &sandboxService{config: config.Config{RootDir: t.TempDir()}}
 	target := "/run/yuanrong/image-process.json"
@@ -106,6 +116,7 @@ func TestPrepareSandboxFilesInjectsImageProcessConfig(t *testing.T) {
 			MountDestinations: defaultSandboxFileDestinations,
 		},
 		nil,
+		false,
 		false,
 		nil,
 		want,
@@ -144,6 +155,7 @@ func TestPrepareSandboxFilesRejectsImageProcessMountConflict(t *testing.T) {
 			"sbox-test",
 			svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
 			nil,
+			false,
 			false,
 			[]*runtime.Mount{{Target: target}},
 			&imageProcessSpec{Version: 1, Args: []string{}, Cwd: "/"},
@@ -196,6 +208,7 @@ func TestPrepareSandboxFiles(t *testing.T) {
 		svc.SandboxDefaults{Hostname: "configured-host"},
 		net.ParseIP("10.88.0.2"),
 		false,
+		false,
 		nil,
 		nil,
 		"",
@@ -236,6 +249,7 @@ func TestPrepareSandboxFilesHonorsParentMount(t *testing.T) {
 		svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
 		nil,
 		false,
+		false,
 		[]*runtime.Mount{explicit},
 		nil,
 		"",
@@ -257,6 +271,7 @@ func TestPrepareSandboxFilesHonorsBaseResolverMount(t *testing.T) {
 			MountDestinations: []string{"/etc/resolv.conf"},
 		},
 		net.ParseIP("10.88.0.2"),
+		false,
 		false,
 		nil,
 		nil,
@@ -295,6 +310,7 @@ func TestPrepareSandboxFilesUsesManagedResolverForNetworkACL(t *testing.T) {
 		},
 		net.ParseIP("10.88.0.2"),
 		true,
+		false,
 		nil,
 		nil,
 		"",
@@ -375,6 +391,7 @@ func TestPrepareSandboxFilesWithoutNetworkACLOnACLNode(t *testing.T) {
 				svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname, MountDestinations: test.baseMounts},
 				net.ParseIP("10.88.0.2"),
 				false,
+				false,
 				mounts,
 				nil,
 				"",
@@ -420,11 +437,159 @@ func TestPrepareSandboxFilesRejectsInvalidHostname(t *testing.T) {
 		svc.SandboxDefaults{Hostname: "bad\nhost"},
 		nil,
 		false,
+		false,
 		[]*runtime.Mount{{Target: "/etc"}},
 		nil,
 		"",
 	)
 	if err == nil || !strings.Contains(err.Error(), "invalid character") {
 		t.Fatalf("invalid hostname error = %v", err)
+	}
+}
+
+func TestPrepareSandboxFilesWritableHosts(t *testing.T) {
+	stubWritableHostsMount(t)
+	resolver := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(resolver, []byte("nameserver 1.1.1.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	service := &sandboxService{config: config.Config{
+		RootDir: t.TempDir(),
+		PluginConfig: config.PluginConfig{RuntimeConfig: config.RuntimeConfig{
+			ResolvConfPath: resolver,
+		}},
+	}}
+	prepared, err := service.prepareSandboxFiles(
+		"sbox-writable",
+		svc.SandboxDefaults{
+			Hostname: svc.DefaultSandboxHostname,
+		},
+		net.ParseIP("10.88.0.2"),
+		false,
+		true,
+		nil,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Rollback()
+	var hosts, hostname, resolverMount *runtime.Mount
+	for _, mount := range prepared.Mounts() {
+		switch mount.GetTarget() {
+		case "/etc/hosts":
+			hosts = mount
+		case "/etc/hostname":
+			hostname = mount
+		case "/etc/resolv.conf":
+			resolverMount = mount
+		}
+	}
+	if hosts == nil || hostname == nil || resolverMount == nil {
+		t.Fatalf("missing managed mounts: %+v", prepared.Mounts())
+	}
+	if !reflect.DeepEqual(hosts.GetOptions(), []string{"bind"}) {
+		t.Fatalf("writable hosts mount options = %v", hosts.GetOptions())
+	}
+	if !reflect.DeepEqual(hostname.GetOptions(), []string{"bind", "ro"}) ||
+		!reflect.DeepEqual(resolverMount.GetOptions(), []string{"bind", "ro"}) {
+		t.Fatalf("hostname/resolver lost read-only protection: %+v %+v", hostname, resolverMount)
+	}
+	hostsContent, err := os.ReadFile(hosts.GetHostPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(hostsContent), "127.0.0.1 localhost") ||
+		!strings.Contains(string(hostsContent), "10.88.0.2 "+svc.DefaultSandboxHostname) {
+		t.Fatalf("hosts initial content = %q", hostsContent)
+	}
+	// P1: the writable hosts file lives on the size-bounded private tmpfs
+	// directory so root-overlay quota bypass is not possible.
+	if prepared.writableHostsDir == "" {
+		t.Fatalf("writable hosts directory was not prepared")
+	}
+	if want := filepath.Join(prepared.root, "hosts-rw"); prepared.writableHostsDir != want {
+		t.Fatalf("writable hosts dir = %q, want %q", prepared.writableHostsDir, want)
+	}
+	if hosts.GetHostPath() != filepath.Join(prepared.writableHostsDir, "hosts") {
+		t.Fatalf("hosts source %q is not inside the bounded directory", hosts.GetHostPath())
+	}
+	if !strings.HasPrefix(hosts.GetHostPath(), prepared.writableHostsDir) {
+		t.Fatalf("hosts source escaped the bounded directory")
+	}
+}
+
+func TestPrepareSandboxFilesWritableHostsIsolatedPerSandbox(t *testing.T) {
+	stubWritableHostsMount(t)
+	service := &sandboxService{config: config.Config{RootDir: t.TempDir()}}
+	sources := make([]string, 0, 2)
+	for _, id := range []string{"sbox-a", "sbox-b"} {
+		prepared, err := service.prepareSandboxFiles(
+			id,
+			svc.SandboxDefaults{
+				Hostname: svc.DefaultSandboxHostname,
+			},
+			net.ParseIP("10.88.0.2"),
+			false,
+			true,
+			nil,
+			nil,
+			"",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer prepared.Rollback()
+		for _, mount := range prepared.Mounts() {
+			if mount.GetTarget() == "/etc/hosts" {
+				sources = append(sources, mount.GetHostPath())
+			}
+		}
+	}
+	if len(sources) != 2 {
+		t.Fatalf("expected one hosts mount per sandbox, got %v", sources)
+	}
+	if sources[0] == sources[1] {
+		t.Fatalf("sandboxes share one hosts source: %v", sources)
+	}
+}
+
+func TestPrepareSandboxFilesHonorsExplicitHostsMountOverWritablePolicy(t *testing.T) {
+	stubWritableHostsMount(t)
+	service := &sandboxService{config: config.Config{RootDir: t.TempDir()}}
+	explicit := &runtime.Mount{
+		Target:  "/etc/hosts",
+		Type:    "bind",
+		Options: []string{"bind", "ro"},
+		Source:  &runtime.Mount_HostPath{HostPath: "/custom/hosts"},
+	}
+	prepared, err := service.prepareSandboxFiles(
+		"sbox-test",
+		svc.SandboxDefaults{
+			Hostname: svc.DefaultSandboxHostname,
+		},
+		net.ParseIP("10.88.0.2"),
+		false,
+		true,
+		[]*runtime.Mount{explicit},
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Rollback()
+	hostsCount := 0
+	for _, mount := range prepared.Mounts() {
+		if mount.GetTarget() == "/etc/hosts" {
+			hostsCount++
+			if !reflect.DeepEqual(mount, explicit) {
+				t.Fatalf("explicit read-only hosts mount was altered: %+v", mount)
+			}
+		}
+	}
+	if hostsCount != 1 {
+		t.Fatalf("expected exactly one hosts mount, got %d in %+v", hostsCount, prepared.Mounts())
 	}
 }

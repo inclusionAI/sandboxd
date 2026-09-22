@@ -36,6 +36,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -301,6 +302,225 @@ func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {
 			assert.Contains(t, response.Message, "XPU allocations require runtime")
 		})
 	}
+}
+
+func TestStartRejectsWritableHostsForFirecracker(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameFirecracker: svc.NewFakeRuntimeHandler(),
+	})
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:       config.RuntimeNameFirecracker,
+		Rootfs:        &runtime.RootfsConfig{},
+		WritableHosts: true,
+	})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, response.Message, "writable /etc/hosts is not supported")
+}
+
+func TestStartRejectsFirecrackerWhenStaticWritableHostsEnabled(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameFirecracker: svc.NewFakeRuntimeHandler(),
+	})
+	s.config.PluginConfig.RuntimeConfig.WritableHosts = true
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime: config.RuntimeNameFirecracker,
+		Rootfs:  &runtime.RootfsConfig{},
+	})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, response.Message, "writable /etc/hosts is not supported")
+}
+
+// TestStartWritableHostsNotRejectedByGate probes that a writable-hosts
+// request for a kernel-backed runtime passes the capability gate and only
+// fails later in resource preparation, which this harness does not
+// configure. End-to-end behavior for these runtimes is covered by the
+// runtime E2E suite.
+func TestStartWritableHostsNotRejectedByGate(t *testing.T) {
+	for _, runtimeName := range []string{
+		config.RuntimeNameRunsc,
+		config.RuntimeNameRunc,
+		config.RuntimeNameKata,
+	} {
+		t.Run(runtimeName, func(t *testing.T) {
+			s := newTestService(t, map[string]svc.Handler{
+				runtimeName: svc.NewFakeRuntimeHandler(),
+			})
+			response, err := s.Start(context.Background(), &runtime.StartRequest{
+				Runtime:       runtimeName,
+				Rootfs:        &runtime.RootfsConfig{},
+				WritableHosts: true,
+			})
+			if err == nil && response.Code == 0 {
+				return // fully wired fake; gate passed
+			}
+			msg := response.GetMessage()
+			if err != nil && msg == "" {
+				msg = err.Error()
+			}
+			assert.NotContains(t, msg, "writable /etc/hosts")
+			assert.NotEqual(t, codes.FailedPrecondition, status.Code(err))
+		})
+	}
+}
+
+// fakeInterfaceAllocator hands out in-memory network resources so unit
+// tests exercise Start without creating host network devices or requiring
+// privileged network setup.
+type fakeInterfaceAllocator struct {
+	next int
+}
+
+func (f *fakeInterfaceAllocator) Allocate() (string, error) {
+	return f.allocateEphemeral("")
+}
+
+func (f *fakeInterfaceAllocator) AllocateEphemeral(string) (string, error) {
+	return f.allocateEphemeral("")
+}
+
+func (f *fakeInterfaceAllocator) allocateEphemeral(string) (string, error) {
+	resource := &networkmanager.NetResource{
+		Ip: net.ParseIP(fmt.Sprintf("10.231.0.%d", 2+f.next%250)),
+	}
+	resource.Interface = &net.Interface{
+		Name:  fmt.Sprintf("tap-fake%d", f.next),
+		Index: 100 + f.next,
+	}
+	f.next++
+	return resource.ToString(), nil
+}
+
+func (f *fakeInterfaceAllocator) Recycle(string) error    { return nil }
+func (f *fakeInterfaceAllocator) Deactivate(string) error { return nil }
+func (f *fakeInterfaceAllocator) Release(string) error    { return nil }
+func (f *fakeInterfaceAllocator) Discard(string) error    { return nil }
+
+// newCaptureTestService builds a service whose Start can run past resource
+// preparation, backed by a fake interface allocator and a stubbed writable
+// hosts tmpfs mount, so unprivileged unit tests reach the hosts assertions
+// without host network or mount privileges.
+func newCaptureTestService(t *testing.T, capture svc.Handler) *sandboxService {
+	t.Helper()
+	stubWritableHostsMount(t)
+	s := newTestService(t, map[string]svc.Handler{"runsc": capture})
+	s.config.DisableCgroup = true
+	s.config.NatBackend = config.NatBackendIptables
+	s.networkMgr = newNetworkManagerForTests(
+		&fakeInterfaceAllocator{}, config.NatBackendIptables, false)
+	return s
+}
+
+// capturingHandler records the StartConfig the server prepared so tests can
+// assert on the mounts that actually reach a runtime handler.
+type capturingHandler struct {
+	svc.Handler
+	captured atomic.Pointer[svc.StartConfig]
+}
+
+func (c *capturingHandler) Start(ctx context.Context, cfg svc.StartConfig) error {
+	c.captured.Store(&cfg)
+	return nil
+}
+
+// hostsMountOptions locates the generated /etc/hosts mount in a StartConfig.
+func hostsMountOptions(cfg *svc.StartConfig) ([]string, bool) {
+	if cfg == nil {
+		return nil, false
+	}
+	for _, mount := range cfg.Mounts {
+		if mount.GetTarget() == "/etc/hosts" {
+			return mount.GetOptions(), true
+		}
+	}
+	return nil, false
+}
+
+func hasOption(options []string, want string) bool {
+	for _, option := range options {
+		if option == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestStartResolvesWritableHostsFromExtraConfig proves the full resolution
+// chain: extra_config.writableHosts must produce a runtime-facing hosts
+// mount without "ro".
+func TestStartResolvesWritableHostsFromExtraConfig(t *testing.T) {
+	capture := &capturingHandler{Handler: svc.NewFakeRuntimeHandler()}
+	s := newCaptureTestService(t, capture)
+	rootfsDir := t.TempDir()
+	_, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime: config.RuntimeNameRunsc,
+		Rootfs: &runtime.RootfsConfig{
+			Type:   runtime.RootfsSrcType_LOCAL,
+			Source: &runtime.RootfsConfig_Path{Path: rootfsDir},
+		},
+		ExtraConfig: `{"writableHosts":true}`,
+		Stdout:      "/dev/null",
+		Stderr:      "/dev/null",
+	})
+	require.NoError(t, err)
+	options, ok := hostsMountOptions(capture.captured.Load())
+	require.True(t, ok, "no /etc/hosts mount reached the runtime handler")
+	assert.False(t, hasOption(options, "ro"),
+		"hosts mount still read-only: %v", options)
+}
+
+// TestStartDefaultHostsStaysReadOnly pins the default: without any writable
+// opt-in the generated hosts mount keeps "ro".
+func TestStartDefaultHostsStaysReadOnly(t *testing.T) {
+	capture := &capturingHandler{Handler: svc.NewFakeRuntimeHandler()}
+	s := newCaptureTestService(t, capture)
+	rootfsDir := t.TempDir()
+	_, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime: config.RuntimeNameRunsc,
+		Rootfs: &runtime.RootfsConfig{
+			Type:   runtime.RootfsSrcType_LOCAL,
+			Source: &runtime.RootfsConfig_Path{Path: rootfsDir},
+		},
+		Stdout: "/dev/null",
+		Stderr: "/dev/null",
+	})
+	require.NoError(t, err)
+	options, ok := hostsMountOptions(capture.captured.Load())
+	require.True(t, ok, "no /etc/hosts mount reached the runtime handler")
+	assert.True(t, hasOption(options, "ro"),
+		"default hosts mount is writable: %v", options)
+}
+
+// TestNewSandboxServiceRejectsGlobalWritableHostsWithFirecracker verifies
+// the startup validation: a node-wide writable_hosts default combined with
+// the firecracker runtime class must fail service construction.
+func TestNewSandboxServiceRejectsGlobalWritableHostsWithFirecracker(t *testing.T) {
+	rc := config.RuntimeConfig{
+		WritableHosts: true,
+		RuntimeBinary: map[string]string{
+			config.RuntimeNameFirecracker: "/bin/true",
+		},
+	}
+	err := validateWritableHostsConfig(rc)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "writable_hosts cannot be enabled node-wide")
+
+	rc.RuntimeBinary = map[string]string{
+		config.RuntimeNameRunsc: "/usr/local/bin/runsc",
+	}
+	assert.NoError(t, validateWritableHostsConfig(rc))
+}
+
+func TestStartRejectsWritableHostsExtraConfigForFirecracker(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameFirecracker: svc.NewFakeRuntimeHandler(),
+	})
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:     config.RuntimeNameFirecracker,
+		Rootfs:      &runtime.RootfsConfig{},
+		ExtraConfig: `{"writableHosts":true}`,
+	})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, response.Message, "writable /etc/hosts is not supported")
 }
 
 func TestStartRejectsEnableKVMForRunsc(t *testing.T) {

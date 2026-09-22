@@ -637,6 +637,24 @@ func resetMetadataIfResourceStateIncompatible(storePath string) error {
 	return nil
 }
 
+// validateWritableHostsConfig rejects a node configuration where writable
+// hosts is enabled globally while the firecracker runtime class is
+// configured: every firecracker start would then fail its capability check,
+// so the mismatch must surface at startup instead of at request time.
+func validateWritableHostsConfig(rc config.RuntimeConfig) error {
+	if !rc.WritableHosts {
+		return nil
+	}
+	if _, ok := rc.RuntimeBinary[config.RuntimeNameFirecracker]; ok {
+		return fmt.Errorf(
+			"runtime configuration: writable_hosts cannot be enabled node-wide while the %s runtime class is configured; restart without the %s runtime or keep writable_hosts scoped to per-request opt-in",
+			config.RuntimeNameFirecracker,
+			config.RuntimeNameFirecracker,
+		)
+	}
+	return nil
+}
+
 func NewSandboxService(root, configPath string) (result SandboxService, retErr error) {
 	// if root dir is not exist, create it
 	if _, err := os.Stat(root); os.IsNotExist(err) {
@@ -654,6 +672,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, err
 	}
 	if err := validateRuntimeFilestore(cfg.RuntimeConfig); err != nil {
+		return nil, err
+	}
+	if err := validateWritableHostsConfig(cfg.RuntimeConfig); err != nil {
 		return nil, err
 	}
 	runscPlatform, err := config.NormalizeRunscPlatform(cfg.RuntimeConfig.Runsc.Platform)
@@ -1073,6 +1094,13 @@ type ExtraConfig struct {
 	// EnableKVM exposes the configured character device as /dev/kvm. It is
 	// intentionally opt-in and valid only for the host-kernel runc runtime.
 	EnableKVM bool `json:"enableKVM,omitempty"`
+
+	// WritableHosts is the extra_config transport for the typed
+	// StartRequest.writable_hosts policy (AKernel issue #71): the SDK and
+	// frontend forward sandbox options through extra_config, and this field
+	// is resolved back into the typed request field, which stays the single
+	// source of truth for the writable-hosts capability gate.
+	WritableHosts bool `json:"writableHosts,omitempty"`
 }
 
 type fsPrepareResult struct {
@@ -1213,6 +1241,25 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		err := fmt.Errorf("enableKVM is supported only by runtime %q", config.RuntimeNameRunc)
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(errord.ErrInvalidArgument)
+	}
+	if extraConfig.WritableHosts {
+		// Resolve the extra_config transport into the typed request field
+		// so a single effective value feeds the capability check below and
+		// prepareSandboxFiles.
+		startReq.WritableHosts = true
+	}
+	// writableHosts is the single effective value across all enablement
+	// paths: the typed request field, the extra_config transport, and the
+	// node-level static configuration.
+	writableHosts := h.config.PluginConfig.RuntimeConfig.WritableHosts ||
+		startReq.WritableHosts
+	if writableHosts && startReq.Runtime == config.RuntimeNameFirecracker {
+		err := fmt.Errorf(
+			"writable /etc/hosts is not supported by runtime %s",
+			config.RuntimeNameFirecracker,
+		)
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrFailedPrecondition))
 	}
 	if len(startReq.XpuAllocations) > 0 && startReq.Runtime != config.RuntimeNameRunsc {
 		err := fmt.Errorf("XPU allocations require runtime %q", config.RuntimeNameRunsc)
@@ -1483,6 +1530,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		defaults,
 		preparedResources.network.Ip,
 		aclEnabled,
+		writableHosts,
 		preparedFilesystem.Mounts(),
 		imageProcess,
 		startReq.InjectEntrypoint,

@@ -105,6 +105,10 @@ var StartCmd = cli.Command{
 			Usage: "accelerator allocation, formatted as type:id[,id...]",
 		},
 		cli.BoolFlag{
+			Name:  "writable-hosts",
+			Usage: "mount the sandbox-generated /etc/hosts read-write (runsc/runc/kata)",
+		},
+		cli.BoolFlag{
 			Name:  "quiet,q",
 			Usage: "print only the sandbox id",
 		},
@@ -184,6 +188,7 @@ var StartCmd = cli.Command{
 			Ports:                   context.StringSlice("port"),
 			XpuAllocations:          xpuAllocations,
 			WritableLayerLimitBytes: writableLayerLimitBytes,
+			WritableHosts:           context.Bool("writable-hosts"),
 			ExtraConfig:             extraConfig,
 			InjectEntrypoint:        context.String("inject-entrypoint"),
 		})

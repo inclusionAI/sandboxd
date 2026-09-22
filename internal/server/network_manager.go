@@ -35,7 +35,7 @@ type dnatRule struct {
 }
 
 type networkManager struct {
-	iface           *networkmanager.InterfaceManager
+	iface           interfaceAllocator
 	natBackend      string
 	enableLocalDNAT bool
 
@@ -58,11 +58,38 @@ func resolveNATBackend(name string) (string, error) {
 	return name, nil
 }
 
+// interfaceAllocator is the slice of InterfaceManager that the sandbox
+// network manager consumes. Unit tests inject a fake implementation instead
+// of constructing a real manager, which would create host network devices.
+type interfaceAllocator interface {
+	Allocate() (string, error)
+	AllocateEphemeral(string) (string, error)
+	Recycle(string) error
+	Deactivate(string) error
+	Release(string) error
+	Discard(string) error
+}
+
 func newNetworkManager(
 	iface *networkmanager.InterfaceManager,
 	natBackend string,
 	enableLocalDNAT bool,
 ) *networkManager {
+	var allocator interfaceAllocator
+	if iface != nil {
+		allocator = iface
+	}
+	return &networkManager{
+		iface:           allocator,
+		natBackend:      natBackend,
+		enableLocalDNAT: enableLocalDNAT,
+		dnatRules:       make(map[string][]*dnatRule),
+	}
+}
+
+// newNetworkManagerForTests builds a network manager backed by the supplied
+// allocator, for use in unit tests.
+func newNetworkManagerForTests(iface interfaceAllocator, natBackend string, enableLocalDNAT bool) *networkManager {
 	return &networkManager{
 		iface:           iface,
 		natBackend:      natBackend,

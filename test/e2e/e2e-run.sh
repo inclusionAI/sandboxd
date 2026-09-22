@@ -66,6 +66,11 @@ export RUNSC_IGNORE_CGROUPS="${DISABLE_CGROUP}"
 SANDBOXD_PID=""
 HTTPD_PID=""
 SANDBOX_ID=""
+WRITABLE_HOSTS_IDS=()
+# WRITABLE_HOSTS_SUFFIX disambiguates sandbox ids between the primary and the
+# cgroup-disabled e2e containers, which both run the runsc case with the same
+# function; fixed ids otherwise collide with the sibling container run.
+WRITABLE_HOSTS_SUFFIX="${E2E_DISABLE_CGROUP:-0}"
 STRESS_IDS=()
 CGROUP_MODE=""
 CGROUP_DIR=""
@@ -146,6 +151,11 @@ cleanup() {
     local stress_id
     for stress_id in "${STRESS_IDS[@]}"; do
         /usr/local/bin/sbox --address "${SOCKET}" --timeout 20s delete "${stress_id}" >/dev/null 2>&1
+    done
+    local hosts_id
+    for hosts_id in "${WRITABLE_HOSTS_IDS[@]:-}"; do
+        [ -n "${hosts_id}" ] || continue
+        /usr/local/bin/sbox --address "${SOCKET}" --timeout 20s delete "${hosts_id}" >/dev/null 2>&1
     done
     if [ -n "${HTTPD_PID}" ]; then
         kill "${HTTPD_PID}" >/dev/null 2>&1
@@ -648,6 +658,12 @@ http_get_without_proxy() {
         tr -d '\r' |
         awk 'body { print } /^$/ { body = 1 }' |
         tail -1
+}
+
+assert_contains() {
+    local got="$1" want="$2" context="$3"
+    grep -qF -- "${want}" <<<"${got}" ||
+        fail "${context}: expected to contain '${want}', got '${got}'"
 }
 
 assert_eq() {
@@ -1700,6 +1716,198 @@ run_storage_quota_check() {
     SANDBOX_ID=""
 }
 
+# run_writable_hosts_checks exercises opt-in writable /etc/hosts on a real
+# runtime (issue #71): append an alias, resolve it, verify isolation from
+# another sandbox and from the node, and confirm managed files stay
+# read-only.
+run_writable_hosts_checks() {
+    local runtime="$1" label="$2" rootfs="$3"
+    log "testing writable /etc/hosts on ${label}"
+    local node_hosts_before
+    node_hosts_before="$(md5sum /etc/hosts)"
+
+    local writable_id
+    writable_id="sbox-e2e-${label}-hosts-n${WRITABLE_HOSTS_SUFFIX}"
+    WRITABLE_HOSTS_IDS+=("${writable_id}")
+    sbox_cmd start \
+        --quiet \
+        --runtime "${runtime}" \
+        --sandbox-id "${writable_id}" \
+        --rootfs "${rootfs}" \
+        --cwd / \
+        --writable-hosts \
+        --cpu-millicores 100 \
+        --memory-mb 128 \
+        /bin/sleep 1800
+    wait_for_state "${writable_id}" "SANDBOX_STATE_RUNNING" 300
+
+    # extra_config is the transport the SDK and frontend use; exercise it in
+    # addition to the typed --writable-hosts flag above.
+    local transport_id="sbox-e2e-${label}-hosts-transport-n${WRITABLE_HOSTS_SUFFIX}"
+    WRITABLE_HOSTS_IDS+=("${transport_id}")
+    sbox_cmd start \
+        --quiet \
+        --runtime "${runtime}" \
+        --sandbox-id "${transport_id}" \
+        --rootfs "${rootfs}" \
+        --cwd / \
+        --extra-config '{"writableHosts":true}' \
+        --cpu-millicores 100 \
+        --memory-mb 128 \
+        /bin/sleep 1800
+    wait_for_state "${transport_id}" "SANDBOX_STATE_RUNNING" 300
+    sbox_cmd exec "${transport_id}" /bin/sh \
+        -c 'echo "127.0.0.1 transport-alias" >> /etc/hosts'
+    sbox_cmd exec "${transport_id}" /bin/sh \
+        -c 'grep -q transport-alias /etc/hosts' ||
+        fail "${label} extra_config writableHosts transport did not apply"
+
+    # Default stays read-only: the managed files reject writes, and a second
+    # sandbox without the opt-in cannot write its hosts either.
+    sbox_cmd exec "${writable_id}" /bin/sh -c \
+        'echo "127.0.0.1 tb4-local-service" >> /etc/hosts'
+    local got
+    got="$(sbox_cmd exec "${writable_id}" /bin/sh \
+        -c 'grep tb4-local-service /etc/hosts')"
+    assert_eq "${got}" "127.0.0.1 tb4-local-service" "${label} hosts append"
+    # busybox ping cannot send raw ICMP inside the sandbox, but its first
+    # line reports the getaddrinfo result, which is what resolves the alias.
+    got="$(sbox_cmd exec "${writable_id}" /bin/sh \
+        -c 'ping -c 1 -W 2 tb4-local-service 2>&1 | head -1' || true)"
+    assert_contains "${got}" "(127.0.0.1)" \
+        "${label} alias resolution"
+
+    # issue #71 acceptance: a local HTTP service must be reachable through
+    # the appended alias, the Terminal-Bench 4.0 separate-verifier shape.
+    sbox_cmd exec "${writable_id}" /bin/sh -c \
+        'mkdir -p /var/www && echo tb4-verifier-served > /var/www/health.txt'
+    # busybox nc has no -z port-scan flag; probe with busybox wget instead.
+    # Detach all stdio from exec so the background server cannot keep the
+    # runtime's exec IO open after the readiness shell exits.
+    sbox_cmd exec "${writable_id}" /bin/sh -c \
+        'httpd -f -p 0.0.0.0:9000 -h /var/www \
+             </dev/null >/tmp/hosts-httpd.log 2>&1 &
+         for i in $(seq 1 10); do
+             wget -T 2 -q -O /dev/null http://127.0.0.1:9000/health.txt && exit 0
+             sleep 1
+         done
+         cat /tmp/hosts-httpd.log >&2
+         exit 1' ||
+        fail "${label} in-sandbox httpd did not start"
+    got="$(sbox_cmd exec "${writable_id}" /bin/sh \
+        -c 'printf "GET /health.txt HTTP/1.0\r\nHost: customer\r\n\r\n" | nc -w 2 tb4-local-service 9000 | tail -1')"
+    assert_eq "${got}" "tb4-verifier-served" \
+        "${label} HTTP access through appended alias"
+
+    # P1: the writable hosts file lives on a size-bounded tmpfs (64k), so a
+    # sandbox cannot drain node storage through /etc/hosts. Fill /etc/hosts
+    # itself past the quota with a single sequential write (no seek: tmpfs
+    # bounds allocated data, not the logical file length a sparse write
+    # could extend without allocating). The over-budget write must fail
+    # with ENOSPC, the file must cap at the tmpfs size, and later appends
+    # must stay bounded too. Writing a neighboring file would exercise the
+    # root filesystem instead of the hosts quota, so only /etc/hosts
+    # counts.
+    # The quota's security property is host-side: the backing tmpfs must cap
+    # the stored hosts data at 64k no matter what the sandbox writes, so
+    # node storage cannot be drained (/the/ issue-#71 concern). Guest-side
+    # error visibility differs per runtime: direct-kernel runtimes
+    # (runsc/runc) surface ENOSPC synchronously, while kata's virtio-fs
+    # writeback cache may accept over-budget writes into the guest page
+    # cache and only report failure on flush. So assert the host-side cap
+    # universally, and additionally require the synchronous ENOSPC error
+    # only on direct-kernel runtimes.
+    local backing_hosts
+    backing_hosts="/home/akernel/sandboxd/root/containers/${writable_id}/sandbox-files/hosts-rw/hosts"
+    if ! mount | grep -q " ${backing_hosts%%/hosts} "; then
+        fail "${label} writable hosts backing tmpfs is not mounted host-side"
+    fi
+    local quota_err
+    quota_err="$(sbox_cmd exec "${writable_id}" /bin/sh \
+        -c 'dd if=/dev/zero of=/etc/hosts bs=1024 count=128 conv=notrunc' 2>&1)" || true
+    if [ "${runtime}" != "kata" ] && ! grep -qi "no space left" <<<"${quota_err}"; then
+        fail "${label} writable hosts quota not enforced synchronously: ${quota_err}"
+    fi
+    # Writes settle into the backing tmpfs synchronously on direct runtimes
+    # and on flush on kata; allow a short settle before measuring.
+    sleep 3
+    local host_size
+    host_size="$(wc -c < "${backing_hosts}" 2>/dev/null | tr -d '[:space:]')"
+    if ! [[ "${host_size}" =~ ^[0-9]+$ ]] || [ "${host_size}" -gt 65536 ]; then
+        fail "${label} host-side hosts size ${host_size:-missing} exceeds the 64k tmpfs budget"
+    fi
+    local hosts_size
+    hosts_size="$(sbox_cmd exec "${writable_id}" /bin/sh \
+        -c 'wc -c < /etc/hosts' | tr -d '[:space:]')"
+    if ! [[ "${hosts_size}" =~ ^[0-9]+$ ]] || \
+       { [ "${runtime}" != "kata" ] && { [ "${hosts_size}" -gt 65536 ] || [ "${hosts_size}" -le 61440 ]; }; }; then
+        fail "${label} guest-visible hosts size ${hosts_size} out of budget for ${runtime}"
+    fi
+
+    if sbox_cmd exec "${writable_id}" /bin/sh \
+        -c 'echo x >> /etc/resolv.conf' 2>/dev/null; then
+        fail "${label} resolver became writable"
+    fi
+    if sbox_cmd exec "${writable_id}" /bin/sh \
+        -c 'echo x >> /etc/hostname' 2>/dev/null; then
+        fail "${label} hostname became writable"
+    fi
+
+    local other_id
+    other_id="sbox-e2e-${label}-hosts-ro-n${WRITABLE_HOSTS_SUFFIX}"
+    WRITABLE_HOSTS_IDS+=("${other_id}")
+    sbox_cmd start \
+        --quiet \
+        --runtime "${runtime}" \
+        --sandbox-id "${other_id}" \
+        --rootfs "${rootfs}" \
+        --cwd / \
+        --cpu-millicores 100 \
+        --memory-mb 128 \
+        /bin/sleep 1800
+    wait_for_state "${other_id}" "SANDBOX_STATE_RUNNING" 300
+    if sbox_cmd exec "${other_id}" /bin/sh \
+        -c 'echo y >> /etc/hosts' 2>/dev/null; then
+        fail "${label} default hosts mount is writable"
+    fi
+    if sbox_cmd exec "${other_id}" /bin/sh \
+        -c 'grep tb4-local-service /etc/hosts' 2>/dev/null; then
+        fail "${label} hosts alias leaked into another sandbox"
+    fi
+
+    sbox_cmd delete "${writable_id}"
+    sbox_cmd delete "${other_id}"
+    sbox_cmd delete "${transport_id}"
+
+    assert_eq "${node_hosts_before}" "$(md5sum /etc/hosts)" \
+        "${label} node hosts file changed"
+    log "writable /etc/hosts checks passed on ${label}"
+}
+
+# run_writable_hosts_firecracker_rejection verifies the capability gate:
+# firecracker rejects writable-hosts starts with a clear error instead of
+# failing deep inside storage preparation.
+run_writable_hosts_firecracker_rejection() {
+    log "testing writable /etc/hosts rejection on firecracker"
+    local rootfs="$1"
+    if sbox_cmd start \
+        --quiet \
+        --runtime firecracker \
+        --sandbox-id sbox-e2e-fc-hosts-reject \
+        --rootfs "${rootfs}" \
+        --cwd / \
+        --writable-hosts \
+        --cpu-millicores 100 \
+        --memory-mb 128 \
+        /bin/sleep 300 >/tmp/fc-hosts-reject.log 2>&1; then
+        fail "firecracker accepted writable-hosts start"
+    fi
+    grep -q "writable /etc/hosts is not supported" \
+        /tmp/fc-hosts-reject.log ||
+        fail "firecracker rejection message is missing: $(cat /tmp/fc-hosts-reject.log)"
+    log "firecracker writable-hosts rejection passed"
+}
+
 run_runc_checks() {
     log "testing runc directory rootfs, KVM injection, and recovery"
     SANDBOX_ID="$(sbox_cmd start \
@@ -2354,10 +2562,22 @@ run_e2e() {
                 run_runsc_checks
                 run_runc_checks
                 ;;
-            runsc) run_runsc_checks ;;
-            runc) run_runc_checks ;;
-            kata) run_kata_checks ;;
-            firecracker) run_firecracker_checks ;;
+            runsc)
+                run_runsc_checks
+                run_writable_hosts_checks runsc runsc "${ROOTFS}"
+                ;;
+            runc)
+                run_runc_checks
+                run_writable_hosts_checks runc runc "${ROOTFS}"
+                ;;
+            kata)
+                run_kata_checks
+                run_writable_hosts_checks kata kata "${ROOTFS}"
+                ;;
+            firecracker)
+                run_firecracker_checks
+                run_writable_hosts_firecracker_rejection "${ROOTFS}"
+                ;;
         esac
         if [ "${NETWORK_SOAK}" = "1" ]; then
             run_network_soak "${E2E_RUNTIME}"
