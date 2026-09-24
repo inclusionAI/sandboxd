@@ -359,10 +359,11 @@ func TestPrepareSandboxFilesUsesRuncResolverOnlyForRunc(t *testing.T) {
 			wantFile: "nameserver 10.88.0.1\nsearch node.example\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			testService := *service
+			testConfig := service.config
 			if test.inherit {
-				testService.config.RuntimeConfig.Runc.ResolvConfPath = ""
+				testConfig.RuntimeConfig.Runc.ResolvConfPath = ""
 			}
+			testService := &sandboxService{config: testConfig, interfaceMgr: service.interfaceMgr}
 			prepared, err := testService.prepareSandboxFiles(
 				"sbox-"+strings.ReplaceAll(test.name, " ", "-"),
 				svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
