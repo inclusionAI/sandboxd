@@ -229,6 +229,11 @@ E2E_NETWORK_CIDR=172.30.252.1/22 \
 /usr/bin/tini -s -- /usr/local/bin/sandboxd-e2e-run serve
 ```
 
+The runc DNS E2E fixture binds `192.0.2.53/32` inside the test container.
+When selecting a custom `E2E_NETWORK_CIDR` for a runc or `all` run, keep that
+address outside the sandbox network range. The fixture is test-only and does
+not provide production DNS forwarding.
+
 ## Shutdown cleanup
 
 Configure an unused `[plugin.network].ip_range` whenever sandboxd shares its
