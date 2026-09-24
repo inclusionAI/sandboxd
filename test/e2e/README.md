@@ -23,7 +23,7 @@ The flow:
 7. restarts sandboxd and verifies active sandbox, network endpoint, runtime
    process, and policy recovery;
 8. verifies runsc in cgroup-disabled mode with `/sys/fs/cgroup` read-only;
-9. verifies runc's ephemeral netns/veth lifecycle and optional KVM injection;
+9. verifies runc's ephemeral netns/veth lifecycle, optional KVM injection, and resolver queries against a test-only local DNS fixture before and after sandboxd restart;
 10. verifies Kata consumes the shared TAP cache without creating a private
     `ktap` lifecycle;
 11. checkpoints the same runsc or Firecracker sandbox ten consecutive times,
@@ -228,6 +228,11 @@ E2E_DISABLE_CGROUP=1 \
 E2E_NETWORK_CIDR=172.30.252.1/22 \
 /usr/bin/tini -s -- /usr/local/bin/sandboxd-e2e-run serve
 ```
+
+The runc DNS E2E fixture binds `192.0.2.53/32` inside the test container.
+When selecting a custom `E2E_NETWORK_CIDR` for a runc or `all` run, keep that
+address outside the sandbox network range. The fixture is test-only and does
+not provide production DNS forwarding.
 
 ## Shutdown cleanup
 

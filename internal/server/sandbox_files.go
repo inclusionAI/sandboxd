@@ -25,6 +25,7 @@ import (
 	"unicode"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageconfig"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
@@ -109,6 +110,7 @@ func (h *sandboxService) prepareSandboxFiles(
 	sandboxID string,
 	defaults svc.SandboxDefaults,
 	networkIP net.IP,
+	runtimeName string,
 	aclEnabled bool,
 	mounts []*runtime.Mount,
 	imageProcess *imageProcessSpec,
@@ -177,6 +179,9 @@ func (h *sandboxService) prepareSandboxFiles(
 	}
 	if needsResolver {
 		resolver := h.config.ResolvConfPath
+		if runtimeName == config.RuntimeNameRunc && h.config.Runc.ResolvConfPath != "" {
+			resolver = h.config.Runc.ResolvConfPath
+		}
 		if resolver == "" {
 			resolver = "/etc/resolv.conf"
 		}

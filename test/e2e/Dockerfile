@@ -21,6 +21,7 @@ RUN apt-get update && \
         busybox-static \
         ca-certificates \
         curl \
+        dnsmasq-base \
         erofs-utils \
         iproute2 \
         ipset \
