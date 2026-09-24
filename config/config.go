@@ -156,6 +156,9 @@ type RuncConfig struct {
 	StateRoot  string `toml:"state_root" json:"stateRoot"`
 	ShimBinary string `toml:"shim_binary" json:"shimBinary"`
 	KVMDevice  string `toml:"kvm_device" json:"kvmDevice"`
+	// ResolvConfPath overrides the node resolver only for runc sandboxes.
+	// Empty preserves the node-wide resolver setting.
+	ResolvConfPath string `toml:"resolv_conf_path" json:"resolvConfPath"`
 }
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.

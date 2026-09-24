@@ -38,12 +38,7 @@ virtualization:
 platform = "kvm"
 ```
 
-The only accepted values are `systrap` and `kvm`; omitting the setting selects
-`systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state
-root, and optional KVM device. Kata uses `plugin.runtime.kata`. Firecracker
-uses `plugin.runtime.firecracker` and requires
-`plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted
-while the other runtimes remain usable.
+The only accepted values are `systrap` and `kvm`; omitting the setting selects `systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state root, optional KVM device, and optional `resolv_conf_path` override for runc only. An empty override inherits the node-wide resolver. Kata uses `plugin.runtime.kata`. Firecracker uses `plugin.runtime.firecracker` and requires `plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted while the other runtimes remain usable.
 
 Firecracker expects KVM at `/dev/kvm`. Its kernel must include virtio block,
 virtio net, vsock, EROFS, ext4, overlayfs, devtmpfs, and the cgroup controllers

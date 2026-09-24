@@ -14,7 +14,11 @@
 
 package config
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/pelletier/go-toml"
+)
 
 func TestDefaultConfigUsesHostResolver(t *testing.T) {
 	if got := DefaultConfig().RuntimeConfig.ResolvConfPath; got != "/etc/resolv.conf" {
@@ -28,6 +32,19 @@ func TestDefaultRuncPaths(t *testing.T) {
 		runc.ShimBinary != DefaultRuncShimBinary ||
 		runc.KVMDevice != DefaultKVMDevice {
 		t.Fatalf("unexpected runc defaults: %+v", runc)
+	}
+}
+
+func TestRuncResolverOverrideDoesNotChangeNodeResolver(t *testing.T) {
+	cfg := DefaultConfig()
+	if err := toml.Unmarshal([]byte("[plugin.runtime.runc]\nresolv_conf_path = \"/config/runc-resolv.conf\"\n"), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.RuntimeConfig.Runc.ResolvConfPath; got != "/config/runc-resolv.conf" {
+		t.Fatalf("runc resolver path = %q", got)
+	}
+	if got := cfg.RuntimeConfig.ResolvConfPath; got != "/etc/resolv.conf" {
+		t.Fatalf("node resolver path changed to %q", got)
 	}
 }
 

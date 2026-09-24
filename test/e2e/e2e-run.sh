@@ -395,6 +395,10 @@ EOF
 {"auths": {}}
 EOF
 
+    # Deliberately distinct from the node resolver: the runc sandbox must
+    # receive this file without changing the ACL DNS proxy's upstream source.
+    printf 'nameserver 192.0.2.53\nsearch runc.e2e\n' > "${CONFIG_DIR}/runc-resolv.conf"
+
     local disable_cgroup=false
     if [ "${DISABLE_CGROUP}" = "1" ]; then
         disable_cgroup=true
@@ -478,6 +482,7 @@ platform = "${RUNSC_PLATFORM}"
 [plugin.runtime.runc]
 state_root = "/run/sandboxd/runc"
 shim_binary = "/usr/local/bin/runc-shim"
+resolv_conf_path = "${CONFIG_DIR}/runc-resolv.conf"
 # The e2e host does not require hardware virtualization. /dev/null lets the
 # suite verify opt-in character-device and OCI device-cgroup injection.
 kvm_device = "/dev/null"
@@ -1727,7 +1732,7 @@ run_runc_checks() {
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${got}" "sandboxd-network-ok" "runc sandbox network"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
-    assert_eq "${got}" "$(cat /etc/resolv.conf)" "runc node resolver on an ACL-enabled node"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/runc-resolv.conf")" "runc-specific resolver on an ACL-enabled node"
     sbox_cmd exec "${SANDBOX_ID}" /bin/test -c /dev/kvm
     local tty_status=0
     printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh || tty_status=$?
@@ -1748,7 +1753,7 @@ run_runc_checks() {
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/echo recovered-runc)"
     assert_eq "${got}" "recovered-runc" "runc exec after sandboxd restart"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
-    assert_eq "${got}" "$(cat /etc/resolv.conf)" "runc node resolver after sandboxd restart"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/runc-resolv.conf")" "runc-specific resolver after sandboxd restart"
 
     local deleted_id="${SANDBOX_ID}"
     sbox_cmd delete "${deleted_id}"

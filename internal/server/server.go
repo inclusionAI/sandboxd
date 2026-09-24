@@ -1482,6 +1482,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		sandboxID,
 		defaults,
 		preparedResources.network.Ip,
+		startReq.Runtime,
 		aclEnabled,
 		preparedFilesystem.Mounts(),
 		imageProcess,
