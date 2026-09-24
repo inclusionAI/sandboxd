@@ -670,8 +670,10 @@ start_runc_dns_fixture() {
 
 assert_runc_resolver_query() {
     local got
-    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/timeout 10 \
-        /bin/nslookup -type=A "${RUNC_DNS_NAME}")" ||
+    # Bound the request at the client rather than starting a timeout process
+    # inside runc, where its signal handling can affect the sandbox init.
+    got="$(/usr/local/bin/sbox --address "${SOCKET}" --timeout 10s \
+        exec "${SANDBOX_ID}" /bin/nslookup -type=A "${RUNC_DNS_NAME}")" ||
         fail "runc resolver query failed"
     printf '%s\n' "${got}" | grep -Fq "${RUNC_DNS_ANSWER}" ||
         fail "runc resolver query did not return the fixture address: ${got}"
