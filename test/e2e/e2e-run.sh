@@ -39,6 +39,9 @@ CGROUP_ROOT="${E2E_CGROUP_ROOT:-sandboxd-e2e}"
 NETWORK_CIDR="${E2E_NETWORK_CIDR:-10.88.0.1/16}"
 GATEWAY_IP="${E2E_GATEWAY_IP:-10.88.0.1}"
 HTTP_PORT="${E2E_HTTP_PORT:-18080}"
+RUNC_DNS_IP="192.0.2.53"
+RUNC_DNS_ANSWER="192.0.2.123"
+RUNC_DNS_NAME="resolver-proof.runc.e2e."
 DNAT_HOST_PORT="${E2E_DNAT_HOST_PORT:-18181}"
 DNAT_GUEST_PORT="${E2E_DNAT_GUEST_PORT:-18180}"
 BRIDGE_NAME="${E2E_BRIDGE_NAME:-sandbox0}"
@@ -65,6 +68,8 @@ export RUNSC_IGNORE_CGROUPS="${DISABLE_CGROUP}"
 
 SANDBOXD_PID=""
 HTTPD_PID=""
+RUNC_DNS_PID=""
+RUNC_DNS_ALIAS_ADDED=0
 SANDBOX_ID=""
 STRESS_IDS=()
 CGROUP_MODE=""
@@ -150,6 +155,13 @@ cleanup() {
     if [ -n "${HTTPD_PID}" ]; then
         kill "${HTTPD_PID}" >/dev/null 2>&1
         wait "${HTTPD_PID}" >/dev/null 2>&1
+    fi
+    if [ -n "${RUNC_DNS_PID}" ]; then
+        kill "${RUNC_DNS_PID}" >/dev/null 2>&1
+        wait "${RUNC_DNS_PID}" >/dev/null 2>&1
+    fi
+    if [ "${RUNC_DNS_ALIAS_ADDED}" = "1" ]; then
+        ip address del "${RUNC_DNS_IP}/32" dev lo >/dev/null 2>&1
     fi
     if [ -n "${SANDBOXD_PID}" ]; then
         kill "${SANDBOXD_PID}" >/dev/null 2>&1
@@ -271,6 +283,9 @@ preflight() {
     for bin in sandboxd sbox checkpoint-restore ip ipset iptables ip6tables busybox mkfs.erofs; do
         command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
     done
+    if [ "${E2E_RUNTIME}" = "runc" ] || [ "${E2E_RUNTIME}" = "all" ]; then
+        command -v dnsmasq >/dev/null 2>&1 || fail "missing command: dnsmasq"
+    fi
     case "${E2E_RUNTIME}" in
         all)
             for bin in runsc runc runc-shim; do
@@ -395,9 +410,9 @@ EOF
 {"auths": {}}
 EOF
 
-    # Deliberately distinct from the node resolver: the runc sandbox must
-    # receive this file without changing the ACL DNS proxy's upstream source.
-    printf 'nameserver 192.0.2.53\nsearch runc.e2e\n' > "${CONFIG_DIR}/runc-resolv.conf"
+    # Distinct from the node resolver and backed by a local E2E-only DNS
+    # fixture so the runc test proves a lookup, not just a mount.
+    printf 'nameserver %s\nsearch runc.e2e\n' "${RUNC_DNS_IP}" > "${CONFIG_DIR}/runc-resolv.conf"
 
     local disable_cgroup=false
     if [ "${DISABLE_CGROUP}" = "1" ]; then
@@ -626,6 +641,40 @@ start_gateway_httpd() {
 
     /bin/busybox httpd -f -p "${GATEWAY_IP}:${HTTP_PORT}" -h "${WWW_ROOT}" &
     HTTPD_PID=$!
+}
+
+start_runc_dns_fixture() {
+    log "starting isolated runc DNS fixture"
+    ip address add "${RUNC_DNS_IP}/32" dev lo
+    RUNC_DNS_ALIAS_ADDED=1
+    dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts \
+        --bind-interfaces --listen-address="${RUNC_DNS_IP}" --port=53 \
+        --host-record="${RUNC_DNS_NAME%.},${RUNC_DNS_ANSWER}" \
+        --pid-file= >/tmp/sandboxd-runc-dns.log 2>&1 &
+    RUNC_DNS_PID=$!
+    local attempt
+    for attempt in $(seq 1 30); do
+        if ! kill -0 "${RUNC_DNS_PID}" >/dev/null 2>&1; then
+            cat /tmp/sandboxd-runc-dns.log >&2
+            fail "runc DNS fixture exited during startup"
+        fi
+        if /bin/timeout 2 /bin/busybox nslookup -type=A "${RUNC_DNS_NAME}" "${RUNC_DNS_IP}" \
+            2>/dev/null | grep -Fq "${RUNC_DNS_ANSWER}"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    cat /tmp/sandboxd-runc-dns.log >&2
+    fail "runc DNS fixture did not answer during readiness checks"
+}
+
+assert_runc_resolver_query() {
+    local got
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/timeout 10 \
+        /bin/nslookup -type=A "${RUNC_DNS_NAME}")" ||
+        fail "runc resolver query failed"
+    printf '%s\n' "${got}" | grep -Fq "${RUNC_DNS_ANSWER}" ||
+        fail "runc resolver query did not return the fixture address: ${got}"
 }
 
 sbox_cmd() {
@@ -1733,6 +1782,7 @@ run_runc_checks() {
     assert_eq "${got}" "sandboxd-network-ok" "runc sandbox network"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
     assert_eq "${got}" "$(cat "${CONFIG_DIR}/runc-resolv.conf")" "runc-specific resolver on an ACL-enabled node"
+    assert_runc_resolver_query
     sbox_cmd exec "${SANDBOX_ID}" /bin/test -c /dev/kvm
     local tty_status=0
     printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh || tty_status=$?
@@ -1754,6 +1804,7 @@ run_runc_checks() {
     assert_eq "${got}" "recovered-runc" "runc exec after sandboxd restart"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
     assert_eq "${got}" "$(cat "${CONFIG_DIR}/runc-resolv.conf")" "runc-specific resolver after sandboxd restart"
+    assert_runc_resolver_query
 
     local deleted_id="${SANDBOX_ID}"
     sbox_cmd delete "${deleted_id}"
@@ -2357,10 +2408,14 @@ run_e2e() {
         case "${E2E_RUNTIME}" in
             all)
                 run_runsc_checks
+                start_runc_dns_fixture
                 run_runc_checks
                 ;;
             runsc) run_runsc_checks ;;
-            runc) run_runc_checks ;;
+            runc)
+                start_runc_dns_fixture
+                run_runc_checks
+                ;;
             kata) run_kata_checks ;;
             firecracker) run_firecracker_checks ;;
         esac

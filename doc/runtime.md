@@ -38,7 +38,13 @@ virtualization:
 platform = "kvm"
 ```
 
-The only accepted values are `systrap` and `kvm`; omitting the setting selects `systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state root, optional KVM device, and optional `resolv_conf_path` override for runc only. An empty override inherits the node-wide resolver. Kata uses `plugin.runtime.kata`. Firecracker uses `plugin.runtime.firecracker` and requires `plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted while the other runtimes remain usable.
+The only accepted values are `systrap` and `kvm`; omitting the setting selects `systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state root, optional KVM device, and resolver source. Kata uses `plugin.runtime.kata`. Firecracker uses `plugin.runtime.firecracker` and requires `plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted while the other runtimes remain usable.
+
+### Runc resolver source
+
+`plugin.runtime.runc.resolv_conf_path` optionally selects the resolver file for runc sandboxes only. An empty value inherits `plugin.runtime.resolv_conf_path`, which defaults to `/etc/resolv.conf`. The source path is resolved in the sandboxd process's filesystem at sandbox creation, must identify a regular file, and is bind-mounted read-only as the sandbox's `/etc/resolv.conf`. If a runtime-provided mount or an explicit sandbox mount already owns that destination or a parent such as `/etc`, sandboxd does not add its resolver mount. The runc override does not change the resolver source used by other runtimes or the managed DNS proxy's upstream configuration.
+
+Runc uses a separate network namespace. Configure nameservers that the runc sandbox can actually reach from that namespace; selecting a file does not provide DNS forwarding. In particular, a node-local loopback resolver or Docker's embedded `127.0.0.11` must not be assumed reachable, and this option does not recreate Docker container-name resolution. A flat resolver file also cannot represent systemd-resolved's per-link split-DNS routing; operators using split DNS must validate a suitable resolver path and connectivity for their deployment. This setting is not a live-update mechanism: changes to its configuration or source file are not guaranteed to update existing sandboxes. Recreate a sandbox to apply a changed resolver deterministically.
 
 Firecracker expects KVM at `/dev/kvm`. Its kernel must include virtio block,
 virtio net, vsock, EROFS, ext4, overlayfs, devtmpfs, and the cgroup controllers

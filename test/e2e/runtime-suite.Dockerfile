@@ -47,6 +47,7 @@ RUN apt-get update && \
         ca-certificates \
         cpio \
         curl \
+        dnsmasq-base \
         e2fsprogs \
         erofs-utils \
         gzip \

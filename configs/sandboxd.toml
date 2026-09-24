@@ -87,6 +87,12 @@ runsc = ""
 #state_root = "/run/sandboxd/runc"
 #shim_binary = "/usr/local/bin/runc-shim"
 #kvm_device = "/dev/kvm"
+# Optional resolver file visible to sandboxd, bind-mounted read-only into runc
+# sandboxes. Its nameservers must be reachable from each runc network namespace.
+# An empty value inherits plugin.runtime.resolv_conf_path (/etc/resolv.conf by
+# default). This option does not by itself provide Docker container-name or
+# systemd-resolved split-DNS routing.
+#resolv_conf_path = "/etc/sandboxd/runc-resolv.conf"
 
 # Firecracker is optional and is registered only when its runtime binary and
 # immutable boot artifacts validate. Its private sparse ext4 writable images

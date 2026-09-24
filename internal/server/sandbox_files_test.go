@@ -348,16 +348,22 @@ func TestPrepareSandboxFilesUsesRuncResolverOnlyForRunc(t *testing.T) {
 		name       string
 		runtime    string
 		aclEnabled bool
+		inherit    bool
 		wantSource string
 		wantFile   string
 	}{
 		{name: "runc", runtime: config.RuntimeNameRunc, wantSource: runcResolver},
+		{name: "runc inherits node resolver", runtime: config.RuntimeNameRunc, inherit: true, wantSource: nodeResolver},
 		{name: "runsc without ACL", runtime: config.RuntimeNameRunsc, wantSource: nodeResolver},
 		{name: "runsc with ACL", runtime: config.RuntimeNameRunsc, aclEnabled: true,
 			wantFile: "nameserver 10.88.0.1\nsearch node.example\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			prepared, err := service.prepareSandboxFiles(
+			testService := *service
+			if test.inherit {
+				testService.config.RuntimeConfig.Runc.ResolvConfPath = ""
+			}
+			prepared, err := testService.prepareSandboxFiles(
 				"sbox-"+strings.ReplaceAll(test.name, " ", "-"),
 				svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
 				net.ParseIP("10.88.0.2"),

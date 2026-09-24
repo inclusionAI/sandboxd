@@ -23,7 +23,7 @@ The flow:
 7. restarts sandboxd and verifies active sandbox, network endpoint, runtime
    process, and policy recovery;
 8. verifies runsc in cgroup-disabled mode with `/sys/fs/cgroup` read-only;
-9. verifies runc's ephemeral netns/veth lifecycle and optional KVM injection;
+9. verifies runc's ephemeral netns/veth lifecycle, optional KVM injection, and resolver queries against a test-only local DNS fixture before and after sandboxd restart;
 10. verifies Kata consumes the shared TAP cache without creating a private
     `ktap` lifecycle;
 11. checkpoints the same runsc or Firecracker sandbox ten consecutive times,
