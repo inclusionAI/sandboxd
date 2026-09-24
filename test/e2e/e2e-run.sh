@@ -285,6 +285,7 @@ preflight() {
     done
     if [ "${E2E_RUNTIME}" = "runc" ] || [ "${E2E_RUNTIME}" = "all" ]; then
         command -v dnsmasq >/dev/null 2>&1 || fail "missing command: dnsmasq"
+        command -v timeout >/dev/null 2>&1 || fail "missing command: timeout"
     fi
     case "${E2E_RUNTIME}" in
         all)
@@ -670,11 +671,11 @@ start_runc_dns_fixture() {
 
 assert_runc_resolver_query() {
     local got
-    # Bound the request at the client rather than starting a timeout process
-    # inside runc, where its signal handling can affect the sandbox init.
-    got="$(/usr/local/bin/sbox --address "${SOCKET}" --timeout 10s \
+    # Bound the host-side exec process without leaving a timeout watchdog
+    # inside the runc sandbox.
+    got="$(timeout -k 2s 10s /usr/local/bin/sbox --address "${SOCKET}" --timeout 10s \
         exec "${SANDBOX_ID}" /bin/nslookup -type=A "${RUNC_DNS_NAME}")" ||
-        fail "runc resolver query failed"
+        fail "runc resolver query failed or timed out"
     printf '%s\n' "${got}" | grep -Fq "${RUNC_DNS_ANSWER}" ||
         fail "runc resolver query did not return the fixture address: ${got}"
 }
