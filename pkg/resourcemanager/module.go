@@ -53,6 +53,8 @@ type Module struct {
 	ephemeralStorageAvailable uint64
 	ephemeralStorageReady     bool
 	transientMemory           map[string]int64
+	utilization               Utilization
+	utilizationSource         utilizationSource
 
 	lastRefresh atomic.Int64 // unix-nano of most recent successful refresh
 	listener    net.Listener
@@ -67,11 +69,12 @@ type Module struct {
 // resourceInfo is the JSON payload served by the /resource endpoint. CPU is
 // reported in scheduler cores, while memory and writable storage use bytes.
 type resourceInfo struct {
-	Cpu      int64                 `json:"cpu"`
-	Mem      int64                 `json:"mem"`
-	Xpu      []xpumanager.Resource `json:"xpu"`
-	Storage  *uint64               `json:"storage,omitempty"`
-	Features []string              `json:"features"`
+	Cpu         int64                 `json:"cpu"`
+	Mem         int64                 `json:"mem"`
+	Xpu         []xpumanager.Resource `json:"xpu"`
+	Storage     *uint64               `json:"storage,omitempty"`
+	Features    []string              `json:"features"`
+	Utilization Utilization           `json:"utilization"`
 }
 
 type xpuProvider interface {
@@ -80,6 +83,12 @@ type xpuProvider interface {
 
 type ephemeralStorageProvider interface {
 	EphemeralStorageCapacity() (capacityBytes, allocatableBytes uint64, err error)
+}
+
+// Snapshot providers return physical occupancy alongside logical storage from
+// one filesystem read. Capacity-only providers remain supported with disk=null.
+type ephemeralStorageSnapshotProvider interface {
+	EphemeralStorageSnapshot() (capacityBytes, allocatableBytes uint64, utilization *float64, err error)
 }
 
 const storageQuotaFeature = "storage-quota-v1"
@@ -93,10 +102,11 @@ func NewModule(sockPath, provider string) (*Module, error) {
 	}
 
 	m := &Module{
-		nodeResource:    nrm,
-		sockPath:        sockPath,
-		stopCh:          make(chan struct{}),
-		transientMemory: make(map[string]int64),
+		nodeResource:      nrm,
+		utilizationSource: newUtilizationSampler(""),
+		sockPath:          sockPath,
+		stopCh:            make(chan struct{}),
+		transientMemory:   make(map[string]int64),
 	}
 
 	// OTLP metrics push is best-effort: a missing collector at startup must
@@ -113,6 +123,12 @@ func NewModule(sockPath, provider string) (*Module, error) {
 	}
 
 	return m, nil
+}
+
+// SetSandboxCgroupRoot includes the managed sandbox root in utilization
+// sampling. Call before Start; an empty root samples only the daemon hierarchy.
+func (m *Module) SetSandboxCgroupRoot(root string) {
+	m.utilizationSource = newUtilizationSampler(root)
 }
 
 // SetSandboxMetricsSource connects the node metrics collector to sandbox
@@ -174,10 +190,11 @@ func (m *Module) Start() error {
 	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.RLock()
 		info := resourceInfo{
-			Cpu:      m.availCpu,
-			Mem:      availableAfterTransientReservations(m.availMem, m.transientMemory),
-			Xpu:      []xpumanager.Resource{},
-			Features: []string{},
+			Cpu:         m.availCpu,
+			Mem:         availableAfterTransientReservations(m.availMem, m.transientMemory),
+			Xpu:         []xpumanager.Resource{},
+			Features:    []string{},
+			Utilization: m.utilization,
 		}
 		if m.xpu != nil {
 			info.Xpu = m.xpu.Resources()
@@ -327,6 +344,8 @@ func (m *Module) refreshLoop() {
 }
 
 func (m *Module) refreshOnce() {
+	m.refreshUtilization()
+	m.refreshEphemeralStorage()
 	cpu, mem, err := m.nodeResource.GetAvailableResource()
 	if err != nil {
 		logrus.Errorf("resourcemanager: refresh failed: %v", err)
@@ -341,7 +360,17 @@ func (m *Module) refreshOnce() {
 	m.mu.Unlock()
 	m.lastRefresh.Store(time.Now().UnixNano())
 	logrus.Debugf("resourcemanager: avail cpu=%d cores mem=%d bytes", cpu, mem)
-	m.refreshEphemeralStorage()
+}
+
+func (m *Module) refreshUtilization() {
+	if m.utilizationSource == nil {
+		return
+	}
+	observation := m.utilizationSource.Sample()
+	m.mu.Lock()
+	observation.Disk = m.utilization.Disk
+	m.utilization = observation
+	m.mu.Unlock()
 }
 
 func (m *Module) refreshEphemeralStorage() {
@@ -349,14 +378,27 @@ func (m *Module) refreshEphemeralStorage() {
 	provider := m.ephemeralStorage
 	m.mu.RUnlock()
 	if provider == nil {
+		m.mu.Lock()
+		m.utilization.Disk = nil
+		m.mu.Unlock()
 		return
 	}
-	capacity, allocatable, err := provider.EphemeralStorageCapacity()
+	var capacity, allocatable uint64
+	var disk *float64
+	var err error
+	if snapshot, ok := provider.(ephemeralStorageSnapshotProvider); ok {
+		capacity, allocatable, disk, err = snapshot.EphemeralStorageSnapshot()
+	} else {
+		capacity, allocatable, err = provider.EphemeralStorageCapacity()
+	}
+	m.mu.Lock()
 	if err != nil {
+		m.utilization.Disk = nil
+		m.mu.Unlock()
 		logrus.Errorf("resourcemanager: ephemeral storage refresh failed: %v", err)
 		return
 	}
-	m.mu.Lock()
+	m.utilization.Disk = disk
 	m.ephemeralStorageCapacity = capacity
 	m.ephemeralStorageAvailable = allocatable
 	m.ephemeralStorageReady = true

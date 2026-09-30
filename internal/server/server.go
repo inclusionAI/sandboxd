@@ -713,6 +713,13 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		if merr != nil {
 			return nil, fmt.Errorf("node-resource module init: %w", merr)
 		}
+		if !cfg.DisableCgroup && cfg.CgroupCacheSize > 0 {
+			root := cfg.CgroupRootName
+			if root == "" {
+				root = config.DefaultCgroupRoot
+			}
+			mod.SetSandboxCgroupRoot(root)
+		}
 		mod.SetXPUProvider(xpuMgr)
 		if serr := mod.Start(); serr != nil {
 			// NewModule already started the OTel collector's periodic-reader
