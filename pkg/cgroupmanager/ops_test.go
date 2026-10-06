@@ -585,6 +585,40 @@ func TestV2OOMWatcherUsesCgroupBaseline(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestV2OOMEventAndStaleLease(t *testing.T) {
+	mountpoint := t.TempDir()
+	name := "/sandbox/lease"
+	group := filepath.Join(mountpoint, name)
+	require.NoError(t, os.MkdirAll(group, 0755))
+	writeTestFile(t, filepath.Join(group, "memory.events"), "oom_kill 0\n")
+	writeTestFile(t, filepath.Join(group, "cgroup.events"), "populated 1\n")
+	w, err := newV2OOMWatcher(mountpoint)
+	require.NoError(t, err)
+	defer w.Close()
+	require.NoError(t, w.Add(name))
+	event, err := w.OOMEvent(name)
+	require.NoError(t, err)
+	writeTestFile(t, filepath.Join(group, "memory.events"), "oom_kill 1\n")
+	select {
+	case <-event:
+	case <-time.After(time.Second):
+		t.Fatal("OOM event waited for empty cgroup")
+	}
+	calls := 0
+	require.NoError(t, w.killOnOOM(name, event, func() error { calls++; return nil }))
+	require.NoError(t, w.Reset(name))
+	fresh, err := w.OOMEvent(name)
+	require.NoError(t, err)
+	assert.NotEqual(t, event, fresh)
+	assert.Error(t, w.killOnOOM(name, event, func() error { calls++; return nil }))
+	assert.Equal(t, 1, calls, "old monitor must not kill reused cgroup")
+	select {
+	case <-fresh:
+		t.Fatal("new lease inherited old OOM")
+	default:
+	}
+}
+
 func TestV2OOMWatcherWaitsForFinalMemoryEvent(t *testing.T) {
 	mountpoint := t.TempDir()
 	name := "/sandbox/lease"
@@ -637,6 +671,27 @@ func TestV1OOMWatcherMultiplexesEventFDs(t *testing.T) {
 	watcher.Remove("/sandbox/b")
 	_, err = watcher.OOMKilled("/sandbox/b")
 	assert.Error(t, err)
+}
+
+func TestV1OOMEventAndStaleLease(t *testing.T) {
+	w, err := newV1OOMWatcher()
+	require.NoError(t, err)
+	defer w.Close()
+	fd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	require.NoError(t, err)
+	const name = "/sandbox/lease"
+	require.NoError(t, w.addFD(name, fd))
+	event, err := w.OOMEvent(name)
+	require.NoError(t, err)
+	wakeEventFD(fd)
+	select {
+	case <-event:
+	case <-time.After(time.Second):
+		t.Fatal("v1 OOM event was not delivered")
+	}
+	require.NoError(t, w.Reset(name))
+	err = w.killOnOOM(name, event, func() error { t.Fatal("old v1 lease was killed"); return nil })
+	require.ErrorIs(t, err, ErrStaleOOMLease)
 }
 
 func TestV1OOMKilledDrainsPendingEventFD(t *testing.T) {

@@ -15,6 +15,7 @@
 package cgroupmanager
 
 import (
+	"errors"
 	"fmt"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
@@ -44,6 +45,46 @@ func (c *CgroupManager) OOMKilled(name string) (bool, error) {
 		return false, fmt.Errorf("cgroup %s is not an active child of %s", name, c.rootName)
 	}
 	return c.oom.OOMKilled(name)
+}
+
+type oomLeaseWatcher interface {
+	OOMEvent(string) (<-chan struct{}, error)
+	killOnOOM(string, <-chan struct{}, func() error) error
+}
+
+// ErrStaleOOMLease means the notification belongs to a released/reused lease.
+var ErrStaleOOMLease = errors.New("stale cgroup OOM lease")
+
+// OOMEvent closes on the first OOM of this lease, independently of runtime
+// exit. Cached cgroups receive a fresh event channel when reset.
+func (c *CgroupManager) OOMEvent(name string) (<-chan struct{}, error) {
+	if !belongsToRoot(name, c.rootName) || !c.usingID.Has(name) {
+		return nil, fmt.Errorf("cgroup %s is not active", name)
+	}
+	w, ok := c.oom.(oomLeaseWatcher)
+	if !ok {
+		return nil, fmt.Errorf("cgroup OOM notifications unavailable")
+	}
+	return w.OOMEvent(name)
+}
+
+// KillOnOOM drains a failed sandbox while holding its OOM lease against reset.
+// Delayed notifications cannot kill a reused cached cgroup.
+func (c *CgroupManager) KillOnOOM(name string, event <-chan struct{}) error {
+	w, ok := c.oom.(oomLeaseWatcher)
+	if !ok {
+		return fmt.Errorf("cgroup OOM notifications unavailable")
+	}
+	return w.killOnOOM(name, event, func() error { return c.Kill(name) })
+}
+
+// Kill drains only an allocated child. It does not release the lease; runtime
+// cleanup must succeed before resource accounting can be recycled.
+func (c *CgroupManager) Kill(name string) error {
+	if !belongsToRoot(name, c.rootName) || !c.cgroups.Has(name) || !c.usingID.Has(name) {
+		return fmt.Errorf("cgroup %s is not an active child of %s", name, c.rootName)
+	}
+	return c.ops.kill(name)
 }
 
 // Stats loads normalized accounting for a sandbox path or the logical root

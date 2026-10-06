@@ -53,8 +53,8 @@ type Manager struct {
 	// implementation. Handlers are loaded before Manager is constructed.
 	serviceHandler cmap.ConcurrentMap[string, svc.Handler]
 
-	// cgroupMgr is used only to consume the manager-level OOM flag. The server
-	// owns resource allocation/release and manager shutdown.
+	// cgroupMgr observes OOM and terminates the failed lease's tasks. The
+	// server owns resource allocation/release and manager shutdown.
 	cgroupMgr *cgroupmanager.CgroupManager
 
 	monitorStopChan cmap.ConcurrentMap[string, chan struct{}]
@@ -486,17 +486,24 @@ func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan st
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cgroupName := m.oomCgroupName(metaData.ID)
+	var oomEvent <-chan struct{}
+	if m.cgroupMgr != nil && cgroupName != "" {
+		var err error
+		oomEvent, err = m.cgroupMgr.OOMEvent(cgroupName)
+		if err != nil {
+			logrus.Warnf("subscribe OOM for %s: %v", metaData.ID, err)
+		}
+	}
 
 	// Collect exit information asynchronously. The kernel OOM subscription
 	// follows the cached cgroup lifetime inside CgroupManager.
 	go func() {
-		exit, err := handler.Wait(ctx, metaData.ID)
+		exit, err, oom := m.waitRuntimeOrOOM(ctx, metaData.ID, cgroupName, oomEvent, handler)
 		// If context was cancelled (monitor stopped), don't send exit event.
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, cgroupmanager.ErrStaleOOMLease) {
 			return
 		}
 
-		oom := m.oomKilled(metaData.ID, cgroupName)
 		logrus.Infof("wait sandbox %s finished, err: %v, exit: %+v, oom: %v",
 			metaData.ID, err, exit, oom)
 
@@ -523,6 +530,44 @@ func (m *Manager) __startMonitor(metaData *runtime.SandboxMetadata, stop chan st
 
 	<-stop
 	logrus.Infof("stop monitor sandbox %s", metaData.ID)
+}
+
+// A cgroup OOM can kill a systrap worker while runtime Wait stays blocked.
+// Observe that failure directly and drain the rest of the sandbox.
+func (m *Manager) waitRuntimeOrOOM(ctx context.Context, id, cgroupName string, oomEvent <-chan struct{}, handler svc.Handler) (svc.Exit, error, bool) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		exit svc.Exit
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() { exit, err := handler.Wait(ctx, id); done <- result{exit, err} }()
+	finishOOM := func() (svc.Exit, error, bool) {
+		cancel()
+		if m.cgroupMgr != nil {
+			if err := m.cgroupMgr.KillOnOOM(cgroupName, oomEvent); err != nil {
+				if errors.Is(err, cgroupmanager.ErrStaleOOMLease) {
+					return svc.Exit{}, err, false
+				}
+				logrus.Errorf("drain OOM sandbox %s: %v", id, err)
+			}
+		}
+		return svc.Exit{ExitCode: 137, ExitedAt: time.Now()}, nil, true
+	}
+	select {
+	case <-ctx.Done():
+		return svc.Exit{}, ctx.Err(), false
+	case r := <-done:
+		// Wait and the kernel notification can become ready together. The
+		// OOM path must drain survivors whichever select case wins.
+		if m.oomKilled(id, cgroupName) {
+			return finishOOM()
+		}
+		return r.exit, r.err, false
+	case <-oomEvent:
+		return finishOOM()
+	}
 }
 
 // oomCgroupName resolves the cgroup before waiting so a concurrent Delete may

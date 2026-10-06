@@ -367,6 +367,43 @@ func TestStartMonitorGoroutine(t *testing.T) {
 
 }
 
+type stuckWaitHandler struct {
+	*svc.FakeRuntimeHandler
+	started chan struct{}
+	release chan struct{}
+}
+
+func (h *stuckWaitHandler) Wait(ctx context.Context, _ string) (svc.Exit, error) {
+	close(h.started)
+	select {
+	case <-h.release:
+		return svc.Exit{ExitCode: 0}, nil
+	case <-ctx.Done():
+		return svc.Exit{}, ctx.Err()
+	}
+}
+
+func TestOOMDoesNotWaitForRuntimeExit(t *testing.T) {
+	handler := &stuckWaitHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler(), started: make(chan struct{}), release: make(chan struct{})}
+	event := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		exit, err, oom := (&Manager{}).waitRuntimeOrOOM(context.Background(), "sbox-partial-oom", "", event, handler)
+		assert.NoError(t, err)
+		assert.True(t, oom)
+		assert.Equal(t, 137, exit.ExitCode)
+	}()
+	<-handler.started
+	close(event)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		close(handler.release)
+		t.Fatal("OOM reporting waited for the runtime to exit")
+	}
+}
+
 func TestHousekeeping(t *testing.T) {
 	healthChan := make(chan bool)
 

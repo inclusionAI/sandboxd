@@ -56,6 +56,12 @@ configuration shows all overrides. The default VM size is one vCPU and
 512 MiB when the request does not supply resources. Requested CPU is rounded
 up to a vCPU count, and guest memory must be at least 128 MiB.
 
+## OOM and failed deletion
+
+A host cgroup OOM makes the entire sandbox terminal (`OOMKilled=true`, exit code 137), even when the kernel kills only a worker and the runtime's init process remains alive. Sandboxd consumes the kernel OOM notification independently of runtime Wait and drains the remaining tasks in that sandbox's allocated cgroup. The OOM lease is guarded against reset so an old notification cannot terminate a later user of the cached cgroup. Cgroup-disabled sandboxes have no host OOM notification; guest-only OOMs remain runtime-owned.
+
+Delete calls for one sandbox share cleanup independently of caller cancellation. Each runtime deletion attempt has a 30-second deadline. If that deadline expires and an allocated cgroup is available, sandboxd drains only that child's processes and retries runtime deletion once with a fresh 30-second deadline. Runsc command output draining is also bounded. Cleanup errors remain visible and retryable: sandbox metadata, filesystem ownership, and resource accounting are released only after the runtime deletion succeeds. This does not guarantee that uninterruptible kernel tasks can be removed; failure must never be reported as successful cleanup.
+
 ## Pooled TAP lifecycle
 
 Runsc, Kata, and Firecracker consume the same interface cache. Each cache entry

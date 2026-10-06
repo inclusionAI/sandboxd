@@ -2166,6 +2166,28 @@ run_firecracker_checks() {
     run_stress_checks firecracker "${rootfs}"
 }
 
+run_partial_oom_check() {
+    log "testing OOM of one host task while sandbox init remains alive"
+    SANDBOX_ID="$(sbox_cmd start --quiet --runtime runsc \
+        --sandbox-id sbox-e2e-partial-oom --rootfs "${ROOTFS}" \
+        --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
+    local child
+    child="$(wait_for_cgroup_child)"
+    # Model the production failure: one high-score host worker is OOM-killed,
+    # not the guest init. Runtime Wait alone cannot observe that failure.
+    /bin/sh -c 'echo 1000 > /proc/self/oom_score_adj; echo $$ > "$1/cgroup.procs"; exec /usr/local/bin/oom-hog' sh "${child}" &
+    local hog_pid=$!
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED"
+    wait "${hog_pid}" || true
+    assert_wait_log "${SANDBOX_ID}" true
+    wait_for_exit_code_log "${SANDBOX_ID}" 137
+    if [ "${CGROUP_MODE}" = v2 ]; then
+        grep -q '^populated 0$' "${child}/cgroup.events" || fail "OOM left host tasks alive"
+    fi
+    timeout 15 sbox --address "${SOCKET}" delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+}
+
 run_runsc_checks() {
     log "starting sandbox"
     SANDBOX_ID="$(sbox_cmd start \
@@ -2223,6 +2245,8 @@ run_runsc_checks() {
     run_checkpoint_restore_check runsc "${ROOTFS}"
     run_host_mount_rw_check runsc "${ROOTFS}" "runsc-${RUNSC_PLATFORM}"
     run_storage_quota_check
+
+    run_partial_oom_check
 
     log "starting immediate OOM sandbox"
     SANDBOX_ID="$(sbox_cmd start \
