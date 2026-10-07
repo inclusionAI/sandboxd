@@ -101,6 +101,15 @@ type RuntimeConfig struct {
 	// only when runtime_binary contains a "firecracker" entry.
 	Firecracker FirecrackerConfig `toml:"firecracker" json:"firecracker"`
 
+	// FirecrackerPVM configures the optional Firecracker microVM runtime for
+	// the kvm-pvm backend. It shares the FirecrackerConfig structure because
+	// the VMM binary and device model are identical; the section exists so a
+	// PVM node can pin different guest boot artifacts (PVM guest kernel and
+	// initrd) without affecting hardware-KVM nodes. It is loaded only when
+	// runtime_binary contains a "firecracker-pvm" entry, and the handler
+	// refuses to start unless the kvm-pvm module is behind /dev/kvm.
+	FirecrackerPVM FirecrackerConfig `toml:"firecracker_pvm" json:"firecrackerPVM"`
+
 	// BasicSpec is the basic spec file for different runtime type.
 	BasicSpec map[string]string `toml:"basic_spec" json:"basicSpec"`
 

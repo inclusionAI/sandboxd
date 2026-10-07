@@ -165,7 +165,7 @@ cleanup() {
         log "checkpoint runtime stderr tail"
         tail -200 /var/log/sandboxd/checkpoint-runtime.stderr >&2
     fi
-    if [ "${status}" -ne 0 ] && [ "${E2E_RUNTIME}" = "firecracker" ]; then
+    if [ "${status}" -ne 0 ] && { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; }; then
         local firecracker_log
         for firecracker_log in \
             /tmp/firecracker-main.stdout \
@@ -204,8 +204,8 @@ preflight() {
     [[ "${REDIS_BENCHMARK_REQUESTS}" =~ ^[1-9][0-9]*$ ]] || fail "E2E_REDIS_BENCHMARK_REQUESTS must be positive"
     [[ "${CPU_LIMIT_MODE}" =~ ^(shares|quota)$ ]] || fail "E2E_CPU_LIMIT_MODE must be shares or quota"
     case "${E2E_RUNTIME}" in
-        all|runsc|runc|kata|firecracker) ;;
-        *) fail "E2E_RUNTIME must be all, runsc, runc, kata, or firecracker" ;;
+        all|runsc|runc|kata|firecracker|firecracker-pvm) ;;
+        *) fail "E2E_RUNTIME must be all, runsc, runc, kata, firecracker, or firecracker-pvm" ;;
     esac
     [[ "${RUNSC_PLATFORM}" =~ ^(systrap|kvm)$ ]] || fail "E2E_RUNSC_PLATFORM must be systrap or kvm"
     case "${E2E_RUNC_ONLY}" in
@@ -224,15 +224,16 @@ preflight() {
     if [ "${E2E_RUNTIME}" = "kata" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
         fail "Kata e2e requires sandbox-managed cgroups"
     fi
-    if [ "${E2E_RUNTIME}" = "firecracker" ] && [ "${DISABLE_CGROUP}" = "1" ]; then
+    if { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; } && [ "${DISABLE_CGROUP}" = "1" ]; then
         fail "Firecracker e2e requires sandbox-managed cgroups"
     fi
     if [ "${FIRECRACKER_VIRTIOFS}" = "1" ] &&
-        [ "${E2E_RUNTIME}" != "firecracker" ]; then
-        fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker"
+        [ "${E2E_RUNTIME}" != "firecracker" ] &&
+        [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; then
+        fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker or firecracker-pvm"
     fi
     if [ -n "${STRESS_ROOTFS}" ]; then
-        [ "${E2E_RUNTIME}" = "firecracker" ] &&
+        { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; } &&
             [ "${FIRECRACKER_VIRTIOFS}" = "1" ] ||
             fail "E2E_STRESS_ROOTFS requires Firecracker virtio-fs"
         [ -x "${STRESS_ROOTFS}/bin/sh" ] ||
@@ -245,13 +246,13 @@ preflight() {
             fail "E2E_STRESS_ROOTFS lacks /stress-data/small"
     fi
     if [ "${STRESS_CHECKPOINT}" = "1" ] && {
-        [ "${E2E_RUNTIME}" != "firecracker" ] ||
+        { [ "${E2E_RUNTIME}" != "firecracker" ] && [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; } ||
             [ "${FIRECRACKER_VIRTIOFS}" != "1" ];
     }; then
         fail "E2E_STRESS_CHECKPOINT requires Firecracker virtio-fs"
     fi
     if [ "${STRESS_ONLY}" = "1" ] && {
-        [ "${E2E_RUNTIME}" != "firecracker" ] ||
+        { [ "${E2E_RUNTIME}" != "firecracker" ] && [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; } ||
             [ "${FIRECRACKER_VIRTIOFS}" != "1" ] ||
             [ "${STRESS_ROUNDS}" = "0" ];
     }; then
@@ -427,8 +428,8 @@ EOF
         kata)
             runtime_binaries='kata = "/usr/local/bin/containerd-shim-kata-v2"'
             ;;
-        firecracker)
-            runtime_binaries='firecracker = "/usr/local/bin/firecracker"'
+        firecracker|firecracker-pvm)
+            runtime_binaries="${E2E_RUNTIME} = \"/usr/local/bin/firecracker\""
             node_resource_config=$'[plugin.node_resource]\nprovider = "cgroup"\nsock_path = "/run/sandboxd/resource.sock"'
             ;;
     esac
@@ -499,11 +500,23 @@ default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
 ${e2e_fc_virtiofs_cfg}
 ${e2e_fc_checkpoint_mode_cfg}
 
+[plugin.runtime.firecracker_pvm]
+kernel_image_path = "${FIRECRACKER_KERNEL}"
+initrd_path = "${FIRECRACKER_INITRD}"
+kernel_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init random.trust_cpu=on"
+kvm_device = "/dev/kvm"
+default_vcpu_count = 1
+default_memory_mib = 256
+default_overlay_size_bytes = ${FIRECRACKER_OVERLAY_BYTES}
+${e2e_fc_virtiofs_cfg}
+${e2e_fc_checkpoint_mode_cfg}
+
 [plugin.runtime.basic_spec]
 runsc = ""
 runc = ""
 kata = ""
 firecracker = ""
+firecracker-pvm = ""
 
 [plugin.runtime.runtime_binary]
 ${runtime_binaries}
@@ -807,7 +820,7 @@ run_checkpoint_restore_check() {
 	local memory_mb=128
 	local extra_config_args=()
 	local checkpoint_mount_args=()
-	if [ "${runtime}" = "firecracker" ]; then
+	if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; then
 		memory_mb=256
 		extra_config_args=(
 			--extra-config
@@ -838,7 +851,7 @@ run_checkpoint_restore_check() {
 		"${checkpoint_mount_args[@]}")"
     assert_eq "${SANDBOX_ID}" "${source_id}" "${suffix} checkpoint source ID"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
-    if [ "${runtime}" = "firecracker" ] &&
+    if { [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; } &&
         [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
         local mounted
         mounted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /mnt/host/input.txt)"
@@ -853,7 +866,7 @@ run_checkpoint_restore_check() {
     fi
     sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo checkpoint-state-ok > /var/checkpoint-persist'
-    if [ "${runtime}" = "firecracker" ]; then
+    if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; then
         local native_fstype
         native_fstype="$(sbox_cmd exec "${SANDBOX_ID}" /bin/awk \
             '$2 == "/var/lib/native-checkpoint" { print $3 }' /proc/mounts)"
@@ -904,7 +917,7 @@ run_checkpoint_restore_check() {
             [ ! -s "${checkpoint_dir}/manifest.json" ]; then
             fail "${suffix} checkpoint ${checkpoint_index} artifact is missing or empty"
         fi
-        if [ "${runtime}" = "firecracker" ] &&
+        if { [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; } &&
             [ -s "${checkpoint_dir}/manifest.json" ]; then
             # Default (checkpoint_mode=full) keeps every generation Full;
             # the incremental case starts with a Full baseline and then
@@ -971,7 +984,7 @@ run_checkpoint_restore_check() {
     local persisted
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" "${suffix} restored writable state"
-    if [ "${runtime}" = "firecracker" ] &&
+    if { [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; } &&
         [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
         local restored_mount
         restored_mount="$(sbox_cmd exec "${SANDBOX_ID}" \
@@ -985,7 +998,7 @@ run_checkpoint_restore_check() {
             fail "${suffix} restored virtio-fs mount was writable"
         fi
     fi
-    if [ "${runtime}" = "firecracker" ]; then
+    if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; then
         local restored_init
         restored_init="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
             'for namespace in mnt pid uts ipc; do test "$(readlink /proc/self/ns/$namespace)" = "$(readlink /proc/1/ns/$namespace)" || exit 1; done; test "$(hostname)" = akernel; cat /proc/1/comm')"
@@ -1038,7 +1051,7 @@ run_checkpoint_restore_check() {
         /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${restored_network}" "sandboxd-network-ok" "${suffix} restored network"
 
-    if [ "${runtime}" = "firecracker" ]; then
+    if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; then
         run_firecracker_post_restore_chain \
             "${suffix}" "${checkpoint_root}" "${advanced}" "${request_file}"
     fi
@@ -1048,7 +1061,7 @@ run_checkpoint_restore_check() {
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" \
         "${suffix} target independent of checkpoint directory"
-    if [ "${runtime}" = "firecracker" ]; then
+    if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; then
         persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat \
             /var/lib/native-checkpoint/state)"
         assert_eq "${persisted}" "native-checkpoint-ok" \
@@ -1179,7 +1192,7 @@ run_firecracker_post_restore_chain() {
 run_network_soak() {
     local runtime="${1}"
     local rootfs="${REDIS_ROOTFS}"
-    if [ "${runtime}" = "firecracker" ] &&
+    if { [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; } &&
         [ "${FIRECRACKER_VIRTIOFS}" != "1" ]; then
         rootfs="${REDIS_EROFS_ROOTFS}"
     fi
@@ -1514,7 +1527,7 @@ run_stress_checks() {
 
     local memory_mb=128
     local cpu_millicores=100
-    if [ "${runtime}" = "firecracker" ]; then
+    if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; then
         memory_mb=256
     fi
     local marker=""
@@ -1586,7 +1599,7 @@ run_stress_checks() {
             wait_for_state "${id}" "SANDBOX_STATE_RUNNING"
         done
         wait_for_cgroup_count "${STRESS_CONCURRENCY}"
-        if [ "${runtime}" = "firecracker" ] && [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
+        if { [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; } && [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
             assert_virtiofsd_cgroups
         fi
 
@@ -1884,6 +1897,10 @@ run_kata_checks() {
 }
 
 run_firecracker_checks() {
+    local fc_runtime=firecracker
+    if [ "${E2E_RUNTIME}" = firecracker-pvm ]; then
+        fc_runtime=firecracker-pvm
+    fi
     local rootfs="${EROFS_ROOTFS}"
     local host_mount="${HOST_MOUNT}/input.txt:/mnt/host/input.txt:bind:ro"
     local root_description="EROFS"
@@ -1899,7 +1916,7 @@ run_firecracker_checks() {
 
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
-        --runtime firecracker \
+        --runtime "${fc_runtime}" \
         --sandbox-id sbox-e2e-firecracker \
         --rootfs "${rootfs}" \
         --cwd / \
@@ -2034,7 +2051,7 @@ run_firecracker_checks() {
         local rejected_id
         if rejected_id="$(sbox_cmd start \
             --quiet \
-            --runtime firecracker \
+            --runtime "${fc_runtime}" \
             --sandbox-id sbox-e2e-firecracker-directory-root \
             --rootfs "${ROOTFS}" \
             --cpu-millicores 100 \
@@ -2045,7 +2062,7 @@ run_firecracker_checks() {
         fi
         if rejected_id="$(sbox_cmd start \
             --quiet \
-            --runtime firecracker \
+            --runtime "${fc_runtime}" \
             --sandbox-id sbox-e2e-firecracker-directory-mount \
             --rootfs "${EROFS_ROOTFS}" \
             --mount "${EROFS_MOUNT_ROOT}:/mnt/dir:bind:ro" \
@@ -2062,7 +2079,7 @@ run_firecracker_checks() {
         local oci_root_id="sbox-e2e-firecracker-oci-root"
         SANDBOX_ID="$(sbox_cmd start \
             --quiet \
-            --runtime firecracker \
+            --runtime "${fc_runtime}" \
             --sandbox-id "${oci_root_id}" \
             --image-url "${OCI_ROOTFS_IMAGE}" \
             --cpu-millicores 100 \
@@ -2084,7 +2101,7 @@ run_firecracker_checks() {
     log "testing Firecracker read-only ${root_description} root"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
-        --runtime firecracker \
+        --runtime "${fc_runtime}" \
         --sandbox-id sbox-e2e-firecracker-readonly \
         --rootfs "${rootfs}" \
         --rootfs-readonly \
@@ -2130,7 +2147,7 @@ run_firecracker_checks() {
     log "testing Firecracker natural exit while sandboxd is unavailable"
     SANDBOX_ID="$(sbox_cmd start \
         --quiet \
-        --runtime firecracker \
+        --runtime "${fc_runtime}" \
         --sandbox-id sbox-e2e-firecracker-exit \
         --rootfs "${rootfs}" \
         --cpu-millicores 100 \
@@ -2155,15 +2172,15 @@ run_firecracker_checks() {
     sbox_cmd delete "${SANDBOX_ID}"
     SANDBOX_ID=""
 
-    run_dnat_check firecracker "Firecracker" "${rootfs}" 256
+    run_dnat_check "${fc_runtime}" "Firecracker" "${rootfs}" 256
 
-    run_checkpoint_restore_check firecracker "${rootfs}"
+    run_checkpoint_restore_check "${fc_runtime}" "${rootfs}"
     if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
-        run_host_mount_rw_check firecracker "${EROFS_ROOTFS}" firecracker-erofs
-        run_host_mount_rw_check firecracker "${ROOTFS}" firecracker-directory
+        run_host_mount_rw_check "${fc_runtime}" "${EROFS_ROOTFS}" firecracker-erofs
+        run_host_mount_rw_check "${fc_runtime}" "${ROOTFS}" firecracker-directory
     fi
-    run_storage_quota_check firecracker "${rootfs}"
-    run_stress_checks firecracker "${rootfs}"
+    run_storage_quota_check "${fc_runtime}" "${rootfs}"
+    run_stress_checks "${fc_runtime}" "${rootfs}"
 }
 
 run_runsc_checks() {
@@ -2342,7 +2359,7 @@ run_e2e() {
     start_sandboxd
     start_gateway_httpd
     if [ "${STRESS_ONLY}" = "1" ]; then
-        run_stress_checks firecracker "${STRESS_ROOTFS:-${ROOTFS}}"
+        run_stress_checks "${E2E_RUNTIME}" "${STRESS_ROOTFS:-${ROOTFS}}"
         log "e2e stress passed"
         return
     fi
@@ -2357,7 +2374,7 @@ run_e2e() {
             runsc) run_runsc_checks ;;
             runc) run_runc_checks ;;
             kata) run_kata_checks ;;
-            firecracker) run_firecracker_checks ;;
+            firecracker|firecracker-pvm) run_firecracker_checks ;;
         esac
         if [ "${NETWORK_SOAK}" = "1" ]; then
             run_network_soak "${E2E_RUNTIME}"
