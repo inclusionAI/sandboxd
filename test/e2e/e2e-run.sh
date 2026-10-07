@@ -295,7 +295,7 @@ preflight() {
             [ -f /opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml ] ||
                 fail "missing Kata Dragonball configuration"
             ;;
-        firecracker)
+        firecracker|firecracker-pvm)
             command -v firecracker >/dev/null 2>&1 || fail "missing command: firecracker"
             command -v mkfs.ext4 >/dev/null 2>&1 || fail "missing command: mkfs.ext4"
             if [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then

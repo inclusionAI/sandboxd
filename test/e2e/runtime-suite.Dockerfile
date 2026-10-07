@@ -137,7 +137,7 @@ RUN set -eux; \
           /opt/kata/share/kata-containers/kata-containers.img \
           /opt/kata/share/kata-containers/vmlinux-dragonball-experimental.container; \
         ;; \
-      firecracker) \
+      firecracker|firecracker-pvm) \
         archive="/tmp/firecracker-${FIRECRACKER_RELEASE}-x86_64.tgz"; \
         curl -fSL --retry 10 --retry-delay 2 --retry-all-errors \
           "${FIRECRACKER_AMD64_URL}" -o "${archive}"; \
@@ -150,6 +150,10 @@ RUN set -eux; \
         test "$(jq -er '.release_tag' "${bundle}/manifest.json")" = \
           "${FIRECRACKER_RELEASE}"; \
         (cd "${bundle}"; sha256sum -c SHA256SUMS); \
+        expected_profile=kvm; \
+        if [ "${E2E_RUNTIME}" = firecracker-pvm ]; then expected_profile=pvm; fi; \
+        test "$(jq -er '.kernel_profile // "kvm"' "${bundle}/manifest.json")" = \
+          "${expected_profile}"; \
         vmm_version="$(jq -er '.vmm.version' "${bundle}/manifest.json")"; \
         "${bundle}/firecracker" --version | \
           grep -F "Firecracker ${vmm_version}"; \

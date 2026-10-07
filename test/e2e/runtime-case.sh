@@ -69,24 +69,24 @@ case "${E2E_CASE}" in
         needs_kvm=1
         run_cgroup_disabled=0
         ;;
-    kata|firecracker)
+    kata|firecracker|firecracker-pvm)
         runtime="${E2E_CASE}"
         platform=systrap
         needs_kvm=1
         run_cgroup_disabled=0
         ;;
-    firecracker-virtiofs)
-        runtime=firecracker
+    firecracker-virtiofs|firecracker-pvm-virtiofs)
+        runtime=${E2E_CASE%-virtiofs}
         platform=systrap
         needs_kvm=1
         run_cgroup_disabled=0
         fc_virtiofs=1
         ;;
-    firecracker-incremental)
+    firecracker-incremental|firecracker-pvm-incremental)
         # Same runtime as the plain firecracker case, but the sandboxd
         # config opts into the incremental checkpoint chain so CI exercises
         # both the default Full algorithm and the incremental implementation.
-        runtime=firecracker
+        runtime=${E2E_CASE%-incremental}
         platform=systrap
         needs_kvm=1
         run_cgroup_disabled=0
@@ -99,7 +99,7 @@ case "${E2E_CASE}" in
         run_cgroup_disabled=0
         ;;
     *)
-        fail "E2E_CASE must be runsc-systrap, runsc-kvm, kata, firecracker, firecracker-incremental, firecracker-virtiofs, or runc"
+        fail "E2E_CASE must be runsc-systrap, runsc-kvm, kata, firecracker, firecracker-incremental, firecracker-virtiofs, firecracker-pvm, firecracker-pvm-incremental, firecracker-pvm-virtiofs, or runc"
         ;;
 esac
 

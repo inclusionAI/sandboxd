@@ -240,3 +240,16 @@ resources, including pooled TAPs, ephemeral runc veth pairs and namespaces,
 SNAT and DNAT rules, ACL hooks, and the `sandbox0` bridge. Kubernetes must
 allow enough termination grace time for cleanup; SIGKILL cannot run shutdown
 hooks.
+
+### PVM node validation
+
+The optional `firecracker-pvm`, `firecracker-pvm-incremental`, and `firecracker-pvm-virtiofs` cases require a dedicated x86-64 PVM host kernel with `kvm_pvm` already loaded. They are excluded from the default hardware-KVM matrix and do not install kernels or switch host modules. Select a checksum-pinned PVM candidate through a separate `RUNTIME_VERSIONS_FILE` that contains the complete runtime manifest with only the Firecracker release, URL, and SHA-256 tuple changed; the targeted image rejects a bundle whose `kernel_profile` differs from the selected runtime. Do not modify the default release pins until the exact CI candidate has been qualified and promoted. The agent initrd is built from the consuming sandboxd revision.
+
+```sh
+RUNTIME_VERSIONS_FILE=/path/to/pvm-candidate-versions.env \
+  E2E_CASE=firecracker-pvm-incremental make e2e-runtime-case
+RUNTIME_VERSIONS_FILE=/path/to/pvm-candidate-versions.env \
+  E2E_CASE=firecracker-pvm-virtiofs make e2e-runtime-case
+```
+
+A direct `make e2e` also accepts `E2E_RUNTIME=firecracker-pvm` with explicitly selected `FIRECRACKER_BINARY`, `FIRECRACKER_KERNEL`, and matching `FIRECRACKER_INITRD`. It runs the same lifecycle and compatibility checks as hardware KVM. The virtio-fs case includes OCI/Nydus image-provider checks and requires reachable image registries; a local-directory-only run must identify any skipped image-provider checks explicitly.
