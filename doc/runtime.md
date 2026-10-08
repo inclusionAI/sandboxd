@@ -38,12 +38,7 @@ virtualization:
 platform = "kvm"
 ```
 
-The only accepted values are `systrap` and `kvm`; omitting the setting selects
-`systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state
-root, and optional KVM device. Kata uses `plugin.runtime.kata`. Firecracker
-uses `plugin.runtime.firecracker` and requires
-`plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted
-while the other runtimes remain usable.
+The only accepted values are `systrap` and `kvm`; omitting the setting selects `systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state root, and optional KVM device. Kata uses `plugin.runtime.kata`. Firecracker uses `plugin.runtime.firecracker` and requires `plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted while the other runtimes remain usable.
 
 Firecracker expects KVM at `/dev/kvm`. Its kernel must include virtio block,
 virtio net, vsock, EROFS, ext4, overlayfs, devtmpfs, and the cgroup controllers
@@ -55,6 +50,25 @@ matching sandboxd `firecracker-agent` as `/init`. Default artifact paths are
 configuration shows all overrides. The default VM size is one vCPU and
 512 MiB when the request does not supply resources. Requested CPU is rounded
 up to a vCPU count, and guest memory must be at least 128 MiB.
+
+## Resolver sources
+
+Sandbox DNS has two modes: managed and direct. With network ACLs enabled, supported runtimes use managed DNS even when an individual sandbox has no policy. Runc uses direct DNS. When network ACLs are disabled, all runtimes use direct DNS.
+
+- Managed DNS: `plugin.runtime.resolv_conf_path` supplies the proxy's upstream nameservers and the search/domain/options retained in generated sandbox resolver files. Each sandbox queries the managed proxy on the bridge address.
+- Direct DNS: `plugin.runtime.direct_resolv_conf_path` optionally selects the resolver file injected into the sandbox. An empty value inherits `plugin.runtime.resolv_conf_path`, which defaults to `/etc/resolv.conf`. The direct override never changes managed DNS upstreams or generated resolver content.
+
+For example, a node-local resolver may serve the proxy while direct-DNS sandboxes need a different, reachable nameserver:
+
+```toml
+[plugin.runtime]
+resolv_conf_path = "/etc/resolv.conf"
+direct_resolv_conf_path = "/etc/sandboxd/direct-resolv.conf"
+```
+
+In direct mode, the source path is resolved in the sandboxd process's filesystem at sandbox creation, must identify a regular file, and is injected read-only as the sandbox's `/etc/resolv.conf`. An invalid selected source fails sandbox creation without falling back to another resolver. If a runtime-provided mount or an explicit sandbox mount already owns that destination or a parent such as `/etc`, sandboxd preserves that mount and does not inspect or inject the default resolver source. Managed DNS instead owns the resolver and rejects conflicting explicit mounts, as described in [Network ACL](network-acl.md).
+
+Configure nameservers that the sandbox can actually reach from its network environment; selecting a file does not provide DNS forwarding. In particular, a node-local loopback resolver or Docker's embedded `127.0.0.11` must not be assumed reachable, and this option does not recreate Docker container-name resolution. A flat resolver file also cannot represent systemd-resolved's per-link split-DNS routing; operators using split DNS must validate a suitable resolver path and connectivity for their deployment. This setting is not a live-update mechanism: changes to its configuration or source file are not guaranteed to update existing sandboxes. Recreate a sandbox to apply a changed resolver deterministically.
 
 ## OOM and failed deletion
 
