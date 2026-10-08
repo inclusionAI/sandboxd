@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -862,12 +863,14 @@ func (handler *Handler) Start(
 		return err
 	}
 
+	tBootStart := time.Now()
 	bootCtx, cancel := context.WithTimeout(ctx, firecrackerAgentTimeout)
 	defer cancel()
 	api := newFirecrackerAPI(apiPath)
 	if err := api.waitReady(bootCtx); err != nil {
 		return err
 	}
+	tAPIReady := time.Now()
 	vcpus, memoryMiB, err := handler.machineSize(startConfig.Resources)
 	if err != nil {
 		return err
@@ -904,9 +907,23 @@ func (handler *Handler) Start(
 	); err != nil {
 		return err
 	}
+	tConfigured := time.Now()
 	if err := waitForFirecrackerAgent(bootCtx, vsockPath); err != nil {
+		// On a boot timeout, preserve the guest serial console and
+		// per-phase timing so the failure can be diagnosed from the
+		// daemon log alone. The stdout/stderr files are still open and
+		// will be closed (and potentially overwritten by the next VM)
+		// after this handler returns, so this is the only chance to
+		// capture what the guest kernel printed before the timeout.
+		logFirecrackerBootTimeout(
+			startConfig.ID, err,
+			tBootStart, tAPIReady, tConfigured,
+			stdout, stderr,
+			command.Process.Pid,
+		)
 		return err
 	}
+	tAgentReady := time.Now()
 	if err := requestFirecrackerAgent(
 		bootCtx,
 		vsockPath,
@@ -915,6 +932,7 @@ func (handler *Handler) Start(
 	); err != nil {
 		return fmt.Errorf("configure Firecracker guest: %w", err)
 	}
+	tGuestConfigured := time.Now()
 	instance.markConfigured()
 	if err := handler.persistInstance(instance); err != nil {
 		return err
@@ -927,13 +945,101 @@ func (handler *Handler) Start(
 	keepStorage = true
 	keepRuntimeArtifacts = true
 	logrus.Infof(
-		"firecracker: started sandbox %s pid=%d vcpus=%d memory=%dMiB",
+		"firecracker: started sandbox %s pid=%d vcpus=%d memory=%dMiB "+
+			"phases: api_ready=%s vm_config=%s agent_boot=%s agent_configure=%s total=%s",
 		startConfig.ID,
 		command.Process.Pid,
 		vcpus,
 		memoryMiB,
+		tAPIReady.Sub(tBootStart).Round(time.Millisecond),
+		tConfigured.Sub(tAPIReady).Round(time.Millisecond),
+		tAgentReady.Sub(tConfigured).Round(time.Millisecond),
+		tGuestConfigured.Sub(tAgentReady).Round(time.Millisecond),
+		time.Since(tBootStart).Round(time.Millisecond),
 	)
 	return nil
+}
+
+// logFirecrackerBootTimeout captures diagnostic evidence when a guest agent
+// health check times out: the per-phase timing breakdown and the tail of the
+// guest serial console. The stdout/stderr files are still open for writing
+// by the VMM process; the read uses ReadAt on a /proc/self/fd clone so the
+// VMM's file offset is never changed and no blocking can occur on non-
+// regular outputs (FIFOs are rejected by the stat check before open).
+func logFirecrackerBootTimeout(
+	sandboxID string,
+	bootErr error,
+	tStart, tAPIReady, tConfigured time.Time,
+	stdout, stderr *os.File,
+	vmmPid int,
+) {
+	logrus.Errorf(
+		"firecracker: boot timeout for %s (pid=%d): %v — "+
+			"phases: api_ready=%s vm_config=%s agent_wait=%s (total budget %s)",
+		sandboxID, vmmPid, bootErr,
+		tAPIReady.Sub(tStart).Round(time.Millisecond),
+		tConfigured.Sub(tAPIReady).Round(time.Millisecond),
+		time.Since(tConfigured).Round(time.Millisecond),
+		firecrackerAgentTimeout,
+	)
+	// Check whether the VMM is still alive; a crashed process produces a
+	// different diagnosis than a slow guest boot.
+	if syscall.Kill(vmmPid, 0) != nil {
+		logrus.Errorf(
+			"firecracker: VMM pid=%d for %s is no longer running at timeout",
+			vmmPid, sandboxID,
+		)
+	}
+	for _, output := range []struct {
+		label string
+		file  *os.File
+	}{
+		{"stdout", stdout},
+		{"stderr", stderr},
+	} {
+		tail := readTailFromWriter(output.file, 4096)
+		if len(tail) == 0 {
+			continue
+		}
+		logrus.Errorf(
+			"firecracker: guest %s tail for %s (last %d bytes):\n%s",
+			output.label, sandboxID, len(tail), string(tail),
+		)
+	}
+}
+
+// readTailFromWriter reads at most n bytes from the tail of a write-mode
+// regular file, without changing the writer's offset or blocking on
+// non-regular files (FIFOs, character devices). It opens a read-only clone
+// via /proc/self/fd and uses ReadAt. Returns nil for empty, non-regular,
+// or unreadable outputs — a diagnostic gap, not a failure.
+func readTailFromWriter(writer *os.File, n int64) []byte {
+	if writer == nil || n <= 0 {
+		return nil
+	}
+	// Stat the writer's fd directly: a FIFO would block on open, so it
+	// must be rejected before the /proc/self/fd open below.
+	info, err := writer.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return nil
+	}
+	// Open a read-only clone of the same file description.
+	path := fmt.Sprintf("/proc/self/fd/%d", writer.Fd())
+	reader, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer reader.Close()
+	size := info.Size()
+	if size > n {
+		size = n
+	}
+	buf := make([]byte, size)
+	read, err := reader.ReadAt(buf, info.Size()-size)
+	if err != nil && err != io.EOF && read == 0 {
+		return nil
+	}
+	return buf[:read]
 }
 
 func openFirecrackerOutput(path string) (*os.File, error) {
@@ -1659,7 +1765,10 @@ func attachFirecrackerProcess(cgroupPath string, pid int) error {
 func waitForFirecrackerAgent(ctx context.Context, vsockPath string) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
+	attempts := 0
+	var lastErr error
 	for {
+		attempts++
 		err := requestFirecrackerAgent(
 			ctx,
 			vsockPath,
@@ -1667,11 +1776,27 @@ func waitForFirecrackerAgent(ctx context.Context, vsockPath string) error {
 			nil,
 		)
 		if err == nil {
+			if attempts > 1 {
+				logrus.Debugf(
+					"firecracker: guest agent ready after %d attempts",
+					attempts,
+				)
+			}
 			return nil
 		}
+		// A deadline may have passed before Done closes. Keep the last
+		// connection or protocol failure instead of replacing it with
+		// the terminal context error.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return fmt.Errorf("wait for Firecracker guest agent: %w (attempts=%d, last error: %v)", err, attempts, lastErr)
+		}
+		lastErr = err
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for Firecracker guest agent: %w", ctx.Err())
+			return fmt.Errorf(
+				"wait for Firecracker guest agent: %w (attempts=%d, last error: %v)",
+				ctx.Err(), attempts, lastErr,
+			)
 		case <-ticker.C:
 		}
 	}
@@ -1696,11 +1821,22 @@ func requestFirecrackerAgentWaiting(
 	value any,
 	maxWait time.Duration,
 ) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	timeout := maxWait
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 		if timeout <= 0 {
-			return ctx.Err()
+			// The deadline has elapsed but the context's timer may
+			// not have fired yet (ctx.Err() returns nil in that
+			// race window). Callers — especially the health-check
+			// retry loop in waitForFirecrackerAgent — treat a nil
+			// return as success, so this must never return nil.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return context.DeadlineExceeded
 		}
 		if timeout > maxWait {
 			timeout = maxWait

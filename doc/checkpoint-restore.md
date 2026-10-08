@@ -220,6 +220,8 @@ Legacy checkpoint artifacts without a backend tag, including v1 archives without
 
 The tested PVM backend reports `KVM_CAP_TSC_CONTROL=0`. Registering PVM requires successful capability and non-zero frequency probes; restoring on PVM requires a recorded non-zero frequency equal to the target's frequency. Unknown or different frequencies fail compatibility verification before starting the VMM. Hardware KVM retains legacy handling for missing frequencies and lets Firecracker apply supported scaling. These checks do not establish heterogeneous CPU migration support; qualify CPU compatibility separately and use the identical VMM, kernel, initrd and virtiofsd stack as the baseline.
 
+Fresh Firecracker starts share a 15-second deadline across VMM API readiness, VM configuration, guest-agent health checks and guest configuration. Startup logs report these phases separately. A failed health check preserves the attempt count and last connection or protocol error; a boot failure also records the available regular-file console tails before cleanup. Empty output paths still discard the console, so configure per-VM stdout and stderr files when collecting boot evidence. An expired or canceled context always fails an unsent guest-agent request, including the interval before the context timer publishes its deadline error.
+
 ### Storage layout for high-performance Firecracker checkpoints
 
 Firecracker memory and the writable block image are separate checkpoint
