@@ -35,6 +35,8 @@ The flow:
     address and the DNAT packet counter instead of treating connectivity alone
     as proof that NAT was exercised.
 
+The runsc partial-OOM regression injects a high-score host worker into the target sandbox's cgroup, resolved from its OCI config rather than directory order in the cgroup cache. A second sandbox remains live throughout the check: the target must report OOM and exit code 137, drain its host tasks, and become uninspectable after deletion, while the guard still executes commands. On cgroup v2 the target's `oom_kill` counter must increase and `cgroup.events` must report `populated 0`.
+
 The checksum-pinned versions are maintained in
 `third_party/runtime-versions.env`. AKernel consumes the same manifest and
 Firecracker runtime bundle when it packages these runtimes. gVisor is
