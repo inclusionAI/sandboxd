@@ -31,6 +31,8 @@ type v1OOMEntry struct {
 	mu        sync.Mutex
 	removed   bool
 	triggered atomic.Bool
+	oomEvent  chan struct{}
+	oomClosed bool
 }
 
 type v1OOMWatcher struct {
@@ -97,7 +99,7 @@ func (w *v1OOMWatcher) Add(name string) error {
 }
 
 func (w *v1OOMWatcher) addFD(name string, fd int) error {
-	entry := &v1OOMEntry{name: name, fd: fd}
+	entry := &v1OOMEntry{name: name, fd: fd, oomEvent: make(chan struct{})}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed.Load() {
@@ -153,6 +155,8 @@ func (w *v1OOMWatcher) Reset(name string) error {
 		return fmt.Errorf("drain OOM eventfd for %s: %w", name, err)
 	}
 	entry.triggered.Store(false)
+	entry.oomEvent = make(chan struct{})
+	entry.oomClosed = false
 	return nil
 }
 
@@ -171,7 +175,7 @@ func (w *v1OOMWatcher) OOMKilled(name string) (bool, error) {
 		return false, fmt.Errorf("drain OOM eventfd for %s: %w", name, err)
 	}
 	if triggered {
-		entry.triggered.Store(true)
+		entry.markOOM()
 	}
 	return entry.triggered.Load(), nil
 }
@@ -212,7 +216,7 @@ func (w *v1OOMWatcher) run() {
 			if !entry.removed {
 				triggered, readErr := drainEventFD(entry.fd)
 				if readErr == nil && triggered {
-					entry.triggered.Store(true)
+					entry.markOOM()
 				}
 			}
 			entry.mu.Unlock()
@@ -261,6 +265,40 @@ func drainEventFD(fd int) (bool, error) {
 			return triggered, err
 		}
 	}
+}
+
+func (e *v1OOMEntry) markOOM() {
+	e.triggered.Store(true)
+	if !e.oomClosed && e.oomEvent != nil {
+		close(e.oomEvent)
+		e.oomClosed = true
+	}
+}
+
+func (w *v1OOMWatcher) OOMEvent(name string) (<-chan struct{}, error) {
+	e, err := w.entry(name)
+	if err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.removed {
+		return nil, fmt.Errorf("OOM watcher for %s was removed", name)
+	}
+	return e.oomEvent, nil
+}
+
+func (w *v1OOMWatcher) killOnOOM(name string, event <-chan struct{}, kill func() error) error {
+	e, err := w.entry(name)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.removed || e.oomEvent != event || !e.triggered.Load() {
+		return fmt.Errorf("%s: %w", name, ErrStaleOOMLease)
+	}
+	return kill()
 }
 
 func wakeEventFD(fd int) {

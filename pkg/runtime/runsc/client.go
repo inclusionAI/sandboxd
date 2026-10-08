@@ -544,6 +544,9 @@ func (c *Client) Delete(ctx context.Context, id string, force bool) error {
 	args = append(args, id)
 
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	// A surviving child may inherit stdout/stderr even after the CLI is
+	// killed. Bound pipe draining as well as the command's lifetime.
+	cmd.WaitDelay = time.Second
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

@@ -38,12 +38,7 @@ virtualization:
 platform = "kvm"
 ```
 
-The only accepted values are `systrap` and `kvm`; omitting the setting selects
-`systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state
-root, and optional KVM device. Kata uses `plugin.runtime.kata`. Firecracker
-uses `plugin.runtime.firecracker` and requires
-`plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted
-while the other runtimes remain usable.
+The only accepted values are `systrap` and `kvm`; omitting the setting selects `systrap`. Runc additionally uses `plugin.runtime.runc` for its shim, state root, and optional KVM device. Kata uses `plugin.runtime.kata`. Firecracker uses `plugin.runtime.firecracker` and requires `plugin.runtime.filestore_dir`. An unavailable optional adapter is omitted while the other runtimes remain usable.
 
 Firecracker expects KVM at `/dev/kvm`. Its kernel must include virtio block,
 virtio net, vsock, EROFS, ext4, overlayfs, devtmpfs, and the cgroup controllers
@@ -63,6 +58,30 @@ The opt-in `firecracker-pvm` class reads `[plugin.runtime.firecracker_pvm]` and 
 Use the validated Firecracker PVM guest bundle and the initrd built from this sandboxd revision. The guest must enable `CONFIG_KVM_GUEST=y`, `CONFIG_PVM_GUEST=y`, `CONFIG_X86_PIE=y`, and `CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS=y` alongside the common AKernel filesystem/network/virtio options. Guest MPK aligns `XCR0.PKRU` with a PKU-capable host and avoids extra intercepted `XSETBV` operations in nested deployments; it does not qualify guest pkey permission enforcement. Do not use host `nopku` as a substitute in the pinned PVM revision.
 
 The optional nested-host DEBUGCTL optimization moves `vcpu->arch.host_debugctl = get_debugctlmsr();` from common `vcpu_enter_guest()` into VMX/SVM entry paths, since PVM maintains its own saved value. It changes the host kernel rather than sandboxd or the guest bundle. Preserve hardware-KVM DEBUGCTL restoration, rebuild/install matching modules together, and separately qualify the optimized host; do not simply remove the save or mix patched core and stock vendor modules. AKernel's `deploy/pvm-runtime.md`, `deploy/pvm/host.config`, and `deploy/pvm/kvm-debugctl-backend-scope.patch` contain the reproduction inputs and the limits of the earlier nested performance experiment. See [checkpoint compatibility](checkpoint-restore.md) for backend identity and PVM TSC-frequency restore gates.
+## Resolver sources
+
+Sandbox DNS has two modes: managed and direct. With network ACLs enabled, supported runtimes use managed DNS even when an individual sandbox has no policy. Runc uses direct DNS. When network ACLs are disabled, all runtimes use direct DNS.
+
+- Managed DNS: `plugin.runtime.resolv_conf_path` supplies the proxy's upstream nameservers and the search/domain/options retained in generated sandbox resolver files. Each sandbox queries the managed proxy on the bridge address.
+- Direct DNS: `plugin.runtime.direct_resolv_conf_path` optionally selects the resolver file injected into the sandbox. An empty value inherits `plugin.runtime.resolv_conf_path`, which defaults to `/etc/resolv.conf`. The direct override never changes managed DNS upstreams or generated resolver content.
+
+For example, a node-local resolver may serve the proxy while direct-DNS sandboxes need a different, reachable nameserver:
+
+```toml
+[plugin.runtime]
+resolv_conf_path = "/etc/resolv.conf"
+direct_resolv_conf_path = "/etc/sandboxd/direct-resolv.conf"
+```
+
+In direct mode, the source path is resolved in the sandboxd process's filesystem at sandbox creation, must identify a regular file, and is injected read-only as the sandbox's `/etc/resolv.conf`. An invalid selected source fails sandbox creation without falling back to another resolver. If a runtime-provided mount or an explicit sandbox mount already owns that destination or a parent such as `/etc`, sandboxd preserves that mount and does not inspect or inject the default resolver source. Managed DNS instead owns the resolver and rejects conflicting explicit mounts, as described in [Network ACL](network-acl.md).
+
+Configure nameservers that the sandbox can actually reach from its network environment; selecting a file does not provide DNS forwarding. In particular, a node-local loopback resolver or Docker's embedded `127.0.0.11` must not be assumed reachable, and this option does not recreate Docker container-name resolution. A flat resolver file also cannot represent systemd-resolved's per-link split-DNS routing; operators using split DNS must validate a suitable resolver path and connectivity for their deployment. This setting is not a live-update mechanism: changes to its configuration or source file are not guaranteed to update existing sandboxes. Recreate a sandbox to apply a changed resolver deterministically.
+
+## OOM and failed deletion
+
+A host cgroup OOM makes the entire sandbox terminal (`OOMKilled=true`, exit code 137), even when the kernel kills only a worker and the runtime's init process remains alive. Sandboxd consumes the kernel OOM notification independently of runtime Wait and drains the remaining tasks in that sandbox's allocated cgroup. The OOM lease is guarded against reset so an old notification cannot terminate a later user of the cached cgroup. Cgroup-disabled sandboxes have no host OOM notification; guest-only OOMs remain runtime-owned.
+
+Delete calls for one sandbox share cleanup independently of caller cancellation. Each runtime deletion attempt has a 30-second deadline. If that deadline expires and an allocated cgroup is available, sandboxd drains only that child's processes and retries runtime deletion once with a fresh 30-second deadline. Runsc command output draining is also bounded. Cleanup errors remain visible and retryable: sandbox metadata, filesystem ownership, and resource accounting are released only after the runtime deletion succeeds. This does not guarantee that uninterruptible kernel tasks can be removed; failure must never be reported as successful cleanup.
 
 ## Pooled TAP lifecycle
 

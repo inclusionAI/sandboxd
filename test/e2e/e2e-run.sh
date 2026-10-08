@@ -39,6 +39,9 @@ CGROUP_ROOT="${E2E_CGROUP_ROOT:-sandboxd-e2e}"
 NETWORK_CIDR="${E2E_NETWORK_CIDR:-10.88.0.1/16}"
 GATEWAY_IP="${E2E_GATEWAY_IP:-10.88.0.1}"
 HTTP_PORT="${E2E_HTTP_PORT:-18080}"
+DIRECT_DNS_IP="192.0.2.53"
+DIRECT_DNS_ANSWER="192.0.2.123"
+DIRECT_DNS_NAME="resolver-proof.direct.e2e."
 DNAT_HOST_PORT="${E2E_DNAT_HOST_PORT:-18181}"
 DNAT_GUEST_PORT="${E2E_DNAT_GUEST_PORT:-18180}"
 BRIDGE_NAME="${E2E_BRIDGE_NAME:-sandbox0}"
@@ -65,7 +68,10 @@ export RUNSC_IGNORE_CGROUPS="${DISABLE_CGROUP}"
 
 SANDBOXD_PID=""
 HTTPD_PID=""
+DIRECT_DNS_PID=""
+DIRECT_DNS_ALIAS_ADDED=0
 SANDBOX_ID=""
+PARTIAL_OOM_GUARD_ID=""
 STRESS_IDS=()
 CGROUP_MODE=""
 CGROUP_DIR=""
@@ -143,6 +149,9 @@ cleanup() {
     if [ -n "${SANDBOX_ID}" ]; then
         /usr/local/bin/sbox --address "${SOCKET}" --timeout 20s delete "${SANDBOX_ID}" >/dev/null 2>&1
     fi
+    if [ -n "${PARTIAL_OOM_GUARD_ID}" ]; then
+        /usr/local/bin/sbox --address "${SOCKET}" --timeout 20s delete "${PARTIAL_OOM_GUARD_ID}" >/dev/null 2>&1
+    fi
     local stress_id
     for stress_id in "${STRESS_IDS[@]}"; do
         /usr/local/bin/sbox --address "${SOCKET}" --timeout 20s delete "${stress_id}" >/dev/null 2>&1
@@ -150,6 +159,13 @@ cleanup() {
     if [ -n "${HTTPD_PID}" ]; then
         kill "${HTTPD_PID}" >/dev/null 2>&1
         wait "${HTTPD_PID}" >/dev/null 2>&1
+    fi
+    if [ -n "${DIRECT_DNS_PID}" ]; then
+        kill "${DIRECT_DNS_PID}" >/dev/null 2>&1
+        wait "${DIRECT_DNS_PID}" >/dev/null 2>&1
+    fi
+    if [ "${DIRECT_DNS_ALIAS_ADDED}" = "1" ]; then
+        ip address del "${DIRECT_DNS_IP}/32" dev lo >/dev/null 2>&1
     fi
     if [ -n "${SANDBOXD_PID}" ]; then
         kill "${SANDBOXD_PID}" >/dev/null 2>&1
@@ -185,6 +201,18 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+check_direct_dns_dependencies() {
+    if [ "${1:-e2e}" != "e2e" ] || [ "${DISABLE_CGROUP}" = "1" ]; then
+        return
+    fi
+    case "${E2E_RUNTIME}" in
+        all|runsc|runc)
+            command -v dnsmasq >/dev/null 2>&1 || fail "missing command: dnsmasq"
+            command -v timeout >/dev/null 2>&1 || fail "missing command: timeout"
+            ;;
+    esac
+}
 
 preflight() {
     mkdir -p /home/akernel
@@ -272,6 +300,7 @@ preflight() {
     for bin in sandboxd sbox checkpoint-restore ip ipset iptables ip6tables busybox mkfs.erofs; do
         command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
     done
+    check_direct_dns_dependencies "${1:-e2e}"
     case "${E2E_RUNTIME}" in
         all)
             for bin in runsc runc runc-shim; do
@@ -396,6 +425,10 @@ EOF
 {"auths": {}}
 EOF
 
+    # Distinct from the node resolver and backed by a local E2E-only DNS
+    # fixture so direct-DNS tests prove a lookup, not just a mount.
+    printf 'nameserver %s\nsearch direct.e2e\n' "${DIRECT_DNS_IP}" > "${CONFIG_DIR}/direct-resolv.conf"
+
     local disable_cgroup=false
     if [ "${DISABLE_CGROUP}" = "1" ]; then
         disable_cgroup=true
@@ -467,6 +500,7 @@ pids_max = 64
 ${node_resource_config}
 
 [plugin.runtime]
+direct_resolv_conf_path = "${CONFIG_DIR}/direct-resolv.conf"
 image_lib_dir = "/e2e/images"
 filestore_dir = "${FILESTORE}"
 filestore_dir_size = "1G"
@@ -585,6 +619,34 @@ EOF
     fi
 }
 
+stop_sandboxd() {
+    log "stopping sandboxd and flushing resource ownership"
+    local pid="${SANDBOXD_PID}"
+    kill -TERM "${pid}" || fail "could not stop sandboxd"
+    local attempt
+    for attempt in $(seq 1 300); do
+        if ! kill -0 "${pid}" >/dev/null 2>&1; then
+            local status=0
+            wait "${pid}" || status=$?
+            SANDBOXD_PID=""
+            [ "${status}" -eq 0 ] || fail "sandboxd shutdown exited with status ${status}"
+            if ip link show "${BRIDGE_NAME}" >/dev/null 2>&1; then
+                fail "sandbox bridge remained after shutdown"
+            fi
+            local links taps
+            links="$(ip -o link show)" || fail "could not inspect network links after shutdown"
+            taps="$(printf '%s\n' "${links}" | awk -F ': ' '$2 ~ /^tap\./ { print $2 }')"
+            [ -z "${taps}" ] || fail "sandbox TAPs remained after shutdown"
+            return
+        fi
+        sleep 0.1
+    done
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+    SANDBOXD_PID=""
+    fail "sandboxd did not shut down within 30 seconds"
+}
+
 crash_sandboxd() {
     log "crashing sandboxd to exercise recovery"
     kill -9 "${SANDBOXD_PID}"
@@ -634,6 +696,42 @@ start_gateway_httpd() {
 
     /bin/busybox httpd -f -p "${GATEWAY_IP}:${HTTP_PORT}" -h "${WWW_ROOT}" &
     HTTPD_PID=$!
+}
+
+start_direct_dns_fixture() {
+    log "starting isolated direct DNS fixture"
+    ip address add "${DIRECT_DNS_IP}/32" dev lo
+    DIRECT_DNS_ALIAS_ADDED=1
+    dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts \
+        --bind-interfaces --listen-address="${DIRECT_DNS_IP}" --port=53 \
+        --host-record="${DIRECT_DNS_NAME%.},${DIRECT_DNS_ANSWER}" \
+        --pid-file= >/tmp/sandboxd-direct-dns.log 2>&1 &
+    DIRECT_DNS_PID=$!
+    local attempt
+    for attempt in $(seq 1 30); do
+        if ! kill -0 "${DIRECT_DNS_PID}" >/dev/null 2>&1; then
+            cat /tmp/sandboxd-direct-dns.log >&2
+            fail "direct DNS fixture exited during startup"
+        fi
+        if /bin/timeout 2 /bin/busybox nslookup -type=A "${DIRECT_DNS_NAME}" "${DIRECT_DNS_IP}" \
+            2>/dev/null | grep -Fq "${DIRECT_DNS_ANSWER}"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    cat /tmp/sandboxd-direct-dns.log >&2
+    fail "direct DNS fixture did not answer during readiness checks"
+}
+
+assert_direct_resolver_query() {
+    local got
+    # Bound the host-side exec process without leaving a timeout watchdog
+    # inside the sandbox. Do not specify a DNS server: exercise resolv.conf.
+    got="$(timeout -k 2s 10s /usr/local/bin/sbox --address "${SOCKET}" --timeout 10s \
+        exec "${SANDBOX_ID}" /bin/nslookup -type=A "${DIRECT_DNS_NAME}")" ||
+        fail "direct resolver query failed or timed out"
+    printf '%s\n' "${got}" | grep -Fq "${DIRECT_DNS_ANSWER}" ||
+        fail "direct resolver query did not return the fixture address: ${got}"
 }
 
 sbox_cmd() {
@@ -1388,6 +1486,32 @@ wait_for_cgroup_child() {
     fail "no cached cgroup appeared below ${CGROUP_DIR}"
 }
 
+wait_for_sandbox_cgroup() {
+    local id="$1"
+    local config="${SANDBOXD_ROOT}/containers/${id}/config.json"
+    local path=""
+    local child=""
+    local i
+    for i in $(seq 1 100); do
+        if [ -f "${config}" ]; then
+            path="$(jq -er '.linux.cgroupsPath // empty' "${config}" 2>/dev/null || true)"
+            case "${path}" in
+                "/${CGROUP_ROOT}/"*)
+                    child="${CGROUP_DIR%/${CGROUP_ROOT}}${path}"
+                    if [ -d "${child}" ]; then
+                        echo "${child}"
+                        return 0
+                    fi
+                    ;;
+                "") ;;
+                *) fail "sandbox ${id} cgroup ${path} is outside /${CGROUP_ROOT}" ;;
+            esac
+        fi
+        sleep 0.1
+    done
+    fail "no cgroup appeared for sandbox ${id}"
+}
+
 wait_for_cgroup_count() {
     local expected="$1"
     local count=0
@@ -1740,7 +1864,8 @@ run_runc_checks() {
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${got}" "sandboxd-network-ok" "runc sandbox network"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
-    assert_eq "${got}" "$(cat /etc/resolv.conf)" "runc node resolver on an ACL-enabled node"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "direct resolver on an ACL-enabled node"
+    assert_direct_resolver_query
     sbox_cmd exec "${SANDBOX_ID}" /bin/test -c /dev/kvm
     local tty_status=0
     printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh || tty_status=$?
@@ -1761,7 +1886,8 @@ run_runc_checks() {
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/echo recovered-runc)"
     assert_eq "${got}" "recovered-runc" "runc exec after sandboxd restart"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
-    assert_eq "${got}" "$(cat /etc/resolv.conf)" "runc node resolver after sandboxd restart"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "direct resolver after sandboxd restart"
+    assert_direct_resolver_query
 
     local deleted_id="${SANDBOX_ID}"
     sbox_cmd delete "${deleted_id}"
@@ -2183,6 +2309,129 @@ run_firecracker_checks() {
     run_stress_checks "${fc_runtime}" "${rootfs}"
 }
 
+run_runsc_direct_dns_checks() {
+    log "testing runsc direct DNS with network ACLs disabled"
+    # Change DNS mode on a drained node after shutdown flushes resource leases.
+    # Keep the store across mode changes and crash recovery.
+    local remaining
+    remaining="$(sbox_cmd list | awk 'NR > 1 { print $1 }')"
+    [ -z "${remaining}" ] || fail "DNS mode change requires a drained node: ${remaining}"
+    stop_sandboxd
+    sed -i 's/^enable_network_acl = true$/enable_network_acl = false/' "${CONFIG_FILE}"
+    grep -qx 'enable_network_acl = false' "${CONFIG_FILE}" || fail "failed to disable network ACLs"
+    start_sandboxd
+
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime runsc \
+        --sandbox-id sbox-e2e-runsc-direct-dns \
+        --rootfs "${ROOTFS}" \
+        --cpu-millicores 1000 \
+        --memory-mb 128 \
+        /bin/sleep 300)"
+    [ -n "${SANDBOX_ID}" ] || fail "direct DNS start returned empty sandbox id"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    local got
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "runsc direct resolver"
+    assert_direct_resolver_query
+
+    # Resource-pool ownership is checkpointed periodically. This DNS recovery
+    # check requires that checkpoint to complete before the crash.
+    sleep 6
+    crash_and_restart_sandboxd
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "runsc direct resolver after restart"
+    assert_direct_resolver_query
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+
+    # Restore managed DNS before the normal runsc lifecycle and ACL checks.
+    remaining="$(sbox_cmd list | awk 'NR > 1 { print $1 }')"
+    [ -z "${remaining}" ] || fail "DNS mode restore requires a drained node: ${remaining}"
+    stop_sandboxd
+    sed -i 's/^enable_network_acl = false$/enable_network_acl = true/' "${CONFIG_FILE}"
+    grep -qx 'enable_network_acl = true' "${CONFIG_FILE}" || fail "failed to enable network ACLs"
+    start_sandboxd
+    log "runsc direct DNS checks passed"
+}
+
+run_partial_oom_check() {
+    log "testing OOM of one host task while sandbox init remains alive"
+    # Keep another sandbox alive so this cannot accidentally pass by picking
+    # the first directory in a one-entry cache. It must survive the target OOM.
+    PARTIAL_OOM_GUARD_ID="$(sbox_cmd start --quiet --runtime runsc \
+        --sandbox-id sbox-e2e-oom-guard --rootfs "${ROOTFS}" \
+        --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
+    SANDBOX_ID="$(sbox_cmd start --quiet --runtime runsc \
+        --sandbox-id sbox-e2e-partial-oom --rootfs "${ROOTFS}" \
+        --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
+    local child
+    child="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
+    assert_cgroup_limits "${child}" 1000 128
+    local guard_child
+    guard_child="$(wait_for_sandbox_cgroup "${PARTIAL_OOM_GUARD_ID}")"
+    [ "${child}" != "${guard_child}" ] || fail "OOM target and guard share a cgroup"
+    log "partial OOM target ${SANDBOX_ID} cgroup ${child}; guard cgroup ${guard_child}"
+    local oom_before=""
+    if [ "${CGROUP_MODE}" = v2 ]; then
+        oom_before="$(awk '$1 == "oom_kill" { print $2 }' "${child}/memory.events")"
+    fi
+    # Model the production failure: one high-score host worker is OOM-killed,
+    # not the guest init. Runtime Wait alone cannot observe that failure.
+    /bin/sh -c 'echo 1000 > /proc/self/oom_score_adj; echo $$ > "$1/cgroup.procs"; exec /usr/local/bin/oom-hog' sh "${child}" &
+    local hog_pid=$!
+    if [ "${CGROUP_MODE}" = v2 ]; then
+        local oom_now="${oom_before}"
+        local attempt
+        # Capture whether host swap is delaying the injection, independently
+        # of sandboxd's handling of an actual OOM notification.
+        for attempt in $(seq 1 30); do
+            oom_now="$(awk '$1 == "oom_kill" { print $2 }' "${child}/memory.events")"
+            [ "${oom_now}" -gt "${oom_before}" ] && break
+            sleep 0.1
+        done
+        log "partial OOM injection: oom_kill=${oom_before}->${oom_now}, memory.current=$(cat "${child}/memory.current"), memory.swap.current=$(cat "${child}/memory.swap.current"), memory.swap.max=$(cat "${child}/memory.swap.max")"
+        # This test needs a resident-memory OOM, not exhaustion of a runner's
+        # entire swap device. Change only this sandbox's test cgroup policy.
+        echo 0 > "${child}/memory.swap.max"
+        for attempt in $(seq 1 100); do
+            oom_now="$(awk '$1 == "oom_kill" { print $2 }' "${child}/memory.events")"
+            [ "${oom_now}" -gt "${oom_before}" ] && break
+            sleep 0.1
+        done
+        if [ "${oom_now}" -le "${oom_before}" ]; then
+            cat "${child}/memory.events" >&2
+            fail "partial OOM injection did not increment target oom_kill"
+        fi
+        log "partial OOM injection confirmed: oom_kill=${oom_before}->${oom_now}"
+    fi
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED"
+    wait "${hog_pid}" || true
+    assert_wait_log "${SANDBOX_ID}" true
+    wait_for_exit_code_log "${SANDBOX_ID}" 137
+    if [ "${CGROUP_MODE}" = v2 ]; then
+        local oom_after
+        oom_after="$(awk '$1 == "oom_kill" { print $2 }' "${child}/memory.events")"
+        [ "${oom_after}" -gt "${oom_before}" ] || fail "OOM counter did not increase in target cgroup"
+        grep -q '^populated 0$' "${child}/cgroup.events" || fail "OOM left host tasks alive"
+    fi
+    wait_for_exec_output "${PARTIAL_OOM_GUARD_ID}" "oom-guard-alive" /bin/echo oom-guard-alive
+    # The guard leased the pre-existing cache entry. Recycle it first so the
+    # one-entry cache keeps that group for the later cached-reuse assertions.
+    sbox_cmd delete "${PARTIAL_OOM_GUARD_ID}"
+    if sbox_cmd inspect "${PARTIAL_OOM_GUARD_ID}" >/dev/null 2>&1; then
+        fail "partial OOM guard still inspectable after delete"
+    fi
+    PARTIAL_OOM_GUARD_ID=""
+    timeout 15 sbox --address "${SOCKET}" delete "${SANDBOX_ID}"
+    if sbox_cmd inspect "${SANDBOX_ID}" >/dev/null 2>&1; then
+        fail "partial OOM sandbox still inspectable after delete"
+    fi
+    SANDBOX_ID=""
+}
+
 run_runsc_checks() {
     log "starting sandbox"
     SANDBOX_ID="$(sbox_cmd start \
@@ -2223,6 +2472,8 @@ run_runsc_checks() {
 
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${got}" "sandboxd-network-ok" "sandbox network"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/grep '^nameserver ' /etc/resolv.conf)"
+    assert_eq "${got}" "nameserver ${GATEWAY_IP}" "runsc managed resolver ignores direct override without a policy"
     run_network_acl_checks "runsc" runsc
 
     sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" || fail "stats output missing memory usage"
@@ -2240,6 +2491,8 @@ run_runsc_checks() {
     run_checkpoint_restore_check runsc "${ROOTFS}"
     run_host_mount_rw_check runsc "${ROOTFS}" "runsc-${RUNSC_PLATFORM}"
     run_storage_quota_check
+
+    run_partial_oom_check
 
     log "starting immediate OOM sandbox"
     SANDBOX_ID="$(sbox_cmd start \
@@ -2357,6 +2610,13 @@ run_e2e() {
     write_config
     prepare_rootfs
     start_sandboxd
+    if [ "${DISABLE_CGROUP}" = "0" ] && {
+        [ "${E2E_RUNTIME}" = "all" ] || [ "${E2E_RUNTIME}" = "runsc" ];
+    }; then
+        start_direct_dns_fixture
+        run_runsc_direct_dns_checks
+    fi
+    # DNS mode changes recreate the bridge; bind the HTTP fixture afterwards.
     start_gateway_httpd
     if [ "${STRESS_ONLY}" = "1" ]; then
         run_stress_checks "${E2E_RUNTIME}" "${STRESS_ROOTFS:-${ROOTFS}}"
@@ -2372,7 +2632,10 @@ run_e2e() {
                 run_runc_checks
                 ;;
             runsc) run_runsc_checks ;;
-            runc) run_runc_checks ;;
+            runc)
+                start_direct_dns_fixture
+                run_runc_checks
+                ;;
             kata) run_kata_checks ;;
             firecracker|firecracker-pvm) run_firecracker_checks ;;
         esac
@@ -2384,7 +2647,7 @@ run_e2e() {
 }
 
 serve_sandboxd() {
-    preflight
+    preflight serve
     cleanup_cgroups
     write_config
     mkdir -p "$(dirname "${LOG_FILE}")"

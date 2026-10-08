@@ -51,6 +51,13 @@ cgroup_root_name = "/sandboxd"
 max_instance_num = 32
 
 [plugin.runtime]
+# Managed DNS upstreams and search/options; also the default direct resolver.
+# resolv_conf_path = "/etc/resolv.conf"
+# Optional resolver for any sandbox that does not use managed DNS, including
+# runc and all runtimes when network ACLs are disabled. Empty inherits the
+# setting above. Existing runtime or explicit resolver mounts take precedence.
+# Nameservers must be reachable from the sandbox; this does not add forwarding.
+# direct_resolv_conf_path = "/etc/sandboxd/direct-resolv.conf"
 # Retained for configuration compatibility; the current runtime does not read it.
 image_lib_dir = "/var/lib/sandboxd/images"
 # Writable gVisor overlays and Firecracker block images are stored here.
