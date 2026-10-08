@@ -39,9 +39,9 @@ CGROUP_ROOT="${E2E_CGROUP_ROOT:-sandboxd-e2e}"
 NETWORK_CIDR="${E2E_NETWORK_CIDR:-10.88.0.1/16}"
 GATEWAY_IP="${E2E_GATEWAY_IP:-10.88.0.1}"
 HTTP_PORT="${E2E_HTTP_PORT:-18080}"
-RUNC_DNS_IP="192.0.2.53"
-RUNC_DNS_ANSWER="192.0.2.123"
-RUNC_DNS_NAME="resolver-proof.runc.e2e."
+DIRECT_DNS_IP="192.0.2.53"
+DIRECT_DNS_ANSWER="192.0.2.123"
+DIRECT_DNS_NAME="resolver-proof.direct.e2e."
 DNAT_HOST_PORT="${E2E_DNAT_HOST_PORT:-18181}"
 DNAT_GUEST_PORT="${E2E_DNAT_GUEST_PORT:-18180}"
 BRIDGE_NAME="${E2E_BRIDGE_NAME:-sandbox0}"
@@ -68,8 +68,8 @@ export RUNSC_IGNORE_CGROUPS="${DISABLE_CGROUP}"
 
 SANDBOXD_PID=""
 HTTPD_PID=""
-RUNC_DNS_PID=""
-RUNC_DNS_ALIAS_ADDED=0
+DIRECT_DNS_PID=""
+DIRECT_DNS_ALIAS_ADDED=0
 SANDBOX_ID=""
 STRESS_IDS=()
 CGROUP_MODE=""
@@ -156,12 +156,12 @@ cleanup() {
         kill "${HTTPD_PID}" >/dev/null 2>&1
         wait "${HTTPD_PID}" >/dev/null 2>&1
     fi
-    if [ -n "${RUNC_DNS_PID}" ]; then
-        kill "${RUNC_DNS_PID}" >/dev/null 2>&1
-        wait "${RUNC_DNS_PID}" >/dev/null 2>&1
+    if [ -n "${DIRECT_DNS_PID}" ]; then
+        kill "${DIRECT_DNS_PID}" >/dev/null 2>&1
+        wait "${DIRECT_DNS_PID}" >/dev/null 2>&1
     fi
-    if [ "${RUNC_DNS_ALIAS_ADDED}" = "1" ]; then
-        ip address del "${RUNC_DNS_IP}/32" dev lo >/dev/null 2>&1
+    if [ "${DIRECT_DNS_ALIAS_ADDED}" = "1" ]; then
+        ip address del "${DIRECT_DNS_IP}/32" dev lo >/dev/null 2>&1
     fi
     if [ -n "${SANDBOXD_PID}" ]; then
         kill "${SANDBOXD_PID}" >/dev/null 2>&1
@@ -412,8 +412,8 @@ EOF
 EOF
 
     # Distinct from the node resolver and backed by a local E2E-only DNS
-    # fixture so the runc test proves a lookup, not just a mount.
-    printf 'nameserver %s\nsearch runc.e2e\n' "${RUNC_DNS_IP}" > "${CONFIG_DIR}/direct-resolv.conf"
+    # fixture so direct-DNS tests prove a lookup, not just a mount.
+    printf 'nameserver %s\nsearch direct.e2e\n' "${DIRECT_DNS_IP}" > "${CONFIG_DIR}/direct-resolv.conf"
 
     local disable_cgroup=false
     if [ "${DISABLE_CGROUP}" = "1" ]; then
@@ -644,40 +644,40 @@ start_gateway_httpd() {
     HTTPD_PID=$!
 }
 
-start_runc_dns_fixture() {
-    log "starting isolated runc DNS fixture"
-    ip address add "${RUNC_DNS_IP}/32" dev lo
-    RUNC_DNS_ALIAS_ADDED=1
+start_direct_dns_fixture() {
+    log "starting isolated direct DNS fixture"
+    ip address add "${DIRECT_DNS_IP}/32" dev lo
+    DIRECT_DNS_ALIAS_ADDED=1
     dnsmasq --conf-file=/dev/null --no-daemon --no-resolv --no-hosts \
-        --bind-interfaces --listen-address="${RUNC_DNS_IP}" --port=53 \
-        --host-record="${RUNC_DNS_NAME%.},${RUNC_DNS_ANSWER}" \
-        --pid-file= >/tmp/sandboxd-runc-dns.log 2>&1 &
-    RUNC_DNS_PID=$!
+        --bind-interfaces --listen-address="${DIRECT_DNS_IP}" --port=53 \
+        --host-record="${DIRECT_DNS_NAME%.},${DIRECT_DNS_ANSWER}" \
+        --pid-file= >/tmp/sandboxd-direct-dns.log 2>&1 &
+    DIRECT_DNS_PID=$!
     local attempt
     for attempt in $(seq 1 30); do
-        if ! kill -0 "${RUNC_DNS_PID}" >/dev/null 2>&1; then
-            cat /tmp/sandboxd-runc-dns.log >&2
-            fail "runc DNS fixture exited during startup"
+        if ! kill -0 "${DIRECT_DNS_PID}" >/dev/null 2>&1; then
+            cat /tmp/sandboxd-direct-dns.log >&2
+            fail "direct DNS fixture exited during startup"
         fi
-        if /bin/timeout 2 /bin/busybox nslookup -type=A "${RUNC_DNS_NAME}" "${RUNC_DNS_IP}" \
-            2>/dev/null | grep -Fq "${RUNC_DNS_ANSWER}"; then
+        if /bin/timeout 2 /bin/busybox nslookup -type=A "${DIRECT_DNS_NAME}" "${DIRECT_DNS_IP}" \
+            2>/dev/null | grep -Fq "${DIRECT_DNS_ANSWER}"; then
             return 0
         fi
         sleep 0.1
     done
-    cat /tmp/sandboxd-runc-dns.log >&2
-    fail "runc DNS fixture did not answer during readiness checks"
+    cat /tmp/sandboxd-direct-dns.log >&2
+    fail "direct DNS fixture did not answer during readiness checks"
 }
 
-assert_runc_resolver_query() {
+assert_direct_resolver_query() {
     local got
     # Bound the host-side exec process without leaving a timeout watchdog
-    # inside the runc sandbox.
+    # inside the sandbox. Do not specify a DNS server: exercise resolv.conf.
     got="$(timeout -k 2s 10s /usr/local/bin/sbox --address "${SOCKET}" --timeout 10s \
-        exec "${SANDBOX_ID}" /bin/nslookup -type=A "${RUNC_DNS_NAME}")" ||
-        fail "runc resolver query failed or timed out"
-    printf '%s\n' "${got}" | grep -Fq "${RUNC_DNS_ANSWER}" ||
-        fail "runc resolver query did not return the fixture address: ${got}"
+        exec "${SANDBOX_ID}" /bin/nslookup -type=A "${DIRECT_DNS_NAME}")" ||
+        fail "direct resolver query failed or timed out"
+    printf '%s\n' "${got}" | grep -Fq "${DIRECT_DNS_ANSWER}" ||
+        fail "direct resolver query did not return the fixture address: ${got}"
 }
 
 sbox_cmd() {
@@ -1785,7 +1785,7 @@ run_runc_checks() {
     assert_eq "${got}" "sandboxd-network-ok" "runc sandbox network"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
     assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "direct resolver on an ACL-enabled node"
-    assert_runc_resolver_query
+    assert_direct_resolver_query
     sbox_cmd exec "${SANDBOX_ID}" /bin/test -c /dev/kvm
     local tty_status=0
     printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh || tty_status=$?
@@ -1807,7 +1807,7 @@ run_runc_checks() {
     assert_eq "${got}" "recovered-runc" "runc exec after sandboxd restart"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
     assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "direct resolver after sandboxd restart"
-    assert_runc_resolver_query
+    assert_direct_resolver_query
 
     local deleted_id="${SANDBOX_ID}"
     sbox_cmd delete "${deleted_id}"
@@ -2225,6 +2225,51 @@ run_firecracker_checks() {
     run_stress_checks firecracker "${rootfs}"
 }
 
+run_runsc_direct_dns_checks() {
+    log "testing runsc direct DNS with network ACLs disabled"
+    # Change DNS mode only on a drained node. Preserve the store so the test
+    # also exercises recovery rather than hiding old state in a fresh node.
+    local remaining
+    remaining="$(sbox_cmd list | awk 'NR > 1 { print $1 }')"
+    [ -z "${remaining}" ] || fail "DNS mode change requires a drained node: ${remaining}"
+    crash_sandboxd
+    sed -i 's/^enable_network_acl = true$/enable_network_acl = false/' "${CONFIG_FILE}"
+    grep -qx 'enable_network_acl = false' "${CONFIG_FILE}" || fail "failed to disable network ACLs"
+    start_sandboxd
+
+    SANDBOX_ID="$(sbox_cmd start \
+        --quiet \
+        --runtime runsc \
+        --sandbox-id sbox-e2e-runsc-direct-dns \
+        --rootfs "${ROOTFS}" \
+        --cpu-millicores 1000 \
+        --memory-mb 128 \
+        /bin/sleep 300)"
+    [ -n "${SANDBOX_ID}" ] || fail "direct DNS start returned empty sandbox id"
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    local got
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "runsc direct resolver"
+    assert_direct_resolver_query
+
+    crash_and_restart_sandboxd
+    wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "runsc direct resolver after restart"
+    assert_direct_resolver_query
+    sbox_cmd delete "${SANDBOX_ID}"
+    SANDBOX_ID=""
+
+    # Restore managed DNS before the normal runsc lifecycle and ACL checks.
+    remaining="$(sbox_cmd list | awk 'NR > 1 { print $1 }')"
+    [ -z "${remaining}" ] || fail "DNS mode restore requires a drained node: ${remaining}"
+    crash_sandboxd
+    sed -i 's/^enable_network_acl = false$/enable_network_acl = true/' "${CONFIG_FILE}"
+    grep -qx 'enable_network_acl = true' "${CONFIG_FILE}" || fail "failed to enable network ACLs"
+    start_sandboxd
+    log "runsc direct DNS checks passed"
+}
+
 run_runsc_checks() {
     log "starting sandbox"
     SANDBOX_ID="$(sbox_cmd start \
@@ -2265,6 +2310,8 @@ run_runsc_checks() {
 
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${got}" "sandboxd-network-ok" "sandbox network"
+    got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/grep '^nameserver ' /etc/resolv.conf)"
+    assert_eq "${got}" "nameserver ${GATEWAY_IP}" "runsc managed resolver ignores direct override without a policy"
     run_network_acl_checks "runsc" runsc
 
     sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" || fail "stats output missing memory usage"
@@ -2410,13 +2457,18 @@ run_e2e() {
     else
         case "${E2E_RUNTIME}" in
             all)
+                start_direct_dns_fixture
+                run_runsc_direct_dns_checks
                 run_runsc_checks
-                start_runc_dns_fixture
                 run_runc_checks
                 ;;
-            runsc) run_runsc_checks ;;
+            runsc)
+                start_direct_dns_fixture
+                run_runsc_direct_dns_checks
+                run_runsc_checks
+                ;;
             runc)
-                start_runc_dns_fixture
+                start_direct_dns_fixture
                 run_runc_checks
                 ;;
             kata) run_kata_checks ;;

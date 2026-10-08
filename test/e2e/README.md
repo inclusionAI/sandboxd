@@ -44,6 +44,8 @@ the repository `AGENTS.md`. The adapters consume runtime state or boot
 protocols that can change, so another version is not assumed compatible until
 this suite passes.
 
+Both runsc platforms also test `plugin.runtime.direct_resolv_conf_path` with network ACLs disabled: they check the injected file and query the isolated DNS fixture without specifying a server, before and after daemon restart. The test drains the node before changing DNS mode, retains the store, then restores ACLs and verifies that a new runsc sandbox still uses managed DNS even without a policy. The direct override therefore has coverage independent of runc without weakening the existing ACL tests.
+
 ## Commands
 
 Run the default runsc and runc suite:
@@ -229,10 +231,7 @@ E2E_NETWORK_CIDR=172.30.252.1/22 \
 /usr/bin/tini -s -- /usr/local/bin/sandboxd-e2e-run serve
 ```
 
-The runc DNS E2E fixture binds `192.0.2.53/32` inside the test container.
-When selecting a custom `E2E_NETWORK_CIDR` for a runc or `all` run, keep that
-address outside the sandbox network range. The fixture is test-only and does
-not provide production DNS forwarding.
+The direct DNS E2E fixture binds `192.0.2.53/32` inside the test container. When selecting a custom `E2E_NETWORK_CIDR` for a runsc, runc, or `all` run, keep that address outside the sandbox network range. The fixture is test-only and does not provide production DNS forwarding.
 
 ## Shutdown cleanup
 
