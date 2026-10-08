@@ -2252,6 +2252,9 @@ run_runsc_direct_dns_checks() {
     assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "runsc direct resolver"
     assert_direct_resolver_query
 
+    # Resource-pool ownership is checkpointed periodically, as in the other
+    # crash-recovery cases. Let that checkpoint complete before killing it.
+    sleep 6
     crash_and_restart_sandboxd
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
