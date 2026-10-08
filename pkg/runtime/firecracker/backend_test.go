@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -86,13 +87,21 @@ func TestDecodeKvmMSRIndices(t *testing.T) {
 }
 
 // TestProbeKvmBackendOnLiveDevice runs the actual ABI probe against the
-// host's /dev/kvm. It is skipped in environments without /dev/kvm.
+// host's /dev/kvm. It is optional in the unprivileged unit suite: the device
+// must exist and be accessible to the user before the ABI itself is tested.
 func TestProbeKvmBackendOnLiveDevice(t *testing.T) {
 	if runtime.GOARCH != "amd64" {
 		t.Skip("MSR backend identification uses the x86-64 KVM ABI")
 	}
-	if _, err := os.Stat("/dev/kvm"); err != nil {
-		t.Skip("no /dev/kvm available")
+	kvm, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+			t.Skipf("live KVM probe unavailable to this user: %v", err)
+		}
+		t.Fatalf("check /dev/kvm access: %v", err)
+	}
+	if err := kvm.Close(); err != nil {
+		t.Fatalf("close KVM access check: %v", err)
 	}
 	backend, err := probeKvmBackend("/dev/kvm")
 	if err != nil {
