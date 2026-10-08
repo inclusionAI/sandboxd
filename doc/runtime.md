@@ -70,6 +70,12 @@ In direct mode, the source path is resolved in the sandboxd process's filesystem
 
 Configure nameservers that the sandbox can actually reach from its network environment; selecting a file does not provide DNS forwarding. In particular, a node-local loopback resolver or Docker's embedded `127.0.0.11` must not be assumed reachable, and this option does not recreate Docker container-name resolution. A flat resolver file also cannot represent systemd-resolved's per-link split-DNS routing; operators using split DNS must validate a suitable resolver path and connectivity for their deployment. This setting is not a live-update mechanism: changes to its configuration or source file are not guaranteed to update existing sandboxes. Recreate a sandbox to apply a changed resolver deterministically.
 
+## OOM and failed deletion
+
+A host cgroup OOM makes the entire sandbox terminal (`OOMKilled=true`, exit code 137), even when the kernel kills only a worker and the runtime's init process remains alive. Sandboxd consumes the kernel OOM notification independently of runtime Wait and drains the remaining tasks in that sandbox's allocated cgroup. The OOM lease is guarded against reset so an old notification cannot terminate a later user of the cached cgroup. Cgroup-disabled sandboxes have no host OOM notification; guest-only OOMs remain runtime-owned.
+
+Delete calls for one sandbox share cleanup independently of caller cancellation. Each runtime deletion attempt has a 30-second deadline. If that deadline expires and an allocated cgroup is available, sandboxd drains only that child's processes and retries runtime deletion once with a fresh 30-second deadline. Runsc command output draining is also bounded. Cleanup errors remain visible and retryable: sandbox metadata, filesystem ownership, and resource accounting are released only after the runtime deletion succeeds. This does not guarantee that uninterruptible kernel tasks can be removed; failure must never be reported as successful cleanup.
+
 ## Pooled TAP lifecycle
 
 Runsc, Kata, and Firecracker consume the same interface cache. Each cache entry

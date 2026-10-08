@@ -283,6 +283,8 @@ message StartResponse {
   string message = 2;
   // ID is the unique sandbox ID.
   string id = 3;
+  // SandboxIP is the address assigned to the sandbox network endpoint.
+  string sandbox_ip = 4;
 }
 
 // CheckpointRequest describes a synchronous checkpoint operation.

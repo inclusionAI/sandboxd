@@ -21,6 +21,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 // TestV010WireContract pins the public protobuf descriptor while allowing
@@ -33,11 +35,54 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	// Rolled for StartRequest.inject_entrypoint (field 22), which supplies the
-	// in-sandbox destination for injected OCI image startup configuration.
+	// Rolled for StartResponse.sandbox_ip (field 4), required for YuanRong
+	// Node Proxy route registration; existing response fields are unchanged.
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "5cbcd4bbad5035b8c2d5224e0f08944f38ee0188d5116e09ac8f16ef5419fc6b"
+	const want = "21eb701d4c16828d5f4ac42d6a50d6f644e038b6b967b4c5165a9dd025aed67b"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
+	}
+}
+
+// Older clients must continue to decode the original fields when the server
+// supplies the sandbox network endpoint required by newer YuanRong releases.
+func TestStartResponseLegacyWireCompatibility(t *testing.T) {
+	response := &StartResponse{Code: 0, Message: "Succeed", ID: "sandbox-compat", SandboxIp: "10.88.0.2"}
+	message := protodesc.ToDescriptorProto(response.ProtoReflect().Descriptor())
+	if got := message.Field[3].GetNumber(); got != 4 {
+		t.Fatalf("sandbox_ip field number = %d, want 4", got)
+	}
+	message.Field = message.Field[:3]
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name:        proto.String("legacy-start-response.proto"),
+		Package:     proto.String("legacy"),
+		Syntax:      proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{message},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := proto.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := dynamicpb.NewMessage(file.Messages().Get(0))
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(wire, legacy); err != nil {
+		t.Fatal(err)
+	}
+	fields := legacy.Descriptor().Fields()
+	if legacy.Get(fields.ByNumber(1)).Int() != 0 || legacy.Get(fields.ByNumber(2)).String() != "Succeed" || legacy.Get(fields.ByNumber(3)).String() != response.ID {
+		t.Fatalf("legacy response fields changed: %s", legacy)
+	}
+	legacyWire, err := proto.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded StartResponse
+	if err := proto.Unmarshal(legacyWire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ID != response.ID || decoded.Message != response.Message || decoded.SandboxIp != "" {
+		t.Fatalf("legacy server response did not retain its original fields: %s", &decoded)
 	}
 }
