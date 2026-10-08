@@ -53,7 +53,7 @@ up to a vCPU count, and guest memory must be at least 128 MiB.
 
 ## Resolver sources
 
-Resolver selection follows the sandbox's DNS mode, not its runtime name. With network ACLs enabled, supported runtimes use managed DNS even when an individual sandbox has no policy. Runc does not support managed DNS; when network ACLs are disabled, all runtimes use direct DNS.
+Sandbox DNS has two modes: managed and direct. With network ACLs enabled, supported runtimes use managed DNS even when an individual sandbox has no policy. Runc uses direct DNS. When network ACLs are disabled, all runtimes use direct DNS.
 
 - Managed DNS: `plugin.runtime.resolv_conf_path` supplies the proxy's upstream nameservers and the search/domain/options retained in generated sandbox resolver files. Each sandbox queries the managed proxy on the bridge address.
 - Direct DNS: `plugin.runtime.direct_resolv_conf_path` optionally selects the resolver file injected into the sandbox. An empty value inherits `plugin.runtime.resolv_conf_path`, which defaults to `/etc/resolv.conf`. The direct override never changes managed DNS upstreams or generated resolver content.

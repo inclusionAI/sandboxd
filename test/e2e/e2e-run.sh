@@ -198,6 +198,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+check_direct_dns_dependencies() {
+    if [ "${1:-e2e}" != "e2e" ] || [ "${DISABLE_CGROUP}" = "1" ]; then
+        return
+    fi
+    case "${E2E_RUNTIME}" in
+        all|runsc|runc)
+            command -v dnsmasq >/dev/null 2>&1 || fail "missing command: dnsmasq"
+            command -v timeout >/dev/null 2>&1 || fail "missing command: timeout"
+            ;;
+    esac
+}
+
 preflight() {
     mkdir -p /home/akernel
     assert_sandboxd_home_is_disk_backed
@@ -283,10 +295,7 @@ preflight() {
     for bin in sandboxd sbox checkpoint-restore ip ipset iptables ip6tables busybox mkfs.erofs; do
         command -v "${bin}" >/dev/null 2>&1 || fail "missing command: ${bin}"
     done
-    if [ "${E2E_RUNTIME}" = "runc" ] || [ "${E2E_RUNTIME}" = "all" ]; then
-        command -v dnsmasq >/dev/null 2>&1 || fail "missing command: dnsmasq"
-        command -v timeout >/dev/null 2>&1 || fail "missing command: timeout"
-    fi
+    check_direct_dns_dependencies "${1:-e2e}"
     case "${E2E_RUNTIME}" in
         all)
             for bin in runsc runc runc-shim; do
@@ -591,6 +600,34 @@ EOF
         chmod 1777 "${REDIS_ROOTFS}/tmp"
         mkfs.erofs "${REDIS_EROFS_ROOTFS}" "${REDIS_ROOTFS}" >/dev/null
     fi
+}
+
+stop_sandboxd() {
+    log "stopping sandboxd and flushing resource ownership"
+    local pid="${SANDBOXD_PID}"
+    kill -TERM "${pid}" || fail "could not stop sandboxd"
+    local attempt
+    for attempt in $(seq 1 300); do
+        if ! kill -0 "${pid}" >/dev/null 2>&1; then
+            local status=0
+            wait "${pid}" || status=$?
+            SANDBOXD_PID=""
+            [ "${status}" -eq 0 ] || fail "sandboxd shutdown exited with status ${status}"
+            if ip link show "${BRIDGE_NAME}" >/dev/null 2>&1; then
+                fail "sandbox bridge remained after shutdown"
+            fi
+            local links taps
+            links="$(ip -o link show)" || fail "could not inspect network links after shutdown"
+            taps="$(printf '%s\n' "${links}" | awk -F ': ' '$2 ~ /^tap\./ { print $2 }')"
+            [ -z "${taps}" ] || fail "sandbox TAPs remained after shutdown"
+            return
+        fi
+        sleep 0.1
+    done
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+    SANDBOXD_PID=""
+    fail "sandboxd did not shut down within 30 seconds"
 }
 
 crash_sandboxd() {
@@ -2227,12 +2264,12 @@ run_firecracker_checks() {
 
 run_runsc_direct_dns_checks() {
     log "testing runsc direct DNS with network ACLs disabled"
-    # Change DNS mode only on a drained node. Preserve the store so the test
-    # also exercises recovery rather than hiding old state in a fresh node.
+    # Change DNS mode on a drained node after shutdown flushes resource leases.
+    # Keep the store across mode changes and crash recovery.
     local remaining
     remaining="$(sbox_cmd list | awk 'NR > 1 { print $1 }')"
     [ -z "${remaining}" ] || fail "DNS mode change requires a drained node: ${remaining}"
-    crash_sandboxd
+    stop_sandboxd
     sed -i 's/^enable_network_acl = true$/enable_network_acl = false/' "${CONFIG_FILE}"
     grep -qx 'enable_network_acl = false' "${CONFIG_FILE}" || fail "failed to disable network ACLs"
     start_sandboxd
@@ -2252,8 +2289,8 @@ run_runsc_direct_dns_checks() {
     assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "runsc direct resolver"
     assert_direct_resolver_query
 
-    # Resource-pool ownership is checkpointed periodically, as in the other
-    # crash-recovery cases. Let that checkpoint complete before killing it.
+    # Resource-pool ownership is checkpointed periodically. This DNS recovery
+    # check requires that checkpoint to complete before the crash.
     sleep 6
     crash_and_restart_sandboxd
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
@@ -2266,7 +2303,7 @@ run_runsc_direct_dns_checks() {
     # Restore managed DNS before the normal runsc lifecycle and ACL checks.
     remaining="$(sbox_cmd list | awk 'NR > 1 { print $1 }')"
     [ -z "${remaining}" ] || fail "DNS mode restore requires a drained node: ${remaining}"
-    crash_sandboxd
+    stop_sandboxd
     sed -i 's/^enable_network_acl = false$/enable_network_acl = true/' "${CONFIG_FILE}"
     grep -qx 'enable_network_acl = true' "${CONFIG_FILE}" || fail "failed to enable network ACLs"
     start_sandboxd
@@ -2449,6 +2486,13 @@ run_e2e() {
     write_config
     prepare_rootfs
     start_sandboxd
+    if [ "${DISABLE_CGROUP}" = "0" ] && {
+        [ "${E2E_RUNTIME}" = "all" ] || [ "${E2E_RUNTIME}" = "runsc" ];
+    }; then
+        start_direct_dns_fixture
+        run_runsc_direct_dns_checks
+    fi
+    # DNS mode changes recreate the bridge; bind the HTTP fixture afterwards.
     start_gateway_httpd
     if [ "${STRESS_ONLY}" = "1" ]; then
         run_stress_checks firecracker "${STRESS_ROOTFS:-${ROOTFS}}"
@@ -2460,16 +2504,10 @@ run_e2e() {
     else
         case "${E2E_RUNTIME}" in
             all)
-                start_direct_dns_fixture
-                run_runsc_direct_dns_checks
                 run_runsc_checks
                 run_runc_checks
                 ;;
-            runsc)
-                start_direct_dns_fixture
-                run_runsc_direct_dns_checks
-                run_runsc_checks
-                ;;
+            runsc) run_runsc_checks ;;
             runc)
                 start_direct_dns_fixture
                 run_runc_checks
@@ -2485,7 +2523,7 @@ run_e2e() {
 }
 
 serve_sandboxd() {
-    preflight
+    preflight serve
     cleanup_cgroups
     write_config
     mkdir -p "$(dirname "${LOG_FILE}")"

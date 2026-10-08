@@ -44,7 +44,9 @@ the repository `AGENTS.md`. The adapters consume runtime state or boot
 protocols that can change, so another version is not assumed compatible until
 this suite passes.
 
-Both runsc platforms also test `plugin.runtime.direct_resolv_conf_path` with network ACLs disabled: they check the injected file and query the isolated DNS fixture without specifying a server, before and after daemon restart. The test drains the node before changing DNS mode, retains the store, then restores ACLs and verifies that a new runsc sandbox still uses managed DNS even without a policy. The direct override therefore has coverage independent of runc without weakening the existing ACL tests.
+Both runsc platforms test `plugin.runtime.direct_resolv_conf_path` with network ACLs disabled: they check the injected file and query the isolated DNS fixture without specifying a server, before and after a daemon crash. Crash checks wait for the periodic resource-ownership checkpoint. DNS mode changes require a drained node and a successful graceful shutdown within 30 seconds, including bridge and TAP cleanup, while retaining the store. After ACLs are enabled, a new runsc sandbox must use managed DNS even without a policy. The HTTP fixture starts after mode changes have recreated the bridge.
+
+`go test ./test/e2e` checks the DNS dependency preflight and bounded shutdown helpers without privileged workloads. It covers missing tools, paths that do not use the DNS fixture, shutdown failures and timeouts, and residual network resources.
 
 ## Commands
 
@@ -189,12 +191,7 @@ artifacts. This avoids both tmpfs-only checkpoint behavior and nested private
 overlays in Docker's writable layer. The harness rejects a tmpfs-backed source
 and verifies the mount again inside the container.
 
-GitHub Actions builds the project-owned E2E binaries once and uploads them as
-a short-lived artifact. Five dependent matrix jobs then build targeted images
-and run runsc with systrap, runsc with KVM, Kata, Firecracker, and runc in
-parallel. The three VM jobs fail immediately when nested KVM is unavailable.
-Each case has its own runner VM, so cgroups, loop devices, TAPs, and network
-state cannot leak between runtimes.
+GitHub Actions builds the project-owned E2E binaries once and uploads them as a short-lived artifact. Seven dependent matrix jobs build targeted images for runsc with systrap, runsc with KVM, Kata, Firecracker (full, incremental, and virtio-fs), and runc. KVM-dependent jobs fail immediately when nested KVM is unavailable. Each case has its own runner VM, so cgroups, loop devices, TAPs, and network state cannot leak between runtimes.
 
 ## GPU debug image
 
@@ -231,7 +228,7 @@ E2E_NETWORK_CIDR=172.30.252.1/22 \
 /usr/bin/tini -s -- /usr/local/bin/sandboxd-e2e-run serve
 ```
 
-The direct DNS E2E fixture binds `192.0.2.53/32` inside the test container. When selecting a custom `E2E_NETWORK_CIDR` for a runsc, runc, or `all` run, keep that address outside the sandbox network range. The fixture is test-only and does not provide production DNS forwarding.
+The direct DNS E2E fixture binds `192.0.2.53/32` inside the test container. When selecting a custom `E2E_NETWORK_CIDR` for a runsc, runc, or `all` run, keep that address outside the sandbox network range. These DNS test paths require `dnsmasq` and `timeout`; preflight checks them before starting sandboxd. Cgroup-disabled tests and manual `serve` mode do not run the fixture or require its tools. The fixture is test-only and does not provide production DNS forwarding.
 
 ## Shutdown cleanup
 
