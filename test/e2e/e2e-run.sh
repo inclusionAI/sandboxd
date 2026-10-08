@@ -2231,13 +2231,18 @@ run_partial_oom_check() {
         grep -q '^populated 0$' "${child}/cgroup.events" || fail "OOM left host tasks alive"
     fi
     wait_for_exec_output "${PARTIAL_OOM_GUARD_ID}" "oom-guard-alive" /bin/echo oom-guard-alive
+    # The guard leased the pre-existing cache entry. Recycle it first so the
+    # one-entry cache keeps that group for the later cached-reuse assertions.
+    sbox_cmd delete "${PARTIAL_OOM_GUARD_ID}"
+    if sbox_cmd inspect "${PARTIAL_OOM_GUARD_ID}" >/dev/null 2>&1; then
+        fail "partial OOM guard still inspectable after delete"
+    fi
+    PARTIAL_OOM_GUARD_ID=""
     timeout 15 sbox --address "${SOCKET}" delete "${SANDBOX_ID}"
     if sbox_cmd inspect "${SANDBOX_ID}" >/dev/null 2>&1; then
         fail "partial OOM sandbox still inspectable after delete"
     fi
     SANDBOX_ID=""
-    sbox_cmd delete "${PARTIAL_OOM_GUARD_ID}"
-    PARTIAL_OOM_GUARD_ID=""
 }
 
 run_runsc_checks() {
