@@ -34,9 +34,12 @@ case "${RUN_UNIT_TESTS}" in
 esac
 
 cd "${ROOT_DIR}"
+GOCACHE="${GOCACHE:-/tmp/go-build}"
+GOMODCACHE="${GOMODCACHE:-/tmp/go-mod-official}"
+export GOCACHE GOMODCACHE
 if [ "${RUN_UNIT_TESTS}" = "1" ]; then
     log "running unit tests once"
-    GOWORK=off GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-official \
+    GOWORK=off \
         GOTOOLCHAIN=auto go test ./...
 fi
 
