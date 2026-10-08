@@ -2208,6 +2208,7 @@ run_partial_oom_check() {
         --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
     local child
     child="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
+    assert_cgroup_limits "${child}" 1000 128
     local guard_child
     guard_child="$(wait_for_sandbox_cgroup "${PARTIAL_OOM_GUARD_ID}")"
     [ "${child}" != "${guard_child}" ] || fail "OOM target and guard share a cgroup"
@@ -2220,6 +2221,31 @@ run_partial_oom_check() {
     # not the guest init. Runtime Wait alone cannot observe that failure.
     /bin/sh -c 'echo 1000 > /proc/self/oom_score_adj; echo $$ > "$1/cgroup.procs"; exec /usr/local/bin/oom-hog' sh "${child}" &
     local hog_pid=$!
+    if [ "${CGROUP_MODE}" = v2 ]; then
+        local oom_now="${oom_before}"
+        local attempt
+        # Capture whether host swap is delaying the injection, independently
+        # of sandboxd's handling of an actual OOM notification.
+        for attempt in $(seq 1 30); do
+            oom_now="$(awk '$1 == "oom_kill" { print $2 }' "${child}/memory.events")"
+            [ "${oom_now}" -gt "${oom_before}" ] && break
+            sleep 0.1
+        done
+        log "partial OOM injection: oom_kill=${oom_before}->${oom_now}, memory.current=$(cat "${child}/memory.current"), memory.swap.current=$(cat "${child}/memory.swap.current"), memory.swap.max=$(cat "${child}/memory.swap.max")"
+        # This test needs a resident-memory OOM, not exhaustion of a runner's
+        # entire swap device. Change only this sandbox's test cgroup policy.
+        echo 0 > "${child}/memory.swap.max"
+        for attempt in $(seq 1 100); do
+            oom_now="$(awk '$1 == "oom_kill" { print $2 }' "${child}/memory.events")"
+            [ "${oom_now}" -gt "${oom_before}" ] && break
+            sleep 0.1
+        done
+        if [ "${oom_now}" -le "${oom_before}" ]; then
+            cat "${child}/memory.events" >&2
+            fail "partial OOM injection did not increment target oom_kill"
+        fi
+        log "partial OOM injection confirmed: oom_kill=${oom_before}->${oom_now}"
+    fi
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED"
     wait "${hog_pid}" || true
     assert_wait_log "${SANDBOX_ID}" true
