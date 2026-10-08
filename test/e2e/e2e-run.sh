@@ -66,6 +66,7 @@ export RUNSC_IGNORE_CGROUPS="${DISABLE_CGROUP}"
 SANDBOXD_PID=""
 HTTPD_PID=""
 SANDBOX_ID=""
+PARTIAL_OOM_GUARD_ID=""
 STRESS_IDS=()
 CGROUP_MODE=""
 CGROUP_DIR=""
@@ -142,6 +143,9 @@ cleanup() {
 
     if [ -n "${SANDBOX_ID}" ]; then
         /usr/local/bin/sbox --address "${SOCKET}" --timeout 20s delete "${SANDBOX_ID}" >/dev/null 2>&1
+    fi
+    if [ -n "${PARTIAL_OOM_GUARD_ID}" ]; then
+        /usr/local/bin/sbox --address "${SOCKET}" --timeout 20s delete "${PARTIAL_OOM_GUARD_ID}" >/dev/null 2>&1
     fi
     local stress_id
     for stress_id in "${STRESS_IDS[@]}"; do
@@ -1375,6 +1379,32 @@ wait_for_cgroup_child() {
     fail "no cached cgroup appeared below ${CGROUP_DIR}"
 }
 
+wait_for_sandbox_cgroup() {
+    local id="$1"
+    local config="${SANDBOXD_ROOT}/containers/${id}/config.json"
+    local path=""
+    local child=""
+    local i
+    for i in $(seq 1 100); do
+        if [ -f "${config}" ]; then
+            path="$(jq -er '.linux.cgroupsPath // empty' "${config}" 2>/dev/null || true)"
+            case "${path}" in
+                "/${CGROUP_ROOT}/"*)
+                    child="${CGROUP_DIR%/${CGROUP_ROOT}}${path}"
+                    if [ -d "${child}" ]; then
+                        echo "${child}"
+                        return 0
+                    fi
+                    ;;
+                "") ;;
+                *) fail "sandbox ${id} cgroup ${path} is outside /${CGROUP_ROOT}" ;;
+            esac
+        fi
+        sleep 0.1
+    done
+    fail "no cgroup appeared for sandbox ${id}"
+}
+
 wait_for_cgroup_count() {
     local expected="$1"
     local count=0
@@ -2168,11 +2198,24 @@ run_firecracker_checks() {
 
 run_partial_oom_check() {
     log "testing OOM of one host task while sandbox init remains alive"
+    # Keep another sandbox alive so this cannot accidentally pass by picking
+    # the first directory in a one-entry cache. It must survive the target OOM.
+    PARTIAL_OOM_GUARD_ID="$(sbox_cmd start --quiet --runtime runsc \
+        --sandbox-id sbox-e2e-oom-guard --rootfs "${ROOTFS}" \
+        --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
     SANDBOX_ID="$(sbox_cmd start --quiet --runtime runsc \
         --sandbox-id sbox-e2e-partial-oom --rootfs "${ROOTFS}" \
         --cpu-millicores 1000 --memory-mb 128 /bin/sleep 300)"
     local child
-    child="$(wait_for_cgroup_child)"
+    child="$(wait_for_sandbox_cgroup "${SANDBOX_ID}")"
+    local guard_child
+    guard_child="$(wait_for_sandbox_cgroup "${PARTIAL_OOM_GUARD_ID}")"
+    [ "${child}" != "${guard_child}" ] || fail "OOM target and guard share a cgroup"
+    log "partial OOM target ${SANDBOX_ID} cgroup ${child}; guard cgroup ${guard_child}"
+    local oom_before=""
+    if [ "${CGROUP_MODE}" = v2 ]; then
+        oom_before="$(awk '$1 == "oom_kill" { print $2 }' "${child}/memory.events")"
+    fi
     # Model the production failure: one high-score host worker is OOM-killed,
     # not the guest init. Runtime Wait alone cannot observe that failure.
     /bin/sh -c 'echo 1000 > /proc/self/oom_score_adj; echo $$ > "$1/cgroup.procs"; exec /usr/local/bin/oom-hog' sh "${child}" &
@@ -2182,10 +2225,19 @@ run_partial_oom_check() {
     assert_wait_log "${SANDBOX_ID}" true
     wait_for_exit_code_log "${SANDBOX_ID}" 137
     if [ "${CGROUP_MODE}" = v2 ]; then
+        local oom_after
+        oom_after="$(awk '$1 == "oom_kill" { print $2 }' "${child}/memory.events")"
+        [ "${oom_after}" -gt "${oom_before}" ] || fail "OOM counter did not increase in target cgroup"
         grep -q '^populated 0$' "${child}/cgroup.events" || fail "OOM left host tasks alive"
     fi
+    wait_for_exec_output "${PARTIAL_OOM_GUARD_ID}" "oom-guard-alive" /bin/echo oom-guard-alive
     timeout 15 sbox --address "${SOCKET}" delete "${SANDBOX_ID}"
+    if sbox_cmd inspect "${SANDBOX_ID}" >/dev/null 2>&1; then
+        fail "partial OOM sandbox still inspectable after delete"
+    fi
     SANDBOX_ID=""
+    sbox_cmd delete "${PARTIAL_OOM_GUARD_ID}"
+    PARTIAL_OOM_GUARD_ID=""
 }
 
 run_runsc_checks() {
