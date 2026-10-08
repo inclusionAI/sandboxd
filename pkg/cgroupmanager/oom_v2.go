@@ -44,6 +44,8 @@ type v2OOMEntry struct {
 	readyClosed bool
 	baseline    uint64
 	triggered   atomic.Bool
+	oomEvent    chan struct{}
+	oomClosed   bool
 }
 
 type v2OOMWatcher struct {
@@ -156,10 +158,11 @@ func (w *v2OOMWatcher) Add(name string) error {
 		memoryWD:   memoryWD,
 		cgroupWD:   cgroupWD,
 		ready:      make(chan struct{}),
+		oomEvent:   make(chan struct{}),
 		baseline:   baseline,
 	}
 	if current > baseline {
-		entry.triggered.Store(true)
+		entry.markOOM()
 		entry.signalReady()
 	}
 	w.byName[name] = entry
@@ -208,6 +211,8 @@ func (w *v2OOMWatcher) Reset(name string) error {
 	}
 	entry.baseline = current
 	entry.triggered.Store(false)
+	entry.oomEvent = make(chan struct{})
+	entry.oomClosed = false
 	entry.ready = make(chan struct{})
 	entry.readyClosed = false
 	return nil
@@ -322,7 +327,7 @@ func (w *v2OOMWatcher) handleEvents(buffer []byte) {
 		if !entry.removed {
 			current, oomErr := readOOMKillCount(entry.memoryPath)
 			if oomErr == nil && current > entry.baseline {
-				entry.triggered.Store(true)
+				entry.markOOM()
 				entry.signalReady()
 			} else if populated, eventErr := readCgroupPopulated(entry.cgroupPath); eventErr == nil &&
 				!populated {
@@ -367,6 +372,42 @@ func (w *v2OOMWatcher) Close() error {
 	_ = unix.Close(w.wakeFD)
 	_ = unix.Close(w.inotifyFD)
 	return unix.Close(w.epollFD)
+}
+
+func (e *v2OOMEntry) markOOM() {
+	e.triggered.Store(true)
+	if !e.oomClosed && e.oomEvent != nil {
+		close(e.oomEvent)
+		e.oomClosed = true
+	}
+}
+
+func (w *v2OOMWatcher) OOMEvent(name string) (<-chan struct{}, error) {
+	e, err := w.entry(name)
+	if err != nil {
+		return nil, err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.removed {
+		return nil, fmt.Errorf("OOM watcher for %s was removed", name)
+	}
+	return e.oomEvent, nil
+}
+
+func (w *v2OOMWatcher) killOnOOM(name string, event <-chan struct{}, kill func() error) error {
+	e, err := w.entry(name)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Reset takes this lock before returning a cgroup to the pool. An old
+	// monitor must never kill processes belonging to a later lease.
+	if e.removed || e.oomEvent != event || !e.triggered.Load() {
+		return fmt.Errorf("%s: %w", name, ErrStaleOOMLease)
+	}
+	return kill()
 }
 
 func readOOMKillCount(path string) (uint64, error) {

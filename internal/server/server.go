@@ -98,6 +98,7 @@ type sandboxService struct {
 	ready                             atomic.Bool
 	recoveryReady                     atomic.Bool
 	deleteGroup                       singleflight.Group
+	runtimeDeleteTimeout              time.Duration
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]struct{}
@@ -281,7 +282,11 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return err
 	}
 
-	err = handler.Delete(ctx, sandboxID)
+	var killCgroup func(string) error
+	if h.cgroupMgr != nil {
+		killCgroup = h.cgroupMgr.Kill
+	}
+	err = h.deleteRuntimeBounded(ctx, sandboxID, handler, resource, killCgroup)
 	if err != nil && !errors.Is(err, errord.ErrNotFound) {
 		metrics.RecordRuntimeCallResult("delete", "failed", c.Metadata.RuntimeHandler)
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler force delete sandbox failed: %v", err)
@@ -318,6 +323,33 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 
 	h.sandboxManager.Delete(sandboxID)
 	return nil
+}
+
+func (h *sandboxService) deleteRuntimeBounded(ctx context.Context, id string, handler svc.Handler, resource sandbox.OccupiedResource, killCgroup func(string) error) error {
+	timeout := h.runtimeDeleteTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	attempt := func() error {
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return handler.Delete(attemptCtx, id)
+	}
+	err := attempt()
+	if !errors.Is(err, context.DeadlineExceeded) || killCgroup == nil {
+		return err
+	}
+	// Shared deletion owns the lease until teardown succeeds. Kill only that
+	// child's processes, then give runsc one bounded cleanup retry.
+	name := resource.Resources[config.ResourceNameCgroup]
+	if name == "" {
+		return err
+	}
+	logrus.Warnf("runtime delete %s timed out; draining cgroup %s before retry", id, name)
+	if killErr := killCgroup(name); killErr != nil {
+		return errors.Join(err, killErr)
+	}
+	return attempt()
 }
 
 // deleteSandbox coalesces concurrent delete requests for the same sandbox.

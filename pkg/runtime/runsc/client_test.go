@@ -69,6 +69,26 @@ func TestCreateUsesExactDebugLogPath(t *testing.T) {
 	t.Fatalf("runsc arguments %q do not contain %q", args, want)
 }
 
+func TestDeleteDeadlineWithInheritedOutputPipe(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "runsc")
+	// The direct child is killed on deadline, but a short-lived grandchild
+	// keeps the output pipe open. WaitDelay must bound CombinedOutput too.
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nsleep 4 &\nwait\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := NewClient(binary, dir).Delete(ctx, "sbox-hung-delete", true)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Delete error=%v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Delete blocked on inherited pipe for %s", elapsed)
+	}
+}
+
 func TestExtraArgs(t *testing.T) {
 	for _, args := range [][]string{nil, {}, {"--net-raw=false", "--allow-packet-socket-write=true"}} {
 		if err := validateExtraArgs(args); err != nil {

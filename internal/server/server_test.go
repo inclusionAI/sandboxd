@@ -112,6 +112,17 @@ func TestWait_NotFound(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestWaitReportsPersistedOOM(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
+	const id = "sbox-oom-wait-response"
+	storeSandboxForDelete(t, s, id)
+	assert.NoError(t, s.sandboxManager.SetExit(id, 137, time.Now().Format(time.RFC3339Nano), true))
+	resp, err := s.Wait(context.Background(), &runtime.WaitRequest{ID: id})
+	assert.NoError(t, err)
+	assert.Equal(t, int32(137), resp.ExitCode)
+	assert.Contains(t, resp.Message, "oom-killed")
+}
+
 func TestResetMetadataIfResourceStateIncompatible_RemovesLegacyResourceState(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "metadata.db")
 	db := store.NewStoreImp(storePath)
@@ -616,6 +627,53 @@ func TestDeleteCoalescesConcurrentRequestsAfterCallerTimeout(t *testing.T) {
 	_, err := s.Delete(context.Background(), &runtime.DeleteRequest{ID: id})
 	assert.NoError(t, err)
 	assert.Equal(t, int32(1), handler.calls.Load())
+}
+
+func TestDeleteTimeoutRetainsMetadataAndAllowsRetry(t *testing.T) {
+	handler := &blockingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler(), started: make(chan struct{}), release: make(chan struct{})}
+	s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	s.runtimeDeleteTimeout = 25 * time.Millisecond
+	const id = "sbox-stuck-delete"
+	storeSandboxForDelete(t, s, id)
+	done := make(chan error, 1)
+	go func() { _, err := s.Delete(context.Background(), &runtime.DeleteRequest{ID: id}); done <- err }()
+	select {
+	case err := <-done:
+		assert.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	case <-time.After(time.Second):
+		close(handler.release)
+		t.Fatal("shared cleanup never completed after runtime timeout")
+	}
+	_, err := s.sandboxManager.Get(id)
+	assert.NoError(t, err, "failed deletion must preserve metadata/resources")
+	close(handler.release)
+	_, err = s.Delete(context.Background(), &runtime.DeleteRequest{ID: id})
+	assert.NoError(t, err)
+	assert.Equal(t, int32(2), handler.calls.Load(), "retry must not join a permanently stuck singleflight")
+}
+
+type timeoutThenDeleteHandler struct {
+	*svc.FakeRuntimeHandler
+	calls int
+}
+
+func (h *timeoutThenDeleteHandler) Delete(ctx context.Context, _ string) error {
+	h.calls++
+	if h.calls == 1 {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
+}
+
+func TestRuntimeDeleteTimeoutDrainsOnlyOwnedCgroupAndRetries(t *testing.T) {
+	h := &timeoutThenDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	s := &sandboxService{runtimeDeleteTimeout: time.Millisecond}
+	kills := 0
+	err := s.deleteRuntimeBounded(context.Background(), "sbox-delete", h, sandbox.OccupiedResource{Resources: map[string]string{config.ResourceNameCgroup: "/sandbox/owned"}}, func(name string) error { assert.Equal(t, "/sandbox/owned", name); kills++; return nil })
+	assert.NoError(t, err)
+	assert.Equal(t, 1, kills)
+	assert.Equal(t, 2, h.calls)
 }
 
 func TestStart_And_Delete(t *testing.T) {
