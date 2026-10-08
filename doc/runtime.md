@@ -56,6 +56,14 @@ configuration shows all overrides. The default VM size is one vCPU and
 512 MiB when the request does not supply resources. Requested CPU is rounded
 up to a vCPU count, and guest memory must be at least 128 MiB.
 
+### Firecracker PVM prerequisites
+
+The opt-in `firecracker-pvm` class reads `[plugin.runtime.firecracker_pvm]` and requires a PVM host ABI; the ordinary `firecracker` class remains hardware KVM. The daemon probes `/dev/kvm` before advertising either class. Use a dedicated PVM host booted from the matching `virt-pvm/linux` kernel with `CONFIG_KVM` and `CONFIG_KVM_PVM`, its complete module tree, and `nokaslr pti=off`. Keep the modules fixed for the daemon's lifetime and restart sandboxd after an operator changes the backend. Retain the networking/storage prerequisites of the chosen deployment, including legacy IPv4/IPv6 filter and connmark modules for AKernel standalone.
+
+Use the validated Firecracker PVM guest bundle and the initrd built from this sandboxd revision. The guest must enable `CONFIG_KVM_GUEST=y`, `CONFIG_PVM_GUEST=y`, `CONFIG_X86_PIE=y`, and `CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS=y` alongside the common AKernel filesystem/network/virtio options. Guest MPK aligns `XCR0.PKRU` with a PKU-capable host and avoids extra intercepted `XSETBV` operations in nested deployments; it does not qualify guest pkey permission enforcement. Do not use host `nopku` as a substitute in the pinned PVM revision.
+
+The optional nested-host DEBUGCTL optimization moves `vcpu->arch.host_debugctl = get_debugctlmsr();` from common `vcpu_enter_guest()` into VMX/SVM entry paths, since PVM maintains its own saved value. It changes the host kernel rather than sandboxd or the guest bundle. Preserve hardware-KVM DEBUGCTL restoration, rebuild/install matching modules together, and separately qualify the optimized host; do not simply remove the save or mix patched core and stock vendor modules. AKernel's `deploy/pvm-runtime.md`, `deploy/pvm/host.config`, and `deploy/pvm/kvm-debugctl-backend-scope.patch` contain the reproduction inputs and the limits of the earlier nested performance experiment. See [checkpoint compatibility](checkpoint-restore.md) for backend identity and PVM TSC-frequency restore gates.
+
 ## Pooled TAP lifecycle
 
 Runsc, Kata, and Firecracker consume the same interface cache. Each cache entry
