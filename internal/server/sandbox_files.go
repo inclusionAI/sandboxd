@@ -25,7 +25,6 @@ import (
 	"unicode"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
-	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageconfig"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
@@ -110,8 +109,7 @@ func (h *sandboxService) prepareSandboxFiles(
 	sandboxID string,
 	defaults svc.SandboxDefaults,
 	networkIP net.IP,
-	runtimeName string,
-	aclEnabled bool,
+	managedDNS bool,
 	mounts []*runtime.Mount,
 	imageProcess *imageProcessSpec,
 	imageProcessTarget string,
@@ -140,7 +138,7 @@ func (h *sandboxService) prepareSandboxFiles(
 	}
 	needsHosts := !mountDestinationsOwn(owners, "/etc/hosts")
 	needsHostname := !mountDestinationsOwn(owners, "/etc/hostname")
-	needsResolver := aclEnabled || !mountDestinationsOwn(owners, "/etc/resolv.conf")
+	needsResolver := managedDNS || !mountDestinationsOwn(owners, "/etc/resolv.conf")
 	if !needsHosts && !needsHostname && !needsResolver && imageProcess == nil {
 		return prepared, nil
 	}
@@ -179,8 +177,8 @@ func (h *sandboxService) prepareSandboxFiles(
 	}
 	if needsResolver {
 		resolver := h.config.ResolvConfPath
-		if runtimeName == config.RuntimeNameRunc && h.config.Runc.ResolvConfPath != "" {
-			resolver = h.config.Runc.ResolvConfPath
+		if !managedDNS && h.config.DirectResolvConfPath != "" {
+			resolver = h.config.DirectResolvConfPath
 		}
 		if resolver == "" {
 			resolver = "/etc/resolv.conf"
@@ -192,7 +190,7 @@ func (h *sandboxService) prepareSandboxFiles(
 		if !info.Mode().IsRegular() {
 			return nil, fmt.Errorf("resolver source %s is not a regular file", resolver)
 		}
-		if !aclEnabled {
+		if !managedDNS {
 			prepared.mounts = append(prepared.mounts, sandboxFileMount("/etc/resolv.conf", resolver))
 		} else {
 			if h.interfaceMgr == nil || h.interfaceMgr.BridgeIp.To4() == nil {

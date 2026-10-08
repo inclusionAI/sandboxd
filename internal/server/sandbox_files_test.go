@@ -106,7 +106,6 @@ func TestPrepareSandboxFilesInjectsImageProcessConfig(t *testing.T) {
 			MountDestinations: defaultSandboxFileDestinations,
 		},
 		nil,
-		config.RuntimeNameRunsc,
 		false,
 		nil,
 		want,
@@ -145,7 +144,6 @@ func TestPrepareSandboxFilesRejectsImageProcessMountConflict(t *testing.T) {
 			"sbox-test",
 			svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
 			nil,
-			config.RuntimeNameRunsc,
 			false,
 			[]*runtime.Mount{{Target: target}},
 			&imageProcessSpec{Version: 1, Args: []string{}, Cwd: "/"},
@@ -197,7 +195,6 @@ func TestPrepareSandboxFiles(t *testing.T) {
 		"sbox-test",
 		svc.SandboxDefaults{Hostname: "configured-host"},
 		net.ParseIP("10.88.0.2"),
-		config.RuntimeNameRunsc,
 		false,
 		nil,
 		nil,
@@ -238,7 +235,6 @@ func TestPrepareSandboxFilesHonorsParentMount(t *testing.T) {
 		"sbox-test",
 		svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
 		nil,
-		config.RuntimeNameRunsc,
 		false,
 		[]*runtime.Mount{explicit},
 		nil,
@@ -261,7 +257,6 @@ func TestPrepareSandboxFilesHonorsBaseResolverMount(t *testing.T) {
 			MountDestinations: []string{"/etc/resolv.conf"},
 		},
 		net.ParseIP("10.88.0.2"),
-		config.RuntimeNameRunsc,
 		false,
 		nil,
 		nil,
@@ -299,7 +294,6 @@ func TestPrepareSandboxFilesUsesManagedResolverForNetworkACL(t *testing.T) {
 			MountDestinations: []string{"/etc/resolv.conf"},
 		},
 		net.ParseIP("10.88.0.2"),
-		config.RuntimeNameRunsc,
 		true,
 		nil,
 		nil,
@@ -322,58 +316,71 @@ func TestPrepareSandboxFilesUsesManagedResolverForNetworkACL(t *testing.T) {
 	}
 }
 
-func TestPrepareSandboxFilesUsesRuncResolverOnlyForRunc(t *testing.T) {
+func TestPrepareSandboxFilesSelectsResolverByDNSMode(t *testing.T) {
 	root := t.TempDir()
 	nodeResolver := filepath.Join(root, "node-resolv.conf")
-	runcResolver := filepath.Join(root, "runc-resolv.conf")
+	directResolver := filepath.Join(root, "direct-resolv.conf")
+	missingResolver := filepath.Join(root, "missing-resolv.conf")
 	for path, content := range map[string]string{
-		nodeResolver: "nameserver 127.0.0.11\nsearch node.example\n",
-		runcResolver: "nameserver 192.0.2.53\nsearch runc.example\n",
+		nodeResolver:   "nameserver 127.0.0.11\nsearch node.example\noptions ndots:2\n",
+		directResolver: "nameserver 192.0.2.53\nsearch direct.example\noptions ndots:5\n",
 	} {
 		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	service := &sandboxService{
-		config: config.Config{
-			RootDir: root,
-			PluginConfig: config.PluginConfig{RuntimeConfig: config.RuntimeConfig{
-				ResolvConfPath: nodeResolver,
-				Runc:           config.RuncConfig{ResolvConfPath: runcResolver},
-			}},
-		},
-		interfaceMgr: &networkmanager.InterfaceManager{BridgeIp: net.ParseIP("10.88.0.1")},
-	}
+	wantManaged := "nameserver 10.88.0.1\nsearch node.example\noptions ndots:2\n"
 	for _, test := range []struct {
-		name       string
-		runtime    string
-		aclEnabled bool
-		inherit    bool
-		wantSource string
-		wantFile   string
+		name         string
+		managedDNS   bool
+		nodeSource   string
+		directSource string
+		wantSource   string
+		wantFile     string
+		wantError    string
 	}{
-		{name: "runc", runtime: config.RuntimeNameRunc, wantSource: runcResolver},
-		{name: "runc inherits node resolver", runtime: config.RuntimeNameRunc, inherit: true, wantSource: nodeResolver},
-		{name: "runsc without ACL", runtime: config.RuntimeNameRunsc, wantSource: nodeResolver},
-		{name: "runsc with ACL", runtime: config.RuntimeNameRunsc, aclEnabled: true,
-			wantFile: "nameserver 10.88.0.1\nsearch node.example\n"},
+		{name: "direct override", nodeSource: nodeResolver, directSource: directResolver, wantSource: directResolver},
+		{name: "direct inherits node resolver", nodeSource: nodeResolver, wantSource: nodeResolver},
+		{name: "direct inherits system resolver", wantSource: "/etc/resolv.conf"},
+		{name: "direct ignores unused node source", nodeSource: missingResolver, directSource: directResolver, wantSource: directResolver},
+		{name: "managed ignores direct override", managedDNS: true, nodeSource: nodeResolver, directSource: directResolver, wantFile: wantManaged},
+		{name: "managed without override", managedDNS: true, nodeSource: nodeResolver, wantFile: wantManaged},
+		{name: "managed ignores missing direct source", managedDNS: true, nodeSource: nodeResolver, directSource: missingResolver, wantFile: wantManaged},
+		{name: "managed ignores nonregular direct source", managedDNS: true, nodeSource: nodeResolver, directSource: root, wantFile: wantManaged},
+		{name: "direct missing source fails without fallback", nodeSource: nodeResolver, directSource: missingResolver, wantError: "inspect resolver source " + missingResolver},
+		{name: "direct nonregular source fails without fallback", nodeSource: nodeResolver, directSource: root, wantError: "is not a regular file"},
+		{name: "direct missing inherited source fails", nodeSource: missingResolver, wantError: "inspect resolver source " + missingResolver},
+		{name: "managed missing node source fails", managedDNS: true, nodeSource: missingResolver, directSource: directResolver, wantError: "inspect resolver source " + missingResolver},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			testConfig := service.config
-			if test.inherit {
-				testConfig.RuntimeConfig.Runc.ResolvConfPath = ""
+			service := &sandboxService{config: config.Config{
+				RootDir: t.TempDir(),
+				PluginConfig: config.PluginConfig{RuntimeConfig: config.RuntimeConfig{
+					ResolvConfPath:       test.nodeSource,
+					DirectResolvConfPath: test.directSource,
+				}},
+			}}
+			if test.managedDNS {
+				service.interfaceMgr = &networkmanager.InterfaceManager{BridgeIp: net.ParseIP("10.88.0.1")}
 			}
-			testService := &sandboxService{config: testConfig, interfaceMgr: service.interfaceMgr}
-			prepared, err := testService.prepareSandboxFiles(
-				"sbox-"+strings.ReplaceAll(test.name, " ", "-"),
+			prepared, err := service.prepareSandboxFiles(
+				"sbox-test",
 				svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname},
 				net.ParseIP("10.88.0.2"),
-				test.runtime,
-				test.aclEnabled,
+				test.managedDNS,
 				nil,
 				nil,
 				"",
 			)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error = %v, want %q", err, test.wantError)
+				}
+				if _, err := os.Stat(filepath.Join(service.config.RootDir, "containers", "sbox-test", "sandbox-files")); !os.IsNotExist(err) {
+					t.Fatalf("failed preparation left sandbox files: %v", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -381,6 +388,9 @@ func TestPrepareSandboxFilesUsesRuncResolverOnlyForRunc(t *testing.T) {
 			var source string
 			for _, mount := range prepared.Mounts() {
 				if mount.GetTarget() == "/etc/resolv.conf" {
+					if source != "" || !reflect.DeepEqual(mount.GetOptions(), []string{"bind", "ro"}) {
+						t.Fatalf("unexpected resolver mount: %+v", mount)
+					}
 					source = mount.GetHostPath()
 				}
 			}
@@ -422,24 +432,31 @@ func TestPrepareSandboxFilesWithoutNetworkACLOnACLNode(t *testing.T) {
 		explicitPath string
 		noBridge     bool
 	}{
-		{name: "node resolver"},
-		{name: "node resolver without bridge", noBridge: true},
+		{name: "direct resolver"},
+		{name: "direct resolver without bridge", noBridge: true},
 		{name: "runtime resolver", baseMounts: []string{"/etc/resolv.conf"}},
+		{name: "runtime parent", baseMounts: []string{"/etc"}},
 		{name: "explicit resolver", explicitPath: "/etc/resolv.conf"},
 		{name: "explicit parent", explicitPath: "/etc"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
-			resolver := filepath.Join(root, "node-resolv.conf")
+			resolver := filepath.Join(root, "direct-resolv.conf")
 			content := "nameserver 192.0.2.53\nsearch svc.example\noptions ndots:2 timeout:1\n"
 			if err := os.WriteFile(resolver, []byte(content), 0644); err != nil {
 				t.Fatal(err)
+			}
+			directSource := resolver
+			if test.explicitPath != "" || len(test.baseMounts) > 0 {
+				// An owned resolver must bypass validation of the unused default.
+				directSource = filepath.Join(root, "missing-direct-resolv.conf")
 			}
 			service := &sandboxService{
 				config: config.Config{
 					RootDir: root,
 					PluginConfig: config.PluginConfig{RuntimeConfig: config.RuntimeConfig{
-						ResolvConfPath: resolver,
+						ResolvConfPath:       filepath.Join(root, "missing-node-resolv.conf"),
+						DirectResolvConfPath: directSource,
 					}},
 				},
 				aclMgr:       &networkacl.Manager{},
@@ -461,7 +478,6 @@ func TestPrepareSandboxFilesWithoutNetworkACLOnACLNode(t *testing.T) {
 				"sbox-runc",
 				svc.SandboxDefaults{Hostname: svc.DefaultSandboxHostname, MountDestinations: test.baseMounts},
 				net.ParseIP("10.88.0.2"),
-				config.RuntimeNameRunc,
 				false,
 				mounts,
 				nil,
@@ -491,11 +507,11 @@ func TestPrepareSandboxFilesWithoutNetworkACLOnACLNode(t *testing.T) {
 			}
 			if len(injected) != 1 || injected[0].GetHostPath() != resolver ||
 				!reflect.DeepEqual(injected[0].GetOptions(), []string{"bind", "ro"}) {
-				t.Fatalf("node resolver mount = %+v", injected)
+				t.Fatalf("direct resolver mount = %+v", injected)
 			}
 			got, err := os.ReadFile(injected[0].GetHostPath())
 			if err != nil || string(got) != content {
-				t.Fatalf("node resolver = %q, %v", got, err)
+				t.Fatalf("direct resolver = %q, %v", got, err)
 			}
 		})
 	}
@@ -507,7 +523,6 @@ func TestPrepareSandboxFilesRejectsInvalidHostname(t *testing.T) {
 		"sbox-test",
 		svc.SandboxDefaults{Hostname: "bad\nhost"},
 		nil,
-		config.RuntimeNameRunsc,
 		false,
 		[]*runtime.Mount{{Target: "/etc"}},
 		nil,

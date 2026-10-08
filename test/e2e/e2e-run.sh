@@ -413,7 +413,7 @@ EOF
 
     # Distinct from the node resolver and backed by a local E2E-only DNS
     # fixture so the runc test proves a lookup, not just a mount.
-    printf 'nameserver %s\nsearch runc.e2e\n' "${RUNC_DNS_IP}" > "${CONFIG_DIR}/runc-resolv.conf"
+    printf 'nameserver %s\nsearch runc.e2e\n' "${RUNC_DNS_IP}" > "${CONFIG_DIR}/direct-resolv.conf"
 
     local disable_cgroup=false
     if [ "${DISABLE_CGROUP}" = "1" ]; then
@@ -486,6 +486,7 @@ pids_max = 64
 ${node_resource_config}
 
 [plugin.runtime]
+direct_resolv_conf_path = "${CONFIG_DIR}/direct-resolv.conf"
 image_lib_dir = "/e2e/images"
 filestore_dir = "${FILESTORE}"
 filestore_dir_size = "1G"
@@ -498,7 +499,6 @@ platform = "${RUNSC_PLATFORM}"
 [plugin.runtime.runc]
 state_root = "/run/sandboxd/runc"
 shim_binary = "/usr/local/bin/runc-shim"
-resolv_conf_path = "${CONFIG_DIR}/runc-resolv.conf"
 # The e2e host does not require hardware virtualization. /dev/null lets the
 # suite verify opt-in character-device and OCI device-cgroup injection.
 kvm_device = "/dev/null"
@@ -1784,7 +1784,7 @@ run_runc_checks() {
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/wget -qO- "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${got}" "sandboxd-network-ok" "runc sandbox network"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
-    assert_eq "${got}" "$(cat "${CONFIG_DIR}/runc-resolv.conf")" "runc-specific resolver on an ACL-enabled node"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "direct resolver on an ACL-enabled node"
     assert_runc_resolver_query
     sbox_cmd exec "${SANDBOX_ID}" /bin/test -c /dev/kvm
     local tty_status=0
@@ -1806,7 +1806,7 @@ run_runc_checks() {
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/echo recovered-runc)"
     assert_eq "${got}" "recovered-runc" "runc exec after sandboxd restart"
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/resolv.conf)"
-    assert_eq "${got}" "$(cat "${CONFIG_DIR}/runc-resolv.conf")" "runc-specific resolver after sandboxd restart"
+    assert_eq "${got}" "$(cat "${CONFIG_DIR}/direct-resolv.conf")" "direct resolver after sandboxd restart"
     assert_runc_resolver_query
 
     local deleted_id="${SANDBOX_ID}"

@@ -82,9 +82,13 @@ type NodeResourceConfig struct {
 type RuntimeConfig struct {
 	RuntimeBinary map[string]string `toml:"runtime_binary" json:"runtimeBinary"`
 
-	// ResolvConfPath is the host resolver file mounted into sandboxes when the
-	// final configuration does not already provide /etc/resolv.conf.
+	// ResolvConfPath supplies managed DNS upstreams and search/options, and is
+	// the default resolver file for sandboxes that do not use managed DNS.
 	ResolvConfPath string `toml:"resolv_conf_path" json:"resolvConfPath"`
+	// DirectResolvConfPath overrides the resolver file only for sandboxes that
+	// do not use managed DNS. Empty inherits ResolvConfPath. Existing runtime
+	// or explicit resolver mounts take precedence over this default injection.
+	DirectResolvConfPath string `toml:"direct_resolv_conf_path" json:"directResolvConfPath"`
 
 	// Runsc configures the gVisor runtime adapter.
 	Runsc RunscConfig `toml:"runsc" json:"runsc"`
@@ -156,9 +160,6 @@ type RuncConfig struct {
 	StateRoot  string `toml:"state_root" json:"stateRoot"`
 	ShimBinary string `toml:"shim_binary" json:"shimBinary"`
 	KVMDevice  string `toml:"kvm_device" json:"kvmDevice"`
-	// ResolvConfPath overrides the node resolver only for runc sandboxes.
-	// Empty preserves the node-wide resolver setting.
-	ResolvConfPath string `toml:"resolv_conf_path" json:"resolvConfPath"`
 }
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.

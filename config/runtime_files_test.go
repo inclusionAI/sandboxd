@@ -24,6 +24,9 @@ func TestDefaultConfigUsesHostResolver(t *testing.T) {
 	if got := DefaultConfig().RuntimeConfig.ResolvConfPath; got != "/etc/resolv.conf" {
 		t.Fatalf("default resolver path = %q", got)
 	}
+	if got := DefaultConfig().RuntimeConfig.DirectResolvConfPath; got != "" {
+		t.Fatalf("direct resolver must inherit the node default, got %q", got)
+	}
 }
 
 func TestDefaultRuncPaths(t *testing.T) {
@@ -35,13 +38,13 @@ func TestDefaultRuncPaths(t *testing.T) {
 	}
 }
 
-func TestRuncResolverOverrideDoesNotChangeNodeResolver(t *testing.T) {
+func TestDirectResolverOverrideDoesNotChangeNodeResolver(t *testing.T) {
 	cfg := DefaultConfig()
-	if err := toml.Unmarshal([]byte("[plugin.runtime.runc]\nresolv_conf_path = \"/config/runc-resolv.conf\"\n"), &cfg); err != nil {
+	if err := toml.Unmarshal([]byte("[plugin.runtime]\ndirect_resolv_conf_path = \"/config/direct-resolv.conf\"\n"), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.RuntimeConfig.Runc.ResolvConfPath; got != "/config/runc-resolv.conf" {
-		t.Fatalf("runc resolver path = %q", got)
+	if got := cfg.RuntimeConfig.DirectResolvConfPath; got != "/config/direct-resolv.conf" {
+		t.Fatalf("direct resolver path = %q", got)
 	}
 	if got := cfg.RuntimeConfig.ResolvConfPath; got != "/etc/resolv.conf" {
 		t.Fatalf("node resolver path changed to %q", got)
