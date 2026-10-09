@@ -21,17 +21,18 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${ROOT_DIR}"
 mkdir -p output
 
-GOWORK=off GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod-official \
+GOCACHE="${GOCACHE:-/tmp/go-build}"
+GOMODCACHE="${GOMODCACHE:-/tmp/go-mod-official}"
+export GOCACHE GOMODCACHE
+
+GOWORK=off \
     GOTOOLCHAIN=auto make release
-CGO_ENABLED=0 GOWORK=off GOCACHE=/tmp/go-build \
-    GOMODCACHE=/tmp/go-mod-official GOTOOLCHAIN=auto \
+CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN=auto \
     go build -o output/oom-hog ./test/e2e/oom-hog
-CGO_ENABLED=0 GOWORK=off GOCACHE=/tmp/go-build \
-    GOMODCACHE=/tmp/go-mod-official GOTOOLCHAIN=auto \
+CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN=auto \
     go build -o output/network-policy-client \
     ./test/e2e/network-policy-client
-CGO_ENABLED=0 GOWORK=off GOCACHE=/tmp/go-build \
-    GOMODCACHE=/tmp/go-mod-official GOTOOLCHAIN=auto \
+CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN=auto \
     go build -o output/checkpoint-restore ./test/e2e/checkpoint-restore
 
 for binary in \
