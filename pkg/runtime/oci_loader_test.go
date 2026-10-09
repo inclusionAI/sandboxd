@@ -204,6 +204,53 @@ func TestGenerateOciAppliesProviderUpdatesLast(t *testing.T) {
 	}
 }
 
+func TestGenerateOciAppliesAscendDevicesCgroupAndMounts(t *testing.T) {
+	loader, err := NewBundleLoader("", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	major, minor := int64(240), int64(3)
+	_, spec, err := loader.GenerateOci(OciLoadOptions{
+		SandboxID: "sandbox-npu", CgroupPath: "/sandbox/npu",
+		Config: StartConfig{
+			Rootfs: t.TempDir(), Resources: &runtime.LinuxSandboxResources{},
+			SpecUpdates: &SpecUpdates{
+				LinuxDevices: []LinuxDevice{{Path: "/dev/davinci3", Type: "c", Major: major, Minor: minor}},
+				DeviceCgroupRules: []LinuxDeviceCgroup{{
+					Allow: true, Type: "c", Major: &major, Minor: &minor, Access: "rwm",
+				}},
+				Mounts: []Mount{{
+					Destination: "/usr/local/Ascend/driver/lib64/driver", Type: "bind",
+					Source: "/usr/local/Ascend/driver/lib64/driver", Options: []string{"ro", "rbind"},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Linux.Devices) != 1 || spec.Linux.Devices[0].Path != "/dev/davinci3" {
+		t.Fatalf("provider devices missing from %+v", spec.Linux.Devices)
+	}
+	for name, set := range map[string][]string{
+		"bounding":    spec.Process.Capabilities.Bounding,
+		"effective":   spec.Process.Capabilities.Effective,
+		"inheritable": spec.Process.Capabilities.Inheritable,
+		"permitted":   spec.Process.Capabilities.Permitted,
+	} {
+		if containsString(set, "CAP_DAC_OVERRIDE") {
+			t.Fatalf("provider unexpectedly added CAP_DAC_OVERRIDE to %s set: %v", name, set)
+		}
+	}
+	if len(spec.Linux.Resources.Devices) != 1 || spec.Linux.Resources.Devices[0].Access != "rwm" {
+		t.Fatalf("provider cgroup rule missing from %+v", spec.Linux.Resources.Devices)
+	}
+	if len(spec.Mounts) == 0 || spec.Mounts[len(spec.Mounts)-1].Destination !=
+		"/usr/local/Ascend/driver/lib64/driver" {
+		t.Fatalf("provider mount missing from %+v", spec.Mounts)
+	}
+}
+
 func TestGenerateOciWithoutCgroup(t *testing.T) {
 	loader, err := NewBundleLoader("", t.TempDir())
 	if err != nil {

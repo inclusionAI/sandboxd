@@ -207,7 +207,7 @@ message Mount {
 // XpuAllocation describes concrete accelerator devices assigned by the
 // scheduler on the selected node.
 message XpuAllocation {
-  // Type is the normalized accelerator type, such as gpu.
+  // Type is the normalized accelerator type, such as gpu or npu.
   string type = 1;
   // DeviceIDs contains node-local physical device IDs selected by the scheduler.
   repeated uint32 device_ids = 2;

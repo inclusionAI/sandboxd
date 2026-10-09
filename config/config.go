@@ -53,7 +53,21 @@ type PluginConfig struct {
 
 	NodeResourceConfig `toml:"node_resource" json:"nodeResource"`
 
+	XPUConfig `toml:"xpu" json:"xpu"`
+
 	ImageManagerConfig `toml:"image" json:"image"`
+}
+
+// XPUConfig contains optional vendor accelerator providers.
+type XPUConfig struct {
+	Ascend AscendConfig `toml:"ascend" json:"ascend"`
+}
+
+// AscendConfig enables the external Ascend OCI adapter for runc sandboxes.
+type AscendConfig struct {
+	Enabled      bool   `toml:"enabled" json:"enabled"`
+	Adapter      string `toml:"adapter" json:"adapter"`
+	MountProfile string `toml:"mount_profile" json:"mountProfile"`
 }
 
 // ImageManagerConfig configures image and mount lifecycle management.
