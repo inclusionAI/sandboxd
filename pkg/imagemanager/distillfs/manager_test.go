@@ -367,6 +367,20 @@ func TestManager_CreateDaemon_OSS(t *testing.T) {
 			},
 		},
 		{
+			name: "create OSS daemon for object in bucket root",
+			opts: &DaemonCreateOpt{
+				ID:       "test-root-object",
+				Name:     "rootfs.img",
+				Endpoint: "oss-cn-hangzhou.aliyuncs.com",
+				Bucket:   "test-bucket",
+			},
+			validate: func(t *testing.T, d *Daemon) {
+				if d.config.Oss.Endpoint != "oss-cn-hangzhou.aliyuncs.com" || d.config.Oss.BucketName != "test-bucket" || d.config.Oss.ObjectPrefix != "" {
+					t.Fatalf("root object request did not override template: %+v", d.config.Oss)
+				}
+			},
+		},
+		{
 			name: "create daemon without overwriting OSS config",
 			opts: &DaemonCreateOpt{
 				ID:   "test-daemon-3",

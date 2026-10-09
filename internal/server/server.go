@@ -55,6 +55,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -241,11 +242,38 @@ func (h *sandboxService) startSandboxRuntime(
 	}
 	if err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
-		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
+		// Delete may need the bundle to stop a partially created runtime.
+		// Only the rollback path can remove it after confirming termination.
 		return errord.ToGRPC(err)
 	}
 
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("StartSandbox %s success, traceID: %v, spanId: %v, cost: %v", startConfig.ID, traceID, spanID, time.Since(start).String())
+	return nil
+}
+
+// rollbackRuntimeAttempt runs after Start/Restore has returned, even on error.
+// A failed or unconfirmed Delete quarantines the startup leases and bundle:
+// they must not be reused while a partial backend may still be alive.
+func (h *sandboxService) rollbackRuntimeAttempt(runtimeName, sandboxID string) error {
+	handler, ok := h.serviceHandler.Get(runtimeName)
+	if !ok {
+		return fmt.Errorf("runtime %q unavailable during rollback", runtimeName)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := handler.Delete(ctx, sandboxID); err != nil && !errors.Is(err, errord.ErrNotFound) {
+		return fmt.Errorf("delete partial runtime %s: %w", sandboxID, err)
+	}
+	states, err := handler.List(ctx)
+	if err != nil {
+		return fmt.Errorf("confirm partial runtime %s deletion: %w", sandboxID, err)
+	}
+	for _, state := range states {
+		if state == nil || state.ID == sandboxID {
+			return fmt.Errorf("partial runtime %s deletion remains unconfirmed", sandboxID)
+		}
+	}
+	h.sandboxManager.CleanSandboxRoot(sandboxID)
 	return nil
 }
 
@@ -509,20 +537,19 @@ func (h *sandboxService) Run() error {
 }
 
 func (h *sandboxService) Shutdown() {
-	logrus.Info("sandbox service shutting down: cleaning up sandboxes")
-
-	// 1. Force-delete all running sandboxes with per-sandbox timeout.
-	sandboxes := h.sandboxManager.List()
-	for _, c := range sandboxes {
-		if c == nil || c.Metadata == nil {
-			continue
+	h.ready.Store(false)
+	h.sandboxManager.Stop()
+	if count := len(h.sandboxManager.List()); count > 0 {
+		// A daemon restart must preserve externally managed workloads and their
+		// pinned networking, cgroups and filesystem mounts. Persistent records
+		// are updated during normal operations and recovered by the next daemon.
+		if h.resourceMod != nil {
+			h.resourceMod.Stop()
 		}
-		id := c.Metadata.ID
-		if err := h.deleteSandbox(context.Background(), id); err != nil {
-			logrus.Warnf("shutdown: failed to delete sandbox %s: %v", id, err)
-		}
-
+		logrus.Infof("sandbox service stopped; preserving %d sandboxes for restart", count)
+		return
 	}
+	logrus.Info("sandbox service shutting down: releasing unused infrastructure")
 
 	h.fsMgr.Shutdown()
 
@@ -1117,7 +1144,31 @@ type resourcePrepareResult struct {
 	err       error
 }
 
+type startProgress struct {
+	runtimeAttempted bool
+}
+
+// finishStart settles failures rejected before execution. Once a runtime has
+// been invoked, its asynchronous work may outlive an RPC error; returning from
+// the Go handler alone is insufficient proof that no backend can appear later.
+func finishStart(ctx context.Context, execute func(*startProgress) (*runtime.StartResponse, error)) (*runtime.StartResponse, error) {
+	progress := &startProgress{}
+	response, err := execute(progress)
+	if err != nil && !progress.runtimeAttempted {
+		// execute has returned, including its deferred rollback. Consumers still
+		// reconcile remaining backends before releasing admission resources.
+		_ = grpc.SetTrailer(ctx, metadata.Pairs("sandboxd-start-settled", "true"))
+	}
+	return response, err
+}
+
 func (h *sandboxService) Start(ctx context.Context, request *runtime.StartRequest) (*runtime.StartResponse, error) {
+	return finishStart(ctx, func(progress *startProgress) (*runtime.StartResponse, error) {
+		return h.startSandbox(ctx, request, progress)
+	})
+}
+
+func (h *sandboxService) startSandbox(ctx context.Context, request *runtime.StartRequest, progress *startProgress) (*runtime.StartResponse, error) {
 	if request == nil {
 		err := fmt.Errorf("start request is nil")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
@@ -1314,7 +1365,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	var preparedResources *preparedStartResources
 	var sandboxFiles *preparedSandboxFiles
 	var filesystemCommitted bool
-	var runtimeStarted bool
 	var dnatConfigured bool
 	var aclAttempted bool
 	var aclRegistered bool
@@ -1323,16 +1373,11 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		if startSucceeded {
 			return
 		}
-		if runtimeStarted {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
-				if err := handler.Delete(cleanupCtx, sandboxID); err != nil {
-					logrus.Warnf("rollback runtime for sandbox %s: %v", sandboxID, err)
-				} else {
-					h.sandboxManager.CleanSandboxRoot(sandboxID)
-				}
+		if progress.runtimeAttempted {
+			if err := h.rollbackRuntimeAttempt(startReq.Runtime, sandboxID); err != nil {
+				logrus.Errorf("quarantine startup resources for sandbox %s: %v", sandboxID, err)
+				return
 			}
-			cancel()
 		}
 		if dnatConfigured {
 			h.networkMgr.cleanupDnatRules(sandboxID)
@@ -1547,6 +1592,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		EnableKVM:               extraConfig.EnableKVM,
 		CheckpointDir:           checkpointDir,
 	}
+	progress.runtimeAttempted = true
 	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
@@ -1554,7 +1600,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			ID:      "",
 		}, err
 	}
-	runtimeStarted = true
 
 	// If Ports are specified, set up DNAT rules using sandbox IP from startSandboxRuntime.
 	if len(startReq.Ports) > 0 {

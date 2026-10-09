@@ -158,6 +158,10 @@ func (k *Handler) Start(ctx context.Context, startConfig runtimecore.StartConfig
 		)
 	}
 
+	if err := prepareKataConsoleSpec(bundlePath, ociSpec); err != nil {
+		return errors.Join(fmt.Errorf("prepare Kata console: %w", err), cleanupMounts())
+	}
+
 	rootfsPlan, err := prepareKataRootfsWithMounter(
 		bundlePath,
 		kataConfig.Rootfs,
