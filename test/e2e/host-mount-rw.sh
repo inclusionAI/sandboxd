@@ -11,7 +11,7 @@ set -Eeuo pipefail
 SOCKET="${SOCKET:-/run/sandboxd/sandboxd.sock}"
 RUNTIME="${RUNTIME:-firecracker}"
 case "${RUNTIME}" in
-    runsc|firecracker) ;;
+    runsc|firecracker|firecracker-pvm) ;;
     *) echo "unsupported runtime: ${RUNTIME}" >&2; exit 1 ;;
 esac
 CASE_ID="${CASE_ID:-${RUNTIME}-rw}"

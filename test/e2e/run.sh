@@ -230,8 +230,8 @@ trap cleanup_container EXIT
 cd "${ROOT_DIR}"
 
 case "${E2E_RUNTIME}" in
-    all|runsc|runc|kata|firecracker) ;;
-    *) fail "E2E_RUNTIME must be all, runsc, runc, kata, or firecracker" ;;
+    all|runsc|runc|kata|firecracker|firecracker-pvm) ;;
+    *) fail "E2E_RUNTIME must be all, runsc, runc, kata, firecracker, or firecracker-pvm" ;;
 esac
 case "${E2E_RUNSC_PLATFORM}" in
     systrap|kvm) ;;
@@ -266,24 +266,24 @@ case "${E2E_KEEP_HOME_FIXTURE}" in
     *) fail "E2E_KEEP_HOME_FIXTURE must be 0 or 1" ;;
 esac
 if [ "${E2E_FIRECRACKER_VIRTIOFS}" = "1" ] &&
-    [ "${E2E_RUNTIME}" != "firecracker" ]; then
-    fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker"
+    { [ "${E2E_RUNTIME}" != "firecracker" ] && [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; }; then
+    fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker or firecracker-pvm"
 fi
 if [ -n "${E2E_STRESS_ROOTFS_HOST}" ]; then
     [ -d "${E2E_STRESS_ROOTFS_HOST}" ] ||
         fail "E2E_STRESS_ROOTFS_HOST is not a directory"
-    [ "${E2E_RUNTIME}" = "firecracker" ] &&
+    { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; } &&
         [ "${E2E_FIRECRACKER_VIRTIOFS}" = "1" ] ||
         fail "E2E_STRESS_ROOTFS_HOST requires Firecracker virtio-fs"
 fi
 if [ "${E2E_STRESS_CHECKPOINT}" = "1" ] && {
-    [ "${E2E_RUNTIME}" != "firecracker" ] ||
+    { [ "${E2E_RUNTIME}" != "firecracker" ] && [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; } ||
         [ "${E2E_FIRECRACKER_VIRTIOFS}" != "1" ];
 }; then
     fail "E2E_STRESS_CHECKPOINT requires Firecracker virtio-fs"
 fi
 if [ "${E2E_STRESS_ONLY}" = "1" ] && {
-    [ "${E2E_RUNTIME}" != "firecracker" ] ||
+    { [ "${E2E_RUNTIME}" != "firecracker" ] && [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; } ||
         [ "${E2E_FIRECRACKER_VIRTIOFS}" != "1" ] ||
         [ "${E2E_STRESS_ROUNDS}" = "0" ];
 }; then
@@ -344,7 +344,7 @@ if [ "${E2E_SKIP_BUILD}" = "0" ]; then
             fail "KATA_ROOT does not contain the Kata guest image"
         [ -c /dev/kvm ] || fail "Kata e2e requires /dev/kvm"
     fi
-    if [ "${E2E_RUNTIME}" = "firecracker" ]; then
+    if { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; }; then
         if [ -z "${FIRECRACKER_BINARY}" ]; then
             FIRECRACKER_BINARY="/usr/local/bin/firecracker"
         fi
@@ -424,7 +424,7 @@ if [ "${E2E_SKIP_BUILD}" = "0" ]; then
         cp -a --sparse=always "${KATA_ROOT}/." "${ROOT_DIR}/output/kata/"
     fi
 
-    if [ "${E2E_RUNTIME}" = "firecracker" ]; then
+    if { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; }; then
         DOCKERFILE="test/e2e/firecracker.Dockerfile"
         install -m 0755 "${FIRECRACKER_BINARY}" output/firecracker
         install -m 0644 "${FIRECRACKER_KERNEL}" output/firecracker-vmlinux
@@ -514,7 +514,7 @@ fi
 if [ "${E2E_RUN_CGROUP_DISABLED}" = "0" ] ||
     [ "${E2E_RUNTIME}" = "runc" ] ||
     [ "${E2E_RUNTIME}" = "kata" ] ||
-    [ "${E2E_RUNTIME}" = "firecracker" ]; then
+    { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; }; then
     log "${E2E_RUNTIME} e2e completed"
     exit 0
 fi

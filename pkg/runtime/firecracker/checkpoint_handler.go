@@ -29,7 +29,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
@@ -502,6 +501,12 @@ func (handler *Handler) buildCheckpointCompat(
 				return nil, fmt.Errorf("digest Firecracker initrd: %w", err)
 			}
 		}
+		// Record the probed KVM backend identity. NewHandler hard-fails
+		// when the probe cannot determine the backend, so this is always
+		// a verified identity in production. Tests that construct a
+		// Handler directly must set kvmBackend explicitly.
+		compat.Backend = handler.kvmBackend
+		compat.TSCFrequencyKHz = handler.tscFrequencyKHz
 		handler.compatDigests = compat
 	}
 	if withVirtioFS && handler.compatDigests.VirtioFSD == "" {
@@ -521,13 +526,57 @@ func (handler *Handler) buildCheckpointCompat(
 }
 
 // verifyCheckpointCompat refuses to restore an artifact whose recorded
-// software stack differs from this handler's. Fields the manifest did not
-// record are skipped, and a manifest without a tuple at all (pre-M3
-// artifacts) restores without stack verification.
+// software stack differs from this handler's. The backend identity gate
+// runs FIRST and applies to every artifact — including legacy v1 archives
+// (no manifest) and v2 manifests without a compat tuple. Untagged artifacts
+// have unknown provenance, including old experimental PVM snapshots:
+//
+//   - Recorded backend == local backend: allow (proceed to digest check).
+//   - Recorded backend != local backend: refuse. A PVM vmstate carries MSRs
+//     (0x4b564df0–0x4b564df5) that hardware KVM rejects at KVM_SET_MSRS
+//     time, and a KVM vmstate lacks the PVM event-switching MSRs; restoring
+//     either direction fails late with a cryptic partial-write error.
+//   - No recorded backend (legacy manifest or v1 archive) + local ==
+//     "kvm": allow. This is backward compatibility for existing hardware-
+//     KVM deployments; the operator is responsible for confirming the
+//     artifact's provenance. A legacy artifact produced on PVM (from
+//     pre-tagging experimental builds) will still fail at MSR write time
+//     on a hardware-KVM node — the gate cannot distinguish it, which is
+//     documented as a known limitation of untagged artifacts.
+//   - No recorded backend + local == "pvm": refuse. The artifact's backend
+//     cannot be verified; it may be an old experimental PVM artifact or a
+//     hardware-KVM artifact. Require a tagged checkpoint instead of guessing.
+//   - Local backend == "" (probe failed): refuse all restores. The handler
+//     cannot verify which backend is loaded and cannot make a safe
+//     compatibility decision. The runtime must not advertise PVM (or
+//     accept a PVM profile) in this state.
+//
+// After the backend gate, fields the manifest did not record are skipped,
+// and a manifest without a tuple at all (pre-M3 artifacts) restores without
+// digest verification.
 func (handler *Handler) verifyCheckpointCompat(
 	artifact *firecrackerCheckpointArtifact,
 ) error {
-	// Legacy v1 archives have no manifest at all; verify only v2 artifacts.
+	// The backend and TSC gates run unconditionally — even for artifacts
+	// with no manifest — because they depend on the local node's identity.
+	// A legacy artifact has no recorded values, which the PVM policy
+	// rejects (it cannot verify safety without them) and the hardware-KVM
+	// policy accepts for backward compatibility.
+	recordedBackend := ""
+	recordedTSC := uint32(0)
+	if artifact.Manifest != nil && artifact.Manifest.Compat != nil {
+		recordedBackend = artifact.Manifest.Compat.Backend
+		recordedTSC = artifact.Manifest.Compat.TSCFrequencyKHz
+	}
+	if err := handler.verifyCheckpointBackend(recordedBackend, artifact); err != nil {
+		return err
+	}
+	if err := handler.verifyCheckpointTSC(recordedTSC, artifact); err != nil {
+		return err
+	}
+
+	// Legacy v1 archives have no manifest at all; only v2 artifacts carry
+	// the digest tuple.
 	if artifact.Manifest == nil {
 		return nil
 	}
@@ -562,6 +611,125 @@ func (handler *Handler) verifyCheckpointCompat(
 		)
 	}
 	return nil
+}
+
+// verifyCheckpointBackend enforces the backend identity policy described on
+// verifyCheckpointCompat. It runs for every artifact, including those with
+// no manifest, because the decision is driven by the local node's probed
+// identity and the artifact's recorded (or absent) backend tag.
+func (handler *Handler) verifyCheckpointBackend(
+	recordedBackend string,
+	artifact *firecrackerCheckpointArtifact,
+) error {
+	localBackend := handler.kvmBackend
+	if localBackend == "" {
+		return fmt.Errorf(
+			"Firecracker checkpoint %s: this node's KVM backend identity is unknown "+
+				"(probe failed at daemon startup); refusing to restore because "+
+				"the artifact's backend (%q) cannot be verified against it. "+
+				"Check /dev/kvm availability and the loaded kvm module.",
+			artifact.Files.State, recordedBackend,
+		)
+	}
+	switch {
+	case recordedBackend == "":
+		// Legacy artifact: produced before backend tagging existed. On
+		// hardware KVM this is the pre-existing behavior (allow); on PVM
+		// its backend cannot be verified, so refuse.
+		if localBackend == KvmBackendPVM {
+			return fmt.Errorf(
+				"Firecracker checkpoint %s has no recorded backend (legacy artifact) "+
+					"and cannot be restored on the PVM backend: its backend "+
+					"identity cannot be verified. "+
+					"Re-checkpoint the sandbox on a PVM node to produce a tagged "+
+					"artifact, or restore this artifact on a hardware-KVM node.",
+				artifact.Files.State,
+			)
+		}
+		return nil // legacy on hardware KVM: allow (backward compatible)
+	case recordedBackend == localBackend:
+		return nil // same backend: allow
+	default:
+		return fmt.Errorf(
+			"Firecracker checkpoint %s was produced on backend %q but this node "+
+				"runs backend %q; cross-backend restore is not supported "+
+				"(the vmstate carries backend-specific MSRs that the other "+
+				"backend rejects at KVM_SET_MSRS time)",
+			artifact.Files.State, recordedBackend, localBackend,
+		)
+	}
+}
+
+// verifyCheckpointTSC refuses a restore when the recorded TSC frequency
+// differs from this node's and the backend cannot scale (PVM:
+// KVM_CAP_TSC_CONTROL=0). The policy is asymmetric:
+//
+//   - Hardware KVM with scaling: allow any recorded frequency; Firecracker
+//     calls KVM_SET_TSC_KHZ.
+//   - PVM (no scaling): the recorded frequency must be present, non-zero,
+//     and match this node's exactly. A zero or missing recorded frequency
+//     is a hard rejection: the artifact predates frequency recording or was
+//     produced on a node where the probe failed, and restoring it without
+//     verification is unsafe on a backend that cannot correct the drift.
+//   - Hardware KVM without scaling: same-frequency required when both are
+//     known; a zero on either side is a warning-level skip because the
+//     legacy behavior must remain backward compatible.
+func (handler *Handler) verifyCheckpointTSC(
+	recordedKHz uint32,
+	artifact *firecrackerCheckpointArtifact,
+) error {
+	isPVM := handler.kvmBackend == KvmBackendPVM
+	if isPVM {
+		if handler.tscFrequencyKHz == 0 {
+			// NewHandler hard-fails for PVM when the local probe fails,
+			// so this means the handler was constructed outside the
+			// normal path (tests). Refuse rather than skip.
+			return fmt.Errorf(
+				"Firecracker checkpoint %s: local TSC frequency is unknown "+
+					"on the PVM backend; refusing to restore without verification",
+				artifact.Files.State,
+			)
+		}
+		if recordedKHz == 0 {
+			return fmt.Errorf(
+				"Firecracker checkpoint %s has no recorded TSC frequency "+
+					"(legacy or failed-probe artifact); the PVM backend does "+
+					"not support TSC scaling and cannot safely restore it. "+
+					"Re-checkpoint on a PVM node that records the frequency.",
+				artifact.Files.State,
+			)
+		}
+		if recordedKHz != handler.tscFrequencyKHz {
+			return fmt.Errorf(
+				"Firecracker checkpoint %s was produced on a node with TSC "+
+					"frequency %d kHz but this PVM node reports %d kHz, and "+
+					"the PVM backend does not support TSC scaling "+
+					"(KVM_CAP_TSC_CONTROL=0). Restore on a node with the "+
+					"same TSC frequency.",
+				artifact.Files.State, recordedKHz, handler.tscFrequencyKHz,
+			)
+		}
+		return nil
+	}
+	// Hardware KVM path.
+	if handler.tscScalingSupported {
+		return nil // Firecracker will call KVM_SET_TSC_KHZ
+	}
+	if recordedKHz == 0 || handler.tscFrequencyKHz == 0 {
+		// Legacy-compatible skip: hardware KVM without scaling but one
+		// side has no frequency. Existing deployments rely on this.
+		return nil
+	}
+	if recordedKHz == handler.tscFrequencyKHz {
+		return nil
+	}
+	return fmt.Errorf(
+		"Firecracker checkpoint %s was produced on a node with TSC "+
+			"frequency %d kHz but this node reports %d kHz, and this "+
+			"backend does not support TSC scaling (KVM_CAP_TSC_CONTROL=0). "+
+			"Restore on a node with the same TSC frequency.",
+		artifact.Files.State, recordedKHz, handler.tscFrequencyKHz,
+	)
 }
 
 func digestFirecrackerStackFile(path string) (string, error) {
@@ -1004,7 +1172,7 @@ func (handler *Handler) Restore(
 		return err
 	}
 	go handler.waitGuest(instance)
-	if err := runtimecommon.WriteSandboxRuntimeMarker(bundlePath, config.RuntimeNameFirecracker); err != nil {
+	if err := runtimecommon.WriteSandboxRuntimeMarker(bundlePath, handler.runtimeName); err != nil {
 		return fmt.Errorf("persist Firecracker restore runtime marker: %w", err)
 	}
 	restoreSucceeded = true

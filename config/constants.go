@@ -27,7 +27,24 @@ const (
 	RuntimeNameKata        = "kata"
 	RuntimeNameRunc        = "runc"
 	RuntimeNameFirecracker = "firecracker"
+	// RuntimeNameFirecrackerPVM selects the Firecracker microVM runtime on
+	// the kvm-pvm backend. The handler probes /dev/kvm and refuses to start
+	// when the PVM vendor module is not loaded; plain "firecracker" equally
+	// refuses on a PVM node. Checkpoint compatibility tuples record the
+	// backend identity, and cross-backend restores are rejected before the
+	// VMM starts.
+	RuntimeNameFirecrackerPVM = "firecracker-pvm"
 )
+
+// IsFirecrackerFamily reports whether a runtime name belongs to the
+// Firecracker microVM adapter (either backend variant). Server-side checks
+// that apply to both variants — checkpoint memory management, writable-layer
+// limits, resource collection — should use this helper rather than matching
+// a single name.
+func IsFirecrackerFamily(runtimeName string) bool {
+	return runtimeName == RuntimeNameFirecracker ||
+		runtimeName == RuntimeNameFirecrackerPVM
+}
 
 // Sandbox service related constants.
 const (
@@ -78,10 +95,11 @@ const (
 // runtime. Server.go consults this when translating a Start RPC into per-pool
 // allocations.
 var RuntimeResources = map[string][]string{
-	RuntimeNameRunsc:       {ResourceNameCgroup, ResourceNameInterface},
-	RuntimeNameKata:        {ResourceNameCgroup, ResourceNameInterface},
-	RuntimeNameRunc:        {ResourceNameCgroup, ResourceNameInterface},
-	RuntimeNameFirecracker: {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameRunsc:          {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameKata:           {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameRunc:           {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameFirecracker:    {ResourceNameCgroup, ResourceNameInterface},
+	RuntimeNameFirecrackerPVM: {ResourceNameCgroup, ResourceNameInterface},
 }
 
 const (

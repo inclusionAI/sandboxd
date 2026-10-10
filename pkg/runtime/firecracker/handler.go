@@ -19,9 +19,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -235,6 +237,32 @@ type Handler struct {
 	compatMu      sync.Mutex
 	compatDigests *firecrackerCheckpointCompat
 
+	// kvmBackend is the KVM vendor backend identity probed from the KVM
+	// ABI (MSR index list) at handler construction. Vendor modules must not
+	// be changed during the daemon's lifetime; drain VMMs and restart the
+	// daemon when changing the host backend. NewHandler hard-fails when it cannot
+	// determine the backend or when the probed backend does not match
+	// the runtimeName's requirement.
+	kvmBackend string
+
+	// runtimeName is the config-level runtime identifier ("firecracker" or
+	// "firecracker-pvm"). It is written into sandbox runtime markers and
+	// read back by recovery, the sbox exec CLI, and the server's
+	// checkpoint orchestration.
+	runtimeName string
+
+	// tscFrequencyKHz is the node's TSC frequency read from a probe vCPU
+	// via KVM_GET_TSC_KHZ at handler construction. Zero means the
+	// frequency could not be read on hardware KVM, preserving legacy behavior.
+	// PVM registration and restores require a verified non-zero frequency.
+	tscFrequencyKHz uint32
+
+	// tscScalingSupported reports KVM_CAP_TSC_CONTROL for the loaded
+	// backend. PVM reports false (no KVM_SET_TSC_KHZ); hardware backends
+	// report true on modern Intel CPUs. When false, a TSC frequency
+	// mismatch between the checkpoint and this node is a hard error.
+	tscScalingSupported bool
+
 	// digestCache memoizes verified checkpoint component digests so warm
 	// restores from a stable directory skip the re-hash.
 	digestCache checkpointDigestCache
@@ -308,12 +336,45 @@ func (handler *Handler) ValidateStartRequest(
 	return nil
 }
 
+// NewHandler creates the hardware-KVM Firecracker handler, preserving the
+// existing constructor API. Use NewHandlerForRuntime for the PVM variant.
 func NewHandler(
 	cfg config.Config,
 	binary string,
 	loader runtimecore.OciLoader,
 ) (*Handler, error) {
-	firecrackerConfig := cfg.RuntimeConfig.Firecracker
+	return NewHandlerForRuntime(cfg, binary, loader, config.RuntimeNameFirecracker)
+}
+
+// NewHandlerForRuntime initializes the explicitly selected Firecracker variant.
+func NewHandlerForRuntime(
+	cfg config.Config,
+	binary string,
+	loader runtimecore.OciLoader,
+	runtimeName string,
+) (*Handler, error) {
+	var firecrackerConfig config.FirecrackerConfig
+	var requiredBackend string
+	switch runtimeName {
+	case config.RuntimeNameFirecracker:
+		firecrackerConfig = cfg.RuntimeConfig.Firecracker
+		requiredBackend = KvmBackendHardware
+	case config.RuntimeNameFirecrackerPVM:
+		if runtime.GOARCH != "amd64" {
+			return nil, fmt.Errorf(
+				"firecracker (%s): the PVM backend is x86-64 only (this build is %s); "+
+					"the MSR-index-list and TSC probes are x86 KVM ABI",
+				runtimeName, runtime.GOARCH,
+			)
+		}
+		firecrackerConfig = cfg.RuntimeConfig.FirecrackerPVM
+		requiredBackend = KvmBackendPVM
+	default:
+		return nil, fmt.Errorf(
+			"firecracker: unsupported runtime name %q (expected %q or %q)",
+			runtimeName, config.RuntimeNameFirecracker, config.RuntimeNameFirecrackerPVM,
+		)
+	}
 	applyFirecrackerDefaults(&firecrackerConfig)
 	if err := validateFirecrackerWritablePolicy(firecrackerConfig); err != nil {
 		return nil, err
@@ -387,7 +448,91 @@ func NewHandler(
 		ociLoader:              loader,
 		virtiofsdPath:          firecrackerConfig.VirtioFSDPath,
 		virtioFSEnabled:        firecrackerConfig.VirtioFSEnabled,
+		runtimeName:            runtimeName,
 		instances:              make(map[string]*firecrackerInstance),
+	}
+	// Probe the actual KVM vendor backend from the ABI and enforce the
+	// match with the runtimeName's requirement. On non-x86 architectures
+	// (arm64), the MSR-index-list probe is unavailable; the plain
+	// firecracker handler skips it and records the hardware-KVM identity.
+	// The PVM handler already
+	// refuses to register on non-x86 above.
+	var backend string
+	var probeErr error
+	if runtime.GOARCH == "amd64" {
+		backend, probeErr = probeKvmBackend(firecrackerConfig.KVMDevice)
+	} else {
+		backend = KvmBackendHardware
+		probeErr = nil
+	}
+	if probeErr != nil {
+		return nil, fmt.Errorf(
+			"firecracker (%s): %v (device %s): checkpoints cannot record a "+
+				"verifiable backend identity and restores cannot be gated safely",
+			runtimeName, probeErr, firecrackerConfig.KVMDevice,
+		)
+	}
+	if backend != requiredBackend {
+		return nil, fmt.Errorf(
+			"firecracker (%s): this node's KVM backend is %q but the runtime "+
+				"requires %q (load the corresponding kvm module or select the "+
+				"other firecracker runtime variant)",
+			runtimeName, backend, requiredBackend,
+		)
+	}
+	handler.kvmBackend = backend
+	logrus.Infof(
+		"firecracker (%s): KVM backend probed as %q on %s",
+		runtimeName, backend, firecrackerConfig.KVMDevice,
+	)
+	// Probe TSC capabilities and frequency for the restore-time gate.
+	// PVM requires both probes to succeed with non-zero results: without
+	// TSC scaling, a restore cannot be verified safe across nodes unless
+	// the local frequency is known. A PVM handler that cannot determine
+	// its own TSC frequency would produce compat tuples that silently
+	// skip the frequency check, defeating the gate.
+	// On non-x86 the TSC probes are skipped entirely (arm64 KVM has no
+	// KVM_GET_TSC_KHZ); the plain firecracker handler records 0 and the
+	// restore-time check is skipped, matching the legacy behavior. The
+	// PVM handler already refuses to register on non-x86 above.
+	if runtime.GOARCH == "amd64" {
+		tscCaps, tscErr := probeKvmTSCCapabilities(firecrackerConfig.KVMDevice)
+		if tscErr != nil {
+			if backend == KvmBackendPVM {
+				return nil, fmt.Errorf(
+					"firecracker (%s): TSC capability probe failed: %v — "+
+						"the PVM runtime requires a verifiable TSC capability "+
+						"to gate restores (no TSC scaling means the frequency "+
+						"must be known)", runtimeName, tscErr,
+				)
+			}
+			logrus.Warnf("firecracker: TSC capability probe failed (non-fatal on hardware KVM): %v", tscErr)
+		} else {
+			handler.tscScalingSupported = tscCaps.ScalingSupported
+		}
+		freqKHz, freqErr := probeKvmTSCFrequency(firecrackerConfig.KVMDevice)
+		if freqErr != nil || freqKHz == 0 {
+			if backend == KvmBackendPVM {
+				return nil, fmt.Errorf(
+					"firecracker (%s): TSC frequency probe returned %d kHz (err: %v) — "+
+						"the PVM runtime requires a non-zero local TSC frequency "+
+						"to gate restores (KVM_CAP_TSC_CONTROL=0 means cross-frequency "+
+						"restore is unsafe without verification)", runtimeName, freqKHz, freqErr,
+				)
+			}
+			logrus.Warnf("firecracker: TSC frequency probe failed or returned 0 (non-fatal on hardware KVM): kHz=%d err=%v", freqKHz, freqErr)
+		} else {
+			handler.tscFrequencyKHz = freqKHz
+			logrus.Infof("firecracker (%s): TSC frequency probed as %d kHz", runtimeName, freqKHz)
+		}
+		if backend == KvmBackendPVM && !handler.tscScalingSupported && handler.tscFrequencyKHz > 0 {
+			logrus.Infof(
+				"firecracker (%s): PVM backend does not support TSC scaling; "+
+					"compat tuples record tsc_frequency_khz=%d and restores on "+
+					"nodes with a different frequency are rejected at verification",
+				runtimeName, handler.tscFrequencyKHz,
+			)
+		}
 	}
 	handler.recoverInstances()
 	return handler, nil
@@ -718,12 +863,14 @@ func (handler *Handler) Start(
 		return err
 	}
 
+	tBootStart := time.Now()
 	bootCtx, cancel := context.WithTimeout(ctx, firecrackerAgentTimeout)
 	defer cancel()
 	api := newFirecrackerAPI(apiPath)
 	if err := api.waitReady(bootCtx); err != nil {
 		return err
 	}
+	tAPIReady := time.Now()
 	vcpus, memoryMiB, err := handler.machineSize(startConfig.Resources)
 	if err != nil {
 		return err
@@ -760,9 +907,23 @@ func (handler *Handler) Start(
 	); err != nil {
 		return err
 	}
+	tConfigured := time.Now()
 	if err := waitForFirecrackerAgent(bootCtx, vsockPath); err != nil {
+		// On a boot timeout, preserve the guest serial console and
+		// per-phase timing so the failure can be diagnosed from the
+		// daemon log alone. The stdout/stderr files are still open and
+		// will be closed (and potentially overwritten by the next VM)
+		// after this handler returns, so this is the only chance to
+		// capture what the guest kernel printed before the timeout.
+		logFirecrackerBootTimeout(
+			startConfig.ID, err,
+			tBootStart, tAPIReady, tConfigured,
+			stdout, stderr,
+			command.Process.Pid,
+		)
 		return err
 	}
+	tAgentReady := time.Now()
 	if err := requestFirecrackerAgent(
 		bootCtx,
 		vsockPath,
@@ -771,25 +932,114 @@ func (handler *Handler) Start(
 	); err != nil {
 		return fmt.Errorf("configure Firecracker guest: %w", err)
 	}
+	tGuestConfigured := time.Now()
 	instance.markConfigured()
 	if err := handler.persistInstance(instance); err != nil {
 		return err
 	}
 	go handler.waitGuest(instance)
-	if err := runtimecommon.WriteSandboxRuntimeMarker(bundlePath, config.RuntimeNameFirecracker); err != nil {
+	if err := runtimecommon.WriteSandboxRuntimeMarker(bundlePath, handler.runtimeName); err != nil {
 		return fmt.Errorf("persist Firecracker runtime marker: %w", err)
 	}
 	startSucceeded = true
 	keepStorage = true
 	keepRuntimeArtifacts = true
 	logrus.Infof(
-		"firecracker: started sandbox %s pid=%d vcpus=%d memory=%dMiB",
+		"firecracker: started sandbox %s pid=%d vcpus=%d memory=%dMiB "+
+			"phases: api_ready=%s vm_config=%s agent_boot=%s agent_configure=%s total=%s",
 		startConfig.ID,
 		command.Process.Pid,
 		vcpus,
 		memoryMiB,
+		tAPIReady.Sub(tBootStart).Round(time.Millisecond),
+		tConfigured.Sub(tAPIReady).Round(time.Millisecond),
+		tAgentReady.Sub(tConfigured).Round(time.Millisecond),
+		tGuestConfigured.Sub(tAgentReady).Round(time.Millisecond),
+		time.Since(tBootStart).Round(time.Millisecond),
 	)
 	return nil
+}
+
+// logFirecrackerBootTimeout captures diagnostic evidence when a guest agent
+// health check times out: the per-phase timing breakdown and the tail of the
+// guest serial console. The stdout/stderr files are still open for writing
+// by the VMM process; the read uses ReadAt on a /proc/self/fd clone so the
+// VMM's file offset is never changed and no blocking can occur on non-
+// regular outputs (FIFOs are rejected by the stat check before open).
+func logFirecrackerBootTimeout(
+	sandboxID string,
+	bootErr error,
+	tStart, tAPIReady, tConfigured time.Time,
+	stdout, stderr *os.File,
+	vmmPid int,
+) {
+	logrus.Errorf(
+		"firecracker: boot timeout for %s (pid=%d): %v — "+
+			"phases: api_ready=%s vm_config=%s agent_wait=%s (total budget %s)",
+		sandboxID, vmmPid, bootErr,
+		tAPIReady.Sub(tStart).Round(time.Millisecond),
+		tConfigured.Sub(tAPIReady).Round(time.Millisecond),
+		time.Since(tConfigured).Round(time.Millisecond),
+		firecrackerAgentTimeout,
+	)
+	// Check whether the VMM is still alive; a crashed process produces a
+	// different diagnosis than a slow guest boot.
+	if syscall.Kill(vmmPid, 0) != nil {
+		logrus.Errorf(
+			"firecracker: VMM pid=%d for %s is no longer running at timeout",
+			vmmPid, sandboxID,
+		)
+	}
+	for _, output := range []struct {
+		label string
+		file  *os.File
+	}{
+		{"stdout", stdout},
+		{"stderr", stderr},
+	} {
+		tail := readTailFromWriter(output.file, 4096)
+		if len(tail) == 0 {
+			continue
+		}
+		logrus.Errorf(
+			"firecracker: guest %s tail for %s (last %d bytes):\n%s",
+			output.label, sandboxID, len(tail), string(tail),
+		)
+	}
+}
+
+// readTailFromWriter reads at most n bytes from the tail of a write-mode
+// regular file, without changing the writer's offset or blocking on
+// non-regular files (FIFOs, character devices). It opens a read-only clone
+// via /proc/self/fd and uses ReadAt. Returns nil for empty, non-regular,
+// or unreadable outputs — a diagnostic gap, not a failure.
+func readTailFromWriter(writer *os.File, n int64) []byte {
+	if writer == nil || n <= 0 {
+		return nil
+	}
+	// Stat the writer's fd directly: a FIFO would block on open, so it
+	// must be rejected before the /proc/self/fd open below.
+	info, err := writer.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return nil
+	}
+	// Open a read-only clone of the same file description.
+	path := fmt.Sprintf("/proc/self/fd/%d", writer.Fd())
+	reader, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer reader.Close()
+	size := info.Size()
+	if size > n {
+		size = n
+	}
+	buf := make([]byte, size)
+	read, err := reader.ReadAt(buf, info.Size()-size)
+	if err != nil && err != io.EOF && read == 0 {
+		return nil
+	}
+	return buf[:read]
 }
 
 func openFirecrackerOutput(path string) (*os.File, error) {
@@ -1270,6 +1520,33 @@ func (handler *Handler) recoverInstances() {
 		if err != nil {
 			continue
 		}
+		// Filter by the persisted runtime marker: a firecracker-pvm
+		// handler must not adopt a sandbox created by the plain
+		// firecracker handler (and vice versa) after a daemon restart,
+		// because the two variants enforce different backend identities
+		// and compat gates. An absent marker is a legacy bundle; only
+		// the plain firecracker handler adopts those for backward
+		// compatibility.
+		markerRuntime, markerErr := runtimecommon.ReadSandboxRuntimeMarker(bundlePath)
+		if markerErr != nil {
+			logrus.Warnf(
+				"firecracker (%s): read runtime marker for %s: %v",
+				handler.runtimeName, entry.Name(), markerErr,
+			)
+			continue
+		}
+		if markerRuntime != handler.runtimeName {
+			if markerRuntime == "" && handler.runtimeName == config.RuntimeNameFirecracker {
+				// Legacy bundle (pre-marker) on the plain firecracker
+				// handler: adopt for backward compatibility.
+			} else {
+				logrus.Infof(
+					"firecracker (%s): skip sandbox %s owned by runtime %q",
+					handler.runtimeName, entry.Name(), markerRuntime,
+				)
+				continue
+			}
+		}
 		state, err := readFirecrackerState(bundlePath)
 		if err != nil {
 			if !os.IsNotExist(err) {
@@ -1488,7 +1765,10 @@ func attachFirecrackerProcess(cgroupPath string, pid int) error {
 func waitForFirecrackerAgent(ctx context.Context, vsockPath string) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
+	attempts := 0
+	var lastErr error
 	for {
+		attempts++
 		err := requestFirecrackerAgent(
 			ctx,
 			vsockPath,
@@ -1496,11 +1776,27 @@ func waitForFirecrackerAgent(ctx context.Context, vsockPath string) error {
 			nil,
 		)
 		if err == nil {
+			if attempts > 1 {
+				logrus.Debugf(
+					"firecracker: guest agent ready after %d attempts",
+					attempts,
+				)
+			}
 			return nil
 		}
+		// A deadline may have passed before Done closes. Keep the last
+		// connection or protocol failure instead of replacing it with
+		// the terminal context error.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return fmt.Errorf("wait for Firecracker guest agent: %w (attempts=%d, last error: %v)", err, attempts, lastErr)
+		}
+		lastErr = err
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for Firecracker guest agent: %w", ctx.Err())
+			return fmt.Errorf(
+				"wait for Firecracker guest agent: %w (attempts=%d, last error: %v)",
+				ctx.Err(), attempts, lastErr,
+			)
 		case <-ticker.C:
 		}
 	}
@@ -1525,11 +1821,22 @@ func requestFirecrackerAgentWaiting(
 	value any,
 	maxWait time.Duration,
 ) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	timeout := maxWait
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = time.Until(deadline)
 		if timeout <= 0 {
-			return ctx.Err()
+			// The deadline has elapsed but the context's timer may
+			// not have fired yet (ctx.Err() returns nil in that
+			// race window). Callers — especially the health-check
+			// retry loop in waitForFirecrackerAgent — treat a nil
+			// return as success, so this must never return nil.
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return context.DeadlineExceeded
 		}
 		if timeout > maxWait {
 			timeout = maxWait

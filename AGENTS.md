@@ -55,14 +55,9 @@ sandboxd runtime suite and the AKernel standalone E2E. Promote the candidate
 without rebuilding it. Only after promotion should this repository pin the
 published release URL and its verified SHA-512 digest.
 
-The AKernel Firecracker release is a checksum-pinned runtime bundle from
-`akernel-dev/firecracker`. It reuses the official VMM binary and packages the
-tested guest kernel, resolved configuration, licenses, checksums, and
-provenance. Build and test an expiring candidate with sandboxd and AKernel,
-then promote those exact bytes without rebuilding them. Only after promotion
-should this repository update the bundle release, URL, and SHA-256 pin. The
-sandboxd-built `firecracker-agent` initrd deliberately remains outside that
-bundle so its guest protocol always matches the consuming sandboxd revision.
+The AKernel Firecracker release is a checksum-pinned runtime bundle from `akernel-dev/firecracker`. It packages the fork-built VMM, tested guest kernel, resolved configuration, licenses, checksums, and provenance. Build and test an expiring candidate with sandboxd and AKernel, then promote those exact bytes without rebuilding them. Only after promotion should this repository update the bundle release, URL, and SHA-256 pin. The sandboxd-built `firecracker-agent` initrd deliberately remains outside that bundle so its guest protocol always matches the consuming sandboxd revision.
+
+The opt-in `firecracker-pvm` profile uses paired OOT `kvm.ko`/`kvm-pvm.ko` modules built against an unchanged distribution host kernel. The host-only `pvm-6.12-host-oot` source and its target-version compatibility changes are distinct from the pinned PVM guest source. VMX/SVM need not be exposed to the host/L1; other PVM CPU features, `nokaslr pti=off`, disabled FRED and the module-loading policy still apply. Keep backend probing and same-backend/TSC-frequency restore gates intact. See `doc/runtime.md` and the AKernel deployment companion for module preparation; never replace a live test server's host kernel or KVM modules to run the PVM suite.
 
 Run the complete runtime compatibility suite on a nested-KVM host with:
 

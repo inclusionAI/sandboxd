@@ -104,7 +104,7 @@ func (h *sandboxService) Checkpoint(
 	defer cancel()
 	cgroupPath := ""
 	var resources *runtime.LinuxSandboxResources
-	if sandbox.Metadata.RuntimeHandler == config.RuntimeNameFirecracker {
+	if config.IsFirecrackerFamily(sandbox.Metadata.RuntimeHandler) {
 		resource, resourceErr := h.sandboxManager.CollectResourceByID(request.ID)
 		if resourceErr != nil {
 			_ = directory.cleanup()

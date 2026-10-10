@@ -77,7 +77,7 @@ func (h *sandboxService) withTransientFirecrackerCheckpointMemory(
 	isCheckpoint bool,
 	operation func() error,
 ) error {
-	if runtimeName != config.RuntimeNameFirecracker {
+	if !config.IsFirecrackerFamily(runtimeName) {
 		return operation()
 	}
 	releaseSlot, err := h.acquireFirecrackerCheckpointMemorySlot(ctx)
