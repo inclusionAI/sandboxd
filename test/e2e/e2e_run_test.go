@@ -111,6 +111,26 @@ command() { printf 'unexpected dependency check\n'; return 1; }
 	}
 }
 
+func TestCheckpointMemoryBudget(t *testing.T) {
+	function := e2eFunctions(t, "checkpoint_memory_mb")
+	for _, tc := range []struct {
+		runtime, platform, want string
+	}{
+		{"runsc", "systrap", "128\n"},
+		{"runsc", "kvm", "256\n"},
+		{"firecracker", "systrap", "256\n"},
+		{"firecracker-pvm", "systrap", "256\n"},
+	} {
+		t.Run(tc.runtime+"/"+tc.platform, func(t *testing.T) {
+			script := function + fmt.Sprintf("checkpoint_memory_mb %q %q\n", tc.runtime, tc.platform)
+			output, err := runE2EHelper(t, script)
+			if err != nil || output != tc.want {
+				t.Fatalf("checkpoint memory budget: err=%v, got=%q, want=%q", err, output, tc.want)
+			}
+		})
+	}
+}
+
 func TestStopSandboxd(t *testing.T) {
 	functions := e2eFunctions(t, "log", "fail", "stop_sandboxd")
 	for _, tc := range []struct {

@@ -901,6 +901,19 @@ run_host_mount_rw_check() {
         KEEP_RUNNING=0 bash /usr/local/bin/sandboxd-host-mount-rw
 }
 
+checkpoint_memory_mb() {
+    local runtime="$1"
+    local platform="$2"
+    if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ] ||
+        { [ "${runtime}" = "runsc" ] && [ "${platform}" = "kvm" ]; }; then
+        # This fixture writes a 100MiB blob before its counter starts. KVM's
+        # sentry/gofer overhead must fit as well; this is not an OOM test.
+        printf '256\n'
+    else
+        printf '128\n'
+    fi
+}
+
 run_checkpoint_restore_check() {
     local runtime="$1"
     local rootfs="$2"
@@ -915,11 +928,11 @@ run_checkpoint_restore_check() {
     local checkpoint_root="${checkpoint_parent}/${suffix}"
 	local checkpoint_dir=""
 	local checkpoint_count=10
-	local memory_mb=128
+	local memory_mb
+	memory_mb="$(checkpoint_memory_mb "${runtime}" "${RUNSC_PLATFORM}")"
 	local extra_config_args=()
 	local checkpoint_mount_args=()
 	if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; then
-		memory_mb=256
 		extra_config_args=(
 			--extra-config
 			'{"nativeWritableMounts":[{"target":"/var/lib/native-checkpoint"}]}'

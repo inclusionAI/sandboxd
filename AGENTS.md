@@ -43,7 +43,7 @@ artifacts used by sandboxd E2E and packaged by AKernel. Keep each release,
 download URL, and checksum synchronized. Do not duplicate runtime versions in
 CI workflow environment variables or Dockerfiles.
 
-gVisor is installed from the complete `gvisor.tar.bz2` release archive. Its SHA-512 pin covers the archive, not the individual runsc binary. Use `third_party/install-gvisor.sh` to validate and install runsc, the containerd shim and all `gvisor-bin/` sidecars together, preserving the adjacent directory layout. Do not mix sidecars from different releases or fall back to downloading them at runtime.
+gVisor is installed from the complete architecture-specific `gvisor-amd64.tar.bz2` or `gvisor-arm64.tar.bz2` release archive. Its SHA-512 pin covers the archive, not the individual runsc binary. Use `third_party/install-gvisor.sh` to validate and install runsc, the containerd shim and all `gvisor-bin/` sidecars together, preserving the adjacent directory layout. Do not mix sidecars from different releases or fall back to downloading them at runtime. The manifest also pins runc for both architectures; consumers must select the artifact matching their target architecture.
 
 The local `RUNSC_BINARY=... make e2e` path also requires the complete adjacent installation. Keep its staging helper, Dockerfile and Docker context allowlist synchronized with the release bundle layout; validate missing helpers before compiling or invoking Docker.
 

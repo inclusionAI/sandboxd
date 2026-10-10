@@ -68,6 +68,8 @@ Build the binaries once and run every targeted image locally:
 make e2e-runtime-suite
 ```
 
+The suite and binary builder honor `GOCACHE` and `GOMODCACHE`; if unset, they retain the `/tmp/go-build` and `/tmp/go-mod-official` defaults. Set both variables to the development host's persistent data disk when building outside CI.
+
 To validate release candidates without changing the tracked version manifest,
 point the suite at a complete alternate manifest:
 
