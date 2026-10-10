@@ -17,9 +17,11 @@ package networkmanager
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -257,6 +259,8 @@ type fakeLinkOperations struct {
 	setDownCount   int
 	setMasterCount int
 	setMACCount    int
+	setDownStarted chan struct{}
+	allowSetDown   chan struct{}
 }
 
 type cleanupNetworkManager struct {
@@ -455,6 +459,10 @@ func (f *fakeLinkOperations) LinkSetUp(netlink.Link) error {
 
 func (f *fakeLinkOperations) LinkSetDown(netlink.Link) error {
 	f.setDownCount++
+	if f.setDownStarted != nil {
+		close(f.setDownStarted)
+		<-f.allowSetDown
+	}
 	return f.setDownErr
 }
 
@@ -585,6 +593,153 @@ func TestAllocateEphemeralCreatesDedicatedLease(t *testing.T) {
 type flakyRawStore struct {
 	*store.MockStore
 	rawErr error
+}
+
+type blockingCountingRawStore struct {
+	*store.MockStore
+
+	mu      sync.Mutex
+	calls   int
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type failFirstBlockingRawStore struct {
+	*store.MockStore
+
+	mu            sync.Mutex
+	calls         int
+	firstEntered  chan struct{}
+	releaseFirst  chan struct{}
+	secondEntered chan struct{}
+}
+
+func (s *failFirstBlockingRawStore) StoreRaw(key string, data []byte) error {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	switch call {
+	case 1:
+		close(s.firstEntered)
+		<-s.releaseFirst
+		return errors.New("first durable commit failed")
+	case 2:
+		close(s.secondEntered)
+	}
+	return s.MockStore.StoreRaw(key, data)
+}
+
+func (s *blockingCountingRawStore) StoreRaw(key string, data []byte) error {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return s.MockStore.StoreRaw(key, data)
+}
+
+func (s *blockingCountingRawStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestConcurrentPooledAllocationsShareDurableCommit(t *testing.T) {
+	const allocations = 32
+	db := &blockingCountingRawStore{
+		MockStore: store.NewMockStore(),
+		entered:   make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	m := &InterfaceManager{
+		db:              db,
+		usingInterfaces: cmap.New[struct{}](),
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, allocations)
+	var ready sync.WaitGroup
+	ready.Add(allocations)
+	for i := range allocations {
+		lease := fmt.Sprintf("lease-%02d", i)
+		m.usingInterfaces.Set(lease, struct{}{})
+		go func() {
+			ready.Done()
+			<-start
+			results <- m.storePooledLease(lease)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	<-db.entered
+
+	select {
+	case err := <-results:
+		t.Fatalf("allocation returned before its active lease was durable: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(db.release)
+	for range allocations {
+		require.NoError(t, <-results)
+	}
+	assert.Equal(t, 1, db.callCount(),
+		"one concurrent allocation burst should share one durable active-set commit")
+
+	stored, err := db.LoadRaw(config.BridgeIpBucket)
+	require.NoError(t, err)
+	var state storedInterfaceIDs
+	require.NoError(t, json.Unmarshal(stored, &state))
+	assert.Len(t, state.Items, allocations)
+}
+
+func TestFailedPooledBatchRollsBackBeforeNextCommit(t *testing.T) {
+	db := &failFirstBlockingRawStore{
+		MockStore:     store.NewMockStore(),
+		firstEntered:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		secondEntered: make(chan struct{}),
+	}
+	f := newTapRecoveryFixture(t, convergedTap(t, 13))
+	f.manager.db = db
+	failedLease := activeLeaseWithIfindex(t, 13)
+	f.manager.usingInterfaces.Set(failedLease, struct{}{})
+	f.linkOps.setDownStarted = make(chan struct{})
+	allowRollback := make(chan struct{})
+	f.linkOps.allowSetDown = allowRollback
+
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- f.manager.storePooledLease(failedLease)
+	}()
+	<-db.firstEntered
+
+	f.manager.usingInterfaces.Set("lease-next", struct{}{})
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- f.manager.storePooledLease("lease-next")
+	}()
+	time.Sleep(2 * activeLeaseStoreBatchWindow)
+	close(db.releaseFirst)
+	<-f.linkOps.setDownStarted
+
+	select {
+	case <-db.secondEntered:
+		t.Fatal("next durable commit began before the failed batch rolled back")
+	case <-time.After(2 * activeLeaseStoreBatchWindow):
+	}
+
+	close(allowRollback)
+	require.ErrorContains(t, <-firstResult, "first durable commit failed")
+	require.NoError(t, <-secondResult)
+
+	stored, err := db.LoadRaw(config.BridgeIpBucket)
+	require.NoError(t, err)
+	var state storedInterfaceIDs
+	require.NoError(t, json.Unmarshal(stored, &state))
+	assert.Equal(t, []string{"lease-next"}, state.Items)
 }
 
 func (f *flakyRawStore) StoreRaw(key string, data []byte) error {

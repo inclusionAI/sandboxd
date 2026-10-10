@@ -564,6 +564,11 @@ func (h *sandboxService) Shutdown() {
 			logrus.Warnf("shutdown: failed to unmount filestore: %v", err)
 		}
 	}
+	if closer, ok := h.store.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			logrus.Warnf("shutdown: failed to close metadata store: %v", err)
+		}
+	}
 	logrus.Info("sandbox service shutdown complete")
 }
 
@@ -646,6 +651,11 @@ func resetMetadataIfResourceStateIncompatible(storePath string) error {
 	}
 
 	db := store.NewStoreImp(storePath)
+	defer func() {
+		if err := db.Close(); err != nil {
+			logrus.Warnf("close metadata compatibility store %s: %v", storePath, err)
+		}
+	}()
 	for _, key := range []string{config.CgroupBucket, config.BridgeIpBucket} {
 		data, err := db.LoadRaw(key)
 		if err != nil {
@@ -660,6 +670,9 @@ func resetMetadataIfResourceStateIncompatible(storePath string) error {
 		}
 		if err := json.Unmarshal(data, &state); err != nil {
 			logrus.Warnf("metadata db %s has incompatible %s bucket (%v); removing stale db", storePath, key, err)
+			if err := db.Close(); err != nil {
+				return fmt.Errorf("close incompatible metadata db %s: %w", storePath, err)
+			}
 			if err := os.Remove(storePath); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("remove incompatible metadata db %s: %w", storePath, err)
 			}
@@ -800,6 +813,13 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	imgSvc := imgMod.Service()
 
 	stateStore := store.NewStoreImp(storePath)
+	defer func() {
+		if retErr != nil {
+			if closeErr := stateStore.Close(); closeErr != nil {
+				logrus.Warnf("init rollback: close metadata store failed: %v", closeErr)
+			}
+		}
+	}()
 	s := &sandboxService{
 		config:                            cfg,
 		store:                             stateStore,
