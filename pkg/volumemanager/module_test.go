@@ -19,6 +19,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/inclusionAI/sandboxd/pkg/loopdevice"
@@ -143,5 +144,44 @@ func TestScaleStorageBytes(t *testing.T) {
 				t.Fatalf("scaleStorageBytes(%d, %g) = %d, want %d", test.physicalBytes, test.ratio, got, test.want)
 			}
 		})
+	}
+}
+
+func TestEphemeralStorageSnapshotUsesPhysicalOccupancy(t *testing.T) {
+	stat := syscall.Statfs_t{Bsize: 4096, Blocks: 100, Bavail: 25}
+	for _, ratio := range []float64{1, 1.5, 2} {
+		capacity, available, disk, err := ephemeralStorageSnapshot(stat, ratio)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if capacity != uint64(409600*ratio) || available != uint64(102400*ratio) || disk == nil || *disk != .75 {
+			t.Fatalf("ratio=%v capacity=%d available=%d disk=%v", ratio, capacity, available, disk)
+		}
+	}
+	_, _, disk, err := ephemeralStorageSnapshot(syscall.Statfs_t{Bsize: 4096}, 1)
+	if err != nil || disk != nil {
+		t.Fatalf("empty filesystem: disk=%v err=%v", disk, err)
+	}
+	for _, invalid := range []syscall.Statfs_t{
+		{Bsize: 0}, {Bsize: 4096, Blocks: 100, Bavail: 101}, {Bsize: 4096, Blocks: math.MaxUint64},
+	} {
+		if _, _, _, err := ephemeralStorageSnapshot(invalid, 1); err == nil {
+			t.Fatalf("accepted invalid statfs: %+v", invalid)
+		}
+	}
+}
+
+func TestEphemeralStorageSnapshotReadsConfiguredFilestore(t *testing.T) {
+	m := NewModule(t.TempDir(), "", false, 2)
+	capacity, available, disk, err := m.EphemeralStorageSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacity == 0 || available > capacity || disk == nil || *disk < 0 || *disk > 1 {
+		t.Fatalf("invalid snapshot: %d %d %v", capacity, available, disk)
+	}
+	m.FilestoreDir = filepath.Join(t.TempDir(), "missing")
+	if _, _, disk, err := m.EphemeralStorageSnapshot(); err == nil || disk != nil {
+		t.Fatalf("missing filestore: disk=%v err=%v", disk, err)
 	}
 }

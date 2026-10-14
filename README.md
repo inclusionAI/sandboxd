@@ -65,6 +65,8 @@ The cgroup provider is read-only and works with both cgroup v1 and v2. It does
 not enable controllers or create child cgroups, including when experimental
 cgroup-disabled execution is selected.
 
+The same `/resource` response includes cached CPU, memory, PID, FD, and filestore disk utilization for advisory scheduling protection. See [resource utilization](doc/resource-utilization.md) for the wire format and sampling scope.
+
 See [test/e2e/README.md](test/e2e/README.md#gpu-debug-image) for the validated
 GPU debug image and manual CUDA test.
 

@@ -124,28 +124,45 @@ func (m *Module) Healthy() bool { return m.healthy.Load() }
 // filestore. The overcommit ratio is applied exactly once here, at the boundary
 // between physical filesystem statistics and scheduler-visible storage.
 func (m *Module) EphemeralStorageCapacity() (uint64, uint64, error) {
+	capacity, available, _, err := m.EphemeralStorageSnapshot()
+	return capacity, available, err
+}
+
+// EphemeralStorageSnapshot reports logical storage and physical occupancy from
+// the same filestore statfs call. Overcommit affects bytes, never occupancy.
+func (m *Module) EphemeralStorageSnapshot() (uint64, uint64, *float64, error) {
 	if m.FilestoreDir == "" {
-		return 0, 0, fmt.Errorf("filestore_dir is not configured")
+		return 0, 0, nil, fmt.Errorf("filestore_dir is not configured")
 	}
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(m.FilestoreDir, &stat); err != nil {
-		return 0, 0, fmt.Errorf("statfs %s: %w", m.FilestoreDir, err)
+		return 0, 0, nil, fmt.Errorf("statfs %s: %w", m.FilestoreDir, err)
 	}
-	if stat.Bsize <= 0 {
-		return 0, 0, fmt.Errorf("statfs %s returned invalid block size %d", m.FilestoreDir, stat.Bsize)
+	return ephemeralStorageSnapshot(stat, m.overcommitRatio)
+}
+
+func ephemeralStorageSnapshot(stat syscall.Statfs_t, ratio float64) (uint64, uint64, *float64, error) {
+	if stat.Bsize <= 0 || stat.Bavail > stat.Blocks {
+		return 0, 0, nil, fmt.Errorf("invalid filestore statfs: block size=%d blocks=%d available=%d", stat.Bsize, stat.Blocks, stat.Bavail)
 	}
 	blockSize := uint64(stat.Bsize)
-	physicalCapacity := stat.Blocks * blockSize
-	physicalAvailable := stat.Bavail * blockSize
-	capacity, err := scaleStorageBytes(physicalCapacity, m.overcommitRatio)
-	if err != nil {
-		return 0, 0, fmt.Errorf("scale filestore capacity: %w", err)
+	if stat.Blocks > math.MaxUint64/blockSize {
+		return 0, 0, nil, fmt.Errorf("filestore capacity overflows bytes")
 	}
-	available, err := scaleStorageBytes(physicalAvailable, m.overcommitRatio)
+	capacity, err := scaleStorageBytes(stat.Blocks*blockSize, ratio)
 	if err != nil {
-		return 0, 0, fmt.Errorf("scale filestore available bytes: %w", err)
+		return 0, 0, nil, fmt.Errorf("scale filestore capacity: %w", err)
 	}
-	return capacity, available, nil
+	available, err := scaleStorageBytes(stat.Bavail*blockSize, ratio)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("scale filestore available bytes: %w", err)
+	}
+	var utilization *float64
+	if stat.Blocks > 0 {
+		used := 1 - float64(stat.Bavail)/float64(stat.Blocks)
+		utilization = &used
+	}
+	return capacity, available, utilization, nil
 }
 
 func scaleStorageBytes(physicalBytes uint64, ratio float64) (uint64, error) {
