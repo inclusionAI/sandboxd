@@ -1,0 +1,15 @@
+# Daemon lifecycle and failed Start
+
+A sandboxd daemon restart preserves externally managed sandboxes. Shutdown stops readiness and sandbox monitors but does not call Delete for existing sandboxes. Their filesystem mounts, cgroups and network objects remain available for the next daemon to recover from persistent records. When there are no sandboxes, Shutdown releases unused infrastructure. Explicit Delete remains responsible for terminating a sandbox and reclaiming its resources. This is distinct from stopping an orchestrator that intentionally deletes its workloads first.
+
+A failed Start may include the gRPC trailer `sandboxd-start-settled: true`. The marker is emitted only for failures rejected before invoking the runtime, after the Start implementation and its deferred rollback have returned. Once a runtime Start or Restore has been attempted, a failure remains unknown: asynchronous backend work may outlive the RPC, and returning from the Go handler is insufficient proof of settlement. It proves that this invocation cannot subsequently create a new backend; it does not prove that rollback succeeded or that no backend remains. Callers must inspect and clean up any remaining backend before releasing admission resources. A transport interruption without the marker remains an unknown outcome; a momentarily empty List is insufficient proof of settlement.
+
+An empty object prefix is valid for an object at the bucket root. Explicit endpoint and bucket values therefore override the object storage template even when ObjectPrefix is empty. Object storage signature compatibility is separate from local HTTP HEAD/Range verification.
+
+If a runtime Start or Restore was attempted and the operation fails, rollback calls the runtime Delete with a fresh, bounded cleanup context, including when the runtime call itself returned an error. The bundle remains available until Delete succeeds and the runtime inventory confirms absence. A Delete failure, inventory failure or remaining backend quarantines the startup leases and bundle instead of returning their network/filesystem/resources to the idle pools. These failures still do not emit a settled trailer: final client outcome reconciliation and automatic reclamation of quarantined, unregistered startup state remain follow-up work. A daemon restart is not established here as proof that every quarantined lease is recovered.
+
+## Kata PTY mounts
+
+Before rootfs preparation, the Kata handler adds a `devpts` mount at `/dev/pts` to the serialized OCI bundle when none exists. The mount uses a private `newinstance` with `ptmxmode=0666`, so the guest's `/dev/ptmx` link can resolve to `/dev/pts/ptmx`. An explicitly configured devpts mount retains its options; a conflicting mount type is rejected before starting the shim.
+
+Tests verify the persisted spec, idempotence, custom options and rejection. A native guest `pty.openpty()` and SDK PTY test are separate runtime acceptance requirements; serialized-spec tests alone do not prove a Kata guest can boot.

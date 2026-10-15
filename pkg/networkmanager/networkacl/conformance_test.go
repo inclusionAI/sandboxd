@@ -692,6 +692,16 @@ func newACLConformanceTopology(t *testing.T) *aclConformanceTopology {
 	peerSandboxPeer := "app" + suffix
 	remotePeer := "arp" + suffix
 
+	// The remote IPv6 peer is routed through this namespace. Do not rely on
+	// a host-wide forwarding default, and restore the previous setting.
+	const forwardingPath = "/proc/sys/net/ipv6/conf/all/forwarding"
+	previousForwarding, err := os.ReadFile(forwardingPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(forwardingPath, []byte("1"), 0600))
+	t.Cleanup(func() {
+		assert.NoError(t, os.WriteFile(forwardingPath, previousForwarding, 0600))
+	})
+
 	runACLCommand(t, "ip", "netns", "add", topology.sandboxNamespace)
 	t.Cleanup(func() { _ = runACLCommandError("ip", "netns", "del", topology.sandboxNamespace) })
 	runACLCommand(t, "ip", "netns", "add", topology.peerSandboxNamespace)

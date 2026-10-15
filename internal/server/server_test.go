@@ -36,7 +36,9 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -1014,4 +1016,161 @@ func TestSetupDnatRules_MultipleContainers(t *testing.T) {
 	s.networkMgr.cleanupDnatRules("ctr-1")
 	assert.Empty(t, s.networkMgr.rulesFor("ctr-1"))
 	assert.NotEmpty(t, s.networkMgr.rulesFor("ctr-2"))
+}
+
+// The marker promises handler completion, not absence of a leftover runtime.
+// Consumers must still reconcile and verify deletion before releasing resources.
+type startTrailerStream struct{ trailer metadata.MD }
+
+func (s *startTrailerStream) Method() string               { return "/runtime.v1.SandboxService/Start" }
+func (s *startTrailerStream) SetHeader(metadata.MD) error  { return nil }
+func (s *startTrailerStream) SendHeader(metadata.MD) error { return nil }
+func (s *startTrailerStream) SetTrailer(md metadata.MD) error {
+	s.trailer = metadata.Join(s.trailer, md)
+	return nil
+}
+
+func TestStartFailureCarriesSettledTrailer(t *testing.T) {
+	service := newTestService(t, nil)
+	defer service.sandboxManager.Stop()
+	stream := &startTrailerStream{}
+	ctx := grpc.NewContextWithServerTransportStream(context.Background(), stream)
+	_, err := service.Start(ctx, nil)
+	assert.Error(t, err)
+	assert.Equal(t, []string{"true"}, stream.trailer.Get("sandboxd-start-settled"))
+}
+
+func TestShutdownPreservesSandboxForDaemonRestart(t *testing.T) {
+	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	const id = "sbox-daemon-restart"
+	storeSandboxForDelete(t, service, id)
+	service.Shutdown()
+	assert.Equal(t, 0, handler.calls, "daemon shutdown must not delete workload")
+	_, err := service.sandboxManager.Get(id)
+	assert.NoError(t, err, "metadata must survive for restart reconciliation")
+	assert.False(t, service.Ready())
+}
+
+func TestStartRuntimeFailureDoesNotCarrySettledTrailer(t *testing.T) {
+	stream := &startTrailerStream{}
+	ctx := grpc.NewContextWithServerTransportStream(context.Background(), stream)
+	_, err := finishStart(ctx, func(progress *startProgress) (*runtime.StartResponse, error) {
+		progress.runtimeAttempted = true
+		return nil, status.Error(codes.Unknown, "runtime may still be executing")
+	})
+	assert.Error(t, err)
+	assert.Empty(t, stream.trailer.Get("sandboxd-start-settled"))
+}
+
+func TestStartSettledTrailerWaitsForRollback(t *testing.T) {
+	stream := &startTrailerStream{}
+	ctx := grpc.NewContextWithServerTransportStream(context.Background(), stream)
+	rollbackReturned := false
+	_, err := finishStart(ctx, func(*startProgress) (*runtime.StartResponse, error) {
+		defer func() { rollbackReturned = true }()
+		assert.Empty(t, stream.trailer.Get("sandboxd-start-settled"))
+		return nil, status.Error(codes.Unknown, "capacity rejected")
+	})
+	assert.Error(t, err)
+	assert.True(t, rollbackReturned)
+	assert.Equal(t, []string{"true"}, stream.trailer.Get("sandboxd-start-settled"))
+}
+
+type failedStartCleanupHandler struct {
+	*svc.FakeRuntimeHandler
+	deleteErr        error
+	deleteCalls      int
+	deleteContextErr error
+	listErr          error
+	states           []*svc.State
+}
+
+func (h *failedStartCleanupHandler) Start(context.Context, svc.StartConfig) error {
+	return status.Error(codes.Unknown, "runtime failed after creating partial state")
+}
+
+func (h *failedStartCleanupHandler) Delete(ctx context.Context, _ string) error {
+	h.deleteCalls++
+	h.deleteContextErr = ctx.Err()
+	return h.deleteErr
+}
+
+func (h *failedStartCleanupHandler) List(context.Context) ([]*svc.State, error) {
+	return h.states, h.listErr
+}
+
+func TestFailedRuntimeStartRetainsRootForCleanup(t *testing.T) {
+	handler := &failedStartCleanupHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	defer service.sandboxManager.Stop()
+	const id = "sbox-partial-start"
+	root := filepath.Join(service.config.RootDir, "containers", id)
+	assert.NoError(t, os.MkdirAll(root, 0755))
+	marker := filepath.Join(root, "partial-runtime-state")
+	assert.NoError(t, os.WriteFile(marker, []byte("needed by runtime delete"), 0600))
+	err := service.startSandboxRuntime(context.Background(), "runsc", svc.StartConfig{ID: id})
+	assert.Error(t, err)
+	assert.FileExists(t, marker, "failed Start must preserve state needed by Delete")
+}
+
+func TestRuntimeRollbackDoesNotReuseCanceledStartContext(t *testing.T) {
+	handler := &failedStartCleanupHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	defer service.sandboxManager.Stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.Error(t, ctx.Err())
+	assert.NoError(t, service.rollbackRuntimeAttempt("runsc", "sbox-partial-start"))
+	assert.Equal(t, 1, handler.deleteCalls)
+	assert.NoError(t, handler.deleteContextErr)
+}
+
+func TestRuntimeRollbackRetainsRootWhenDeleteFails(t *testing.T) {
+	handler := &failedStartCleanupHandler{
+		FakeRuntimeHandler: svc.NewFakeRuntimeHandler(),
+		deleteErr:          status.Error(codes.Unavailable, "runtime still active"),
+	}
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	defer service.sandboxManager.Stop()
+	const id = "sbox-partial-start"
+	root := filepath.Join(service.config.RootDir, "containers", id)
+	assert.NoError(t, os.MkdirAll(root, 0755))
+	marker := filepath.Join(root, "partial-runtime-state")
+	assert.NoError(t, os.WriteFile(marker, []byte("needed for retry"), 0600))
+	assert.Error(t, service.rollbackRuntimeAttempt("runsc", id))
+	assert.Equal(t, 1, handler.deleteCalls)
+	assert.FileExists(t, marker)
+}
+
+func TestRuntimeRollbackRetainsRootUntilAbsenceConfirmed(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		listErr error
+		states  []*svc.State
+	}{
+		{name: "list unavailable", listErr: status.Error(codes.Unavailable, "inventory unavailable")},
+		{name: "backend still present", states: []*svc.State{{ID: "sbox-partial-start"}}},
+		{name: "malformed inventory", states: []*svc.State{nil}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &failedStartCleanupHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler(), listErr: test.listErr, states: test.states}
+			service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+			defer service.sandboxManager.Stop()
+			root := filepath.Join(service.config.RootDir, "containers", "sbox-partial-start")
+			assert.NoError(t, os.MkdirAll(root, 0755))
+			assert.Error(t, service.rollbackRuntimeAttempt("runsc", "sbox-partial-start"))
+			assert.DirExists(t, root)
+		})
+	}
+}
+
+func TestRuntimeRollbackRemovesRootAfterConfirmedDelete(t *testing.T) {
+	handler := &failedStartCleanupHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler()}
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	defer service.sandboxManager.Stop()
+	root := filepath.Join(service.config.RootDir, "containers", "sbox-partial-start")
+	assert.NoError(t, os.MkdirAll(root, 0755))
+	assert.NoError(t, service.rollbackRuntimeAttempt("runsc", "sbox-partial-start"))
+	assert.NoDirExists(t, root)
 }
