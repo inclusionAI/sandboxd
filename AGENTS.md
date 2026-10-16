@@ -90,3 +90,7 @@ Per-sandbox managed storage comprises the private ext4 writable layer, virtio-fs
 The optional `[plugin.image].chunk_db_size` is node-wide and must reach every distill-fs mount, stats, and GC invocation, including daemon recovery. Sandboxd owns capacity consistency; distill-fs does not coordinate or validate agreement across processes. Empty configuration must omit the new flag for compatibility with older binaries. Existing databases cannot resize; Pod hostname changes clear the image-manager root, while same-Pod service restarts preserve it.
 
 `make distillfs-test` runs real FUSE mount, read, stats, GC, and daemon recovery checks in a private mount namespace. It requires sudo, `/dev/fuse`, and `mkfs.erofs`; `DISTILL_FS_BINARY` selects the production executable (default `output/distill-fs/distill_fs`). The storage CI job downloads and verifies the formal release pinned in `third_party/runtime-versions.env` before running it. Explicitly enabled integration must fail when prerequisites are missing, never silently skip.
+
+# Accelerator Contract
+
+Ascend is an optional external adapter for physical 310P and 910 A2/A3 devices with runc. Keep driver-reported model normalization separate from runtime-family validation; do not add per-SKU allowlists. The SDK/scheduler matches the normalized reported model. Provider library directories use additive `SpecUpdates.PrependLibraryPaths`, preserving the application environment; device-visibility variables still use authoritative overrides.

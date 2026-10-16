@@ -200,8 +200,8 @@ GitHub Actions builds the project-owned E2E binaries once and uploads them as a 
 ## GPU debug image
 
 `gpu.Dockerfile` builds a standalone debug image with sandboxd, sbox, the
-checksum-verified gVisor runsc release, `nvidia-container-cli` 1.19.1, and the
-CUDA vectorAdd sample rootfs. It starts sandboxd in experimental
+checksum-verified gVisor runsc release, NVIDIA Container Toolkit 1.19.1, and
+the CUDA vectorAdd sample rootfs. It starts sandboxd in experimental
 cgroup-disabled mode:
 
 ```bash

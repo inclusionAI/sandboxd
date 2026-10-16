@@ -107,9 +107,20 @@ type StartConfig struct {
 // this boundary so vendor-specific discovery and authorization do not leak
 // into the runsc client.
 type SpecUpdates struct {
+	// Envs carries provider-owned device visibility settings. Prestart is used
+	// by providers such as NVIDIA whose toolkit performs injection in an OCI
+	// hook; Ascend resolves the corresponding OCI objects before runc starts.
 	Envs        []*runtime.KeyValue
 	Prestart    []Hook
 	Annotations map[string]string
+	// LinuxDevices and DeviceCgroupRules authorize provider-selected device
+	// nodes. Mounts carries the provider's read-only driver/runtime files.
+	LinuxDevices      []LinuxDevice
+	DeviceCgroupRules []LinuxDeviceCgroup
+	Mounts            []Mount
+	// PrependLibraryPaths adds driver library directories ahead of the final
+	// image/request LD_LIBRARY_PATH without replacing application directories.
+	PrependLibraryPaths []string
 	// RequiresHostWritableRootfs requests a private writable rootfs view
 	// before provider hooks execute. It is separate from the writable layer
 	// visible to workloads after the sandbox starts.
