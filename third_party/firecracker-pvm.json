@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "distribution": "release",
+  "repository": "akernel-dev/firecracker",
+  "commit": "6315fe1ca7f1847cfc682590be2e05e97d76fb22",
+  "run_id": 38717545796,
+  "artifact_id": 11963278876,
+  "artifact_digest": "sha256:4c278a0dc651b97ce4036a65ef46a94fa678204ae4b37769a87b4f30b2905c68",
+  "release_tag": "v1.16.1-akernel.4",
+  "archive_name": "firecracker-v1.16.1-akernel.4-x86_64.tgz",
+  "archive_sha256": "150571da7a370d647e94011768acceac1b6920a2f2e7349f0e86b05b340e112f",
+  "guest_commit": "ca68979e554da5c483c627ced55cb7a55f605b11",
+  "guest_source_sha256": "f3ed347a283bd55d7c8def667d5e9c24e7226c88f6eebf64e5001c81963b8d46",
+  "archive_url": "https://github.com/akernel-dev/firecracker/releases/download/v1.16.1-akernel.4/firecracker-v1.16.1-akernel.4-x86_64.tgz"
+}

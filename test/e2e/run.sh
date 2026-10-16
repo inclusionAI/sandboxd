@@ -18,6 +18,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 . "${SCRIPT_DIR}/gvisor-bundle.sh"
+. "${SCRIPT_DIR}/redis-stage.sh"
 
 DOCKER="${DOCKER:-docker}"
 IMAGE="${SANDBOXD_E2E_IMAGE:-sandboxd-e2e:local}"
@@ -52,6 +53,7 @@ REDIS_CONTAINER="${CONTAINER}-redis"
 REDIS_ROOTFS_CONTAINER="${CONTAINER}-redis-rootfs"
 REDIS_NETWORK="${CONTAINER}-network"
 REDIS_RESULT_KEY="sandboxd-e2e:${CONTAINER}:dnat"
+REDIS_READY_KEY="${REDIS_RESULT_KEY}:ready"
 REDIS_FIXTURE_DIR=""
 REDIS_HOST=""
 SANDBOXD_HOME_FIXTURE_DIR=""
@@ -175,9 +177,16 @@ prepare_network_soak() {
     [ -n "${REDIS_HOST}" ] || fail "external Redis has no container IP"
     "${DOCKER}" exec "${REDIS_CONTAINER}" \
         redis-cli set "${REDIS_RESULT_KEY}" pending >/dev/null
+    "${DOCKER}" exec "${REDIS_CONTAINER}" \
+        redis-cli set "${REDIS_READY_KEY}" waiting >/dev/null
 }
 
 run_redis_dnat_benchmark() {
+    if ! wait_for_redis_soak_stage; then
+        "${DOCKER}" exec "${REDIS_CONTAINER}" \
+            redis-cli set "${REDIS_RESULT_KEY}" fail >/dev/null || true
+        return 1
+    fi
     local seen_container=0
     local redis_ready=0
     local i
@@ -230,8 +239,8 @@ trap cleanup_container EXIT
 cd "${ROOT_DIR}"
 
 case "${E2E_RUNTIME}" in
-    all|runsc|runc|kata|firecracker) ;;
-    *) fail "E2E_RUNTIME must be all, runsc, runc, kata, or firecracker" ;;
+    all|runsc|runc|kata|firecracker|firecracker-pvm) ;;
+    *) fail "E2E_RUNTIME must be all, runsc, runc, kata, firecracker, or firecracker-pvm" ;;
 esac
 case "${E2E_RUNSC_PLATFORM}" in
     systrap|kvm) ;;
@@ -266,24 +275,24 @@ case "${E2E_KEEP_HOME_FIXTURE}" in
     *) fail "E2E_KEEP_HOME_FIXTURE must be 0 or 1" ;;
 esac
 if [ "${E2E_FIRECRACKER_VIRTIOFS}" = "1" ] &&
-    [ "${E2E_RUNTIME}" != "firecracker" ]; then
-    fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker"
+    { [ "${E2E_RUNTIME}" != "firecracker" ] && [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; }; then
+    fail "E2E_FIRECRACKER_VIRTIOFS requires E2E_RUNTIME=firecracker or firecracker-pvm"
 fi
 if [ -n "${E2E_STRESS_ROOTFS_HOST}" ]; then
     [ -d "${E2E_STRESS_ROOTFS_HOST}" ] ||
         fail "E2E_STRESS_ROOTFS_HOST is not a directory"
-    [ "${E2E_RUNTIME}" = "firecracker" ] &&
+    { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; } &&
         [ "${E2E_FIRECRACKER_VIRTIOFS}" = "1" ] ||
         fail "E2E_STRESS_ROOTFS_HOST requires Firecracker virtio-fs"
 fi
 if [ "${E2E_STRESS_CHECKPOINT}" = "1" ] && {
-    [ "${E2E_RUNTIME}" != "firecracker" ] ||
+    { [ "${E2E_RUNTIME}" != "firecracker" ] && [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; } ||
         [ "${E2E_FIRECRACKER_VIRTIOFS}" != "1" ];
 }; then
     fail "E2E_STRESS_CHECKPOINT requires Firecracker virtio-fs"
 fi
 if [ "${E2E_STRESS_ONLY}" = "1" ] && {
-    [ "${E2E_RUNTIME}" != "firecracker" ] ||
+    { [ "${E2E_RUNTIME}" != "firecracker" ] && [ "${E2E_RUNTIME}" != "firecracker-pvm" ]; } ||
         [ "${E2E_FIRECRACKER_VIRTIOFS}" != "1" ] ||
         [ "${E2E_STRESS_ROUNDS}" = "0" ];
 }; then
@@ -344,7 +353,7 @@ if [ "${E2E_SKIP_BUILD}" = "0" ]; then
             fail "KATA_ROOT does not contain the Kata guest image"
         [ -c /dev/kvm ] || fail "Kata e2e requires /dev/kvm"
     fi
-    if [ "${E2E_RUNTIME}" = "firecracker" ]; then
+    if { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; }; then
         if [ -z "${FIRECRACKER_BINARY}" ]; then
             FIRECRACKER_BINARY="/usr/local/bin/firecracker"
         fi
@@ -424,7 +433,7 @@ if [ "${E2E_SKIP_BUILD}" = "0" ]; then
         cp -a --sparse=always "${KATA_ROOT}/." "${ROOT_DIR}/output/kata/"
     fi
 
-    if [ "${E2E_RUNTIME}" = "firecracker" ]; then
+    if { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; }; then
         DOCKERFILE="test/e2e/firecracker.Dockerfile"
         install -m 0755 "${FIRECRACKER_BINARY}" output/firecracker
         install -m 0644 "${FIRECRACKER_KERNEL}" output/firecracker-vmlinux
@@ -462,6 +471,7 @@ if [ "${E2E_NETWORK_SOAK}" = "1" ]; then
         -e "E2E_REDIS_HOST=${REDIS_HOST}"
         -e "E2E_REDIS_DNAT_HOST_PORT=${REDIS_DNAT_HOST_PORT}"
         -e "E2E_REDIS_RESULT_KEY=${REDIS_RESULT_KEY}"
+        -e "E2E_REDIS_READY_KEY=${REDIS_READY_KEY}"
         -v "${REDIS_FIXTURE_DIR}:/e2e-fixtures:ro"
     )
 fi
@@ -483,7 +493,8 @@ set +e
     -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
     -e "E2E_FIRECRACKER_CHECKPOINT_MODE=${E2E_FIRECRACKER_CHECKPOINT_MODE:-}" \
     -e "E2E_FIRECRACKER_VIRTIOFS=${E2E_FIRECRACKER_VIRTIOFS}" \
-    -e "E2E_OCI_ROOTFS_IMAGE=${REDIS_IMAGE}" \
+    -e "E2E_OCI_ROOTFS_IMAGE=${E2E_OCI_ROOTFS_IMAGE:-${REDIS_IMAGE}}" \
+    -e "E2E_OCI_REGISTRY_SCHEME=${E2E_OCI_REGISTRY_SCHEME:-https}" \
     "${network_soak_args[@]}" \
     "${stress_rootfs_args[@]}" \
     -v "${SANDBOXD_HOME_FIXTURE_DIR}:/home/akernel:rw" \
@@ -514,7 +525,7 @@ fi
 if [ "${E2E_RUN_CGROUP_DISABLED}" = "0" ] ||
     [ "${E2E_RUNTIME}" = "runc" ] ||
     [ "${E2E_RUNTIME}" = "kata" ] ||
-    [ "${E2E_RUNTIME}" = "firecracker" ]; then
+    { [ "${E2E_RUNTIME}" = "firecracker" ] || [ "${E2E_RUNTIME}" = "firecracker-pvm" ]; }; then
     log "${E2E_RUNTIME} e2e completed"
     exit 0
 fi

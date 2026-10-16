@@ -16,6 +16,7 @@ package common
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -34,4 +35,26 @@ func WriteSandboxRuntimeMarker(bundlePath, runtimeName string) error {
 		return err
 	}
 	return os.Rename(temporaryPath, finalPath)
+}
+
+// ReadSandboxRuntimeMarker returns the runtime name recorded in an OCI
+// bundle's runtime.json. An absent marker returns "" (legacy bundles
+// predating the marker), which callers should treat as "unknown owner"
+// and skip rather than adopt when multiple runtime variants share the
+// same containers root.
+func ReadSandboxRuntimeMarker(bundlePath string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(bundlePath, "runtime.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	var marker struct {
+		Runtime string `json:"runtime"`
+	}
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return "", fmt.Errorf("decode runtime marker: %w", err)
+	}
+	return marker.Runtime, nil
 }

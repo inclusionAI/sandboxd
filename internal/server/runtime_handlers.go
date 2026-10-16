@@ -56,12 +56,12 @@ func newRuntimeHandler(
 			return nil, err
 		}
 		return runc.NewHandler(cfg, binary, loader)
-	case config.RuntimeNameFirecracker:
+	case config.RuntimeNameFirecracker, config.RuntimeNameFirecrackerPVM:
 		loader, err := newRuntimeBundleLoader(cfg, runtimeName, sandboxRoot)
 		if err != nil {
 			return nil, err
 		}
-		return firecracker.NewHandler(cfg, binary, loader)
+		return firecracker.NewHandlerForRuntime(cfg, binary, loader, runtimeName)
 	default:
 		return nil, errord.ErrNotImplemented
 	}

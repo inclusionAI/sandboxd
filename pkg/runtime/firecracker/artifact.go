@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -45,14 +47,29 @@ const (
 // mismatch; manifests without a tuple (pre-M3 artifacts) restore without
 // stack verification. Vcpus is informational — the vmstate already pins the
 // count a restored VM comes up with.
+//
+// Backend records the KVM vendor backend identity ("pvm" or "kvm") probed
+// from the KVM ABI at checkpoint time. Cross-backend restores are refused:
+// the vmstate carries backend-specific MSRs (PVM: 0x4b564df0–0x4b564df5)
+// that the other backend rejects at KVM_SET_MSRS time. A manifest without
+// a backend has unknown provenance, including older experimental PVM
+// snapshots. It is refused on PVM nodes but accepted on hardware KVM nodes
+// for backward compatibility.
 type firecrackerCheckpointCompat struct {
 	Arch        string `json:"arch,omitempty"`
 	Firecracker string `json:"firecracker,omitempty"`
 	VirtioFSD   string `json:"virtiofsd,omitempty"`
 	Kernel      string `json:"kernel,omitempty"`
 	Initrd      string `json:"initrd,omitempty"`
+	Backend     string `json:"backend,omitempty"`
 	Vcpus       uint32 `json:"vcpus,omitempty"`
 	KernelArgs  string `json:"kernel_args,omitempty"`
+	// TSCFrequencyKHz is the node's TSC frequency in kHz at checkpoint
+	// time, read from a probe vCPU via KVM_GET_TSC_KHZ. A restore on a
+	// node with a different frequency is refused when the backend does
+	// not support TSC scaling (PVM: KVM_CAP_TSC_CONTROL=0). Zero means
+	// the frequency could not be read; the check is skipped in that case.
+	TSCFrequencyKHz uint32 `json:"tsc_frequency_khz,omitempty"`
 }
 
 // firecrackerCheckpointManifest describes the contents of a v2 checkpoint
@@ -179,6 +196,7 @@ func finalizeFirecrackerCheckpointV2(
 	files firecrackerCheckpointFiles,
 	manifest *firecrackerCheckpointManifest,
 ) (retErr error) {
+	started := time.Now()
 	manifest.Version = firecrackerCheckpointVersion2
 	manifest.CreatedAt = time.Now().UTC()
 	if manifest.VirtioFS != (files.VirtioFSState != "") {
@@ -210,6 +228,14 @@ func finalizeFirecrackerCheckpointV2(
 		manifest.Digests[component.name] = digest
 	}
 
+	digested := time.Now()
+	defer func() {
+		logrus.WithFields(logrus.Fields{
+			"directory":  filepath.Dir(files.State),
+			"digest_us":  digested.Sub(started).Microseconds(),
+			"publish_us": time.Since(digested).Microseconds(),
+		}).Debug("firecracker: checkpoint manifest phases")
+	}()
 	manifestPath := filepath.Join(
 		filepath.Dir(files.State),
 		firecrackerCheckpointManifestName,

@@ -1,0 +1,74 @@
+name: PVM isolated L1 E2E
+"on":
+  push:
+    branches: [feat/pvm-candidate-adx]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pvm-isolated-l1
+  cancel-in-progress: false
+jobs:
+  pvm:
+    if: github.repository == 'hky1999/sandboxd' && github.ref_name == 'feat/pvm-candidate-adx'
+    runs-on: [self-hosted, linux, x64, pvm-l1-ubuntu7]
+    timeout-minutes: 180
+    env:
+      DOCKER_HOST: unix:///run/pvm-ci-docker.sock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify disposable L1 boundary
+        run: |
+          echo "PVM_CI_OUTPUT=${RUNNER_TEMP}/pvm-ci" >>"${GITHUB_ENV}"
+          python3 test/e2e/pvm-l1.py
+      - name: Install L1 build and runtime prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 test/e2e/pvm-l1.py
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y build-essential pkg-config libseccomp-dev \
+            iproute2 iptables erofs-utils xfsprogs fuse3 e2fsprogs \
+            clang llvm jq cpio curl git
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run real PVM runtime cases
+        run: bash test/e2e/pvm-ci.sh
+      - name: Clean owned PVM test containers
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 test/e2e/pvm-l1.py
+          for runtime in firecracker-pvm firecracker-pvm-incremental firecracker-pvm-virtiofs; do
+            for suffix in "" -no-cgroup; do
+              name="pvm-ci-${GITHUB_RUN_ID}-${runtime}${suffix}"
+              if docker inspect "${name}" >/dev/null 2>&1; then
+                test "$(docker inspect --format '{{.Config.Image}}' "${name}")" = "sandboxd-runtime-e2e:${runtime}"
+                docker rm -f "${name}"
+              fi
+            done
+          done
+      - name: Collect bounded qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pvm-runtime-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/pvm-ci
+          retention-days: 30
+          if-no-files-found: error
+      - name: Unload owned L1 PVM modules
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 test/e2e/pvm-l1.py
+          if [[ -d /sys/module/kvm_pvm ]]; then rmmod kvm_pvm; fi
+          if [[ -d /sys/module/kvm ]]; then rmmod kvm; fi

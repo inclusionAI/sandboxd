@@ -119,6 +119,7 @@ func TestCheckpointMemoryBudget(t *testing.T) {
 		{"runsc", "systrap", "128\n"},
 		{"runsc", "kvm", "256\n"},
 		{"firecracker", "systrap", "256\n"},
+		{"firecracker-pvm", "systrap", "256\n"},
 	} {
 		t.Run(tc.runtime+"/"+tc.platform, func(t *testing.T) {
 			script := function + fmt.Sprintf("checkpoint_memory_mb %q %q\n", tc.runtime, tc.platform)

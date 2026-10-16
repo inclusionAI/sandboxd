@@ -245,3 +245,28 @@ resources, including pooled TAPs, ephemeral runc veth pairs and namespaces,
 SNAT and DNAT rules, ACL hooks, and the `sandbox0` bridge. Kubernetes must
 allow enough termination grace time for cleanup; SIGKILL cannot run shutdown
 hooks.
+
+### PVM node validation
+
+The optional `firecracker-pvm`, `firecracker-pvm-incremental`, and `firecracker-pvm-virtiofs` cases require a dedicated x86-64 PVM host kernel with `kvm_pvm` already loaded. They are excluded from the default hardware-KVM matrix and do not install kernels or switch host modules. Select the independently locked PVM candidate through `third_party/firecracker-pvm.json` and `prepare-firecracker-pvm.py`; the targeted image rejects a bundle whose `kernel_profile` differs from the selected runtime. Do not modify the default release pins until the exact CI candidate has been qualified and promoted. The agent initrd is built from the consuming sandboxd revision.
+
+```sh
+RUNTIME_VERSIONS_FILE=/path/to/pvm-candidate-versions.env \
+  E2E_CASE=firecracker-pvm-incremental make e2e-runtime-case
+RUNTIME_VERSIONS_FILE=/path/to/pvm-candidate-versions.env \
+  E2E_CASE=firecracker-pvm-virtiofs make e2e-runtime-case
+```
+
+A direct `make e2e` also accepts `E2E_RUNTIME=firecracker-pvm` with explicitly selected `FIRECRACKER_BINARY`, `FIRECRACKER_KERNEL`, and matching `FIRECRACKER_INITRD`. It runs the same lifecycle and compatibility checks as hardware KVM. The virtio-fs case includes OCI/Nydus image-provider checks and requires reachable image registries; a local-directory-only run must identify any skipped image-provider checks explicitly.
+
+The current Actions matrix covers hardware KVM, not PVM. Adding a PVM case to that matrix without preparing an isolated PVM L1 is insufficient: the backend probe must reject stock hardware KVM. A dedicated PVM qualification job should boot its own disposable L1 with a checksum-pinned distribution kernel and matched OOT module pair, run the Full, Incremental and virtio-fs cases inside it, and export kernel/module/bundle provenance, restore-integrity checks and cleanup results. Use the same candidate bundle bytes for AKernel SDK/image-provider/pressure validation before promotion. Never switch a shared runner or active cluster's KVM modules for CI, and do not infer PVM qualification from successful ordinary Firecracker jobs.
+
+## Independent PVM candidate qualification
+
+`.github/workflows/pvm-e2e.yml` is separate from the hardware-KVM matrix. It runs the Full, Incremental and virtio-fs PVM cases on an ephemeral `pvm-l1-ubuntu7` runner located inside an owned disposable L1. The provisioner boots the unchanged qualified distro kernel with VMX/SVM hidden, sets CPU/memory limits outside the L1, supplies `/etc/akernel-pvm-ci.json` and the checksum-verified OSPKE-fixed modules under `/opt/akernel-pvm-ci/modules`, and starts only the private `unix:///run/pvm-ci-docker.sock` daemon. `pvm-l1.py` refuses module operations outside that contract and probes the actual PVM MSR ABI and nonzero TSC frequency. The provisioner stops the L1 after the job, including cancellation/failure; workflow cleanup removes only its uniquely named containers and unloads the pair inside the L1.
+
+`third_party/firecracker-pvm.json` selects the published `v1.16.1-akernel.4` PVM archive and retains the original Actions run/commit, artifact digest, archive digest and strict guest source as provenance. Its published archive is byte-identical to the qualified candidate. `prepare-firecracker-pvm.py` validates those bytes, provenance, x86-64 ELF files and the PVM/PIE/MPK configuration before staging the original archive into a Git-ignored build-context directory. A local `PVM_CANDIDATE_ARCHIVE` reuses exactly the pinned bytes; it cannot override the pin. An Actions distribution requires `GH_TOKEN` and never forwards its Authorization header to blob storage. After exact-byte qualification and promotion, the same descriptor can select `distribution=release` with the published repository/tag/archive URL and unchanged archive/provenance digests; public release downloads require no token or live Actions artifact. A release URL must exactly match the pinned repository, tag and filename, and every staged copy receives the same archive, ELF, provenance and configuration checks. KVM retains the ordinary runtime manifest. Selecting a PVM case reads the separate pin and cannot silently consume a KVM bundle. Unpromoted candidates expire normally; update the reviewed pin after rebuilding instead of bypassing validation. No release is promoted by this workflow.
+
+The isolated runner's `/opt/akernel-pvm-ci/fixtures.json` identifies its anonymous local OCI/Nydus registry and pinned image fixtures. PVM runtime CI uses its Redis OCI fixture through an explicit HTTP registry scheme; ordinary E2E retains its HTTPS/default image settings. This removes public-registry connectivity from guest boot/restore acceptance without replacing image-provider tests with directory roots. Preserve failed-run artifacts; a registry-resolution timeout does not prove a guest-agent timeout.
+
+The external Redis DNAT client waits for an explicit `ready` signal from the suite after the guest Redis responds to PING. The unchanged 300-second DNAT readiness budget starts at that stage; earlier checkpoint and host-mount tests do not consume it. The pre-stage wait is separately bounded by `E2E_REDIS_STAGE_TIMEOUT_SECONDS` (default 1800) and exits when the suite container stops. The guest-agent boot budget remains 15 seconds.

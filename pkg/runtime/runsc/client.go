@@ -567,6 +567,8 @@ func isRunscNotFound(output []byte) bool {
 func (c *Client) ListJSON(ctx context.Context) ([]byte, error) {
 	args := append(c.globalArgs(), "list", "--format", "json")
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	// Bound inherited pipes if a child outlives the canceled list process.
+	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

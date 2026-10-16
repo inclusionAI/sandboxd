@@ -89,6 +89,10 @@ type Manager struct {
 	// isHousekeepingRunning prevents overlapping runtime/disk reconciliation
 	// passes when one pass lasts longer than the periodic interval.
 	isHousekeepingRunning atomic.Bool
+
+	// Runtime poll failures are local to that backend, not process health.
+	runtimePollErrors sync.Map // runtime name -> error
+	runtimePollBusy   sync.Map // runtime name -> *atomic.Bool
 }
 
 // exitNotifier is a one-shot broadcast channel used to wake up any number of
@@ -272,49 +276,46 @@ func (m *Manager) housekeeping() {
 	defer m.isHousekeepingRunning.Store(false)
 
 	logrus.Debugf("start housekeeping: %d sandboxes", m.sandboxes.Count())
+	pollStarted := time.Now()
+	cstates, polled := m.collectRuntimeStates(10 * time.Second)
+	pollCost := time.Since(pollStarted)
+	// Process readiness reflects the outcome of local reconciliation. A slow
+	// successful write must not close admission after the write has completed.
+	// Runtime poll failures close only the affected handler's admission.
 	start := time.Now()
-
-	// 1. Health check
+	ready := true
 	defer func() {
 		spent := time.Since(start)
+		logrus.Debugf("housekeeping phases: runtime_poll=%s local=%s", pollCost, spent)
 		if spent >= config.HouseKeepingMaxCostTime {
-			logrus.Warnf("housekeeping finished, cost %v which is too long", spent)
-			m.healthChan <- false
-		} else {
-			logrus.Debugf("housekeeping finished, cost %v", spent)
-			m.healthChan <- true
+			logrus.Warnf("housekeeping local reconciliation cost %v which is too long", spent)
 		}
+		m.healthChan <- ready
 	}()
-
-	// 2. Maintain m.sandboxes
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cstates := make(map[string]*svc.State)
-
-	for r, handler := range m.serviceHandler.Items() {
-		states, err := handler.List(ctx)
-		if err != nil {
-			logrus.Errorf("list %s sandboxes failed: %v", r, err)
-			continue
-		}
-		for idx := range states {
-			cstates[states[idx].ID] = states[idx]
-		}
-	}
 
 	for id, sb := range m.sandboxes.Items() {
 		if sb == nil {
 			m.sandboxes.Remove(id)
 			continue
 		}
+		// A failed or canceled list says nothing about these sandboxes.
+		// Preserve metadata/status and let their existing monitors continue.
+		if sb.Metadata != nil && !polled[sb.Metadata.RuntimeHandler] {
+			continue
+		}
 
 		// check root
-		if _, err := os.Stat(sb.PATH); err != nil && os.IsNotExist(err) {
-			logrus.Errorf("sandbox %s root %s is not exist", id, sb.PATH)
-			m.ReceiveEvent(Event{
-				Type:      EventTypeDelete,
-				SandboxID: id,
-			})
+		if _, err := os.Stat(sb.PATH); err != nil {
+			if os.IsNotExist(err) {
+				logrus.Errorf("sandbox %s root %s is not exist", id, sb.PATH)
+				m.ReceiveEvent(Event{
+					Type:      EventTypeDelete,
+					SandboxID: id,
+				})
+			} else {
+				ready = false
+				logrus.WithError(err).Errorf("stat sandbox %s root %s failed", id, sb.PATH)
+			}
 			continue
 		}
 
@@ -322,6 +323,7 @@ func (m *Manager) housekeeping() {
 			if err := sb.Status.UpdateSync(func(status Status) (Status, error) {
 				return UpdateStatusByState(cstates[id], status), nil
 			}); err != nil {
+				ready = false
 				logrus.Errorf("update sandbox %s status failed: %v", id, err)
 			}
 		}
@@ -343,8 +345,14 @@ func (m *Manager) housekeeping() {
 	dir, err := os.ReadDir(m.recyclePath)
 	if err == nil {
 		for _, d := range dir {
-			os.RemoveAll(filepath.Join(m.recyclePath, d.Name()))
+			if err := os.RemoveAll(filepath.Join(m.recyclePath, d.Name())); err != nil {
+				ready = false
+				logrus.WithError(err).Errorf("remove recycled sandbox %s failed", d.Name())
+			}
 		}
+	} else if !os.IsNotExist(err) {
+		ready = false
+		logrus.WithError(err).Error("read recycled sandboxes failed")
 	}
 
 	// 4. Complement monitoring (double check strategy)

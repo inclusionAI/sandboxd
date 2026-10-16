@@ -69,24 +69,24 @@ case "${E2E_CASE}" in
         needs_kvm=1
         run_cgroup_disabled=0
         ;;
-    kata|firecracker)
+    kata|firecracker|firecracker-pvm)
         runtime="${E2E_CASE}"
         platform=systrap
         needs_kvm=1
         run_cgroup_disabled=0
         ;;
-    firecracker-virtiofs)
-        runtime=firecracker
+    firecracker-virtiofs|firecracker-pvm-virtiofs)
+        runtime=${E2E_CASE%-virtiofs}
         platform=systrap
         needs_kvm=1
         run_cgroup_disabled=0
         fc_virtiofs=1
         ;;
-    firecracker-incremental)
+    firecracker-incremental|firecracker-pvm-incremental)
         # Same runtime as the plain firecracker case, but the sandboxd
         # config opts into the incremental checkpoint chain so CI exercises
         # both the default Full algorithm and the incremental implementation.
-        runtime=firecracker
+        runtime=${E2E_CASE%-incremental}
         platform=systrap
         needs_kvm=1
         run_cgroup_disabled=0
@@ -99,9 +99,22 @@ case "${E2E_CASE}" in
         run_cgroup_disabled=0
         ;;
     *)
-        fail "E2E_CASE must be runsc-systrap, runsc-kvm, kata, firecracker, firecracker-incremental, firecracker-virtiofs, or runc"
+        fail "E2E_CASE must be runsc-systrap, runsc-kvm, kata, firecracker, firecracker-incremental, firecracker-virtiofs, firecracker-pvm, firecracker-pvm-incremental, firecracker-pvm-virtiofs, or runc"
         ;;
 esac
+
+if [[ "${runtime}" = firecracker-pvm ]]; then
+    candidate_args=()
+    if [[ -n "${PVM_CANDIDATE_ARCHIVE:-}" ]]; then
+        candidate_args+=(--archive "${PVM_CANDIDATE_ARCHIVE}")
+    fi
+    python3 "${ROOT_DIR}/third_party/prepare-firecracker-pvm.py" "${candidate_args[@]}"
+    mapfile -t pvm_fields < <(python3 "${ROOT_DIR}/third_party/prepare-firecracker-pvm.py" --fields)
+    [[ ${#pvm_fields[@]} -eq 3 ]] || fail "invalid PVM candidate inputs"
+    FIRECRACKER_RELEASE="${pvm_fields[0]}"
+    FIRECRACKER_AMD64_SHA256="${pvm_fields[1]}"
+    FIRECRACKER_AMD64_URL="${pvm_fields[2]}"
+fi
 
 cd "${ROOT_DIR}"
 for binary in \
@@ -123,6 +136,8 @@ fi
 image="${SANDBOXD_E2E_IMAGE:-sandboxd-runtime-e2e:${E2E_CASE}}"
 log "building targeted image ${image}"
 "${DOCKER}" build \
+    --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY \
+    --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy \
     --build-arg "E2E_RUNTIME=${runtime}" \
     --build-arg "E2E_VIRTIOFS=${fc_virtiofs:-0}" \
     --build-arg "VIRTIOFSD_REVISION=${VIRTIOFSD_REVISION}" \
@@ -144,8 +159,8 @@ log "building targeted image ${image}"
 
 log "running ${E2E_CASE}"
 SANDBOXD_E2E_IMAGE="${image}" \
-    SANDBOXD_E2E_CONTAINER="sandboxd-e2e-${E2E_CASE}" \
-    SANDBOXD_E2E_DISABLED_CONTAINER="sandboxd-e2e-${E2E_CASE}-no-cgroup" \
+    SANDBOXD_E2E_CONTAINER="${SANDBOXD_E2E_CONTAINER:-sandboxd-e2e-${E2E_CASE}}" \
+    SANDBOXD_E2E_DISABLED_CONTAINER="${SANDBOXD_E2E_DISABLED_CONTAINER:-sandboxd-e2e-${E2E_CASE}-no-cgroup}" \
     E2E_RUNTIME="${runtime}" \
     E2E_RUNSC_PLATFORM="${platform}" \
     E2E_RUN_CGROUP_DISABLED="${run_cgroup_disabled}" \

@@ -15,6 +15,7 @@
 package firecrackerproto
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -25,10 +26,19 @@ import (
 // well-known agent port. The handshake is read byte-by-byte so no protocol
 // bytes can be stranded in a temporary buffered reader.
 func DialAgent(path string, timeout time.Duration) (net.Conn, error) {
-	connection, err := net.DialTimeout("unix", path, timeout)
+	return DialAgentContext(context.Background(), path, timeout)
+}
+
+// DialAgentContext also interrupts the vsock handshake on cancellation.
+// After it returns, the caller owns cancellation of subsequent protocol I/O.
+func DialAgentContext(ctx context.Context, path string, timeout time.Duration) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: timeout}
+	connection, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("dial Firecracker vsock %s: %w", path, err)
 	}
+	stopClosing := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stopClosing()
 	if timeout > 0 {
 		_ = connection.SetDeadline(time.Now().Add(timeout))
 	}

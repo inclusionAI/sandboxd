@@ -16,11 +16,26 @@ package server
 
 import (
 	"fmt"
+
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 )
 
 func (h *sandboxService) checkRuntime(requestRuntime string) error {
 	if !h.serviceHandler.Has(requestRuntime) {
 		return fmt.Errorf("runtime handler %q is not supported", requestRuntime)
+	}
+	return nil
+}
+
+// Admission is runtime-specific. Cleanup must still reach a degraded handler.
+func (h *sandboxService) checkRuntimeAdmission(requestRuntime string) error {
+	if err := h.checkRuntime(requestRuntime); err != nil {
+		return err
+	}
+	if h.sandboxManager != nil {
+		if err := h.sandboxManager.RuntimeHealthError(requestRuntime); err != nil {
+			return errord.ToGRPCf(errord.ErrUnavailable, "runtime %q reconciliation unavailable: %v", requestRuntime, err)
+		}
 	}
 	return nil
 }

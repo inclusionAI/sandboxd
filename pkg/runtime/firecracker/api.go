@@ -59,7 +59,7 @@ func (api *firecrackerAPI) waitReady(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for Firecracker API socket %s: %w", api.socket, ctx.Err())
+			return fmt.Errorf("wait for Firecracker API socket %s: %w", api.socket, context.Cause(ctx))
 		case <-ticker.C:
 		}
 	}

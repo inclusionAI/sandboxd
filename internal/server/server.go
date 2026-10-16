@@ -197,7 +197,7 @@ func (h *sandboxService) startSandboxRuntime(
 		}
 	}()
 
-	if err = h.checkRuntime(runtimeName); err != nil {
+	if err = h.checkRuntimeAdmission(runtimeName); err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("check runtime failed: %v", err)
 		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
 	}
@@ -456,8 +456,8 @@ func (h *sandboxService) Stats(ctx context.Context, request *runtime.StatsReques
 }
 
 // ListAvailableRuntimes returns a stable snapshot of runtime classes whose
-// handlers initialized successfully. Configured classes that failed to load
-// are absent from serviceHandler and therefore from this list.
+// handlers initialized successfully and whose last reconciliation did not fail.
+// A failed backend is omitted without hiding healthy runtime classes.
 func (h *sandboxService) ListAvailableRuntimes(
 	_ context.Context,
 	_ *runtime.ListAvailableRuntimesRequest,
@@ -465,7 +465,12 @@ func (h *sandboxService) ListAvailableRuntimes(
 	if !h.Healthy() {
 		return nil, errord.ToGRPCf(errord.ErrUnavailable, "sandbox service is not ready")
 	}
-	runtimeClasses := h.serviceHandler.Keys()
+	runtimeClasses := make([]string, 0, h.serviceHandler.Count())
+	for _, name := range h.serviceHandler.Keys() {
+		if h.checkRuntimeAdmission(name) == nil {
+			runtimeClasses = append(runtimeClasses, name)
+		}
+	}
 	sort.Strings(runtimeClasses)
 	runtimes := make([]*runtime.RuntimeInfo, 0, len(runtimeClasses))
 	for _, runtimeClass := range runtimeClasses {
@@ -1036,9 +1041,10 @@ func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
 	_, runscEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameRunsc]
 	_, runcEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameRunc]
 	_, firecrackerEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameFirecracker]
-	if (runscEnabled || runcEnabled || firecrackerEnabled) &&
+	_, firecrackerPVMEnabled := runtimeConfig.RuntimeBinary[config.RuntimeNameFirecrackerPVM]
+	if (runscEnabled || runcEnabled || firecrackerEnabled || firecrackerPVMEnabled) &&
 		strings.TrimSpace(runtimeConfig.FilestoreDir) == "" {
-		return errors.New("runsc, runc, and firecracker require plugin.runtime.filestore_dir")
+		return errors.New("runsc, runc, and firecracker(-pvm) require plugin.runtime.filestore_dir")
 	}
 	if err := config.ValidateFilestoreOvercommitRatio(runtimeConfig.FilestoreOvercommitRatio); err != nil {
 		return fmt.Errorf("plugin.runtime: %w", err)
@@ -1307,11 +1313,12 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	}
 	if startReq.WritableLayerLimitBytes > 0 {
 		if startReq.Runtime != config.RuntimeNameRunsc &&
-			startReq.Runtime != config.RuntimeNameFirecracker {
+			!config.IsFirecrackerFamily(startReq.Runtime) {
 			err := fmt.Errorf(
-				"writable layer limits require runtime %q or %q; runtime %q is unsupported",
+				"writable layer limits require runtime %q, %q, or %q; runtime %q is unsupported",
 				config.RuntimeNameRunsc,
 				config.RuntimeNameFirecracker,
+				config.RuntimeNameFirecrackerPVM,
 				startReq.Runtime,
 			)
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
@@ -1329,7 +1336,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 	}
 
-	if err := h.checkRuntime(startReq.Runtime); err != nil {
+	if err := h.checkRuntimeAdmission(startReq.Runtime); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
 			Message: fmt.Sprintf("runtime %q is not available: %v", startReq.Runtime, err),

@@ -126,3 +126,8 @@ output/
 ## local build
 .cache
 .bash_history
+
+/third_party/firecracker-candidate/*.tgz
+/third_party/firecracker-candidate/*.pending
+
+__pycache__/

@@ -20,6 +20,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // Os returns the singleton instance of IoUtil.
@@ -55,7 +58,24 @@ func (e *EmbedIoUtil) WriteFile(filename string, data []byte, perm os.FileMode) 
 	return AtomicWriteFile(filename, data, perm)
 }
 
-func AtomicWriteFile(filename string, data []byte, perm os.FileMode) error {
+func AtomicWriteFile(filename string, data []byte, perm os.FileMode) (retErr error) {
+	started := time.Now()
+	phase := "create"
+	last := started
+	fields := logrus.Fields{"path": filename, "bytes": len(data)}
+	record := func(next string) {
+		now := time.Now()
+		fields[phase+"_us"] = now.Sub(last).Microseconds()
+		phase, last = next, now
+	}
+	defer func() {
+		record("done")
+		fields["total_us"] = time.Since(started).Microseconds()
+		if retErr != nil {
+			fields["error"] = retErr.Error()
+		}
+		logrus.WithFields(fields).Debug("atomic file write phases")
+	}()
 	f, err := os.CreateTemp(filepath.Dir(filename), ".tmp-"+filepath.Base(filename))
 	if err != nil {
 		return err
@@ -64,17 +84,21 @@ func AtomicWriteFile(filename string, data []byte, perm os.FileMode) error {
 		f.Close()
 		return err
 	}
+	record("write")
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return err
 	}
+	record("fsync")
 	if err := f.Sync(); err != nil {
 		f.Close()
 		return err
 	}
+	record("close")
 	if err := f.Close(); err != nil {
 		return err
 	}
+	record("rename")
 	return os.Rename(f.Name(), filename)
 }
 

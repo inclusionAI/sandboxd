@@ -20,6 +20,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/containerd/cgroups/v3"
 )
@@ -90,11 +93,14 @@ func withFirecrackerProcessInCheckpointCgroup(
 		cleanSandboxCgroup == firecrackerCheckpointCgroup {
 		return fmt.Errorf("Firecracker checkpoint requires a non-root sandbox cgroup")
 	}
+	started := time.Now()
 	if err := move(firecrackerCheckpointCgroup, pid); err != nil {
 		return fmt.Errorf("move paused Firecracker VMM to checkpoint cgroup: %w", err)
 	}
 
+	movedOut := time.Now()
 	snapshotErr := snapshot()
+	snapshotted := time.Now()
 	if err := move(sandboxCgroup, pid); err != nil {
 		moveErr := fmt.Errorf(
 			"move paused Firecracker VMM back to sandbox cgroup %s: %w",
@@ -110,5 +116,10 @@ func withFirecrackerProcessInCheckpointCgroup(
 		}
 		return errors.Join(snapshotErr, moveErr, stopErr)
 	}
+	logrus.WithFields(logrus.Fields{
+		"pid": pid, "move_out_us": movedOut.Sub(started).Microseconds(),
+		"native_snapshot_us": snapshotted.Sub(movedOut).Microseconds(),
+		"move_back_us":       time.Since(snapshotted).Microseconds(),
+	}).Debug("firecracker: snapshot cgroup phases")
 	return snapshotErr
 }

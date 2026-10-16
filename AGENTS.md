@@ -55,14 +55,11 @@ sandboxd runtime suite and the AKernel standalone E2E. Promote the candidate
 without rebuilding it. Only after promotion should this repository pin the
 published release URL and its verified SHA-512 digest.
 
-The AKernel Firecracker release is a checksum-pinned runtime bundle from
-`akernel-dev/firecracker`. It reuses the official VMM binary and packages the
-tested guest kernel, resolved configuration, licenses, checksums, and
-provenance. Build and test an expiring candidate with sandboxd and AKernel,
-then promote those exact bytes without rebuilding them. Only after promotion
-should this repository update the bundle release, URL, and SHA-256 pin. The
-sandboxd-built `firecracker-agent` initrd deliberately remains outside that
-bundle so its guest protocol always matches the consuming sandboxd revision.
+The AKernel Firecracker release is a checksum-pinned runtime bundle from `akernel-dev/firecracker`. It packages the fork-built VMM, tested guest kernel, resolved configuration, licenses, checksums, and provenance. Build and test an expiring candidate with sandboxd and AKernel, then promote those exact bytes without rebuilding them. Only after promotion should this repository update the bundle release, URL, and SHA-256 pin. The sandboxd-built `firecracker-agent` initrd deliberately remains outside that bundle so its guest protocol always matches the consuming sandboxd revision.
+
+The opt-in `firecracker-pvm` profile uses paired OOT `kvm.ko`/`kvm-pvm.ko` modules built against an unchanged distribution host kernel. The host-only `pvm-6.12-host-oot` source and its target-version compatibility changes are distinct from the pinned PVM guest source. VMX/SVM need not be exposed to the host/L1; other PVM CPU features, `nokaslr pti=off`, disabled FRED and the module-loading policy still apply. Keep backend probing and same-backend/TSC-frequency restore gates intact. See `doc/runtime.md` and the AKernel deployment companion for module preparation; never replace a live test server's host kernel or KVM modules to run the PVM suite.
+
+PVM runtime changes target `inclusionAI/sandboxd:main`; the AKernel consumer targets `inclusionAI/AKernel:develop`. Fork feature branches provide isolated qualification before upstream review. The AKernel host profile owns the OSPKE-fixed OOT source pin; a guest update does not replace that fix. The companion Firecracker fork pins a strict-TSC guest candidate; the default release manifest still selects ordinary KVM, while existing PVM bundles built from older guest source remain limited to the same-host/L1-boot restore boundary. Keep backend/frequency/software-digest and kernel-argument gates when qualifying that candidate. The independent PVM descriptor `third_party/firecracker-pvm.json` supports either a locked Actions candidate or its promoted public release, without changing ordinary KVM pins. Release downloads retain the same archive/provenance checks and need no token or live Actions artifact. Only switch to the published release URL after exact-byte qualification and promotion. The independent `pvm-e2e.yml` workflow runs the locked PVM bundle on an ephemeral L1 runner; the ordinary hardware-KVM matrix remains unchanged. The L1 owner marker, bounded resources, private Docker socket and actual PVM MSR/TSC probes are mandatory; never install the OOT pair on a physical runner. See `test/e2e/README.md` for the runner contract. DEBUGCTL remains an optional module-source patch.
 
 Run the complete runtime compatibility suite on a nested-KVM host with:
 
@@ -90,3 +87,5 @@ Per-sandbox managed storage comprises the private ext4 writable layer, virtio-fs
 The optional `[plugin.image].chunk_db_size` is node-wide and must reach every distill-fs mount, stats, and GC invocation, including daemon recovery. Sandboxd owns capacity consistency; distill-fs does not coordinate or validate agreement across processes. Empty configuration must omit the new flag for compatibility with older binaries. Existing databases cannot resize; Pod hostname changes clear the image-manager root, while same-Pod service restarts preserve it.
 
 `make distillfs-test` runs real FUSE mount, read, stats, GC, and daemon recovery checks in a private mount namespace. It requires sudo, `/dev/fuse`, and `mkfs.erofs`; `DISTILL_FS_BINARY` selects the production executable (default `output/distill-fs/distill_fs`). The storage CI job downloads and verifies the formal release pinned in `third_party/runtime-versions.env` before running it. Explicitly enabled integration must fail when prerequisites are missing, never silently skip.
+
+Runtime inventory failures are isolated per handler: failed classes leave advertisements and new admission until a successful bounded poll; cleanup and other backends remain available. Preserve that isolation and tracked sandbox state when changing housekeeping or runtime availability. Process readiness continues to cover local reconciliation and core modules.

@@ -42,11 +42,14 @@ func stackFixture(t *testing.T) *Handler {
 		}
 	}
 	return &Handler{
-		binary:        binary,
-		kernelPath:    kernel,
-		initrdPath:    initrd,
-		virtiofsdPath: virtiofsd,
-		kernelArgs:    "console=ttyS0",
+		binary:              binary,
+		kernelPath:          kernel,
+		initrdPath:          initrd,
+		virtiofsdPath:       virtiofsd,
+		kernelArgs:          "console=ttyS0",
+		kvmBackend:          KvmBackendHardware,
+		tscFrequencyKHz:     2500000,
+		tscScalingSupported: true,
 	}
 }
 

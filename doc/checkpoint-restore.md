@@ -207,6 +207,23 @@ own stack and refuses on a mismatch, naming the conflicting field. Manifests
 without a tuple (artifacts from before the tuple existed) restore without stack
 verification.
 
+#### KVM backend identity
+
+The `compat` tuple records the probed `backend` (`"pvm"` or `"kvm"`) and, on x86-64, `tsc_frequency_khz`. At daemon startup, `KVM_GET_MSR_INDEX_LIST` on the system-wide `/dev/kvm` fd distinguishes PVM using `MSR_PVM_VCPU_STRUCT` (0x4b564df1). A failed x86 backend probe prevents registration. The `firecracker` runtime requires hardware KVM, while the opt-in `firecracker-pvm` runtime requires PVM and reads `[plugin.runtime.firecracker_pvm]`. PVM is rejected on non-x86 builds; hardware KVM preserves its non-x86 behavior without using x86 MSR or TSC ioctls.
+
+Cross-backend restores fail before starting the VMM. PVM vmstate carries backend-specific event-delivery MSRs that hardware KVM rejects at `KVM_SET_MSRS`; hardware-KVM state lacks those PVM MSRs. The gate reports an incompatibility instead of exposing a late partial MSR write failure. Daemon recovery also checks each bundle's `runtime.json`: a handler adopts only its runtime variant, and only the hardware-KVM handler retains support for legacy bundles without a marker.
+
+Legacy checkpoint artifacts without a backend tag, including v1 archives without a manifest or a v2 manifest without `compat`, follow an asymmetric policy:
+
+- Hardware-KVM nodes retain legacy restore behavior. Operators must confirm provenance: old experimental PVM checkpoints are also untagged and can still fail on hardware KVM.
+- PVM nodes refuse artifacts whose backend cannot be verified. Produce a new checkpoint using the PVM runtime instead of relabeling an old manifest.
+
+The tested PVM backend reports `KVM_CAP_TSC_CONTROL=0`. Registering PVM requires successful capability and non-zero frequency probes; restoring on PVM requires a recorded non-zero frequency equal to the target's frequency. Unknown or different frequencies fail compatibility verification before starting the VMM. Hardware KVM retains legacy handling for missing frequencies and lets Firecracker apply supported scaling. These checks do not establish heterogeneous CPU migration support; qualify CPU compatibility separately and use the identical VMM, kernel, initrd and virtiofsd stack as the baseline.
+
+The opt-in strict-TSC guest candidate improves kernel clock and timer recovery when a same-frequency PVM TSC offset changes, but it does not preserve raw RDTSC/RDTSCP continuity or provide TSC scaling. Continue to validate the entire compatibility tuple. A different guest digest or `pvm_tsc` kernel argument is incompatible with an existing checkpoint; retain the original stack or recreate workloads. PVM bundles built from the older guest source remain limited to the same host/L1 boot and TSC domain until a separately qualified strict-TSC PVM bundle is selected.
+
+Fresh Firecracker starts share a 15-second deadline across VMM API readiness, VM configuration, guest-agent health checks and guest configuration. Startup logs report these phases separately. If the VMM exits during a fresh start or restore, sandboxd cancels readiness and configuration I/O and reports the VMM exit status without waiting for the agent deadline. A failed health check preserves the attempt count and last connection or protocol error; a boot failure also records the available regular-file console tails before cleanup. Empty output paths still discard the console, so configure per-VM stdout and stderr files when collecting boot evidence. An expired or canceled context always fails an unsent guest-agent request, including the interval before the context timer publishes its deadline error.
+
 ### Storage layout for high-performance Firecracker checkpoints
 
 Firecracker memory and the writable block image are separate checkpoint
@@ -409,3 +426,9 @@ New sandboxes default to `writable_io_engine = "AsyncDirect"` and `writable_cach
 The VMM persists the engine and cache policy in device state and reopens the writable disk with the saved policy on restore. Changing sandboxd's defaults affects newly created VMs; it does not override the policy captured in an existing checkpoint. Checkpoint compatibility still requires matching runtime digests. Direct-I/O alignment requirements are queried again for the restored image on its destination filesystem. Request-owned alignment buffers and in-flight I/O are completed before snapshotting; completed reads reach guest memory and dirty tracking before the device state is saved. Alignment buffers are not separate checkpoint artifacts.
 
 The destination host must support the saved I/O engine. In particular, direct engines require the destination kernel and backing filesystem to report `STATX_DIOALIGN`, normally available for ext4 and XFS on upstream Linux 6.1 or newer; asynchronous engines also require usable `io_uring`. Restore fails when those capabilities are unavailable and never automatically changes the saved engine to buffered I/O. Operators using hosts without Direct I/O alignment-query support must explicitly configure `Async` or `Sync` before creating new sandboxes; this setting cannot make an existing Direct I/O checkpoint compatible with such a host. See [host I/O compatibility and configuration](runtime.md) for details.
+
+#### Checkpoint timing diagnostics
+
+The Firecracker completion log keeps `layout`, `flush`, `pause`, `snapshot`, `overlay`, `resume`, `seal` and `total` timings, and splits the `seal` interval into `manifest`, `adopt`, `persist` and `writeback_queue`. The debug log separates manifest component hashing from publication, native snapshot time from both cgroup moves, and atomic state-file creation, writing, `fsync`, closing and rename. `seal` includes instance-state persistence and queue submission; it is not a measurement of guest-memory hashing or an assurance that all checkpoint data reached stable storage. Collect these timings alongside I/O and CPU-pressure measurements before attributing nested checkpoint latency to the virtualization backend.
+
+When profiling nested PVM, keep the VMM and its vCPU threads outside ptrace. Following sandboxd forks can otherwise perturb guest startup even with a narrow displayed syscall filter. For example, `strace -f -b execve` follows sandboxd threads but detaches children when they execute another program; verify the running Firecracker process reports `TracerPid: 0`. Record outer block-I/O limits as well as CPU/memory limits. Separate virtual disks or ext4/XFS filesystems can still share one capped backing device. Memory-backed checkpoint controls are diagnostics and do not replace persistent-storage or restore qualification.

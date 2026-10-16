@@ -403,3 +403,21 @@ func fileNames(files []*os.File) []string {
 	}
 	return names
 }
+
+func TestListDeadlineWithInheritedOutputPipe(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nsleep 4 &\nwait\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := NewClient(binary, dir).ListJSON(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ListJSON error=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("ListJSON blocked on inherited pipe for %s", elapsed)
+	}
+}

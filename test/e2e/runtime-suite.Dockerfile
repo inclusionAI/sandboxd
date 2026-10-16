@@ -79,6 +79,7 @@ COPY output/oom-hog /usr/local/bin/oom-hog
 COPY output/network-policy-client /usr/local/bin/network-policy-client
 COPY output/checkpoint-restore /usr/local/bin/checkpoint-restore
 COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
+COPY third_party/firecracker-candidate/ /tmp/firecracker-candidate/
 COPY third_party/install-gvisor.sh /usr/local/libexec/install-gvisor.sh
 COPY test/e2e/host-mount-rw.sh /usr/local/bin/sandboxd-host-mount-rw
 COPY --from=virtiofsd-runtime /virtiofsd/ /
@@ -138,10 +139,14 @@ RUN set -eux; \
           /opt/kata/share/kata-containers/kata-containers.img \
           /opt/kata/share/kata-containers/vmlinux-dragonball-experimental.container; \
         ;; \
-      firecracker) \
+      firecracker|firecracker-pvm) \
         archive="/tmp/firecracker-${FIRECRACKER_RELEASE}-x86_64.tgz"; \
-        curl -fSL --retry 10 --retry-delay 2 --retry-all-errors \
-          "${FIRECRACKER_AMD64_URL}" -o "${archive}"; \
+        if [ "${E2E_RUNTIME}" = firecracker-pvm ]; then \
+          cp /tmp/firecracker-candidate/firecracker.tgz "${archive}"; \
+        else \
+          curl -fSL --retry 10 --retry-delay 2 --retry-all-errors \
+            "${FIRECRACKER_AMD64_URL}" -o "${archive}"; \
+        fi; \
         echo "${FIRECRACKER_AMD64_SHA256}  ${archive}" | sha256sum -c -; \
         mkdir -p /tmp/firecracker-release; \
         tar -xzf "${archive}" -C /tmp/firecracker-release; \
@@ -151,6 +156,10 @@ RUN set -eux; \
         test "$(jq -er '.release_tag' "${bundle}/manifest.json")" = \
           "${FIRECRACKER_RELEASE}"; \
         (cd "${bundle}"; sha256sum -c SHA256SUMS); \
+        expected_profile=kvm; \
+        if [ "${E2E_RUNTIME}" = firecracker-pvm ]; then expected_profile=pvm; fi; \
+        test "$(jq -er '.kernel_profile // "kvm"' "${bundle}/manifest.json")" = \
+          "${expected_profile}"; \
         vmm_version="$(jq -er '.vmm.version' "${bundle}/manifest.json")"; \
         "${bundle}/firecracker" --version | \
           grep -F "Firecracker ${vmm_version}"; \
@@ -177,7 +186,7 @@ RUN set -eux; \
         exit 1; \
         ;; \
     esac; \
-    rm -rf /tmp/firecracker-initrd /tmp/firecracker-release \
+    rm -rf /tmp/firecracker-initrd /tmp/firecracker-release /tmp/firecracker-candidate \
       /tmp/firecracker-*.tgz /tmp/kata-static-*.tar.zst \
       /tmp/runc.amd64 /tmp/gvisor.tar.bz2; \
     chmod 0755 \
