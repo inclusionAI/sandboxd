@@ -15,11 +15,13 @@
 package store
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -40,6 +42,24 @@ func TestDataConvert(t *testing.T) {
 	if strings.Contains(any.String(), "key1") == false || strings.Contains(any.String(), "value1") == false {
 		t.Fatalf("FromAny() error, result is not equal, got: %s", any.String())
 	}
+}
+
+func TestBboltStoreReusesConnectionAndReleasesItOnClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metadata.db")
+	db := NewStoreImp(path)
+	require.NoError(t, db.StoreRaw("first", []byte("one")))
+	firstConnection := db.db
+	require.NotNil(t, firstConnection)
+
+	require.NoError(t, db.StoreRaw("second", []byte("two")))
+	require.Same(t, firstConnection, db.db)
+	require.NoError(t, db.Close())
+
+	reopened := NewStoreImp(path)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	got, err := reopened.LoadRaw("second")
+	require.NoError(t, err)
+	require.Equal(t, []byte("two"), got)
 }
 
 func TestStore(t *testing.T) {
