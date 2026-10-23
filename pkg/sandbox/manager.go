@@ -145,6 +145,9 @@ func NewManager(
 	if err := m.loadSandboxes(); err != nil {
 		return nil, err
 	}
+	if err := m.reconcileStoppedRunscOrphans(); err != nil {
+		return nil, err
+	}
 	for sandboxID := range m.sandboxes.Items() {
 		m.idGenerator.Reserve(sandboxID)
 	}
