@@ -67,6 +67,8 @@ Save and restore must use matching runtime builds. Drain sandboxes before replac
 
 ## Checkpoint output synchronization
 
+Runsc's per-execution host staging overlay uses the Linux 5.10+ `volatile` mount option. Its upper directory holds disposable mount targets and host-hook output, is recreated for each execution, and is never a recovery artifact. Without this option, tearing down one overlay synchronizes the shared backing filesystem and can block behind other sandboxes' checkpoint writes. This does not change runsc's separate guest writable filestore or the checkpoint output synchronization below. Do not reuse a volatile staging upper directory after a host crash; normal preparation removes and recreates it.
+
 `plugin.runtime.checkpoint_sync.sync_output` defaults to `false`, preserving the existing page-cache completion contract. Set it to `true` when successful checkpoint publication must include the backing filesystem's synchronization guarantee:
 
 ```toml

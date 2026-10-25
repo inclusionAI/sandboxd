@@ -37,11 +37,15 @@ var mountRunscNVProxyEROFSImage = runtimecommon.MountReadOnlyEROFSImage
 
 var mountRunscNVProxyOverlay = func(lowerDir, upperDir, workDir, target string) error {
 	options := fmt.Sprintf(
-		"lowerdir=%s,upperdir=%s,workdir=%s",
+		"lowerdir=%s,upperdir=%s,workdir=%s,volatile",
 		lowerDir,
 		upperDir,
 		workDir,
 	)
+	// This overlay only stages mount targets and host hook output. It is
+	// recreated for every execution; guest writes use runsc's separate
+	// filestore. Do not let teardown sync the entire shared upper filesystem
+	// while other sandboxes are persisting checkpoints (Linux 5.10 ovl_sync_fs).
 	return syscall.Mount("overlay", target, "overlay", 0, options)
 }
 
