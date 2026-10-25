@@ -152,6 +152,9 @@ type RuntimeConfig struct {
 
 // RunscConfig contains options passed to the gVisor runsc adapter.
 type RunscConfig struct {
+	// RestoreConcurrency bounds simultaneous restore Start RPCs, including
+	// filesystem preparation. Zero selects 16; valid explicit values are 1..1024.
+	RestoreConcurrency int `toml:"restore_concurrency" json:"restoreConcurrency"`
 	// Platform selects gVisor's syscall interception platform.
 	Platform string `toml:"platform" json:"platform"`
 	// ExtraArgs supplies operator-owned runsc flags. Nil preserves --net-raw;

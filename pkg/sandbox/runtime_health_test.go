@@ -23,6 +23,45 @@ type runtimePollFixture struct {
 
 func (h *runtimePollFixture) List(ctx context.Context) ([]*svc.State, error) { return h.list(ctx) }
 
+func TestWaitRuntimeHealthRequiresSuccessfulPollWithoutChangingDeadline(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	m := &Manager{serviceHandler: cmap.New[svc.Handler]()}
+	m.serviceHandler.Set("runsc", &runtimePollFixture{list: func(context.Context) ([]*svc.State, error) {
+		if fail.Load() {
+			return nil, errors.New("inventory unavailable")
+		}
+		return nil, nil
+	}})
+	m.collectRuntimeStates(time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	done := make(chan error, 1)
+	go func() { done <- m.WaitRuntimeHealth(ctx, "runsc") }()
+	fail.Store(false)
+	select {
+	case err := <-done:
+		t.Fatalf("health reopened before a successful poll: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	require.Error(t, m.RuntimeHealthError("runsc"))
+	m.collectRuntimeStates(time.Second)
+	require.NoError(t, <-done)
+	actual, _ := ctx.Deadline()
+	require.Equal(t, deadline, actual)
+	require.NoError(t, m.RuntimeHealthError("runsc"))
+}
+
+func TestWaitRuntimeHealthCancellationDoesNotReopenAdmission(t *testing.T) {
+	m := &Manager{}
+	m.runtimePollErrors.Store("runsc", errors.New("inventory unavailable"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, m.WaitRuntimeHealth(ctx, "runsc"), context.DeadlineExceeded)
+	require.Error(t, m.RuntimeHealthError("runsc"))
+}
+
 func TestRuntimePollTimeoutIsolatedAndRecovers(t *testing.T) {
 	var slow atomic.Bool
 	slow.Store(true)
