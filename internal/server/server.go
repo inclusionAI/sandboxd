@@ -105,6 +105,8 @@ type sandboxService struct {
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]struct{}
+	restoreAdmissionMu                sync.Mutex
+	restoreAdmissionSlots             chan struct{}
 	firecrackerCheckpointMemorySlotMu sync.Mutex
 	firecrackerCheckpointMemorySlot   chan struct{}
 }
@@ -197,7 +199,7 @@ func (h *sandboxService) startSandboxRuntime(
 		}
 	}()
 
-	if err = h.checkRuntimeAdmission(runtimeName); err != nil {
+	if err = h.checkStartRuntimeAdmission(ctx, runtimeName, startConfig.CheckpointDir); err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("check runtime failed: %v", err)
 		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
 	}
@@ -708,6 +710,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, err
 	}
 	if err := validateRuntimeFilestore(cfg.RuntimeConfig); err != nil {
+		return nil, err
+	}
+	if _, err := runscRestoreConcurrency(cfg.RuntimeConfig.Runsc.RestoreConcurrency); err != nil {
 		return nil, err
 	}
 	runscPlatform, err := config.NormalizeRunscPlatform(cfg.RuntimeConfig.Runsc.Platform)
@@ -1336,7 +1341,12 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 	}
 
-	if err := h.checkRuntimeAdmission(startReq.Runtime); err != nil {
+	releaseRestore, err := h.acquireRestoreAdmission(ctx, startReq.Runtime, checkpointDir)
+	if err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+	}
+	defer releaseRestore()
+	if err := h.checkStartRuntimeAdmission(ctx, startReq.Runtime, checkpointDir); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
 			Message: fmt.Sprintf("runtime %q is not available: %v", startReq.Runtime, err),

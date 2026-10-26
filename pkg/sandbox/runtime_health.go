@@ -24,6 +24,27 @@ func (m *Manager) RuntimeHealthError(name string) error {
 	return nil
 }
 
+// WaitRuntimeHealth waits for a successful inventory poll without reopening
+// runtime advertisement or treating unavailable inventory as an empty list.
+// The caller owns the deadline; cancellation does not change backend health.
+func (m *Manager) WaitRuntimeHealth(ctx context.Context, name string) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if m.RuntimeHealthError(name) == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (m *Manager) collectRuntimeStates(timeout time.Duration) (map[string]*svc.State, map[string]bool) {
 	states := make(map[string]*svc.State)
 	polled := make(map[string]bool)

@@ -17,6 +17,7 @@ package runsc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"os"
 	"path/filepath"
@@ -304,5 +305,67 @@ func TestCleanupRunscNVProxyRootfsDetachesBusyMount(t *testing.T) {
 	}
 	if len(flags) != 3 || flags[0] != 0 || flags[1] != syscall.MNT_DETACH || flags[2] != 0 {
 		t.Fatalf("unexpected unmount flags: %v", flags)
+	}
+}
+
+// Run in a private mount namespace with SANDBOXD_RUNSC_MOUNT_TEST=1.
+func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
+	if os.Getenv("SANDBOXD_RUNSC_MOUNT_TEST") != "1" {
+		t.Skip("requires explicit opt-in inside a private mount namespace")
+	}
+	for _, hostWritable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("host-writable=%t", hostWritable), func(t *testing.T) {
+			bundle := t.TempDir()
+			lower := t.TempDir()
+			if err := os.WriteFile(filepath.Join(lower, "image-file"), []byte("image"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			spec := &runtimecore.Spec{Root: &runtimecore.Root{Path: lower, Readonly: true}}
+			cleanup, err := prepareRunscPrivateRootfs(bundle, spec, hostWritable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := cleanup(); err != nil {
+					t.Error(err)
+				}
+			})
+			merged := filepath.Join(bundle, spec.Root.Path)
+			mounts, err := os.ReadFile("/proc/self/mountinfo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, line := range strings.Split(string(mounts), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) > 6 && fields[4] == merged {
+					found = true
+					if !strings.Contains(","+fields[len(fields)-1]+",", ",volatile,") {
+						t.Fatalf("disposable staging overlay can synchronize unrelated host writes: %s", line)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("private rootfs is not a distinct overlay mount")
+			}
+			if spec.Root.Readonly == hostWritable {
+				t.Fatalf("unexpected guest root readonly=%t", spec.Root.Readonly)
+			}
+			if err := os.WriteFile(filepath.Join(merged, "image-file"), []byte("private"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(lower, "image-file"))
+			if err != nil || string(data) != "image" {
+				t.Fatalf("private rootfs mutated shared lower: %q, %v", data, err)
+			}
+			if err := cleanup(); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{runscNVProxyRootfsDir, runscNVProxyUpperDir, runscNVProxyWorkDir} {
+				if _, err := os.Lstat(filepath.Join(bundle, name)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("staging path remains after cleanup: %s, %v", name, err)
+				}
+			}
+		})
 	}
 }
