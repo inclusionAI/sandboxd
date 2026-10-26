@@ -16,9 +16,6 @@ func runscRestoreConcurrency(value int) (int, error) {
 	if value < 0 || value > 1024 {
 		return 0, fmt.Errorf("runsc restore_concurrency must be zero or between 1 and 1024")
 	}
-	if value == 0 {
-		return 16, nil
-	}
 	return value, nil
 }
 
@@ -28,17 +25,20 @@ func (h *sandboxService) acquireRestoreAdmission(ctx context.Context, runtimeNam
 	if runtimeName != config.RuntimeNameRunsc || checkpointDir == "" {
 		return func() {}, nil
 	}
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Minute)
-		defer cancel()
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	limit, err := runscRestoreConcurrency(h.config.RuntimeConfig.Runsc.RestoreConcurrency)
 	if err != nil {
 		return nil, err
+	}
+	if limit == 0 {
+		return func() {}, nil
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Minute)
+		defer cancel()
 	}
 	h.restoreAdmissionMu.Lock()
 	if h.restoreAdmissionSlots == nil {

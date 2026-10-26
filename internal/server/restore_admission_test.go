@@ -7,12 +7,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"github.com/pelletier/go-toml"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -72,17 +74,27 @@ func TestRestoreAdmissionQueueDoesNotReserveIDOrPrepareFilesystem(t *testing.T) 
 	require.Empty(t, handler.restores)
 }
 
-func TestRestoreAdmissionDefaultLimit(t *testing.T) {
-	s := &sandboxService{}
-	for range 16 {
-		release, err := s.acquireRestoreAdmission(context.Background(), config.RuntimeNameRunsc, "/checkpoint")
-		require.NoError(t, err)
-		defer release()
+func TestRestoreAdmissionOmittedOrZeroDoesNotLimit(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		toml string
+	}{
+		{name: "omitted", toml: "[plugin.runtime.runsc]\n"},
+		{name: "explicit zero", toml: "[plugin.runtime.runsc]\nrestore_concurrency = 0\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := &sandboxService{}
+			require.NoError(t, toml.NewDecoder(strings.NewReader(test.toml)).Decode(&s.config))
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			// Keep all permits outstanding to catch an implicit default cap of 16.
+			for i := range 32 {
+				release, err := s.acquireRestoreAdmission(ctx, config.RuntimeNameRunsc, "/checkpoint")
+				require.NoError(t, err, "restore %d must not queue when throttling is disabled", i+1)
+				t.Cleanup(release)
+			}
+		})
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	_, err := s.acquireRestoreAdmission(ctx, config.RuntimeNameRunsc, "/checkpoint")
-	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestRestoreAdmissionReleasesCapacityAndPreservesDeadline(t *testing.T) {
