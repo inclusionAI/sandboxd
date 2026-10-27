@@ -133,6 +133,10 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
 	}
+	config, managedFilestores, err := r.prepareFileBackedTmpfs(config)
+	if err != nil {
+		return err
+	}
 
 	rootOverlay, rootOverlaySize, err := r.resolveRootOverlay(config.WritableLayerLimitBytes)
 	if err != nil {
@@ -169,11 +173,12 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 	}
 
 	startArgs := StartArgs{
-		ID:          config.ID,
-		BundleDir:   bundlePath,
-		UserStdout:  config.Stdout,
-		UserStderr:  config.Stderr,
-		RootOverlay: rootOverlay,
+		ManagedFilestores: managedFilestores,
+		ID:                config.ID,
+		BundleDir:         bundlePath,
+		UserStdout:        config.Stdout,
+		UserStderr:        config.Stderr,
+		RootOverlay:       rootOverlay,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),
@@ -218,9 +223,16 @@ func (r *Handler) Restore(
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
 	}
+	config, managedFilestores, err := r.prepareFileBackedTmpfs(config)
+	if err != nil {
+		return err
+	}
 	adoptDir, err := filestoreRestoreDirectory(config.CheckpointDir)
 	if err != nil {
 		return fmt.Errorf("validate runsc checkpoint filestores: %w", err)
+	}
+	if managedFilestores && adoptDir == "" {
+		return fmt.Errorf("managed file-backed tmpfs restore requires filestore artifacts")
 	}
 	rootOverlay, rootOverlaySize, err := r.resolveRootOverlay(
 		config.WritableLayerLimitBytes,
@@ -271,6 +283,7 @@ func (r *Handler) Restore(
 	}
 
 	startArgs := StartArgs{
+		ManagedFilestores: managedFilestores,
 		ID:                config.ID,
 		BundleDir:         bundlePath,
 		UserStdout:        config.Stdout,

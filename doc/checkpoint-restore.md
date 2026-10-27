@@ -1,5 +1,15 @@
 # Checkpoint and restore
 
+## Managed file-backed tmpfs
+
+The runsc Start API accepts `extra_config` JSON with `fileBackedTmpfsMounts`, for example `{"fileBackedTmpfsMounts":[{"target":"/var/lib/akernel-image-snapshots","sizeMB":2048}]}`. Each mount uses a sandbox-owned anonymous filestore rather than guest-memory-backed file contents. This is intended for private Docker/containerd writable upper/work directories above shared read-only image roots; Dockerfiles and Compose definitions do not change.
+
+Mount quotas are reserved from `storage_mb` and must leave a positive root filesystem quota. Targets must be canonical absolute paths and cannot overlap reserved system paths, existing mounts or other managed targets. The source directory is an empty sandbox-owned mount identity, not caller-owned writable host storage. Runtime metadata persists the opt-in so checkpoints retain the same behavior across daemon restarts even if the node default is `full`.
+
+Checkpoints save all managed anonymous filestores with the existing reflink format and omit their file bytes from the guest memory-page stream. Restore requires the filestore manifest and clones the artifacts before adoption; source snapshots remain immutable across independent restored writers. The complete runtime bundle must support anonymous tmpfs mount hints and same-filesystem FICLONE. File backing can still incur page cache and cgroup memory charges. Guest process memory is saved separately and this feature does not implement incremental RAM snapshots.
+
+The mount preparation is adapted from Tianyu Zhou's `tianyuzhou95/sandboxd` commit `4ff87a3a7779ba35b9a0b737bdf92046e35052df`; it retains the current runtime adapter, filestore validation and old-kernel parent-mount-namespace handling. This opt-in does not change unrelated sandbox checkpoint defaults.
+
 sandboxd supports checkpointing a running sandbox into a caller-owned
 directory and starting a new sandbox from that checkpoint.
 
