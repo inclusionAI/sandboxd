@@ -374,61 +374,13 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 	mountID := generateContainerID(imageURL)
 	timing.Stage("prepare_mount_id", time.Since(stageStart))
 
-	stageStart = time.Now()
-	img, err := m.fetchImage(ctx, imageURL)
+	resolved, err := m.resolveImageLayers(ctx, imageURL, timing.Stage)
 	if err != nil {
 		timing.RecordError(err)
 		return "", nil, nil, err
 	}
-	timing.Stage("fetch_image", time.Since(stageStart))
-
-	// Extract environment variables and process metadata from image config.
-	if cfg, cfgErr := img.ConfigFile(); cfgErr == nil && cfg != nil {
-		envVars = cfg.Config.Env
-		imageProcess = imageconfig.FromOCI(cfg.Config)
-		if len(envVars) == 0 {
-			logrus.Debugf("image config has no env vars: %s", imageURL)
-		}
-	} else if cfgErr != nil {
-		logrus.Warnf("failed to read image config for env extraction: %s: %v", imageURL, cfgErr)
-		return "", nil, nil, fmt.Errorf("failed to read image config for %s: %w", imageURL, cfgErr)
-	}
-
-	stageStart = time.Now()
-	layers, err := img.Layers()
-	if err != nil {
-		err = fmt.Errorf("failed to get image layers for %s: %w", imageURL, err)
-		timing.RecordError(err)
-		return "", nil, nil, err
-	}
-	if len(layers) == 0 {
-		err = fmt.Errorf("image %s has no layers", imageURL)
-		timing.RecordError(err)
-		return "", nil, nil, err
-	}
-	timing.Stage("list_layers", time.Since(stageStart))
-	logrus.Infof("OCI mount fetched manifest: image=%s layer_count=%d", imageURL, len(layers))
-
-	stageStart = time.Now()
-	diffIDs, err := resolveImageLayerDiffIDs(img, layers)
-	if err != nil {
-		timing.RecordError(err)
-		return "", nil, nil, err
-	}
-	chainIDs, err := buildChainIDs(diffIDs)
-	if err != nil {
-		timing.RecordError(err)
-		return "", nil, nil, err
-	}
-	timing.Stage("build_chain_ids", time.Since(stageStart))
-
-	stageStart = time.Now()
-	layerDigests, layerPaths, err := m.extractLayersWithWorkers(ctx, layers)
-	if err != nil {
-		timing.RecordError(err)
-		return "", nil, nil, err
-	}
-	timing.Stage("extract_layers", time.Since(stageStart))
+	envVars, imageProcess = resolved.Env, resolved.ImageProcess
+	chainIDs, layerDigests, layerPaths := resolved.ChainIDs, resolved.LayerDigests, resolved.LayerPaths
 	reservedDigests = append(reservedDigests, layerDigests...)
 
 	if err := ctx.Err(); err != nil {
@@ -512,6 +464,11 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 		ImageProcess:  imageconfig.Clone(imageProcess),
 		CreatedAtUnix: record.CreatedAtUnix,
 	})
+	if immutableReference(imageURL) {
+		if err := m.store.putImmutableImage(&resolved.immutableImageRecord); err != nil {
+			logrus.WithError(err).Warn("could not cache immutable OCI image metadata")
+		}
+	}
 	rollbackResources = false
 	logrus.Infof("OCI mount success: image=%s mount_id=%s mount_path=%s layers=%d cost=%s", imageURL, mountID, mountPath, len(layerDigests), time.Since(opStart))
 
