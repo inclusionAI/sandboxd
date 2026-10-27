@@ -28,6 +28,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 )
 
 type checkpointDirectory struct {
@@ -39,6 +40,7 @@ func (h *sandboxService) Checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 ) (*runtime.CheckpointResponse, error) {
+	started := time.Now()
 	if request == nil {
 		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "checkpoint request is nil")
 	}
@@ -116,6 +118,7 @@ func (h *sandboxService) Checkpoint(
 			resources = sandbox.Status.Get().Resources
 		}
 	}
+	captureStarted := time.Now()
 	err = h.withTransientFirecrackerCheckpointMemory(
 		checkpointCtx,
 		sandbox.Metadata.RuntimeHandler,
@@ -153,6 +156,8 @@ func (h *sandboxService) Checkpoint(
 		}
 		return nil, errord.ToGRPC(operationErr)
 	}
+	captureDuration := time.Since(captureStarted)
+	syncStarted := time.Now()
 	if h.config.PluginConfig.RuntimeConfig.CheckpointSync.SyncOutput {
 		if err := syncCheckpointOutput(checkpointCtx, directory.path); err != nil {
 			operationErr := fmt.Errorf(
@@ -168,6 +173,13 @@ func (h *sandboxService) Checkpoint(
 			return nil, errord.ToGRPCf(errord.ErrUnavailable, "%v", operationErr)
 		}
 	}
+	logrus.WithFields(logrus.Fields{
+		"sandbox_id":     request.ID,
+		"runtime_ms":     float64(captureDuration.Microseconds()) / 1000,
+		"sync_output":    h.config.PluginConfig.RuntimeConfig.CheckpointSync.SyncOutput,
+		"sync_output_ms": float64(time.Since(syncStarted).Microseconds()) / 1000,
+		"total_ms":       float64(time.Since(started).Microseconds()) / 1000,
+	}).Info("checkpoint stages completed")
 	return &runtime.CheckpointResponse{}, nil
 }
 

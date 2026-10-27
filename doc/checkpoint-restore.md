@@ -10,6 +10,8 @@ Checkpoints save all managed anonymous filestores with the existing reflink form
 
 The mount preparation is adapted from Tianyu Zhou's `tianyuzhou95/sandboxd` commit `4ff87a3a7779ba35b9a0b737bdf92046e35052df`; it retains the current runtime adapter, filestore validation and old-kernel parent-mount-namespace handling. This opt-in does not change unrelated sandbox checkpoint defaults.
 
+The successful Checkpoint RPC logs `runtime_ms`, `sync_output_ms` and `total_ms` separately. Runtime capture and the optional filesystem persistence barrier have different completion points; compare both with the runtime's own serialization/page-output timings rather than treating the whole API call as a stop-the-world interval.
+
 sandboxd supports checkpointing a running sandbox into a caller-owned
 directory and starting a new sandbox from that checkpoint.
 
