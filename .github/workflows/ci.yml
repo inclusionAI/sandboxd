@@ -228,6 +228,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cpu-checker
+          extra_modules="linux-modules-extra-$(uname -r)"
+          if apt-cache show "${extra_modules}" >/dev/null 2>&1; then
+            sudo apt-get install -y "${extra_modules}"
+          fi
 
       - name: Prepare network and filesystem prerequisites
         run: |
