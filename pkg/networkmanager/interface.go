@@ -87,6 +87,14 @@ type InterfaceManager struct {
 	db      store.DbStore
 	storeMu sync.Mutex
 
+	// activeStoreMu coordinates short group commits for allocations. Every
+	// waiter is released only after a snapshot containing its in-memory lease
+	// has been durably written. This preserves write-before-handoff while
+	// avoiding one bbolt transaction and fsync per concurrent allocation.
+	activeStoreMu      sync.Mutex
+	activeStorePending []*activeStoreRequest
+	activeStoreRunning bool
+
 	// storeMark is used to mark whether the cgroup id need to be stored.
 	// If it's true, manager should not exit.
 	storeMark atomic.Bool
@@ -99,6 +107,13 @@ type InterfaceManager struct {
 }
 
 const defaultInterfaceSysctlRoot = "/proc/sys/net/ipv4/conf"
+
+const activeLeaseStoreBatchWindow = 2 * time.Millisecond
+
+type activeStoreRequest struct {
+	lease string
+	done  chan error
+}
 
 type linkOperations interface {
 	LinkByName(string) (netlink.Link, error)
@@ -486,8 +501,8 @@ func (m *InterfaceManager) markUsingPooled(netResourceStr string) (string, error
 	if err != nil {
 		return "", err
 	}
-	if err := m.store(); err != nil {
-		return "", errors.Join(err, m.rollbackPooledHandout(marked))
+	if err := m.storePooledLease(marked); err != nil {
+		return "", err
 	}
 	return marked, nil
 }
@@ -794,6 +809,57 @@ func (m *InterfaceManager) keepStoring() {
 			}
 		}
 	}()
+}
+
+// storePooledLease batches allocations that reach the write-before-handoff
+// boundary together. The first waiter starts a short collection window. The
+// resulting store snapshots every lease already marked active, then releases
+// only the waiters covered by that snapshot. Allocations arriving while the
+// store is in progress form the next batch, so none can return based on a
+// snapshot taken before its lease was active. A failed batch is rolled back by
+// the flusher before the next snapshot begins, preventing failed handouts from
+// being written back as active by a later successful batch.
+func (m *InterfaceManager) storePooledLease(lease string) error {
+	if m.db == nil {
+		return nil
+	}
+	req := &activeStoreRequest{lease: lease, done: make(chan error, 1)}
+	m.activeStoreMu.Lock()
+	m.activeStorePending = append(m.activeStorePending, req)
+	if !m.activeStoreRunning {
+		m.activeStoreRunning = true
+		go m.flushActiveStoreBatches()
+	}
+	m.activeStoreMu.Unlock()
+	return <-req.done
+}
+
+func (m *InterfaceManager) flushActiveStoreBatches() {
+	for {
+		time.Sleep(activeLeaseStoreBatchWindow)
+
+		m.activeStoreMu.Lock()
+		batch := m.activeStorePending
+		m.activeStorePending = nil
+		m.activeStoreMu.Unlock()
+
+		err := m.store()
+		for _, req := range batch {
+			batchErr := err
+			if err != nil {
+				batchErr = errors.Join(err, m.rollbackPooledHandout(req.lease))
+			}
+			req.done <- batchErr
+		}
+
+		m.activeStoreMu.Lock()
+		if len(m.activeStorePending) == 0 {
+			m.activeStoreRunning = false
+			m.activeStoreMu.Unlock()
+			return
+		}
+		m.activeStoreMu.Unlock()
+	}
 }
 
 func (m *InterfaceManager) store() error {

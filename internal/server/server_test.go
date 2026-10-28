@@ -127,6 +127,7 @@ func TestResetMetadataIfResourceStateIncompatible_RemovesLegacyResourceState(t *
 	storePath := filepath.Join(t.TempDir(), "metadata.db")
 	db := store.NewStoreImp(storePath)
 	assert.NoError(t, db.StoreRaw(config.CgroupBucket, []byte{0x0b, 0x0a, 0x05}))
+	assert.NoError(t, db.Close())
 
 	assert.NoError(t, resetMetadataIfResourceStateIncompatible(storePath))
 	assert.NoFileExists(t, storePath)
@@ -137,6 +138,7 @@ func TestResetMetadataIfResourceStateIncompatible_KeepsJSONResourceState(t *test
 	db := store.NewStoreImp(storePath)
 	assert.NoError(t, db.StoreRaw(config.CgroupBucket, []byte(`{"items":["/akernel/abc"]}`)))
 	assert.NoError(t, db.StoreRaw(config.BridgeIpBucket, []byte(`{"items":["{\"ip\":\"172.17.0.2\"}"]}`)))
+	assert.NoError(t, db.Close())
 
 	assert.NoError(t, resetMetadataIfResourceStateIncompatible(storePath))
 	assert.FileExists(t, storePath)
