@@ -46,6 +46,8 @@ the repository `AGENTS.md`. The adapters consume runtime state or boot
 protocols that can change, so another version is not assumed compatible until
 this suite passes.
 
+Runsc fixtures budget 256 host tasks per sandbox cgroup for startup helpers, gofer, sentry and sidecars; the other targeted runtimes retain a 64-task budget. Kernel PID accounting includes threads, and transient setup can exceed 64 tasks on large hosts even for a single guest process. The suite checks the actual cgroup v1/v2 PID limit against the selected budget. These fixture limits do not change node configuration defaults or define a guest process limit.
+
 Both runsc platforms test `plugin.runtime.direct_resolv_conf_path` with network ACLs disabled: they check the injected file and query the isolated DNS fixture without specifying a server, before and after a daemon crash. Crash checks wait for the periodic resource-ownership checkpoint. DNS mode changes require a drained node and a successful graceful shutdown within 30 seconds, including bridge and TAP cleanup, while retaining the store. After ACLs are enabled, a new runsc sandbox must use managed DNS even without a policy. The HTTP fixture starts after mode changes have recreated the bridge.
 
 `go test ./test/e2e` checks the DNS dependency preflight and bounded shutdown helpers without privileged workloads. It covers missing tools, paths that do not use the DNS fixture, shutdown failures and timeouts, and residual network resources.
@@ -54,7 +56,7 @@ Both runsc platforms test `plugin.runtime.direct_resolv_conf_path` with network 
 
 Run the default runsc and runc suite:
 
-`RUNSC_BINARY` must point to `runsc` from a complete extracted gVisor release, with the matching `containerd-shim-runsc-v1` and all four executable `gvisor-bin/` helpers beside it. The runner validates the layout before building and copies the complete installation into the image; a bare runsc is rejected rather than falling back to embedded helpers. Use `third_party/install-gvisor.sh` with the manifest's archive SHA-512 to prepare a verified installation. Locally built bundles must preserve the same layout and matching source revision; adjacency alone cannot prove binary provenance.
+`RUNSC_BINARY` must point to `runsc` from a complete extracted gVisor release, with the matching `containerd-shim-runsc-v1` and all five executable `gvisor-bin/` helpers beside it, including `runsc-fd-parking`. The runner validates the layout before building and copies the complete installation into the image; a bare runsc is rejected rather than falling back to embedded helpers. Use `third_party/install-gvisor.sh` with the manifest's archive SHA-512 to prepare a verified installation. Locally built bundles must preserve the same layout and matching source revision; adjacency alone cannot prove binary provenance.
 
 ```bash
 RUNSC_BINARY=/usr/local/bin/runsc \
@@ -79,6 +81,7 @@ RUNTIME_VERSIONS_FILE=/tmp/runtime-versions.env make e2e-runtime-suite
 
 The alternate manifest must define every runtime artifact, not only gVisor.
 The complete suite requires KVM even though its first case uses systrap.
+The privileged fixture uses a host cgroup root named after `SANDBOXD_E2E_CONTAINER` (default `sandboxd-e2e`). Select a unique container name for each local task; `E2E_CGROUP_ROOT` can explicitly select its cgroup root. Container names, networks, image tags and disk fixture directories must also be isolated when sharing a host.
 Hosted CI runners must provide the required kernel features. The workflow installs the userspace KVM checker and the matching `linux-modules-extra-$(uname -r)` package when APT publishes it, then explicitly loads and probes the network, filesystem, TUN and per-case KVM prerequisites. Some Azure kernels provide the required modules without a separately published extras package. A missing module or unusable device still fails the corresponding prerequisite step; preparing a host never substitutes for running the runtime case.
 The `runsc-reflink` case also requires live filestores and checkpoints on the same reflink-capable filesystem. Use `E2E_HOME_FIXTURE_PARENT` to select an XFS directory with reflink enabled. The runtime's mount namespaces must permit FICLONE between its backing-file and snapshot descriptors; some older kernels return `EXDEV` even for the same underlying filesystem. CI runs this case on Ubuntu 24.04 with a dedicated XFS fixture and fails on unsupported clones rather than skipping the test.
 

@@ -509,7 +509,7 @@ cgroup_cache_size = 1
 interface_cache_size = ${interface_cache_size}
 cgroup_root_name = "/${CGROUP_ROOT}"
 max_instance_num = ${max_instance_num}
-pids_max = 64
+pids_max = $(runtime_fixture_pids_max)
 
 ${node_resource_config}
 
@@ -1646,6 +1646,8 @@ assert_cgroup_limits() {
         quota=1000
     fi
     local memory_bytes=$((memory_mb * 1024 * 1024))
+    local pids_max
+    pids_max="$(runtime_fixture_pids_max)"
 
     if [ "${CGROUP_MODE}" = "v2" ]; then
         if [ "${CPU_LIMIT_MODE}" = "quota" ]; then
@@ -1657,7 +1659,7 @@ assert_cgroup_limits() {
             assert_eq "$(tr -d '\n' < "${child}/cpu.max")" "max 100000" "v2 unlimited cpu.max"
         fi
         assert_eq "$(tr -d '\n' < "${child}/memory.max")" "${memory_bytes}" "v2 memory.max"
-        assert_eq "$(tr -d '\n' < "${child}/pids.max")" "64" "v2 pids.max"
+        assert_eq "$(tr -d '\n' < "${child}/pids.max")" "${pids_max}" "v2 pids.max"
     else
         local cpu_path="${CPU_CGROUP_DIR}/${CGROUP_ROOT}/${group_name}"
         if [ "${CPU_LIMIT_MODE}" = "quota" ]; then
@@ -1671,7 +1673,7 @@ assert_cgroup_limits() {
         assert_eq "$(tr -d '\n' < "${child}/memory.limit_in_bytes")" "${memory_bytes}" "v1 memory.limit"
         assert_eq \
             "$(tr -d '\n' < "/sys/fs/cgroup/pids/${CGROUP_ROOT}/${group_name}/pids.max")" \
-            "64" \
+            "${pids_max}" \
             "v1 pids.max"
     fi
 }
@@ -2425,6 +2427,16 @@ run_runsc_direct_dns_checks() {
     grep -qx 'enable_network_acl = true' "${CONFIG_FILE}" || fail "failed to enable network ACLs"
     start_sandboxd
     log "runsc direct DNS checks passed"
+}
+
+runtime_fixture_pids_max() {
+    # The limit includes transient setup threads as well as the gofer,
+    # sentry and sidecars. Startup can exceed 64 tasks on large hosts.
+    # Keep headroom and continue checking the finite kernel limit.
+    case "${E2E_RUNTIME}" in
+        all|runsc) printf '256\n' ;;
+        *) printf '64\n' ;;
+    esac
 }
 
 runsc_fixture_memory_mb() {

@@ -15,6 +15,7 @@ MEMBERS = (
     "gvisor-bin/checkpointgofer",
     "gvisor-bin/gvisor_sentry",
     "gvisor-bin/gvisor-sentry-prewarmer",
+    "gvisor-bin/runsc-fd-parking",
     "gvisor-bin/runsc-metric-server",
 )
 INSTALLER = Path(__file__).with_name("install-gvisor.sh")
@@ -54,7 +55,9 @@ class InstallTest(unittest.TestCase):
         self.check_archive(bad_hash=True)
 
     def test_missing_sidecar(self):
-        self.check_archive(members=MEMBERS[:-1])
+        for member in MEMBERS:
+            with self.subTest(member=member):
+                self.check_archive(members=tuple(name for name in MEMBERS if name != member))
 
     def test_duplicate(self):
         self.check_archive(members=MEMBERS + ("runsc",))

@@ -44,7 +44,9 @@ disable_cgroup = false
 # limit and lets runsc, Kata, and Firecracker derive CPU topology from it.
 cpu_limit_mode = "quota"
 cgroup_cache_size = 1
-# Maximum processes per sandbox. Omit or set to 0 for unlimited.
+# Maximum host tasks per sandbox, including runtime helper threads.
+# Budget for runtime startup as well as the workload; this is not a guest
+# process limit. Omit or set to 0 for unlimited.
 # pids_max = 4096
 interface_cache_size = 1
 cgroup_root_name = "/sandboxd"

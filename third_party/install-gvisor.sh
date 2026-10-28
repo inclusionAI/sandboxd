@@ -16,7 +16,7 @@ printf '%s  %s\n' "$digest" "$archive" | sha512sum --check --status
 
 # Accept only the release layout. Reject duplicates, links, special files,
 # and unexpected paths before extracting anything into the destination.
-expected=$'containerd-shim-runsc-v1\ngvisor-bin/checkpointgofer\ngvisor-bin/gvisor-sentry-prewarmer\ngvisor-bin/gvisor_sentry\ngvisor-bin/runsc-metric-server\nrunsc'
+expected=$'containerd-shim-runsc-v1\ngvisor-bin/checkpointgofer\ngvisor-bin/gvisor-sentry-prewarmer\ngvisor-bin/gvisor_sentry\ngvisor-bin/runsc-fd-parking\ngvisor-bin/runsc-metric-server\nrunsc'
 actual="$(tar -tjf "$archive" | sed 's#^\./##' | sed '/^$/d; /\/$/d' | LC_ALL=C sort)"
 [[ "$actual" == "$expected" ]] || {
     echo "unexpected gVisor archive members" >&2

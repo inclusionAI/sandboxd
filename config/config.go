@@ -248,7 +248,8 @@ type ResourceConfig struct {
 	CgroupRootName string `toml:"cgroup_root_name" json:"cgroupRootName"`
 	// CgroupCacheSize is the size of cgroup cache. Default is same as max_instance_num.
 	CgroupCacheSize int `toml:"cgroup_cache_size" json:"cgroupCacheSize"`
-	// PidsMax is the maximum number of processes allowed in each sandbox cgroup.
+	// PidsMax bounds host tasks (processes and threads), including runtime
+	// helpers, in each sandbox cgroup. It is not a guest process count.
 	// Zero leaves the kernel default of unlimited processes unchanged.
 	PidsMax int64 `toml:"pids_max" json:"pidsMax"`
 	// InterfaceCacheSize is the size of interface cache. Default is same as max_instance_num.
