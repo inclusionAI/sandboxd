@@ -28,6 +28,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 )
 
 type checkpointDirectory struct {
@@ -39,6 +40,7 @@ func (h *sandboxService) Checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 ) (*runtime.CheckpointResponse, error) {
+	started := time.Now()
 	if request == nil {
 		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "checkpoint request is nil")
 	}
@@ -116,6 +118,7 @@ func (h *sandboxService) Checkpoint(
 			resources = sandbox.Status.Get().Resources
 		}
 	}
+	captureStarted := time.Now()
 	err = h.withTransientFirecrackerCheckpointMemory(
 		checkpointCtx,
 		sandbox.Metadata.RuntimeHandler,
@@ -153,6 +156,8 @@ func (h *sandboxService) Checkpoint(
 		}
 		return nil, errord.ToGRPC(operationErr)
 	}
+	captureDuration := time.Since(captureStarted)
+	syncStarted := time.Now()
 	if h.config.PluginConfig.RuntimeConfig.CheckpointSync.SyncOutput {
 		if err := syncCheckpointOutput(checkpointCtx, directory.path); err != nil {
 			operationErr := fmt.Errorf(
@@ -168,6 +173,13 @@ func (h *sandboxService) Checkpoint(
 			return nil, errord.ToGRPCf(errord.ErrUnavailable, "%v", operationErr)
 		}
 	}
+	logrus.WithFields(logrus.Fields{
+		"sandbox_id":     request.ID,
+		"runtime_ms":     float64(captureDuration.Microseconds()) / 1000,
+		"sync_output":    h.config.PluginConfig.RuntimeConfig.CheckpointSync.SyncOutput,
+		"sync_output_ms": float64(time.Since(syncStarted).Microseconds()) / 1000,
+		"total_ms":       float64(time.Since(started).Microseconds()) / 1000,
+	}).Info("checkpoint stages completed")
 	return &runtime.CheckpointResponse{}, nil
 }
 
@@ -235,11 +247,42 @@ func syncCheckpointDirectory(ctx context.Context, dir string) error {
 }
 
 func syncCheckpointFile(path string) error {
+	started := time.Now()
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	return errors.Join(file.Sync(), file.Close())
+	opened := time.Now()
+	kind, size := "unknown", int64(-1)
+	if info, statErr := file.Stat(); statErr == nil {
+		size = info.Size()
+		if info.IsDir() {
+			kind = "directory"
+		} else if info.Mode().IsRegular() {
+			kind = "file"
+		}
+	}
+	syncStarted := time.Now()
+	syncErr := file.Sync()
+	synced := time.Now()
+	closeErr := file.Close()
+	closed := time.Now()
+	err = errors.Join(syncErr, closeErr)
+	fields := logrus.Fields{
+		"path":          path,
+		"kind":          kind,
+		"logical_bytes": size,
+		"open_us":       opened.Sub(started).Microseconds(),
+		"sync_us":       synced.Sub(syncStarted).Microseconds(),
+		"close_us":      closed.Sub(synced).Microseconds(),
+		"total_us":      closed.Sub(started).Microseconds(),
+	}
+	entry := logrus.WithFields(fields)
+	if err != nil {
+		entry = entry.WithError(err)
+	}
+	entry.Debug("checkpoint output file sync completed")
+	return err
 }
 
 // checkpointGuestMemoryResources returns the guest-visible limit persisted in

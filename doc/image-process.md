@@ -47,3 +47,6 @@ and file operations.
 OCI and Nydus caches persist the extracted metadata. Records created by older
 sandboxd versions are upgraded lazily only when inherited startup is requested,
 so ordinary cached image mounts remain usable without registry access.
+# Immutable ROFS metadata reuse
+
+The existing OCI image provider retains resolved process configuration and layer/chain identities for digest-pinned references in its own metadata database after unmount. A subsequent mount can reuse verified local extracted layers without contacting the registry. Mutable tags continue through the registry path. Cached metadata holds no layer references, so normal layer GC remains effective; missing cached file data triggers the authenticated registry path and partial reservations are rolled back. Nydus images continue through the existing Nydus/ROFS provider without conversion or a second Harbor-managed image cache.

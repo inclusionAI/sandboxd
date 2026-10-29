@@ -78,6 +78,7 @@ type StartArgs struct {
 	RootOverlay string
 	// FilestoreAdoptDir is per-restore state, never a persistent global option.
 	FilestoreAdoptDir string
+	ManagedFilestores bool
 	Network           NetworkConfig
 }
 
@@ -146,7 +147,7 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		rootOverlay = RootFileOverlay(c.Options.FilestoreDir, c.Options.OverlayTmpfsSize)
 	}
 	cmdArgs = append(cmdArgs, "--overlay2="+rootOverlay)
-	if c.Options.ReflinkFilestores {
+	if c.Options.ReflinkFilestores || args.ManagedFilestores || args.FilestoreAdoptDir != "" {
 		// Older kernels require identical mount objects for FICLONE. Fresh
 		// backing files must use the launcher's mount, like checkpoint files.
 		cmdArgs = append(cmdArgs, "--filestore-parent-mountns=true")
@@ -307,7 +308,11 @@ func (c *Client) Checkpoint(
 	if leaveRunning {
 		args = append(args, "--leave-running")
 	}
-	if c.Options.ReflinkFilestores {
+	reflink, err := c.useReflinkCheckpoint(id)
+	if err != nil {
+		return err
+	}
+	if reflink {
 		args = append(args,
 			"--skip-filestore-pages",
 			"--filestore-snapshot-dir="+filepath.Join(imageDir, filestoreDirectoryName),
@@ -322,7 +327,7 @@ func (c *Client) Checkpoint(
 		}
 		return fmt.Errorf("runsc checkpoint %s failed: %w: %s", id, err, strings.TrimSpace(string(output)))
 	}
-	if c.Options.ReflinkFilestores {
+	if reflink {
 		directory, err := filestoreRestoreDirectory(imageDir)
 		if err != nil {
 			return fmt.Errorf("validate runsc filestore checkpoint: %w", err)
