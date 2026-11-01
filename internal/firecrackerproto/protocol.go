@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	Version   = uint16(2)
+	Version   = uint16(3)
 	AgentPort = uint32(52)
 
 	maxMessageSize = 16 << 20
@@ -70,8 +70,9 @@ const (
 
 // CheckpointRequest carries the checkpoint lifecycle event to the guest agent.
 type CheckpointRequest struct {
-	Outcome     string   `json:"outcome"`               // "resume", "error", or "restore"
-	Environment []string `json:"environment,omitempty"` // target env after restore
+	HostTimeUnixNano int64    `json:"host_time_unix_nano"`   // trusted host CLOCK_REALTIME at dispatch
+	Outcome          string   `json:"outcome"`               // "resume", "error", or "restore"
+	Environment      []string `json:"environment,omitempty"` // target env after restore
 }
 
 type Response struct {

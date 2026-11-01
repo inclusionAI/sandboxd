@@ -82,6 +82,12 @@ The server synchronizes every regular file and directory, including the capture 
 
 The following Firecracker performance and durability descriptions assume the default `sync_output=false` profile. With synchronization enabled, the server adds its barrier after the runtime completes its capture, outside the runtime's guest pause window.
 
+## Firecracker guest wall clock
+
+After loading a snapshot, and when resuming the continuing source after capture or a failed capture, sandboxd sends the current host Unix time over the trusted guest-agent channel. The agent sets guest `CLOCK_REALTIME` before releasing the cooperative checkpoint handoff. A missing or invalid timestamp or a failed clock update fails that handoff. This corrects wall-clock age inherited from a Golden or ordinary snapshot; it does not advance `CLOCK_MONOTONIC`, replay elapsed timers, or guarantee that arbitrary non-cooperative guest threads cannot run before synchronization. The host clock must itself be synchronized.
+
+The guest-agent protocol is version 3. Existing checkpoint compatibility checks require the same initrd digest, so artifacts captured with the prior agent must be rebuilt, including Golden templates. No periodic time service or E2B-specific clock policy is introduced.
+
 ## Firecracker artifacts and incremental checkpoints
 
 The Firecracker runtime writes *uncompressed* checkpoint directories (layout

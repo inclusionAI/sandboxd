@@ -208,7 +208,7 @@ func (handler *Handler) Checkpoint(
 			cleanupCtx,
 			state.VsockPath,
 			firecrackerproto.MessageCheckpoint,
-			firecrackerproto.CheckpointRequest{Outcome: "error"},
+			firecrackerproto.CheckpointRequest{Outcome: "error", HostTimeUnixNano: time.Now().UnixNano()},
 		); err != nil {
 			retErr = errors.Join(
 				retErr,
@@ -276,14 +276,12 @@ func (handler *Handler) Checkpoint(
 				ctx,
 				state.VsockPath,
 				firecrackerproto.MessageCheckpoint,
-				firecrackerproto.CheckpointRequest{Outcome: "resume"},
+				firecrackerproto.CheckpointRequest{Outcome: "resume", HostTimeUnixNano: time.Now().UnixNano()},
 			); err != nil {
-				logrus.Warnf(
-					"firecracker: release checkpointed sandbox %s: %v",
-					sandboxID, err,
-				)
+				resumeErr = fmt.Errorf("release checkpointed Firecracker sandbox %s: %w", sandboxID, err)
+			} else {
+				handoffReleased = true
 			}
-			handoffReleased = true
 		}
 	}
 	tResumed := time.Now()
@@ -1166,8 +1164,9 @@ func (handler *Handler) Restore(
 		vsockPath,
 		firecrackerproto.MessageCheckpoint,
 		firecrackerproto.CheckpointRequest{
-			Outcome:     "restore",
-			Environment: plan.configure.Process.Env,
+			Outcome:          "restore",
+			HostTimeUnixNano: time.Now().UnixNano(),
+			Environment:      plan.configure.Process.Env,
 		},
 	); err != nil {
 		return fmt.Errorf("release restored Firecracker sandbox: %w", err)
