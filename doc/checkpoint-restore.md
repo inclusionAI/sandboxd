@@ -88,6 +88,8 @@ After loading a snapshot, and when resuming the continuing source after capture 
 
 The guest-agent protocol is version 3. Existing checkpoint compatibility checks require the same initrd digest, so artifacts captured with the prior agent must be rebuilt, including Golden templates. No periodic time service or E2B-specific clock policy is introduced.
 
+A continuing checkpoint still fails if its handoff request is not acknowledged. That failure does not establish whether the guest consumed the release: it may have resumed and opened the next FIFO reader before the acknowledgment was lost. Once sandboxd attempts the release, deferred cleanup does not send another outcome for that capture. Failures before the first release attempt retain the existing resume-and-error cleanup. An unacknowledged release leaves source handoff state uncertain; callers must reconcile or explicitly stop the source rather than assume either successful continuation or safe replay of an old outcome.
+
 ## Firecracker artifacts and incremental checkpoints
 
 The Firecracker runtime writes *uncompressed* checkpoint directories (layout

@@ -625,6 +625,74 @@ func waitForCheckpointReader(t *testing.T, handoff *checkpointHandoff) {
 	t.Fatal("checkpoint handoff reader did not register")
 }
 
+func TestCheckpointClockFailureKeepsNextFIFOBlocked(t *testing.T) {
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handoff.close()
+	state.mu.Lock()
+	previous := state.handoff
+	state.handoff = handoff
+	state.mu.Unlock()
+	defer func() {
+		state.mu.Lock()
+		state.handoff = previous
+		state.mu.Unlock()
+	}()
+
+	type readResult struct {
+		data string
+		err  error
+	}
+	openReader := func() <-chan readResult {
+		result := make(chan readResult, 1)
+		go func() {
+			data, err := os.ReadFile(handoff.fifoPath)
+			result <- readResult{string(data), err}
+		}()
+		waitForCheckpointReader(t, handoff)
+		return result
+	}
+	readResume := func(result <-chan readResult) {
+		t.Helper()
+		select {
+		case read := <-result:
+			if read.err != nil || read.data != "resume\n" {
+				t.Fatalf("FIFO outcome = %q, %v", read.data, read.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("checkpoint FIFO release timed out")
+		}
+	}
+	resume := firecrackerproto.CheckpointRequest{Outcome: "resume", HostTimeUnixNano: 1}
+	first := openReader()
+	if err := releaseCheckpointWithClock(resume, func(int64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	readResume(first)
+	next := openReader()
+	denied := errors.New("clock update denied")
+	if err := releaseCheckpointWithClock(resume, func(int64) error { return denied }); !errors.Is(err, denied) {
+		t.Fatalf("clock update error = %v", err)
+	}
+	handoff.mu.Lock()
+	stillWaiting := handoff.reader != nil
+	handoff.mu.Unlock()
+	if !stillWaiting {
+		t.Fatal("failed clock update released the next FIFO generation")
+	}
+	select {
+	case read := <-next:
+		t.Fatalf("next FIFO completed before a successful release: %+v", read)
+	default:
+	}
+	if err := releaseCheckpointWithClock(resume, func(int64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	readResume(next)
+}
+
 type recordingWriteCloser struct {
 	bytes.Buffer
 	closed bool
