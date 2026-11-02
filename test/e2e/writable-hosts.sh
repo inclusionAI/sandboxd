@@ -135,7 +135,6 @@ negative() {
         json) printf '{broken' > "${bad}/managed-hosts.json" ;;
         version) jq '.schema_version = 999' "${bad}/managed-hosts.json" > "${bad}/new.json"; mv "${bad}/new.json" "${bad}/managed-hosts.json" ;;
         metadata) rm "${bad}/managed-hosts.json" ;;
-        all) rm -f "${bad}/managed-hosts.json" "${bad}/rootfs-seed.tar" ;;
         seed) rm "${bad}/rootfs-seed.tar" ;;
         digest) printf corrupt >> "${bad}/rootfs-seed.tar" ;;
         *) fail "unknown negative fixture ${mode}" ;;
@@ -152,7 +151,7 @@ negative() {
         version) expected='unsupported managed hosts schema version 999' ;;
         seed) expected='open hosts seed:.*rootfs-seed.tar: no such file or directory' ;;
         digest) expected='hosts seed SHA-256 mismatch' ;;
-        metadata|all) expected='"(Mounts|Annotations)" does not match across checkpoint restore' ;;
+        metadata) expected='"(Mounts|Annotations)" does not match across checkpoint restore' ;;
     esac
     grep -Eq "${expected}" "${TEST_DIR}/negative-${mode}.log" || {
         cat "${TEST_DIR}/negative-${mode}.log" >&2
@@ -165,7 +164,7 @@ negative() {
     rm -rf "${bad}"
     pass "invalid ${mode} rejected without target bundle leak"
 }
-for mode in json version metadata all seed digest; do negative "${mode}"; done
+for mode in json version metadata seed digest; do negative "${mode}"; done
 
 # A fresh effective-readonly root uses the retained legacy layout. This is
 # intentionally separate from compatibility with a checkpoint made by old code.

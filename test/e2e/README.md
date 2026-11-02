@@ -184,7 +184,7 @@ For a Firecracker virtio-fs storage soak, set `E2E_STRESS_ROOTFS_HOST` to a host
 
 ## Writable hosts tests
 
-The runsc suites exercise [managed hosts](../../doc/runtime.md#sandbox-hosts-file) through server RPCs with EROFS and directory roots: first-process content/permissions, edits and replacement, isolated restores, empty/deleted state, daemon recovery, readonly fallback, corrupt artifacts and cleanup. These specialized modes require runsc and a dedicated test daemon; they skip the ordinary runtime suite and Redis soak and fail on missing prerequisites. Build binaries first, then select one mode:
+These runsc-only modes test [managed hosts](../../doc/runtime.md#sandbox-hosts-file) through server RPCs using a dedicated daemon and fresh fixtures. Basic mode covers EROFS and directory roots. They skip the ordinary runtime suite and Redis soak and fail on missing prerequisites. Build binaries, then select one mode:
 
 ```bash
 make e2e-runtime-binaries
@@ -197,15 +197,15 @@ E2E_CASE=runsc-systrap E2E_HOSTS_CONCURRENCY=16 \
   E2E_HOSTS_ROOTFS_KIND=directory make e2e-runtime-case
 ```
 
-Use `E2E_CASE=runsc-kvm` for KVM and `E2E_KEEP_HOME_FIXTURE=1` to retain logs and proof files at the printed fixture path. Relative-bind mode supplies distinct existing bundle-relative and daemon-CWD-relative sources and checks the selected marker before and after restore.
+Use `E2E_CASE=runsc-kvm` for KVM and `E2E_KEEP_HOME_FIXTURE=1` to retain logs. Relative-bind mode checks distinct existing bundle/CWD source markers before and after restore.
 
-Nydus mode requires `/dev/fuse`, Linux static `nydus-image` v2.4.0 and the verified distill-fs release selected by the consumer. The official `nydus-static-v2.4.0-linux-amd64.tgz` archive SHA-256 is `e4f7de672ced6031c13c3c38a599993f8a8103b0cf85f9b0783f5f5fa7c8b3dc`. Use `third_party/runtime-versions.env` for sandboxd's distill-fs pin or AKernel's `builder/distill-fs-versions.env` when qualifying its image. The test verifies a real RAFS v5/FUSE mount whose `/` and `/etc` return unsupported `flistxattr`; an ordinary empty-xattr directory is insufficient. Both regression modes check hosts writes, source deletion and restore without replay, immutable inputs and cleanup.
+Nydus requires `/dev/fuse`, static Linux `nydus-image` v2.4.0 and the consumer-pinned distill-fs release. The official `nydus-static-v2.4.0-linux-amd64.tgz` SHA-256 is `e4f7de672ced6031c13c3c38a599993f8a8103b0cf85f9b0783f5f5fa7c8b3dc`. The case verifies a real RAFS v5/FUSE mount with unsupported `flistxattr` on `/` and `/etc`; an empty attribute list is insufficient.
 
-Concurrency accepts 2–64 workers (`0` disables it); `E2E_HOSTS_ROOTFS_KIND` defaults to `erofs`. Scale within host capacity: the fixture reserves `2 * count + 2` admission/network slots and `128 * count + 256` MiB non-reflink filestore space, separately from each sandbox's 64 MiB quota. Barriers synchronize create, write, checkpoint and restore phases; logs record actual overlap. Assertions cover per-instance writes, shared-snapshot clone isolation, artifact immutability and inventory/bundle/filestore cleanup. Mixed invalid-schema requests test rejection before runtime launch, not post-sentry failures. This is bounded concurrency, not a long-duration soak.
+Concurrency accepts 2–64 workers (`0` disables it); `E2E_HOSTS_ROOTFS_KIND` defaults to `erofs`. Budget `2 * count + 2` admission/network slots and `128 * count + 256` MiB non-reflink filestore space; each sandbox still has a 64 MiB writable quota. Barriers verify overlapping lifecycle operations, write isolation, immutable artifacts and cleanup. This is bounded concurrency, not a soak; invalid-schema requests fail before runtime launch.
 
-True old-snapshot compatibility requires `LEGACY_CHECKPOINT` and `LEGACY_REQUEST` produced by a baseline sandboxd with the same runtime and compatible lower paths; stripped new metadata is only a corruption test. Daemon recovery requires the parent-owned `RESTART_HANDSHAKE=1`; direct scripts never signal an arbitrary service. Missing fixtures/handshake are reported as **NOT QUALIFIED**, separately from readonly fallback.
+Old-snapshot compatibility requires paired `LEGACY_CHECKPOINT`/`LEGACY_REQUEST` from baseline sandboxd with the same runtime and compatible lower paths; stripped metadata tests corruption only. Daemon recovery requires parent-owned `RESTART_HANDSHAKE=1`. Missing fixtures/handshake yield **NOT QUALIFIED**. Readonly fallback does not qualify old-snapshot compatibility. Direct scripts never signal an arbitrary service.
 
-For direct script invocation, use the required environment variables documented in each script's header and keep `writable-hosts-common.sh` adjacent. Use fresh result directories and do not share the daemon with unrelated workloads.
+For direct invocation, follow each script's header and keep `writable-hosts-common.sh` adjacent.
 
 ## Host requirements
 

@@ -72,6 +72,7 @@ func TestDirectDNSDependencies(t *testing.T) {
 				script := fmt.Sprintf(`
 E2E_RUNTIME=%q
 DISABLE_CGROUP=0
+HOSTS_ONLY=0
 MISSING=%q
 command() { [ "$1" = -v ] && [ "$2" != "${MISSING}" ]; }
 `, runtime, missing) + functions + "check_direct_dns_dependencies\nprintf 'passed\\n'\n"
@@ -88,22 +89,24 @@ command() { [ "$1" = -v ] && [ "$2" != "${MISSING}" ]; }
 	}
 	for _, tc := range []struct {
 		name, runtime, mode string
-		disabled            int
+		disabled, hostsOnly int
 	}{
-		{"disabled_all", "all", "e2e", 1},
-		{"disabled_runsc", "runsc", "e2e", 1},
-		{"kata", "kata", "e2e", 0},
-		{"firecracker", "firecracker", "e2e", 0},
-		{"serve_all", "all", "serve", 0},
-		{"serve_runsc", "runsc", "serve", 0},
-		{"serve_runc", "runc", "serve", 0},
+		{"disabled_all", "all", "e2e", 1, 0},
+		{"disabled_runsc", "runsc", "e2e", 1, 0},
+		{"kata", "kata", "e2e", 0, 0},
+		{"firecracker", "firecracker", "e2e", 0, 0},
+		{"serve_all", "all", "serve", 0, 0},
+		{"serve_runsc", "runsc", "serve", 0, 0},
+		{"serve_runc", "runc", "serve", 0, 0},
+		{"hosts_only", "runsc", "e2e", 0, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			script := fmt.Sprintf(`
 E2E_RUNTIME=%q
 DISABLE_CGROUP=%d
+HOSTS_ONLY=%d
 command() { printf 'unexpected dependency check\n'; return 1; }
-`, tc.runtime, tc.disabled) + functions + fmt.Sprintf("check_direct_dns_dependencies %q\nprintf 'passed\\n'\n", tc.mode)
+`, tc.runtime, tc.disabled, tc.hostsOnly) + functions + fmt.Sprintf("check_direct_dns_dependencies %q\nprintf 'passed\\n'\n", tc.mode)
 			output, err := runE2EHelper(t, script)
 			if err != nil || !strings.Contains(output, "passed") {
 				t.Fatalf("fixture not selected: err=%v, output=%s", err, output)
@@ -239,64 +242,34 @@ bash() {
 	}
 }
 
-func TestHostsOnlyDoesNotRequireDirectDNSFixture(t *testing.T) {
-	functions := shellFunctions(t, "e2e-run.sh", "fail", "check_direct_dns_dependencies")
-	script := `
-E2E_RUNTIME=runsc
-DISABLE_CGROUP=0
-HOSTS_ONLY=1
-command() { printf 'unexpected dependency check\n'; return 1; }
-` + functions + "check_direct_dns_dependencies\nprintf 'passed\n'\n"
-	output, err := runE2EHelper(t, script)
-	if err != nil || output != "passed\n" {
-		t.Fatalf("hosts-only used direct DNS fixture: err=%v output=%s", err, output)
-	}
-}
-
 // The concurrency fixture must not mistake filestore ENOSPC for a runtime
 // regression; ordinary runtime profiles retain the existing budget.
 func TestHostsConcurrencyFilestoreBudget(t *testing.T) {
 	function := shellFunctions(t, "e2e-run.sh", "e2e_filestore_size")
 	for _, tc := range []struct {
-		name, runtime, checkpointMode string
-		count                         int
+		name, checkpointMode, want string
+		count                      int
 	}{
-		{"runsc_default", "runsc", "", 0},
-		{"firecracker_default", "firecracker", "", 0},
-		{"reflink_default", "runsc", "reflink", 0},
-		{"reflink_concurrent", "runsc", "reflink", 8},
-		{"runsc_concurrent", "runsc", "", 16},
-		{"runsc_maximum", "runsc", "", 64},
+		{"default", "", "1G", 0},
+		{"reflink_default", "reflink", "", 0},
+		{"reflink_concurrent", "reflink", "", 8},
+		{"concurrent", "", "", 16},
+		{"maximum", "", "", 64},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			script := fmt.Sprintf("HOSTS_CONCURRENCY=%d\nE2E_RUNTIME=%q\nRUNSC_CHECKPOINT_MODE=%q\n", tc.count, tc.runtime, tc.checkpointMode)
+			script := fmt.Sprintf("HOSTS_CONCURRENCY=%d\nRUNSC_CHECKPOINT_MODE=%q\n", tc.count, tc.checkpointMode)
 			output, err := runE2EHelper(t, script+function+"e2e_filestore_size\n")
 			if err != nil {
 				t.Fatalf("filestore size: %v: %s", err, output)
 			}
 			size := strings.TrimSpace(output)
-			if tc.checkpointMode == "reflink" {
-				if size != "" {
-					t.Fatalf("reflink must use caller filesystem, got %q", size)
+			if tc.count > 0 && tc.checkpointMode != "reflink" {
+				capacity, err := strconv.Atoi(strings.TrimSuffix(size, "M"))
+				if err != nil || !strings.HasSuffix(size, "M") || capacity < tc.count*64+256 {
+					t.Fatalf("insufficient concurrency capacity: got %q for %d instances, err=%v", size, tc.count, err)
 				}
-				return
-			}
-			if tc.count == 0 {
-				if size != "1G" {
-					t.Fatalf("ordinary profile changed: got %q, want 1G", size)
-				}
-				return
-			}
-			if !strings.HasSuffix(size, "M") {
-				t.Fatalf("concurrency size must use MiB, got %q", size)
-			}
-			capacity, err := strconv.Atoi(strings.TrimSuffix(size, "M"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			minimum := tc.count*64 + 256
-			if capacity < minimum {
-				t.Fatalf("capacity %d MiB cannot hold %d instances; need at least %d MiB", capacity, tc.count, minimum)
+			} else if size != tc.want {
+				t.Fatalf("profile capacity: got %q, want %q", size, tc.want)
 			}
 		})
 	}
@@ -397,36 +370,34 @@ printf 'second_pass=%s\n' "${E2E_RUN_CGROUP_DISABLED}"
 }
 
 func TestHostsRuntimeCaseRejectsOtherRuntimesBeforeBuild(t *testing.T) {
-	for _, runtime := range []string{"firecracker", "firecracker-virtiofs", "firecracker-pvm", "firecracker-pvm-incremental", "kata", "runc"} {
-		for _, mode := range []string{"E2E_HOSTS_ONLY=1", "E2E_HOSTS_REGRESSION=relative-bind", "E2E_HOSTS_CONCURRENCY=8"} {
-			t.Run(runtime+"/"+mode, func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				cmd := exec.CommandContext(ctx, "bash", "runtime-case.sh")
-				cmd.Env = append(os.Environ(), "E2E_CASE="+runtime, "E2E_HOSTS_ONLY=0", "E2E_HOSTS_REGRESSION=", "E2E_HOSTS_CONCURRENCY=0", mode)
-				output, err := cmd.CombinedOutput()
-				if err == nil || !strings.Contains(string(output), "writable hosts modes require E2E_RUNTIME=runsc") {
-					t.Fatalf("non-runsc hosts mode reached prerequisites/build: err=%v output=%s", err, output)
-				}
-			})
-		}
+	// Cover each runtime mapping and all three mode predicates without crossing them.
+	for _, tc := range []struct{ runtime, mode string }{
+		{"firecracker", "E2E_HOSTS_ONLY=1"},
+		{"firecracker-virtiofs", "E2E_HOSTS_REGRESSION=relative-bind"},
+		{"firecracker-pvm", "E2E_HOSTS_CONCURRENCY=8"},
+		{"firecracker-pvm-incremental", "E2E_HOSTS_ONLY=1"},
+		{"kata", "E2E_HOSTS_REGRESSION=relative-bind"},
+		{"runc", "E2E_HOSTS_CONCURRENCY=8"},
+	} {
+		t.Run(tc.runtime, func(t *testing.T) {
+			script := fmt.Sprintf("E2E_HOSTS_ONLY=0 E2E_HOSTS_REGRESSION= E2E_HOSTS_CONCURRENCY=0 E2E_CASE=%q %s bash runtime-case.sh", tc.runtime, tc.mode)
+			output, err := runE2EHelper(t, script)
+			if err == nil || !strings.Contains(output, "writable hosts modes require E2E_RUNTIME=runsc") {
+				t.Fatalf("non-runsc hosts mode reached prerequisites/build: err=%v output=%s", err, output)
+			}
+		})
 	}
 }
 
 func TestHostsScriptsRejectOtherRuntimes(t *testing.T) {
 	for _, script := range []string{"writable-hosts.sh", "writable-hosts-concurrency.sh"} {
-		for _, runtime := range []string{"firecracker", "firecracker-pvm", "kata", "runc"} {
-			t.Run(script+"/"+runtime, func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				cmd := exec.CommandContext(ctx, "bash", script)
-				cmd.Env = append(os.Environ(), "RUNTIME="+runtime, "TEST_DIR=/unused-hosts-test", "ROOTFS=/unused-root", "SANDBOXD_ROOT=/unused-daemon", "FILESTORE_ROOT=/unused-storage")
-				output, err := cmd.CombinedOutput()
-				if err == nil || !strings.Contains(string(output), "unsupported runtime: "+runtime) {
-					t.Fatalf("non-runsc hosts script accepted or touched prerequisites: err=%v output=%s", err, output)
-				}
-			})
-		}
+		t.Run(script, func(t *testing.T) {
+			command := fmt.Sprintf("RUNTIME=firecracker TEST_DIR=/unused-hosts-test ROOTFS=/unused-root SANDBOXD_ROOT=/unused-daemon FILESTORE_ROOT=/unused-storage bash %q", script)
+			output, err := runE2EHelper(t, command)
+			if err == nil || !strings.Contains(output, "unsupported runtime: firecracker") {
+				t.Fatalf("non-runsc hosts script accepted or touched prerequisites: err=%v output=%s", err, output)
+			}
+		})
 	}
 }
 

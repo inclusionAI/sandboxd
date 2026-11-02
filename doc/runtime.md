@@ -69,9 +69,9 @@ The optional nested-host DEBUGCTL optimization moves `vcpu->arch.host_debugctl =
 
 ## Sandbox hosts file
 
-Runsc initializes platform-managed `/etc/hosts` as an ordinary file in the private writable root before workload execution. It starts with mode `0644`, UID/GID 0, localhost/IPv6 aliases and the assigned sandbox IP/hostname. Root can edit, replace, truncate or delete it without changing the host or image; other users follow normal file permissions. No public option is required.
+Runsc initializes platform-managed `/etc/hosts` as an ordinary file in each private writable root before workload execution, with mode `0644`, UID/GID 0, localhost/IPv6 aliases and the sandbox IP/hostname. Root can modify, replace or remove it without changing the host or image; normal file permissions apply. No public option is required.
 
-Caller/base-spec mounts covering the target take priority. Effective read-only roots retain read-only hosts injection; positive writable-layer limits retain writable-root precedence. Directory roots with an explicit OCI user namespace are rejected for private hosts because their ownership/ACL view differs from the host, including after provider fallback from EROFS. Direct EROFS, external hosts mounts and legacy layouts retain their existing rules. This feature is runsc-only; other runtimes, hostname and resolver behavior are unchanged. See [managed hosts state](checkpoint-restore.md#managed-hosts-state) for initialization constraints and snapshot compatibility.
+Caller/base-spec mounts covering the target take priority. Effective read-only roots keep read-only hosts; positive writable-layer limits take writable-root precedence. Private hosts reject directory roots with an explicit OCI user namespace, including provider fallback from EROFS, because ownership/ACLs differ from the host view. This feature is runsc-only; other runtimes, hostname and resolver behavior are unchanged. See [managed hosts state](checkpoint-restore.md#managed-hosts-state) for initialization and snapshot compatibility.
 
 ## Resolver sources
 

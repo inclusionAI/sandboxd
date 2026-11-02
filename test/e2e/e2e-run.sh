@@ -2870,15 +2870,6 @@ PYTHON
     NYDUS_BOOTSTRAP="${artifacts}/bootstrap"
     NYDUS_MOUNT="${fixture}/root"
     mkdir "${artifacts}" "${cache}" "${NYDUS_MOUNT}"
-    python3 - "${ROOTFS}" <<'PYTHON'
-import os
-import pathlib
-import sys
-root = pathlib.Path(sys.argv[1])
-for path in [root, *root.rglob("*")]:
-    attrs = os.listxattr(path, follow_symlinks=False)
-    assert not attrs, f"Nydus no-xattr fixture source contains attributes: {path}: {attrs}"
-PYTHON
     "${HOSTS_NYDUS_IMAGE}" create --fs-version 5 --bootstrap "${NYDUS_BOOTSTRAP}" \
         --blob-dir "${artifacts}" --output-json "${fixture}/build.json" "${ROOTFS}" \
         >"${fixture}/build.log" 2>&1

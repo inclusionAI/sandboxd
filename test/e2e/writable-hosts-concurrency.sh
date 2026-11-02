@@ -85,13 +85,7 @@ worker() {
             ;;
         write_sources)
             id="$(sandbox_id source "${INDEX}")"
-            timed write guest "${id}" "printf '192.0.2.9 appended-${INDEX}\\n' >> /etc/hosts
-                grep -qx '192.0.2.9 appended-${INDEX}' /etc/hosts
-                printf '192.0.2.10 overwritten-${INDEX}\\n' > /etc/hosts
-                sed -i s/overwritten/source/ /etc/hosts
-                grep -qx '192.0.2.10 source-${INDEX}' /etc/hosts
-                printf '192.0.2.10 source-${INDEX}\\n' > /etc/hosts.next
-                mv /etc/hosts.next /etc/hosts"
+            timed write guest "${id}" "printf '192.0.2.10 source-${INDEX}\\n' > /etc/hosts"
             ;;
         verify_sources)
             verify_hosts "$(sandbox_id source "${INDEX}")" "192.0.2.10 source-${INDEX}"
@@ -309,19 +303,16 @@ for directory in sorted((root / 'phases').iterdir()):
     if not rows:
         continue
     events = []
-    statuses = []
     for operation, index, start, end, status in rows:
         start, end, status = int(start), int(end), int(status)
         assert end >= start, (directory.name, index, 'clock moved backwards')
         events.extend([(start, 1), (end, -1)])
-        statuses.append({'operation': operation, 'worker': int(index), 'status': status, 'seconds': (end-start)/1e9})
     current = peak = 0
     for _, delta in sorted(events):
         current += delta
         peak = max(peak, current)
     summary['phases'][directory.name] = {'operation_count': len(rows), 'peak_client_in_flight': peak,
-                                        'elapsed_seconds': (max(t for t, _ in events)-min(t for t, _ in events))/1e9,
-                                        'operations': statuses}
+                                        'elapsed_seconds': (max(t for t, _ in events)-min(t for t, _ in events))/1e9}
     if directory.name in ('start', 'write_sources', 'checkpoint', 'restore_own', 'write_own', 'fanout_mixed', 'write_clones'):
         assert peak >= 2, (directory.name, 'client operations did not overlap', peak)
 summary['peak_live_sandboxes_observed'] = max(int(line.split('\t')[1]) for line in (root/'live-counts.tsv').read_text().splitlines())

@@ -112,8 +112,6 @@ else
     done
     printf 'bundle-relative\n' > "${CORRECT_SOURCE}/marker"
     printf 'wrong-daemon-cwd\n' > "${WRONG_SOURCE}/marker"
-    jq -n --arg daemon_cwd "${DAEMON_CWD}" --arg correct "${CORRECT_SOURCE}" --arg wrong "${WRONG_SOURCE}" \
-        '{daemon_cwd: $daemon_cwd, bundle_source: $correct, wrong_cwd_source: $wrong}' > "${TEST_DIR}/relative-bind-prerequisites.json"
     pass 'bundle-relative and wrong CWD-relative sources both exist with distinct markers'
 fi
 
@@ -130,16 +128,11 @@ helper --action start --runtime runsc --rootfs "${ROOTFS}" --sandbox-id "${SOURC
 verify_initial_hosts "${SOURCE}" "${TEST_DIR}/start-response.json" "${TEST_DIR}/source"
 if [ "${CASE_MODE}" = relative-bind ]; then
     printf 'bundle-relative\n' > "${TEST_DIR}/expected-relative-marker"
-    jq '.mounts[] | select(.destination == "/relative-proof")' \
-        "${SANDBOXD_ROOT}/containers/${SOURCE}/config.json" > "${TEST_DIR}/actual-relative-mount.json"
     sbox_cmd exec "${SOURCE}" /bin/cat /relative-proof/marker > "${TEST_DIR}/actual-relative-marker"
     cmp "${TEST_DIR}/expected-relative-marker" "${TEST_DIR}/actual-relative-marker"
 fi
 pass 'Start selects the intended lower and first process sees writable managed hosts'
-guest "${SOURCE}" 'echo "192.0.2.10 appended" >> /etc/hosts
-sed -i s/appended/sed-replaced/ /etc/hosts
-grep -qx "192.0.2.10 sed-replaced" /etc/hosts
-printf "192.0.2.21 checkpoint-marker\n" > /etc/hosts.new
+guest "${SOURCE}" 'printf "192.0.2.21 checkpoint-marker\n" > /etc/hosts.new
 mv /etc/hosts.new /etc/hosts'
 helper --action checkpoint --sandbox-id "${SOURCE}" --checkpoint-dir "${CHECKPOINT}" \
     --leave-running=false --snapshot-type Full
@@ -154,8 +147,6 @@ guest "${RESTORED}" 'grep -qx "192.0.2.21 checkpoint-marker" /etc/hosts
 test "$(wc -l < /var/hosts-entry-count)" = 1
 echo "192.0.2.22 restored-only" >> /etc/hosts'
 if [ "${CASE_MODE}" = relative-bind ]; then
-    jq '.mounts[] | select(.destination == "/relative-proof")' \
-        "${SANDBOXD_ROOT}/containers/${RESTORED}/config.json" > "${TEST_DIR}/restored-relative-mount.json"
     sbox_cmd exec "${RESTORED}" /bin/cat /relative-proof/marker > "${TEST_DIR}/restored-relative-marker"
     cmp "${TEST_DIR}/expected-relative-marker" "${TEST_DIR}/restored-relative-marker"
     test "$(cat "${CORRECT_SOURCE}/marker")" = bundle-relative

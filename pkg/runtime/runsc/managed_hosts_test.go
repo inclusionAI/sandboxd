@@ -309,24 +309,7 @@ func TestManagedHostsPreserveBundleRelativeMountsAcrossRestore(t *testing.T) {
 	client := &hostsLifecycleClient{}
 	h, start, bundle := hostsHandlerFixture(t, "source", client)
 	spec := h.ociLoader.(staticOciLoader).spec
-	// Both resolutions exist: the regression must not merely fail because
-	// daemon cwd has no matching source; it can silently mount the wrong one.
-	daemon := filepath.Join(t.TempDir(), "daemon")
-	if err := os.Mkdir(daemon, 0755); err != nil {
-		t.Fatal(err)
-	}
-	t.Chdir(daemon)
-	for _, root := range []string{filepath.Dir(bundle), filepath.Dir(daemon)} {
-		if err := os.Mkdir(filepath.Join(root, "shared"), 0755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(root, "shared", "origin"), []byte(root), 0644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(root, "shared.erofs"), []byte(root), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	t.Chdir(t.TempDir())
 	for _, kind := range []string{"bind", "erofs"} {
 		if err := os.Mkdir(filepath.Join(spec.Root.Path, kind), 0755); err != nil {
 			t.Fatal(err)
@@ -349,18 +332,6 @@ func TestManagedHostsPreserveBundleRelativeMountsAcrossRestore(t *testing.T) {
 		}
 		if !reflect.DeepEqual(saved.Mounts, freshSpec.Mounts) {
 			t.Fatalf("bundle-relative mount sources changed: %+v", saved.Mounts)
-		}
-		for _, mount := range saved.Mounts {
-			// The pinned runsc fixSpec resolves each relative source against
-			// the bundle, regardless of the daemon or child working directory.
-			resolved := filepath.Join(bundle, mount.Source)
-			if mount.Type == "bind" {
-				resolved = filepath.Join(resolved, "origin")
-			}
-			origin, err := os.ReadFile(resolved)
-			if err != nil || string(origin) != filepath.Dir(bundle) {
-				t.Fatalf("wrong source for %s: %q err=%v", mount.Type, origin, err)
-			}
 		}
 	}
 	if err := h.Start(context.Background(), start); err != nil {

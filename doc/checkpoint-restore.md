@@ -46,9 +46,9 @@ in progress for a source sandbox at a time.
 `checkpoint_dir` must be absolute, must not be `/`, and must not contain
 symbolic links. Its parent must already exist. The leaf may be absent, in which
 case sandboxd creates it, or it may be an existing empty directory. sandboxd
-never overwrites a non-empty directory. Runsc output must remain outside its source bundle, and restore inputs must remain separate from the target bundle.
+never overwrites a non-empty directory.
 
-Concurrent runsc checkpoints in one daemon must use disjoint output directories: overlapping requests fail before writing, and reservations remain held through failure cleanup. Other runtimes retain sandbox-level exclusion.
+Within one daemon, runsc rejects checkpoint outputs overlapping the source bundle or another active output directory, and restore inputs overlapping the target bundle. Output reservations remain held through failure cleanup. Other runtimes retain sandbox-level exclusion.
 
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
@@ -71,11 +71,11 @@ Save and restore must use matching runtime builds. Drain sandboxes before replac
 
 Runsc checkpoints preserve managed `/etc/hosts` contents and existence, including truncation and deletion. Restore does not regenerate entries for a new IP address. [Caller-owned mounts](runtime.md#sandbox-hosts-file) retain their external-storage contract.
 
-`managed-hosts.json` records the schema, runtime, effective root mode and hosts layout. Private-rootfs checkpoints also retain the original immutable `rootfs-seed.tar` and its SHA-256. The seed is an initialization dependency, not live hosts content: restore copies it into each target bundle and loads native state without replaying initialization. Keep both artifacts with the checkpoint, outside `filestores/`, so source deletion and later target checkpoints remain independent.
+The versioned `managed-hosts.json` records runtime, root mode and layout. Private-rootfs checkpoints also keep immutable `rootfs-seed.tar` with its SHA-256. The seed is an initialization dependency, not live hosts content. Keep both artifacts with the checkpoint, outside `filestores/`; restore copies the seed into each target bundle and loads native state without replay, supporting source deletion and repeated checkpoints.
 
-Initialization reads parent metadata from the original lower; EROFS requires a temporary read-only host loop mount. Directory lowers treat `listxattr` ENOTSUP/EOPNOTSUPP or ENOSYS as no visible attributes, including Nydus without xattrs; direct EROFS inspection stays strict. Other metadata errors, symlink/non-directory parents and unrepresentable metadata fail creation. Restore reuses the seed. OCI relative mount sources remain bundle-relative. Sandboxd reserves `dev.gvisor.tar.rootfs.upper` and its suffixed keys, plus `allow-rootfs-tar-annotation` and `restore-spec-validation` flags/OCI annotations against caller or provider overrides.
+Creation rejects symlink/non-directory parents, unrepresentable metadata and metadata errors. Directory lowers may lack `listxattr` support; direct EROFS inspection stays strict. Managed seed/restore annotations and flags cannot be overridden by callers or providers. OCI relative mount sources remain bundle-relative.
 
-Old snapshots retain their existing hosts preparation and mount priority. Missing sidecars are only legacy candidates: strict native spec validation rejects stripped new-layout metadata. Invalid sidecars/seeds, digest failures or incompatible runtime, root mode or mount ownership fail explicitly. New-layout snapshots are not guaranteed to work with older sandboxd. Matching runtime builds remain required; other runtimes do not use these artifacts.
+Old snapshots retain hosts preparation and mount priority. Missing sidecars are only legacy candidates: strict native spec validation rejects stripped new-layout metadata. Invalid artifacts, digest failures or incompatible runtime, root mode or mount ownership fail explicitly. New-layout snapshots are not guaranteed to work with older sandboxd; matching runtime builds remain required.
 
 ## Checkpoint output synchronization
 

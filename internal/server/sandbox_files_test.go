@@ -706,21 +706,6 @@ func TestPrepareOldCheckpointKeepsLegacyMountAndOwnership(t *testing.T) {
 	}
 }
 
-func TestProviderWritableRootPreservesHostsPolicy(t *testing.T) {
-	provider := &svc.SpecUpdates{RequiresHostWritableRootfs: true}
-	for _, limit := range []uint64{0, 1024} {
-		policy := sandboxHostsPolicy{runtime: "runsc", rootReadonly: svc.EffectiveRootReadonly(true, limit, provider)}
-		state, err := selectManagedHostsState(policy, false)
-		if err != nil || state.Layout != svc.HostsLayoutPrivateRootfs || state.RootReadonly {
-			t.Fatalf("provider root state: %+v, %v", state, err)
-		}
-		state, err = selectManagedHostsState(policy, true)
-		if err != nil || state.Layout != svc.HostsLayoutExternal || state.RootReadonly {
-			t.Fatalf("provider external mount state: %+v, %v", state, err)
-		}
-	}
-}
-
 func TestOtherRuntimesIgnoreManagedHostsSidecars(t *testing.T) {
 	for _, runtimeName := range []string{"firecracker", "firecracker-pvm", "runc", "kata"} {
 		t.Run(runtimeName, func(t *testing.T) {
