@@ -43,6 +43,25 @@ With `memory_limit.enabled=true`, cgroup-provider memory capacity comes from the
 
 Cgroup and Kubernetes providers preserve byte precision instead of rounding down to whole GiB. This precision behavior also applies with `memory_limit.enabled=false`. For example, a provider capacity of 10.5GiB is reported as 10.5GiB rather than 10GiB. Final advertised capacity remains subject to provider policy, the optional parent ceiling and transient reservations. YuanRong converts resource units internally; its view may have a small conversion tolerance.
 
+## Parent memory metrics
+
+When the node-resource module and cgroup manager are enabled, sandboxd exports the configured sandbox parent's live cgroup v2 memory values over its existing OTLP metrics connection. The OTel Collector can forward them to Prometheus with its existing remote-write pipeline; this does not add a second sandboxd `/metrics` endpoint. The reader uses `cgroup_root_name` and the selected backend mountpoint, rather than hardcoding `/akernel` or reading the hierarchy root `/`.
+
+| OTel gauge | Prometheus name | Value |
+| --- | --- | --- |
+| `sandbox.parent.memory.current` | `sandbox_parent_memory_current_bytes` | The parent's `memory.current`, including descendants and cached charges. |
+| `sandbox.parent.memory.max` | `sandbox_parent_memory_max_bytes` | The same parent's finite numeric `memory.max`. |
+
+Both gauges use bytes and carry the `cgroup_path` attribute, such as `/sandboxd` or `/akernel`, alongside the existing node resource identity. A single callback reads one parent snapshot for the pair. These observations are independent of `memory_limit.enabled`: an existing finite kernel limit can be monitored without enabling automatic budget configuration. They read live kernel state, not the startup `MemoryLimit()` cache or the resource provider's schedulable capacity.
+
+The first implementation supports cgroup v2. An absent reader, cgroup v1, a missing or malformed control file, a limit observed changing during the read, literal `memory.max=max`, or a value outside the signed 64-bit OTel range produces no pair. Errors are not reported as idle zero usage. Numeric `memory.current=0` and numeric `memory.max=0` remain valid raw observations; a zero maximum does not define a utilization ratio. Current usage may temporarily exceed a finite maximum and is not clamped.
+
+Consumers must require a complete, fresh pair from each current node source and matching `cgroup_path`, reject nonpositive maxima, and treat missing data as unknown. In particular, Prometheus can retain previous samples after an observation stops; omission is not immediate invalidation, and a retained value must not be treated as a fresh reading or as zero. Source, membership or limit changes require rebuilding any decision observation window.
+
+For one node the occupancy ratio is `current / max`. Across a pool, use `sum(current) / sum(max)` over the same complete node set before averaging over time. This ratio includes reclaimable cache and is not interchangeable with a working-set or `MemTotal-MemAvailable` pressure ratio. Thresholds need to account for that distinction.
+
+The new gauges do not change the parent budget, `/resource.mem`, `node.memory.total`, individual sandbox metrics, or scheduler allocation accounting. They neither add Firecracker checkpoint sibling usage to the parent nor subtract live usage from advertised scheduling capacity.
+
 ## Startup and rollout
 
 With the policy enabled, sandboxd writes `memory.max` only when adding a finite limit to an unlimited parent or lowering an existing finite limit. Both cases require the entire sandbox subtree to have no processes and residual `memory.current` to be no greater than the new limit. Startup refuses the change before writing if these conditions are not met; rollout runbooks must drain the subtree before either operation.

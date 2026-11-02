@@ -884,6 +884,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		metrics.RecordResourceGauge("cgroup", float64(cgroupMgr.CacheSizeLimit()))
 		if nodeResMod != nil {
 			nodeResMod.SetCgroupStatsReader(cgroupMgr.Stats)
+			nodeResMod.SetParentMemoryReader(cgroupMgr.ReadParentMemory)
 		}
 		defer func() {
 			if retErr != nil {

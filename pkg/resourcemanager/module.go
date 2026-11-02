@@ -182,6 +182,16 @@ func (m *Module) SetCgroupStatsReader(
 	}
 }
 
+// SetParentMemoryReader routes parent memory metrics through the managed
+// CgroupManager's selected memory controller and configured parent cgroup.
+func (m *Module) SetParentMemoryReader(
+	reader func() (cgroupmanager.ParentMemoryStats, error),
+) {
+	if m.collector != nil {
+		m.collector.SetParentMemoryReader(reader)
+	}
+}
+
 // MarkSandboxStopped records a terminal sandbox state for asynchronous export.
 func (m *Module) MarkSandboxStopped(target sandbox.MetricsTarget) {
 	if m.collector != nil {
