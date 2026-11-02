@@ -17,6 +17,7 @@ package firecrackerproto
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"net"
 	"path/filepath"
 	"testing"
@@ -198,4 +199,27 @@ type testError struct {
 
 func (err *testError) Error() string {
 	return err.value
+}
+
+func TestCheckpointRequestCarriesHostWallClock(t *testing.T) {
+	const stamp = int64(1793514804267548000)
+	var request CheckpointRequest
+	if err := json.Unmarshal([]byte(`{"outcome":"restore","host_time_unix_nano":1793514804267548000}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	var actual int64
+	if err := json.Unmarshal(fields["host_time_unix_nano"], &actual); err != nil {
+		t.Fatalf("host clock lost from checkpoint handoff: %s: %v", encoded, err)
+	}
+	if actual != stamp {
+		t.Fatalf("host clock = %d, want %d", actual, stamp)
+	}
 }

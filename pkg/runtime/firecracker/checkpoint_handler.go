@@ -186,9 +186,12 @@ func (handler *Handler) Checkpoint(
 		discardUnsealedFirecrackerCheckpoint(files)
 		return fmt.Errorf("pause Firecracker sandbox %s: %w", sandboxID, err)
 	}
-	handoffReleased := false
+	// Once a release is attempted, a transport error cannot prove the guest
+	// did not consume it. Replaying an unversioned outcome could release the
+	// next FIFO reader, so cleanup is only safe before that first attempt.
+	handoffReleaseAttempted := false
 	defer func() {
-		if retErr == nil || handoffReleased ||
+		if retErr == nil || handoffReleaseAttempted ||
 			!firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 			return
 		}
@@ -204,11 +207,12 @@ func (handler *Handler) Checkpoint(
 			)
 			return
 		}
+		handoffReleaseAttempted = true
 		if err := requestFirecrackerAgent(
 			cleanupCtx,
 			state.VsockPath,
 			firecrackerproto.MessageCheckpoint,
-			firecrackerproto.CheckpointRequest{Outcome: "error"},
+			firecrackerproto.CheckpointRequest{Outcome: "error", HostTimeUnixNano: time.Now().UnixNano()},
 		); err != nil {
 			retErr = errors.Join(
 				retErr,
@@ -216,7 +220,6 @@ func (handler *Handler) Checkpoint(
 			)
 			return
 		}
-		handoffReleased = true
 	}()
 	tPaused := time.Now()
 	// Clone the writable layer BEFORE the memory snapshot: the snapshot writes
@@ -272,18 +275,15 @@ func (handler *Handler) Checkpoint(
 			resumeErr = fmt.Errorf("resume Firecracker sandbox %s: %w", sandboxID, err)
 		}
 		if resumeErr == nil {
+			handoffReleaseAttempted = true
 			if err := requestFirecrackerAgent(
 				ctx,
 				state.VsockPath,
 				firecrackerproto.MessageCheckpoint,
-				firecrackerproto.CheckpointRequest{Outcome: "resume"},
+				firecrackerproto.CheckpointRequest{Outcome: "resume", HostTimeUnixNano: time.Now().UnixNano()},
 			); err != nil {
-				logrus.Warnf(
-					"firecracker: release checkpointed sandbox %s: %v",
-					sandboxID, err,
-				)
+				resumeErr = fmt.Errorf("release checkpointed Firecracker sandbox %s: %w", sandboxID, err)
 			}
-			handoffReleased = true
 		}
 	}
 	tResumed := time.Now()
@@ -1166,8 +1166,9 @@ func (handler *Handler) Restore(
 		vsockPath,
 		firecrackerproto.MessageCheckpoint,
 		firecrackerproto.CheckpointRequest{
-			Outcome:     "restore",
-			Environment: plan.configure.Process.Env,
+			Outcome:          "restore",
+			HostTimeUnixNano: time.Now().UnixNano(),
+			Environment:      plan.configure.Process.Env,
 		},
 	); err != nil {
 		return fmt.Errorf("release restored Firecracker sandbox: %w", err)

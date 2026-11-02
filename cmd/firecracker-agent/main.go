@@ -859,14 +859,29 @@ func (handoff *checkpointHandoff) close() {
 }
 
 func releaseCheckpoint(request firecrackerproto.CheckpointRequest) error {
+	return releaseCheckpointWithClock(request, func(nanos int64) error {
+		stamp := unix.NsecToTimespec(nanos)
+		return unix.ClockSettime(unix.CLOCK_REALTIME, &stamp)
+	})
+}
+
+func releaseCheckpointWithClock(request firecrackerproto.CheckpointRequest, setClock func(int64) error) error {
 	if request.Outcome != "resume" && request.Outcome != "restore" && request.Outcome != "error" {
 		return fmt.Errorf("invalid checkpoint outcome %q", request.Outcome)
+	}
+	if request.HostTimeUnixNano <= 0 {
+		return errors.New("checkpoint host wall-clock timestamp must be positive")
 	}
 	state.mu.RLock()
 	handoff := state.handoff
 	state.mu.RUnlock()
 	if handoff == nil {
 		return errors.New("checkpoint handoff is not configured")
+	}
+	// A VM snapshot preserves its old wall clock. Correct it before releasing
+	// the cooperative workload; CLOCK_MONOTONIC and existing timers are untouched.
+	if err := setClock(request.HostTimeUnixNano); err != nil {
+		return fmt.Errorf("synchronize checkpoint guest wall clock: %w", err)
 	}
 	if request.Outcome == "restore" {
 		if err := writeCheckpointEnvironment(handoff.environmentPath, request.Environment); err != nil {

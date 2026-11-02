@@ -625,6 +625,74 @@ func waitForCheckpointReader(t *testing.T, handoff *checkpointHandoff) {
 	t.Fatal("checkpoint handoff reader did not register")
 }
 
+func TestCheckpointClockFailureKeepsNextFIFOBlocked(t *testing.T) {
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handoff.close()
+	state.mu.Lock()
+	previous := state.handoff
+	state.handoff = handoff
+	state.mu.Unlock()
+	defer func() {
+		state.mu.Lock()
+		state.handoff = previous
+		state.mu.Unlock()
+	}()
+
+	type readResult struct {
+		data string
+		err  error
+	}
+	openReader := func() <-chan readResult {
+		result := make(chan readResult, 1)
+		go func() {
+			data, err := os.ReadFile(handoff.fifoPath)
+			result <- readResult{string(data), err}
+		}()
+		waitForCheckpointReader(t, handoff)
+		return result
+	}
+	readResume := func(result <-chan readResult) {
+		t.Helper()
+		select {
+		case read := <-result:
+			if read.err != nil || read.data != "resume\n" {
+				t.Fatalf("FIFO outcome = %q, %v", read.data, read.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("checkpoint FIFO release timed out")
+		}
+	}
+	resume := firecrackerproto.CheckpointRequest{Outcome: "resume", HostTimeUnixNano: 1}
+	first := openReader()
+	if err := releaseCheckpointWithClock(resume, func(int64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	readResume(first)
+	next := openReader()
+	denied := errors.New("clock update denied")
+	if err := releaseCheckpointWithClock(resume, func(int64) error { return denied }); !errors.Is(err, denied) {
+		t.Fatalf("clock update error = %v", err)
+	}
+	handoff.mu.Lock()
+	stillWaiting := handoff.reader != nil
+	handoff.mu.Unlock()
+	if !stillWaiting {
+		t.Fatal("failed clock update released the next FIFO generation")
+	}
+	select {
+	case read := <-next:
+		t.Fatalf("next FIFO completed before a successful release: %+v", read)
+	default:
+	}
+	if err := releaseCheckpointWithClock(resume, func(int64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	readResume(next)
+}
+
 type recordingWriteCloser struct {
 	bytes.Buffer
 	closed bool
@@ -633,4 +701,63 @@ type recordingWriteCloser struct {
 func (w *recordingWriteCloser) Close() error {
 	w.closed = true
 	return nil
+}
+
+func TestCheckpointClockBeforeHandoff(t *testing.T) {
+	for _, outcome := range []string{"resume", "restore", "error"} {
+		t.Run(outcome, func(t *testing.T) {
+			result := make(chan string, 1)
+			handoff := &checkpointHandoff{reader: result, environmentPath: filepath.Join(t.TempDir(), "environment")}
+			previous := state.handoff
+			state.handoff = handoff
+			defer func() { state.handoff = previous }()
+			const stamp = int64(1793514804267548000)
+			called := false
+			err := releaseCheckpointWithClock(firecrackerproto.CheckpointRequest{Outcome: outcome, HostTimeUnixNano: stamp}, func(actual int64) error {
+				if actual != stamp {
+					t.Fatalf("clock timestamp = %d", actual)
+				}
+				if len(result) != 0 {
+					t.Fatal("workload released before clock correction")
+				}
+				called = true
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !called {
+				t.Fatal("guest clock not synchronized")
+			}
+			select {
+			case actual := <-result:
+				if actual != outcome {
+					t.Fatalf("outcome = %q", actual)
+				}
+			default:
+				t.Fatal("handoff not released")
+			}
+		})
+	}
+}
+
+func TestCheckpointClockFailureKeepsHandoffBlocked(t *testing.T) {
+	result := make(chan string, 1)
+	previous := state.handoff
+	state.handoff = &checkpointHandoff{reader: result}
+	defer func() { state.handoff = previous }()
+	denied := errors.New("clock permission denied")
+	err := releaseCheckpointWithClock(firecrackerproto.CheckpointRequest{Outcome: "restore", HostTimeUnixNano: 1}, func(int64) error { return denied })
+	if !errors.Is(err, denied) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(result) != 0 {
+		t.Fatal("failed clock correction released workload")
+	}
+	for _, stamp := range []int64{0, -1} {
+		err := releaseCheckpointWithClock(firecrackerproto.CheckpointRequest{Outcome: "restore", HostTimeUnixNano: stamp}, func(int64) error { t.Fatal("invalid timestamp reached clock syscall"); return nil })
+		if err == nil {
+			t.Fatalf("invalid timestamp %d accepted", stamp)
+		}
+	}
 }
