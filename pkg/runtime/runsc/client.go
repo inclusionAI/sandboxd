@@ -185,7 +185,7 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		if cmd.Err == nil && !filepath.IsAbs(cmd.Path) {
 			// exec.Command resolves a bare name via the caller's PATH before
 			// chdir. Keep that resolution even with a relative PATH entry.
-			cmd.Path, err = filepath.Abs(cmd.Path)
+			cmd.Path, err = absoluteHostPath(cmd.Path)
 			if err != nil {
 				return err
 			}
@@ -277,23 +277,58 @@ func (c *Client) forSeededCreate(args StartArgs) (*Client, StartArgs, error) {
 
 func absoluteRunscPathFlag(key, value string) (string, error) {
 	switch key {
-	case "--log", "--debug-log", "--panic-log", "--coverage-report", "--pcap-log", "--final-metrics-log", "--profiling-metrics-log", "--platform_device_path", "--profile-block", "--profile-cpu", "--profile-heap", "--profile-mutex", "--trace", "--pod-init-config", "--shared-root", "--TESTONLY-autosave-image-path":
+	case "--log", "--debug-log", "--panic-log", "--coverage-report", "--pcap-log", "--final-metrics-log", "--profiling-metrics-log", "--profile-block", "--profile-cpu", "--profile-heap", "--profile-mutex", "--trace", "--pod-init-config", "--shared-root", "--TESTONLY-autosave-image-path":
 		if value != "" && !(key == "--profiling-metrics-log" && value == "-") {
 			return absoluteHostPath(value)
 		}
+	case "--platform_device_path":
+		return absolutePlatformDevicePaths(value)
 	case "--overlay2":
 		return absoluteOverlayDirectory(value)
 	}
 	return value, nil
 }
 
-func absoluteHostPath(value string) (string, error) {
-	absolute, err := filepath.Abs(value)
-	if err == nil && strings.HasSuffix(value, string(filepath.Separator)) && !strings.HasSuffix(absolute, string(filepath.Separator)) {
-		// runsc uses a trailing slash to distinguish log directories.
-		absolute += string(filepath.Separator)
+// Match the pinned runsc parser: without '=' the whole value is one path;
+// otherwise only paths in comma-separated platform=path pairs change with CWD.
+func absolutePlatformDevicePaths(value string) (string, error) {
+	if !strings.Contains(value, "=") {
+		if value == "" {
+			return value, nil
+		}
+		return absoluteHostPath(value)
 	}
-	return absolute, err
+	pairs := strings.Split(value, ",")
+	seen := make(map[string]struct{}, len(pairs))
+	for i, pair := range pairs {
+		name, path, ok := strings.Cut(pair, "=")
+		if !ok || name == "" || path == "" {
+			return "", fmt.Errorf("invalid --platform_device_path %q: expected platform=path pairs with non-empty names and paths", value)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return "", fmt.Errorf("invalid --platform_device_path %q: duplicate platform %q", value, name)
+		}
+		seen[name] = struct{}{}
+		absolute, err := absoluteHostPath(path)
+		if err != nil {
+			return "", err
+		}
+		pairs[i] = name + "=" + absolute
+	}
+	return strings.Join(pairs, ","), nil
+}
+
+func absoluteHostPath(value string) (string, error) {
+	if filepath.IsAbs(value) {
+		return value, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil || value == "" {
+		return cwd, err
+	}
+	// Do not Clean: the kernel must resolve symlinks before a following '..'.
+	// Keep trailing separators too; runsc uses them to identify log directories.
+	return strings.TrimSuffix(cwd, string(filepath.Separator)) + string(filepath.Separator) + value, nil
 }
 
 func absoluteOverlayDirectory(value string) (string, error) {
@@ -309,7 +344,7 @@ func absoluteOverlayDirectory(value string) (string, error) {
 	if directory == "" {
 		return "", errors.New("root overlay directory is empty")
 	}
-	absolute, err := filepath.Abs(directory)
+	absolute, err := absoluteHostPath(directory)
 	if err != nil {
 		return "", err
 	}

@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"unicode/utf8"
 
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"golang.org/x/sys/unix"
@@ -202,13 +201,22 @@ func hostsDirectoryXattrs(fd int, policy hostsXattrPolicy) (map[string]string, e
 	if err != nil {
 		return nil, err
 	}
+	return hostsDirectoryXattrRecords(names, func(name string) ([]byte, error) {
+		return readDirectoryXattr(fd, name)
+	})
+}
+
+func hostsDirectoryXattrRecords(names []byte, read func(string) ([]byte, error)) (map[string]string, error) {
 	records := make(map[string]string)
 	total := len(names)
 	for _, name := range strings.Split(string(names), "\x00") {
-		if name == "" {
+		// Match runsc's root overlay copy-up: it uses the default trusted
+		// namespace, so lower overlay controls must not configure the upper.
+		// user.overlay.* remains ordinary metadata without userxattr mode.
+		if name == "" || strings.HasPrefix(name, "trusted.overlay.") {
 			continue
 		}
-		value, err := readDirectoryXattr(fd, name)
+		value, err := read(name)
 		if err != nil {
 			return nil, fmt.Errorf("read directory xattr %q: %w", name, err)
 		}
@@ -228,15 +236,14 @@ func hostsDirectoryXattrs(fd int, policy hostsXattrPolicy) (map[string]string, e
 // Match the pinned gVisor tmpfs/tar.go writer, including its special POSIX
 // ACL representation. Reject attributes that would otherwise be silently lost.
 func hostsXattrPAXValue(name string, value []byte) (string, error) {
-	if name == "" || strings.ContainsAny(name, "=\x00") || !utf8.ValidString(name) || len(value) == 0 {
+	if name == "" || strings.ContainsAny(name, "=\x00") {
 		return "", fmt.Errorf("directory xattr %q cannot be represented in the hosts seed", name)
 	}
 	if name == "system.posix_acl_access" || name == "system.posix_acl_default" {
 		return base64.RawStdEncoding.EncodeToString(value), nil
 	}
-	if !utf8.Valid(value) {
-		return "", fmt.Errorf("directory xattr %q is not a supported textual PAX value", name)
-	}
+	// archive/tar and runsc preserve SCHILY.xattr values as raw bytes, including
+	// invalid UTF-8, NULs and empty values. Only the name needs PAX validation.
 	return string(value), nil
 }
 

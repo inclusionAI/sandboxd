@@ -207,7 +207,7 @@ func finalizeManagedHosts(bundle string, spec *runtimecore.Spec, state *runtimec
 				spec.Annotations[key] = absolute
 			}
 			if key == runtimecore.GVisorRootfsAnnotationPrefix+"source" && value != "" && !filepath.IsAbs(value) {
-				absolute, err := filepath.Abs(value)
+				absolute, err := absoluteHostPath(value)
 				if err != nil {
 					return err
 				}

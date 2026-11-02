@@ -40,6 +40,28 @@ func TestHostsSeedPreservesDirectoryMetadata(t *testing.T) {
 	if err := unix.Setxattr(etc, "user.hosts-seed-test", []byte("preserved"), 0); err != nil {
 		t.Fatal(err)
 	}
+	directoryXattrs := []struct {
+		path   string
+		values map[string][]byte
+	}{
+		{root, map[string][]byte{
+			"user.hosts-seed-binary": {0xff, 0x00, 0x80},
+			"user.hosts-seed-empty":  {},
+			"user.overlay.opaque":    []byte("y"),
+		}},
+		{etc, map[string][]byte{
+			"user.hosts-seed-binary": {0x80, '\n', '=', 0x00, 0xff},
+			"user.hosts-seed-\xff":   []byte("name-preserved"),
+			"user.overlay.redirect":  []byte("ordinary-xattr"),
+		}},
+	}
+	for _, directory := range directoryXattrs {
+		for name, value := range directory.values {
+			if err := unix.Setxattr(directory.path, name, value, 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	// A minimal default ACL remains meaningful even without named users.
 	acl := make([]byte, 4+3*8)
 	binary.LittleEndian.PutUint32(acl, 2)
@@ -68,6 +90,14 @@ func TestHostsSeedPreservesDirectoryMetadata(t *testing.T) {
 	if headers[1].PAXRecords["SCHILY.xattr.user.hosts-seed-test"] != "preserved" || headers[1].PAXRecords["SCHILY.xattr.system.posix_acl_default"] != base64.RawStdEncoding.EncodeToString(acl) {
 		t.Fatalf("xattrs or ACL were not preserved: %#v", headers[1].PAXRecords)
 	}
+	for index, directory := range directoryXattrs {
+		for name, value := range directory.values {
+			got, exists := headers[index].PAXRecords["SCHILY.xattr."+name]
+			if !exists || !bytes.Equal([]byte(got), value) {
+				t.Fatalf("header %q xattr %q = %x (exists=%t), want %x", headers[index].Name, name, got, exists, value)
+			}
+		}
+	}
 	data, err := encodeHostsSeed(headers, []runtimecore.InitialFile{{Path: "/etc/hosts", Content: []byte("initial\n"), Mode: 0644}})
 	if err != nil {
 		t.Fatal(err)
@@ -80,6 +110,16 @@ func TestHostsSeedPreservesDirectoryMetadata(t *testing.T) {
 		}
 		if name == "./etc/" && (!header.ModTime.Equal(mtime) || header.Mode != int64(stat.Mode&07777)) {
 			t.Fatalf("tar lost directory metadata: %+v", header)
+		}
+		for index, parentName := range []string{"./", "./etc/"} {
+			if name == parentName {
+				for attrName, value := range directoryXattrs[index].values {
+					got, exists := header.PAXRecords["SCHILY.xattr."+attrName]
+					if !exists || !bytes.Equal([]byte(got), value) {
+						t.Fatalf("tar header %q xattr %q = %x (exists=%t), want %x", name, attrName, got, exists, value)
+					}
+				}
+			}
 		}
 		if name == "./etc/hosts" {
 			content, err := io.ReadAll(reader)
@@ -124,7 +164,7 @@ func TestHostsXattrRepresentation(t *testing.T) {
 		name  string
 		value []byte
 	}{
-		{"user.binary", []byte{255}}, {"user.empty", nil}, {"user.bad=name", []byte("ok")},
+		{"", []byte("ok")}, {"user.bad=name", []byte("ok")}, {"user.bad\x00name", []byte("ok")},
 	} {
 		if _, err := hostsXattrPAXValue(tc.name, tc.value); err == nil {
 			t.Fatalf("silently accepted unrepresentable attribute %q", tc.name)
@@ -137,6 +177,55 @@ func TestHostsXattrRepresentation(t *testing.T) {
 	}
 	if encoded, err := hostsXattrPAXValue("security.selinux", []byte("label\x00")); err != nil || encoded != "label\x00" {
 		t.Fatalf("PAX xattr trailing NUL was rejected: %q %v", encoded, err)
+	}
+	for _, tc := range []struct {
+		name  string
+		value []byte
+	}{
+		{"user.binary", []byte{0xff, 0x00, 0x80}},
+		{"user.binary", []byte{0x80, '\n', '=', 0x00, 0xff}},
+		{"user.empty", nil},
+		{"user.nonutf8-\xff", []byte("name-preserved")},
+	} {
+		encoded, err := hostsXattrPAXValue(tc.name, tc.value)
+		if err != nil || !bytes.Equal([]byte(encoded), tc.value) {
+			t.Fatalf("PAX xattr %q = %x, %v, want %x", tc.name, encoded, err, tc.value)
+		}
+	}
+}
+
+func TestHostsDirectoryXattrsExcludeOverlayControls(t *testing.T) {
+	// The root overlay uses trusted.overlay.*, not userxattr mode. Its
+	// controls must be skipped before reading values, even if inaccessible.
+	want := map[string][]byte{
+		"trusted.overlayish.opaque": []byte("preserved"),
+		"trusted.overlay":           []byte("preserved"),
+		"user.overlay.opaque":       []byte("y"),
+		"user.overlay.redirect":     {0xff, 0x00, 0x80},
+		"user.empty":                {},
+	}
+	names := []string{"trusted.overlay.opaque", "trusted.overlay.redirect", "trusted.overlay.metacopy", "trusted.overlay.origin", "trusted.overlay."}
+	for name := range want {
+		names = append(names, name)
+	}
+	got, err := hostsDirectoryXattrRecords([]byte(strings.Join(names, "\x00")+"\x00"), func(name string) ([]byte, error) {
+		value, ok := want[name]
+		if !ok {
+			t.Fatalf("read overlay control attribute %q", name)
+		}
+		return value, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected seed xattrs: %#v", got)
+	}
+	for name, value := range want {
+		encoded, exists := got["SCHILY.xattr."+name]
+		if !exists || !bytes.Equal([]byte(encoded), value) {
+			t.Fatalf("seed xattr %q = %x (exists=%t), want %x", name, encoded, exists, value)
+		}
 	}
 }
 

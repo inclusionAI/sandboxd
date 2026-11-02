@@ -244,6 +244,67 @@ func TestManagedHostsHandlerRejectsOverlappingArtifactWithoutCleanup(t *testing.
 	}
 }
 
+func TestManagedHostsPreserveSymlinkParentAnnotations(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	actual := filepath.Join(root, "actual")
+	if err := os.MkdirAll(filepath.Join(actual, "nested"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(actual, "nested"), "image-link"); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"image", "device", "overlay"} {
+		if err := os.WriteFile(filepath.Join(actual, name), []byte("intended-"+name), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte("wrong-"+name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, mode := range []string{"relative", "absolute"} {
+		t.Run(mode, func(t *testing.T) {
+			h, start, bundle := hostsHandlerFixture(t, mode, &hostsLifecycleClient{})
+			spec := h.ociLoader.(staticOciLoader).spec
+			state, err := h.prepareFreshManagedHosts(bundle, spec, start)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefix := "image-link/../"
+			if mode == "absolute" {
+				prefix = root + "/" + prefix
+			}
+			spec.Annotations = map[string]string{
+				runtimecore.GVisorRootfsAnnotationPrefix + "type":    "erofs",
+				runtimecore.GVisorRootfsAnnotationPrefix + "source":  prefix + "image",
+				runtimecore.GVisorRootfsAnnotationPrefix + "overlay": "dir=" + prefix + "overlay",
+				"dev.gvisor.flag.platform_device_path":               "kvm=" + prefix + "device",
+			}
+			if err := finalizeManagedHosts(bundle, spec, state); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(bundle, "config.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var saved runtimecore.Spec
+			if err := json.Unmarshal(data, &saved); err != nil {
+				t.Fatal(err)
+			}
+			for name, key := range map[string]string{"image": runtimecore.GVisorRootfsAnnotationPrefix + "source", "device": "dev.gvisor.flag.platform_device_path", "overlay": runtimecore.GVisorRootfsAnnotationPrefix + "overlay"} {
+				path := saved.Annotations[key]
+				path = strings.TrimPrefix(strings.TrimPrefix(path, "kvm="), "dir=")
+				if !filepath.IsAbs(path) {
+					t.Fatalf("annotation %s is still relative: %q", key, path)
+				}
+				if got, err := os.ReadFile(path); err != nil || string(got) != "intended-"+name {
+					t.Fatalf("annotation %s changed path meaning: %q, %v", key, got, err)
+				}
+			}
+		})
+	}
+}
+
 func TestManagedHostsPreserveBundleRelativeMountsAcrossRestore(t *testing.T) {
 	client := &hostsLifecycleClient{}
 	h, start, bundle := hostsHandlerFixture(t, "source", client)

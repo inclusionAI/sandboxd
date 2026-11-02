@@ -48,7 +48,7 @@ symbolic links. Its parent must already exist. The leaf may be absent, in which
 case sandboxd creates it, or it may be an existing empty directory. sandboxd
 never overwrites a non-empty directory. Runsc output must remain outside its source bundle, and restore inputs must remain separate from the target bundle.
 
-Concurrent runsc checkpoints in the same daemon must use disjoint output directories. While a runsc output directory is reserved, another runsc request for that directory or any ancestor or descendant fails before writing output. The reservation remains held through failure cleanup so a rejected request cannot delete another request's artifacts. Other runtimes retain their existing sandbox-level exclusion.
+Concurrent runsc checkpoints in one daemon must use disjoint output directories: overlapping requests fail before writing, and reservations remain held through failure cleanup. Other runtimes retain sandbox-level exclusion.
 
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
@@ -69,11 +69,13 @@ Save and restore must use matching runtime builds. Drain sandboxes before replac
 
 ## Managed hosts state
 
-The [sandbox hosts file contract](runtime.md#sandbox-hosts-file) defines runsc initialization, permissions and mount precedence. Writes, replacement, truncation and deletion of managed `/etc/hosts` follow the private root filesystem's checkpoint state. Restore retains the saved contents and existence state without regenerating entries for the newly allocated IP address. Caller-owned mount contents retain their external-storage contract.
+Runsc checkpoints preserve managed `/etc/hosts` contents and existence, including truncation and deletion. Restore does not regenerate entries for a new IP address. [Caller-owned mounts](runtime.md#sandbox-hosts-file) retain their external-storage contract.
 
-A runsc checkpoint carries `managed-hosts.json`, recording the schema, runtime, effective root mode, and hosts layout. Private-rootfs checkpoints also contain the original immutable `rootfs-seed.tar` and its SHA-256. This seed supplies creation-time dependencies, not the current hosts content. Restore copies it into the new bundle, keeps the same relative annotation, and loads saved native state without replaying initialization. Keep these files with the complete checkpoint, outside the separately managed `filestores/` directory. Deleting the source must not delete caller-owned copies; each restored sandbox retains its own initialization dependencies for later checkpoints.
+`managed-hosts.json` records the schema, runtime, effective root mode and hosts layout. Private-rootfs checkpoints also retain the original immutable `rootfs-seed.tar` and its SHA-256. The seed is an initialization dependency, not live hosts content: restore copies it into each target bundle and loads native state without replaying initialization. Keep both artifacts with the checkpoint, outside `filestores/`, so source deletion and later target checkpoints remain independent.
 
-Runsc snapshots made before this schema retain the old preparation path and mount priority; they are not converted to writable hosts. An absent sidecar is only a legacy candidate: native spec validation still rejects a checkpoint whose saved seed annotation has been removed. Invalid sidecars, missing seeds, digest failures, or requested changes to the saved runtime, root mode or mount ownership fail explicitly. New-layout snapshots are not promised to work with old sandboxd versions. This does not relax the matching-runtime-build requirement. Firecracker and other runtimes do not opt into this hosts sidecar contract.
+Initialization reads parent metadata from the original lower; EROFS requires a temporary read-only host loop mount. Directory lowers treat `listxattr` ENOTSUP/EOPNOTSUPP or ENOSYS as no visible attributes, including Nydus without xattrs; direct EROFS inspection stays strict. Other metadata errors, symlink/non-directory parents and unrepresentable metadata fail creation. Restore reuses the seed. OCI relative mount sources remain bundle-relative. Sandboxd reserves `dev.gvisor.tar.rootfs.upper` and its suffixed keys, plus `allow-rootfs-tar-annotation` and `restore-spec-validation` flags/OCI annotations against caller or provider overrides.
+
+Old snapshots retain their existing hosts preparation and mount priority. Missing sidecars are only legacy candidates: strict native spec validation rejects stripped new-layout metadata. Invalid sidecars/seeds, digest failures or incompatible runtime, root mode or mount ownership fail explicitly. New-layout snapshots are not guaranteed to work with older sandboxd. Matching runtime builds remain required; other runtimes do not use these artifacts.
 
 ## Checkpoint output synchronization
 
