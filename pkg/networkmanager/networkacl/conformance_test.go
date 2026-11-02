@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -601,7 +602,7 @@ func (f *aclConformanceFixture) assertActiveTCPInvalidated(t *testing.T, update 
 	require.NoError(t, err)
 	stdout, err := command.StdoutPipe()
 	require.NoError(t, err)
-	var stderr bytes.Buffer
+	var stderr aclHelperOutput
 	command.Stderr = &stderr
 	require.NoError(t, command.Start())
 	lines := scanACLHelperLines(stdout)
@@ -629,7 +630,7 @@ func (f *aclConformanceFixture) assertManagedReverseUDP(
 	require.NoError(t, err)
 	stdout, err := command.StdoutPipe()
 	require.NoError(t, err)
-	var stderr bytes.Buffer
+	var stderr aclHelperOutput
 	command.Stderr = &stderr
 	require.NoError(t, command.Start())
 	lines := scanACLHelperLines(stdout)
@@ -801,7 +802,7 @@ func startACLHelperServer(t *testing.T, namespace, mode, address string) {
 	command := aclHelperCommand(context.Background(), namespace, mode, address, 64)
 	stdout, err := command.StdoutPipe()
 	require.NoError(t, err)
-	var stderr bytes.Buffer
+	var stderr aclHelperOutput
 	command.Stderr = &stderr
 	require.NoError(t, command.Start())
 	lines := scanACLHelperLines(stdout)
@@ -1102,3 +1103,16 @@ func aclTCPRoundTrip(connection net.Conn, size int) error {
 	}
 	return nil
 }
+
+// Helper processes write stderr while readiness/verdict markers are checked.
+type aclHelperOutput struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *aclHelperOutput) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(data)
+}
+func (b *aclHelperOutput) String() string { b.mu.Lock(); defer b.mu.Unlock(); return b.buffer.String() }
