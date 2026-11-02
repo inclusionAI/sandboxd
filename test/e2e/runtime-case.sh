@@ -110,7 +110,7 @@ case "${E2E_CASE}" in
         ;;
 esac
 
-if [ "${E2E_HOSTS_ONLY:-0}" = 1 ] || [ -n "${E2E_HOSTS_REGRESSION:-}" ] || [ "${E2E_HOSTS_CONCURRENCY:-0}" != 0 ]; then
+if [ "${E2E_HOSTS_ONLY:-0}" = 1 ] || [ -n "${E2E_HOSTS_REGRESSION:-}" ]; then
     [ "${runtime}" = runsc ] || fail "writable hosts modes require E2E_RUNTIME=runsc"
 fi
 
@@ -169,7 +169,7 @@ log "building targeted image ${image}"
     .
 
 network_soak=1
-if [ -n "${E2E_HOSTS_REGRESSION:-}" ] || [ "${E2E_HOSTS_CONCURRENCY:-0}" != 0 ] || [ "${E2E_HOSTS_ONLY:-0}" = 1 ]; then
+if [ -n "${E2E_HOSTS_REGRESSION:-}" ] || [ "${E2E_HOSTS_ONLY:-0}" = 1 ]; then
     network_soak=0
     run_cgroup_disabled=0
 fi

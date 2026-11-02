@@ -193,15 +193,11 @@ E2E_CASE=runsc-systrap E2E_HOSTS_REGRESSION=relative-bind make e2e-runtime-case
 E2E_CASE=runsc-systrap E2E_HOSTS_REGRESSION=nydus \
   E2E_HOSTS_NYDUS_IMAGE_HOST=/absolute/path/to/verified/nydus-image \
   E2E_HOSTS_DISTILL_FS_HOST=/absolute/path/to/verified/distill_fs make e2e-runtime-case
-E2E_CASE=runsc-systrap E2E_HOSTS_CONCURRENCY=16 \
-  E2E_HOSTS_ROOTFS_KIND=directory make e2e-runtime-case
 ```
 
 Use `E2E_CASE=runsc-kvm` for KVM and `E2E_KEEP_HOME_FIXTURE=1` to retain logs. Relative-bind mode checks distinct existing bundle/CWD source markers before and after restore.
 
 Nydus requires `/dev/fuse`, static Linux `nydus-image` v2.4.0 and the consumer-pinned distill-fs release. The official `nydus-static-v2.4.0-linux-amd64.tgz` SHA-256 is `e4f7de672ced6031c13c3c38a599993f8a8103b0cf85f9b0783f5f5fa7c8b3dc`. The case verifies a real RAFS v5/FUSE mount with unsupported `flistxattr` on `/` and `/etc`; an empty attribute list is insufficient.
-
-Concurrency accepts 2–64 workers (`0` disables it); `E2E_HOSTS_ROOTFS_KIND` defaults to `erofs`. Budget `2 * count + 2` admission/network slots and `128 * count + 256` MiB non-reflink filestore space; each sandbox still has a 64 MiB writable quota. Barriers verify overlapping lifecycle operations, write isolation, immutable artifacts and cleanup. This is bounded concurrency, not a soak; invalid-schema requests fail before runtime launch.
 
 Old-snapshot compatibility requires paired `LEGACY_CHECKPOINT`/`LEGACY_REQUEST` from baseline sandboxd with the same runtime and compatible lower paths; stripped metadata tests corruption only. Daemon recovery requires parent-owned `RESTART_HANDSHAKE=1`. Missing fixtures/handshake yield **NOT QUALIFIED**. Readonly fallback does not qualify old-snapshot compatibility. Direct scripts never signal an arbitrary service.
 

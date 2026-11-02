@@ -40,8 +40,6 @@ E2E_STRESS_CHECKPOINT="${E2E_STRESS_CHECKPOINT:-0}"
 E2E_STRESS_ONLY="${E2E_STRESS_ONLY:-0}"
 E2E_HOSTS_ONLY="${E2E_HOSTS_ONLY:-0}"
 E2E_HOSTS_REGRESSION="${E2E_HOSTS_REGRESSION:-}"
-E2E_HOSTS_CONCURRENCY="${E2E_HOSTS_CONCURRENCY:-0}"
-E2E_HOSTS_ROOTFS_KIND="${E2E_HOSTS_ROOTFS_KIND:-erofs}"
 E2E_HOSTS_NYDUS_IMAGE_HOST="${E2E_HOSTS_NYDUS_IMAGE_HOST:-}"
 E2E_HOSTS_DISTILL_FS_HOST="${E2E_HOSTS_DISTILL_FS_HOST:-}"
 E2E_CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
@@ -276,15 +274,12 @@ configure_hosts_suite() {
         ""|nydus|relative-bind) ;;
         *) fail "E2E_HOSTS_REGRESSION must be empty, nydus, or relative-bind" ;;
     esac
-    [[ "${E2E_HOSTS_CONCURRENCY}" =~ ^(0|[2-9]|[1-5][0-9]|6[0-4])$ ]] || fail "E2E_HOSTS_CONCURRENCY must be 0 or 2..64"
-    case "${E2E_HOSTS_ROOTFS_KIND}" in erofs|directory) ;; *) fail "E2E_HOSTS_ROOTFS_KIND must be erofs or directory" ;; esac
-    if [ "${E2E_HOSTS_ONLY}" = 1 ] || [ -n "${E2E_HOSTS_REGRESSION}" ] || [ "${E2E_HOSTS_CONCURRENCY}" != 0 ]; then
+    if [ "${E2E_HOSTS_ONLY}" = 1 ] || [ -n "${E2E_HOSTS_REGRESSION}" ]; then
         [ "${E2E_RUNTIME}" = runsc ] || fail "writable hosts modes require E2E_RUNTIME=runsc"
         [ "${E2E_NETWORK_SOAK}" = 0 ] && [ "${E2E_STRESS_ONLY:-0}" = 0 ] || fail "hosts specialized modes cannot be combined with other suite-only modes"
         if [ "${E2E_HOSTS_ONLY}" = 1 ]; then
-            [ -z "${E2E_HOSTS_REGRESSION}" ] && [ "${E2E_HOSTS_CONCURRENCY}" = 0 ] || fail "select one hosts specialized mode"
+            [ -z "${E2E_HOSTS_REGRESSION}" ] || fail "select one hosts specialized mode"
         fi
-        [ -z "${E2E_HOSTS_REGRESSION}" ] || [ "${E2E_HOSTS_CONCURRENCY}" = 0 ] || fail "select one hosts specialized mode"
         E2E_RUN_CGROUP_DISABLED=0
     fi
 }
@@ -530,8 +525,6 @@ set +e
     -e "E2E_STRESS_ONLY=${E2E_STRESS_ONLY}" \
     -e "E2E_HOSTS_ONLY=${E2E_HOSTS_ONLY}" \
     -e "E2E_HOSTS_REGRESSION=${E2E_HOSTS_REGRESSION}" \
-    -e "E2E_HOSTS_CONCURRENCY=${E2E_HOSTS_CONCURRENCY}" \
-    -e "E2E_HOSTS_ROOTFS_KIND=${E2E_HOSTS_ROOTFS_KIND}" \
     -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
     -e "E2E_CGROUP_ROOT=${CGROUP_ROOT}" \
     -e "E2E_RUNTIME=${E2E_RUNTIME}" \

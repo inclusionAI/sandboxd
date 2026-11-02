@@ -54,7 +54,6 @@ COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
 COPY test/e2e/writable-hosts-common.sh /usr/local/bin/writable-hosts-common.sh
 COPY test/e2e/writable-hosts.sh /usr/local/bin/sandboxd-writable-hosts
 COPY test/e2e/writable-hosts-regressions.sh /usr/local/bin/sandboxd-writable-hosts-regressions
-COPY test/e2e/writable-hosts-concurrency.sh /usr/local/bin/sandboxd-writable-hosts-concurrency
 COPY test/e2e/host-mount-rw.sh /usr/local/bin/sandboxd-host-mount-rw
 
 RUN chmod 0755 \
