@@ -43,12 +43,11 @@ var errCgroupManagerStopped = errors.New("cgroup manager is stopped")
 
 type CgroupManager struct {
 	// max is the pool ceiling: using + idle + in-flight creates never exceed it.
-	max            int
-	cacheSize      int
-	rootName       string
-	pidsMax        int64
-	memoryMax      int64
-	memoryHeadroom int64
+	max       int
+	cacheSize int
+	rootName  string
+	pidsMax   int64
+	memoryMax int64
 
 	usingID cmap.ConcurrentMap[string, struct{}]
 	idleID  *util.Queue[string]
@@ -98,10 +97,10 @@ type storedCgroupIDs struct {
 // CacheSizeLimit exposes the configured cache target for metrics reporting.
 func (c *CgroupManager) CacheSizeLimit() int { return c.cacheSize }
 
-// MemoryLimit returns the aggregate sandbox ceiling and its runtime headroom.
+// MemoryLimit returns the aggregate sandbox ceiling.
 // A zero ceiling means automatic parent memory limiting is disabled.
-func (c *CgroupManager) MemoryLimit() (maxBytes, headroomBytes int64) {
-	return c.memoryMax, c.memoryHeadroom
+func (c *CgroupManager) MemoryLimit() int64 {
+	return c.memoryMax
 }
 
 func (c *CgroupManager) gc() {
@@ -392,7 +391,6 @@ func NewCgroupManager(
 	db store.DbStore,
 	cfg config.ResourceConfig,
 	max int,
-	distillReserve ...int64,
 ) (*CgroupManager, error) {
 	if cfg.PidsMax < 0 {
 		return nil, fmt.Errorf("pids_max must be non-negative")
@@ -424,8 +422,8 @@ func NewCgroupManager(
 	if err := ops.prepareRoot(rootName, cfg.PidsMax); err != nil {
 		return nil, err
 	}
-	memoryMax, memoryHeadroom, err := configureRootMemoryLimit(
-		ops, rootName, cfg.MemoryLimit, distillReserve, "/proc/meminfo", writeRootMemoryMax,
+	memoryMax, err := configureRootMemoryLimit(
+		ops, rootName, cfg.MemoryLimit, "/proc/meminfo", writeRootMemoryMax,
 	)
 	if err != nil {
 		return nil, err
@@ -480,23 +478,22 @@ func NewCgroupManager(
 	}
 
 	c := &CgroupManager{
-		max:            max,
-		cacheSize:      cfg.CgroupCacheSize,
-		rootName:       rootName,
-		pidsMax:        cfg.PidsMax,
-		memoryMax:      memoryMax,
-		memoryHeadroom: memoryHeadroom,
-		usingID:        usingIDs,
-		idleID:         util.New(""),
-		cgroups:        cgroups,
-		generator:      util.NewFixedLengthIDGenerator(12, cgroups.Keys(), util.PrefixID(filepath.Join("/", rootName)+"/")),
-		createReqs:     make(chan *createRequest, max),
-		db:             db,
-		gcQueue:        util.New(""),
-		gcWake:         make(chan struct{}, 1),
-		ops:            ops,
-		oom:            oom,
-		stopCh:         make(chan struct{}),
+		max:        max,
+		cacheSize:  cfg.CgroupCacheSize,
+		rootName:   rootName,
+		pidsMax:    cfg.PidsMax,
+		memoryMax:  memoryMax,
+		usingID:    usingIDs,
+		idleID:     util.New(""),
+		cgroups:    cgroups,
+		generator:  util.NewFixedLengthIDGenerator(12, cgroups.Keys(), util.PrefixID(filepath.Join("/", rootName)+"/")),
+		createReqs: make(chan *createRequest, max),
+		db:         db,
+		gcQueue:    util.New(""),
+		gcWake:     make(chan struct{}, 1),
+		ops:        ops,
+		oom:        oom,
+		stopCh:     make(chan struct{}),
 	}
 
 	for id := range cgroups.Items() {

@@ -118,14 +118,14 @@ func NewModule(sockPath, provider string) (*Module, error) {
 	return m, nil
 }
 
-// SetMemoryLimit clips each refreshed provider capacity to maxBytes-headroomBytes.
+// SetMemoryLimit clips each refreshed provider capacity to the parent maxBytes.
 // For the cgroup provider, root is the managed cgroup name within its visible
 // memory-controller mount. CPU capacity continues to use sandboxd's own group.
 // Other providers retain their existing policies before the capacity is clipped.
 // Call this before Start, after the managed root's limit has been applied.
-func (m *Module) SetMemoryLimit(root string, maxBytes, headroomBytes int64) error {
-	if maxBytes <= 0 || headroomBytes < 0 || headroomBytes >= maxBytes {
-		return fmt.Errorf("memory limit must satisfy max > headroom >= 0")
+func (m *Module) SetMemoryLimit(root string, maxBytes int64) error {
+	if maxBytes <= 0 {
+		return fmt.Errorf("memory limit must be positive")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -142,7 +142,7 @@ func (m *Module) SetMemoryLimit(root string, maxBytes, headroomBytes int64) erro
 			return err
 		}
 	}
-	m.memoryCeiling = maxBytes - headroomBytes
+	m.memoryCeiling = maxBytes
 	return nil
 }
 

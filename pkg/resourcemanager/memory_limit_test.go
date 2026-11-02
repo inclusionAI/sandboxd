@@ -60,7 +60,7 @@ func memoryLimitFixture(t *testing.T, mode cgroups.CGMode, max int64) (*Module, 
 }
 
 func TestMemoryLimitCgroupCapacityAndRestart(t *testing.T) {
-	const max, headroom = 5*gib + 333, int64(12345)
+	const max = 5*gib + 333
 	for _, mode := range []cgroups.CGMode{cgroups.Legacy, cgroups.Unified} {
 		t.Run(cgroupModeName(mode), func(t *testing.T) {
 			m, managed := memoryLimitFixture(t, mode, max)
@@ -69,21 +69,21 @@ func TestMemoryLimitCgroupCapacityAndRestart(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 2*gib, memBefore, "unset policy uses the service memory group")
 			for _, root := range []string{"/", "relative", "/lite/../akernel", "/missing"} {
-				require.Error(t, m.SetMemoryLimit(root, max, headroom))
+				require.Error(t, m.SetMemoryLimit(root, max))
 			}
-			require.NoError(t, m.SetMemoryLimit("/lite/akernel", max, headroom))
+			require.NoError(t, m.SetMemoryLimit("/lite/akernel", max))
 			cpuAfter, mem, err := m.nodeResource.GetAvailableResource()
 			require.NoError(t, err)
 			require.Equal(t, cpuBefore, cpuAfter, "CPU must still use the service group")
 			require.Equal(t, max, mem, "provider bytes must not round to GiB")
 			m.refreshOnce()
 			_, mem = m.Capacity()
-			require.Equal(t, max-headroom, mem, "provider capacity is clipped once")
+			require.Equal(t, max, mem, "the parent cap is reported without a second reserve or headroom deduction")
 			release, ok := m.ReserveTransientMemory("checkpoint", 777)
 			require.True(t, ok)
 			m.refreshOnce()
 			_, mem = m.Capacity()
-			require.Equal(t, max-headroom-777, mem)
+			require.Equal(t, max-777, mem)
 			_, ok = m.ReserveTransientMemory("overflow", mem+1)
 			require.False(t, ok)
 			releaseRest, ok := m.ReserveTransientMemory("remaining", mem)
@@ -95,7 +95,7 @@ func TestMemoryLimitCgroupCapacityAndRestart(t *testing.T) {
 			release()
 			release()
 			_, mem = m.Capacity()
-			require.Equal(t, max-headroom, mem)
+			require.Equal(t, max, mem)
 			filename := "memory.max"
 			if mode == cgroups.Legacy {
 				filename = "memory.limit_in_bytes"
@@ -106,7 +106,7 @@ func TestMemoryLimitCgroupCapacityAndRestart(t *testing.T) {
 			require.Equal(t, 3*gib+55, mem, "lower provider capacity stays authoritative")
 			m.Stop()
 			restarted := &Module{nodeResource: &originalProvider}
-			require.NoError(t, restarted.SetMemoryLimit("/lite/akernel", max, headroom))
+			require.NoError(t, restarted.SetMemoryLimit("/lite/akernel", max))
 			restarted.refreshOnce()
 			_, mem = restarted.Capacity()
 			require.Equal(t, 3*gib+55, mem, "restart reads the existing managed-root limit")
@@ -115,13 +115,15 @@ func TestMemoryLimitCgroupCapacityAndRestart(t *testing.T) {
 }
 
 func TestMemoryLimitSocketAndMetrics(t *testing.T) {
-	const max, headroom = 5*gib + 333, int64(12345)
+	const max = 5*gib + 333
 	m, _ := memoryLimitFixture(t, cgroups.Unified, max)
-	require.NoError(t, m.SetMemoryLimit("/lite/akernel", max, headroom))
+	require.NoError(t, m.SetMemoryLimit("/lite/akernel", max))
 	require.NoError(t, m.Start())
 	t.Cleanup(m.Stop)
 	require.Eventually(t, m.Healthy, time.Second, time.Millisecond)
-	require.Error(t, m.SetMemoryLimit("/lite/akernel", max, 0))
+	_, initialMemory := m.Capacity()
+	require.Equal(t, max, initialMemory, "the socket starts with the full parent memory ceiling")
+	require.Error(t, m.SetMemoryLimit("/lite/akernel", max))
 	require.Error(t, m.Start())
 	release, ok := m.ReserveTransientMemory("checkpoint", 777)
 	require.True(t, ok)
@@ -137,7 +139,7 @@ func TestMemoryLimitSocketAndMetrics(t *testing.T) {
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&info))
 	cpu, mem := m.Capacity()
 	require.Equal(t, info.Cpu*1000, cpu)
-	require.Equal(t, max-headroom-777, info.Mem)
+	require.Equal(t, max-777, info.Mem)
 	require.Equal(t, info.Mem, mem)
 	observation := &recordIntObserver{}
 	require.NoError(t, (&Collector{capacity: m}).memTotalCallback(context.Background(), observation))
@@ -147,16 +149,20 @@ func TestMemoryLimitSocketAndMetrics(t *testing.T) {
 func TestMemoryLimitValidationAndProviderStaleness(t *testing.T) {
 	provider := &memoryLimitNodeResourceManager{cpu: 4500, mem: 8*gib + 111}
 	m := &Module{nodeResource: provider}
-	for _, limits := range [][2]int64{{0, 0}, {-1, 0}, {1, -1}, {1, 1}, {1, 2}} {
-		require.Error(t, m.SetMemoryLimit("/akernel", limits[0], limits[1]))
+	for _, max := range []int64{0, -1} {
+		require.Error(t, m.SetMemoryLimit("/akernel", max))
 	}
 	m.refreshOnce()
 	_, mem := m.Capacity()
 	require.Equal(t, 8*gib+111, mem, "unset policy keeps provider capacity")
-	require.NoError(t, m.SetMemoryLimit("/akernel", 5*gib+333, 12345))
+	require.NoError(t, m.SetMemoryLimit("/akernel", 1))
 	m.refreshOnce()
 	_, mem = m.Capacity()
-	require.Equal(t, 5*gib+333-12345, mem)
+	require.Equal(t, int64(1), mem, "a positive byte-sized cap must not be rounded away")
+	require.NoError(t, m.SetMemoryLimit("/akernel", 5*gib+333))
+	m.refreshOnce()
+	_, mem = m.Capacity()
+	require.Equal(t, 5*gib+333, mem)
 	provider.fail.Store(true)
 	m.refreshOnce()
 	_, retained := m.Capacity()
@@ -174,7 +180,7 @@ func TestMemoryLimitValidationAndProviderStaleness(t *testing.T) {
 	provider.mem = 8*gib + 111
 	m.refreshOnce()
 	_, mem = m.Capacity()
-	require.Equal(t, 5*gib+333-12345, mem, "recovery must apply the ceiling again")
+	require.Equal(t, 5*gib+333, mem, "recovery must apply the ceiling again")
 }
 
 // The open-source module retains cached capacity on provider failures and uses
@@ -194,7 +200,7 @@ func (*memoryLimitNodeResourceManager) Stop() {}
 
 func TestMemoryLimitLifecycleConcurrency(t *testing.T) {
 	m, _ := memoryLimitFixture(t, cgroups.Unified, 5*gib)
-	require.NoError(t, m.SetMemoryLimit("/lite/akernel", 5*gib, 1024))
+	require.NoError(t, m.SetMemoryLimit("/lite/akernel", 5*gib))
 	require.NoError(t, m.Start())
 	var wg sync.WaitGroup
 	for range 8 {
@@ -206,26 +212,26 @@ func TestMemoryLimitLifecycleConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 	require.Error(t, m.Start())
-	require.Error(t, m.SetMemoryLimit("/lite/akernel", 5*gib, 0))
+	require.Error(t, m.SetMemoryLimit("/lite/akernel", 5*gib))
 	stopped := &Module{nodeResource: &stubNodeResourceManager{}, stopCh: make(chan struct{})}
 	stopped.Stop()
 	require.Error(t, stopped.Start())
-	require.Error(t, stopped.SetMemoryLimit("/akernel", 5*gib, 0))
+	require.Error(t, stopped.SetMemoryLimit("/akernel", 5*gib))
 }
 
 func TestMemoryLimitKubernetesCapacityClipsWithoutDoubleDeduction(t *testing.T) {
 	provider := &k8sWatchResourceManager{totalCPU: 4000, totalMem: 8*gib + 555,
 		allocatedCPU: 500, allocatedMem: 2*gib + 111}
 	m := &Module{nodeResource: provider}
-	const max, headroom = 7*gib + 333, int64(12345)
-	require.NoError(t, m.SetMemoryLimit("/akernel", max, headroom))
+	const max = 7*gib + 333
+	require.NoError(t, m.SetMemoryLimit("/akernel", max))
 	m.refreshOnce()
 	_, mem := m.Capacity()
 	require.Equal(t, 6*gib+444, mem, "the provider's deductions are not repeated")
 	provider.allocatedMem = 0
 	m.refreshOnce()
 	_, mem = m.Capacity()
-	require.Equal(t, max-headroom, mem)
+	require.Equal(t, max, mem)
 	provider.allocatedMem = provider.totalMem - 777
 	m.refreshOnce()
 	_, mem = m.Capacity()

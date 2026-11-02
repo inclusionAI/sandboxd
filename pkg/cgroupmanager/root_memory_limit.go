@@ -28,94 +28,60 @@ import (
 )
 
 func configureRootMemoryLimit(
-	ops cgroupOps, root string, cfg config.MemoryLimitConfig, distillReserve []int64,
+	ops cgroupOps, root string, cfg config.MemoryLimitConfig,
 	meminfo string, writeMax func(string, int64) error,
-) (int64, int64, error) {
+) (int64, error) {
 	if !cfg.Enabled {
-		return 0, 0, nil
+		return 0, nil
 	}
 	v2, ok := ops.(*cgroupV2)
 	if !ok {
-		return 0, 0, errors.New("memory_limit requires cgroup v2")
+		return 0, errors.New("memory_limit requires cgroup v2")
 	}
 	normalized, err := validateMemoryLimitRoot(root)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	if len(distillReserve) != 1 || distillReserve[0] <= 0 {
-		return 0, 0, errors.New("memory_limit requires a positive finite distill-fs memory reserve")
+	reserve, err := parseMemoryBytes(cfg.TotalReserve)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory_limit.total_reserve %q: %w", cfg.TotalReserve, err)
 	}
-	page := int64(os.Getpagesize())
-	distill := distillReserve[0]
-	if distill > math.MaxInt64-(page-1) {
-		return 0, 0, errors.New("distill-fs memory reserve overflows page rounding")
+	if reserve <= 0 {
+		return 0, errors.New("memory_limit.total_reserve must be positive and finite")
 	}
-	distill = ((distill + page - 1) / page) * page
 	group := filepath.Join(v2.mountpoint, normalized)
 	total, err := rootMemoryCapacity(v2.mountpoint, group, meminfo)
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	reserves := []struct {
-		name, value string
-		positive    bool
-	}{
-		{"system_reserve", cfg.SystemReserve, true},
-		{"control_reserve", cfg.ControlReserve, true},
-		{"other_reserve", cfg.OtherReserve, false},
-		{"safety_buffer", cfg.SafetyBuffer, true},
-		{"runtime_headroom", cfg.RuntimeHeadroom, false},
+	if reserve >= total {
+		return 0, errors.New("memory_limit.total_reserve exhausts effective memory capacity")
 	}
-	values := make([]int64, len(reserves))
-	for i, reserve := range reserves {
-		if reserve.name == "control_reserve" && reserve.value == "auto" {
-			values[i], err = readMemoryMax(filepath.Join(v2.mountpoint, "system.slice", "memory.max"))
-		} else if reserve.value == "" && !reserve.positive {
-			values[i] = 0
-		} else {
-			values[i], err = parseMemoryBytes(reserve.value)
-		}
-		if err != nil {
-			return 0, 0, fmt.Errorf("invalid memory_limit.%s %q: %w", reserve.name, reserve.value, err)
-		}
-		if reserve.positive && values[i] <= 0 {
-			return 0, 0, fmt.Errorf("memory_limit.%s must be positive and finite", reserve.name)
-		}
-	}
-	// Subtract independently, avoiding overflow from adding reserves first.
-	candidate := total
-	for _, reserve := range append(values[:4:4], distill) {
-		if reserve >= candidate {
-			return 0, 0, errors.New("memory_limit reserves exhaust effective memory capacity")
-		}
-		candidate -= reserve
-	}
-	candidate = candidate / page * page
+	page := int64(os.Getpagesize())
+	candidate := (total - reserve) / page * page
 	if candidate == 0 {
-		return 0, 0, errors.New("memory_limit leaves less than one page")
+		return 0, errors.New("memory_limit leaves less than one page")
 	}
 	computed := candidate
+
 	existing, err := readMemoryMax(filepath.Join(group, "memory.max"))
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 	if existing > 0 && existing < candidate {
 		candidate = existing
 	}
-	if values[4] >= candidate {
-		return 0, 0, errors.New("memory_limit.runtime_headroom must be below the effective parent limit")
-	}
 	if existing == 0 || candidate < existing {
 		if err := checkRootMemoryEmpty(group, candidate); err != nil {
-			return 0, 0, err
+			return 0, err
 		}
 		if err := writeMax(group, candidate); err != nil {
-			return 0, 0, fmt.Errorf("set parent memory.max: %w", err)
+			return 0, fmt.Errorf("set parent memory.max: %w", err)
 		}
 	}
-	logrus.Infof("parent memory_limit bytes: total=%d system=%d control=%d other=%d distill=%d safety=%d candidate=%d effective=%d runtime_headroom=%d",
-		total, values[0], values[1], values[2], distill, values[3], computed, candidate, values[4])
-	return candidate, values[4], nil
+	logrus.Infof("parent memory_limit bytes: total=%d total_reserve=%d candidate=%d effective=%d",
+		total, reserve, computed, candidate)
+	return candidate, nil
 }
 
 // Validate before prepareRoot, which creates paths and enables controllers.

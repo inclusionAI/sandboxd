@@ -256,16 +256,44 @@ type ResourceConfig struct {
 	InterfaceCacheSize int `toml:"interface_cache_size" json:"interfaceCacheSize"`
 }
 
-// MemoryLimitConfig contains deployment budgets, not current memory usage.
-// Sizes are integer bytes or B/KiB/MiB/GiB/TiB. ControlReserve also accepts
-// "auto" to reuse the visible system.slice memory.max.
+// MemoryLimitConfig reserves a deployment-selected total outside the sandbox
+// parent. TotalReserve is integer bytes or B/KiB/MiB/GiB/TiB; it does not set
+// component limits or automatically include the independent distill-fs limit.
 type MemoryLimitConfig struct {
-	Enabled         bool   `toml:"enabled" json:"enabled"`
-	SystemReserve   string `toml:"system_reserve" json:"systemReserve"`
-	ControlReserve  string `toml:"control_reserve" json:"controlReserve"`
-	OtherReserve    string `toml:"other_reserve" json:"otherReserve"`
-	SafetyBuffer    string `toml:"safety_buffer" json:"safetyBuffer"`
-	RuntimeHeadroom string `toml:"runtime_headroom" json:"runtimeHeadroom"`
+	Enabled      bool   `toml:"enabled" json:"enabled"`
+	TotalReserve string `toml:"total_reserve" json:"totalReserve"`
+}
+
+// UnmarshalTOML rejects removed budget fields instead of silently changing the
+// parent limit or scheduling capacity when an old configuration is upgraded.
+func (c *MemoryLimitConfig) UnmarshalTOML(value interface{}) error {
+	table, ok := value.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("memory_limit must be a table")
+	}
+	decoded := *c
+	for key, value := range table {
+		switch key {
+		case "enabled":
+			enabled, ok := value.(bool)
+			if !ok {
+				return fmt.Errorf("memory_limit.enabled must be a boolean")
+			}
+			decoded.Enabled = enabled
+		case "total_reserve":
+			reserve, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("memory_limit.total_reserve must be a byte-size string")
+			}
+			decoded.TotalReserve = reserve
+		case "system_reserve", "control_reserve", "other_reserve", "safety_buffer", "runtime_headroom":
+			return fmt.Errorf("memory_limit.%s was removed; migrate to total_reserve (see doc/node-memory-limit.md)", key)
+		default:
+			return fmt.Errorf("unknown memory_limit field %q; only enabled and total_reserve are supported", key)
+		}
+	}
+	*c = decoded
+	return nil
 }
 
 // NormalizeRunscPlatform validates the configured gVisor platform. An empty

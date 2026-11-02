@@ -22,48 +22,37 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMemoryLimitConfigAndDistillReserve(t *testing.T) {
-	var cfg config.Config
-	require.NoError(t, toml.Unmarshal([]byte(`
+func TestMemoryLimitConfigAndIndependentDistillLimit(t *testing.T) {
+	for _, value := range []string{"", "0", "256MiB", "64GiB"} {
+		t.Run(value, func(t *testing.T) {
+			var cfg config.Config
+			require.NoError(t, toml.Unmarshal([]byte(`
 [plugin.resource]
 cgroup_cache_size = 1
 [plugin.resource.memory_limit]
 enabled = true
-system_reserve = "512MiB"
-control_reserve = "auto"
-other_reserve = "256MiB"
-safety_buffer = "512MiB"
-runtime_headroom = "134217735"
+total_reserve = "1280MiB"
 [plugin.image]
-cgroup_memory_limit = "256MiB"
+cgroup_memory_limit = "`+value+`"
 `), &cfg))
-	require.True(t, cfg.MemoryLimit.Enabled)
-	require.Equal(t, "512MiB", cfg.MemoryLimit.SystemReserve)
-	require.Equal(t, "auto", cfg.MemoryLimit.ControlReserve)
-	require.Equal(t, "256MiB", cfg.MemoryLimit.OtherReserve)
-	require.Equal(t, "512MiB", cfg.MemoryLimit.SafetyBuffer)
-	require.Equal(t, "134217735", cfg.MemoryLimit.RuntimeHeadroom)
-	reserve, err := memoryLimitDistillReserve(cfg)
-	require.NoError(t, err)
-	require.Equal(t, []int64{256 << 20}, reserve)
-
-	for _, value := range []string{"", "0", "-1", "max", "invalid", "9223372036854775807GiB"} {
-		invalid := cfg
-		invalid.CgroupMemoryLimit = value
-		_, err := memoryLimitDistillReserve(invalid)
-		require.Error(t, err, value)
+			require.True(t, cfg.MemoryLimit.Enabled)
+			require.Equal(t, "1280MiB", cfg.MemoryLimit.TotalReserve)
+			require.Equal(t, value, cfg.CgroupMemoryLimit)
+			require.NoError(t, validateMemoryLimitConfig(cfg), "parent policy does not require or derive a distill-fs reserve")
+		})
 	}
-	disabledCgroup := cfg
-	disabledCgroup.DisableCgroup = true
-	_, err = memoryLimitDistillReserve(disabledCgroup)
-	require.Error(t, err)
-	disabledCache := cfg
-	disabledCache.CgroupCacheSize = 0
-	_, err = memoryLimitDistillReserve(disabledCache)
-	require.Error(t, err)
+}
+
+func TestMemoryLimitRequiresCgroupManagement(t *testing.T) {
+	cfg := config.Config{PluginConfig: config.PluginConfig{ResourceConfig: config.ResourceConfig{
+		CgroupCacheSize: 1, MemoryLimit: config.MemoryLimitConfig{Enabled: true, TotalReserve: "1GiB"},
+	}}}
+	require.NoError(t, validateMemoryLimitConfig(cfg))
+	cfg.DisableCgroup = true
+	require.ErrorContains(t, validateMemoryLimitConfig(cfg), "enabled cgroup management")
+	cfg.DisableCgroup = false
+	cfg.CgroupCacheSize = 0
+	require.ErrorContains(t, validateMemoryLimitConfig(cfg), "positive cgroup_cache_size")
 	cfg.MemoryLimit.Enabled = false
-	cfg.CgroupMemoryLimit = "invalid"
-	reserve, err = memoryLimitDistillReserve(cfg)
-	require.NoError(t, err, "disabled policy must not validate unused reserves")
-	require.Nil(t, reserve)
+	require.NoError(t, validateMemoryLimitConfig(cfg), "disabled policy must not require cgroup management")
 }
