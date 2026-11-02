@@ -26,9 +26,9 @@ import (
 
 // Load only the helpers under test: sourcing the entrypoint would start
 // privileged workloads and install its destructive cleanup trap.
-func shellFunctions(t *testing.T, filename string, names ...string) string {
+func e2eFunctions(t *testing.T, names ...string) string {
 	t.Helper()
-	data, err := os.ReadFile(filename)
+	data, err := os.ReadFile("e2e-run.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,14 +64,13 @@ func runE2EHelper(t *testing.T, script string) (string, error) {
 }
 
 func TestDirectDNSDependencies(t *testing.T) {
-	functions := shellFunctions(t, "e2e-run.sh", "fail", "check_direct_dns_dependencies")
+	functions := e2eFunctions(t, "fail", "check_direct_dns_dependencies")
 	for _, runtime := range []string{"all", "runsc", "runc"} {
 		for _, missing := range []string{"none", "dnsmasq", "timeout"} {
 			t.Run(runtime+"/"+missing, func(t *testing.T) {
 				script := fmt.Sprintf(`
 E2E_RUNTIME=%q
 DISABLE_CGROUP=0
-HOSTS_ONLY=0
 MISSING=%q
 command() { [ "$1" = -v ] && [ "$2" != "${MISSING}" ]; }
 `, runtime, missing) + functions + "check_direct_dns_dependencies\nprintf 'passed\\n'\n"
@@ -88,24 +87,22 @@ command() { [ "$1" = -v ] && [ "$2" != "${MISSING}" ]; }
 	}
 	for _, tc := range []struct {
 		name, runtime, mode string
-		disabled, hostsOnly int
+		disabled            int
 	}{
-		{"disabled_all", "all", "e2e", 1, 0},
-		{"disabled_runsc", "runsc", "e2e", 1, 0},
-		{"kata", "kata", "e2e", 0, 0},
-		{"firecracker", "firecracker", "e2e", 0, 0},
-		{"serve_all", "all", "serve", 0, 0},
-		{"serve_runsc", "runsc", "serve", 0, 0},
-		{"serve_runc", "runc", "serve", 0, 0},
-		{"hosts_only", "runsc", "e2e", 0, 1},
+		{"disabled_all", "all", "e2e", 1},
+		{"disabled_runsc", "runsc", "e2e", 1},
+		{"kata", "kata", "e2e", 0},
+		{"firecracker", "firecracker", "e2e", 0},
+		{"serve_all", "all", "serve", 0},
+		{"serve_runsc", "runsc", "serve", 0},
+		{"serve_runc", "runc", "serve", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			script := fmt.Sprintf(`
 E2E_RUNTIME=%q
 DISABLE_CGROUP=%d
-HOSTS_ONLY=%d
 command() { printf 'unexpected dependency check\n'; return 1; }
-`, tc.runtime, tc.disabled, tc.hostsOnly) + functions + fmt.Sprintf("check_direct_dns_dependencies %q\nprintf 'passed\\n'\n", tc.mode)
+`, tc.runtime, tc.disabled) + functions + fmt.Sprintf("check_direct_dns_dependencies %q\nprintf 'passed\\n'\n", tc.mode)
 			output, err := runE2EHelper(t, script)
 			if err != nil || !strings.Contains(output, "passed") {
 				t.Fatalf("fixture not selected: err=%v, output=%s", err, output)
@@ -115,7 +112,7 @@ command() { printf 'unexpected dependency check\n'; return 1; }
 }
 
 func TestCheckpointMemoryBudget(t *testing.T) {
-	function := shellFunctions(t, "e2e-run.sh", "checkpoint_memory_mb")
+	function := e2eFunctions(t, "checkpoint_memory_mb")
 	for _, tc := range []struct {
 		runtime, platform, want string
 	}{
@@ -135,7 +132,7 @@ func TestCheckpointMemoryBudget(t *testing.T) {
 }
 
 func TestStopSandboxd(t *testing.T) {
-	functions := shellFunctions(t, "e2e-run.sh", "log", "fail", "stop_sandboxd")
+	functions := e2eFunctions(t, "log", "fail", "stop_sandboxd")
 	for _, tc := range []struct {
 		name, message, tap                         string
 		stopAfter, waitStatus, bridge, links, term int
@@ -204,43 +201,6 @@ trap 'printf "pid=%%s; events=%%s\n" "${SANDBOXD_PID}" "${EVENTS}"' EXIT
 	}
 }
 
-func TestWritableHostsRestartHandshake(t *testing.T) {
-	function := shellFunctions(t, "e2e-run.sh", "run_writable_hosts_check")
-	for _, exitCode := range []int{0, 7} {
-		t.Run(fmt.Sprint(exitCode), func(t *testing.T) {
-			script := fmt.Sprintf(`
-SANDBOXD_HOME=%q
-SANDBOXD_ROOT=/test-owned-root
-SOCKET=/test-owned-socket
-HOSTS_CHILD_PID=""
-log() { :; }
-sleep() { command sleep 0.01; }
-crash_and_restart_sandboxd() { printf 'test-owned-restart\n'; }
-bash() {
-    # Use a real child shell, like the installed script: macOS bash 3.2 may
-    # terminate a background shell-function loop early after command sleep.
-    command bash -c '
-        set -eu
-        mkdir "${TEST_DIR}"
-        if [ %d != 0 ]; then exit %d; fi
-        touch "${TEST_DIR}/restart.request"
-        until [ -f "${TEST_DIR}/restart.done" ]; do sleep 0.01; done
-        printf "child-passed\n"
-    '
-}
-`, t.TempDir(), exitCode, exitCode) + function + "run_writable_hosts_check runsc /fixture case\n"
-			output, err := runE2EHelper(t, script)
-			if exitCode == 0 {
-				if err != nil || strings.Count(output, "test-owned-restart") != 1 || !strings.Contains(output, "child-passed") {
-					t.Fatalf("restart handshake: err=%v output=%s", err, output)
-				}
-			} else if err == nil || strings.Contains(output, "test-owned-restart") {
-				t.Fatalf("failed child was accepted or restarted: err=%v output=%s", err, output)
-			}
-		})
-	}
-}
-
 // A failed List is not evidence that rollback removed the sandbox. Exercise
 // both empty and partial failed responses before allowing the clean marker.
 func TestWritableHostsInventoryAbsence(t *testing.T) {
@@ -282,77 +242,5 @@ printf 'clean\n'
 				t.Fatalf("false cleanup success: err=%v want exit=%d output=%s", err, tc.wantExitCode, output)
 			}
 		})
-	}
-}
-
-func TestHostsOnlySourceRunner(t *testing.T) {
-	function := shellFunctions(t, "run.sh", "configure_hosts_suite")
-	for _, tc := range []struct {
-		name, runtime, regression string
-		only, soak                int
-		wantSecond                int
-		wantError                 bool
-	}{
-		{"default", "all", "", 0, 0, 1, false},
-		{"ordinary_firecracker", "firecracker", "", 0, 0, 1, false},
-		{"ordinary_network_soak", "all", "", 0, 1, 1, false},
-		{"hosts_only", "runsc", "", 1, 0, 0, false},
-		{"regression", "runsc", "relative-bind", 0, 0, 0, false},
-		{"invalid_hosts_only", "runsc", "", 2, 0, 1, true},
-		{"hosts_only_network_soak", "runsc", "", 1, 1, 1, true},
-		{"hosts_only_firecracker", "firecracker", "", 1, 0, 1, true},
-		{"regression_firecracker", "firecracker", "nydus", 0, 0, 1, true},
-		{"hosts_only_all", "all", "", 1, 0, 1, true},
-		{"hosts_only_and_regression", "runsc", "relative-bind", 1, 0, 1, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			script := fmt.Sprintf(`
-E2E_RUNTIME=%q
-E2E_HOSTS_ONLY=%d
-E2E_HOSTS_REGRESSION=%q
-E2E_NETWORK_SOAK=%d
-E2E_RUN_CGROUP_DISABLED=1
-fail() { printf '%%s\n' "$*" >&2; exit 1; }
-`, tc.runtime, tc.only, tc.regression, tc.soak) + function + `
-configure_hosts_suite
-printf 'second_pass=%s\n' "${E2E_RUN_CGROUP_DISABLED}"
-`
-			output, err := runE2EHelper(t, script)
-			if tc.wantError {
-				if err == nil || strings.Contains(output, "second_pass=") {
-					t.Fatalf("invalid mode accepted: err=%v output=%s", err, output)
-				}
-			} else if err != nil || output != fmt.Sprintf("second_pass=%d\n", tc.wantSecond) {
-				t.Fatalf("second suite selection: err=%v output=%s", err, output)
-			}
-		})
-	}
-}
-
-func TestHostsRuntimeCaseRejectsOtherRuntimesBeforeBuild(t *testing.T) {
-	// Cover each runtime mapping and both mode predicates without crossing them.
-	for _, tc := range []struct{ runtime, mode string }{
-		{"firecracker", "E2E_HOSTS_ONLY=1"},
-		{"firecracker-virtiofs", "E2E_HOSTS_REGRESSION=relative-bind"},
-		{"firecracker-pvm", "E2E_HOSTS_ONLY=1"},
-		{"firecracker-pvm-incremental", "E2E_HOSTS_ONLY=1"},
-		{"kata", "E2E_HOSTS_REGRESSION=relative-bind"},
-		{"runc", "E2E_HOSTS_REGRESSION=relative-bind"},
-	} {
-		t.Run(tc.runtime, func(t *testing.T) {
-			script := fmt.Sprintf("E2E_HOSTS_ONLY=0 E2E_HOSTS_REGRESSION= E2E_CASE=%q %s bash runtime-case.sh", tc.runtime, tc.mode)
-			output, err := runE2EHelper(t, script)
-			if err == nil || !strings.Contains(output, "writable hosts modes require E2E_RUNTIME=runsc") {
-				t.Fatalf("non-runsc hosts mode reached prerequisites/build: err=%v output=%s", err, output)
-			}
-		})
-	}
-}
-
-func TestHostsScriptsRejectOtherRuntimes(t *testing.T) {
-	command := "RUNTIME=firecracker TEST_DIR=/unused-hosts-test ROOTFS=/unused-root SANDBOXD_ROOT=/unused-daemon bash writable-hosts.sh"
-	output, err := runE2EHelper(t, command)
-	if err == nil || !strings.Contains(output, "unsupported runtime: firecracker") {
-		t.Fatalf("non-runsc hosts script accepted or touched prerequisites: err=%v output=%s", err, output)
 	}
 }

@@ -2801,7 +2801,7 @@ run_cgroup_disabled_checks() {
 }
 
 # Build these fixtures inside the test container; no host mount propagation or
-# registry is needed. Caller-supplied tools must match the documented pins.
+# registry is needed.
 prepare_hosts_regression() {
     [ -n "${HOSTS_REGRESSION}" ] || return 0
     local fixture="${SANDBOXD_HOME}/hosts-regression"
