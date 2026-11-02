@@ -36,6 +36,7 @@ import (
 
 // Config corresponds to the [plugin.image] sandboxd configuration section.
 type Config struct {
+	ManagementSocket  string // Optional private Unix API for trusted runtime image preparation.
 	ChunkDBSize       string // ChunkDB map capacity; empty uses the distill-fs default.
 	Root              string
 	DistillFsBin      string
@@ -62,6 +63,8 @@ type Module struct {
 	mgr        distillfs.Manager
 	ociMgr     *oci.Manager
 	worker     *api.HttpWorker
+	service    api.Service
+	management *api.ManagementServer
 	closedOnce sync.Once
 	healthy    atomic.Bool
 }
@@ -132,14 +135,27 @@ func NewModule(cfg Config) (*Module, error) {
 		return nil, fmt.Errorf("imagemanager: http worker: %w", err)
 	}
 
-	m := &Module{cfg: cfg, mgr: mgr, ociMgr: ociMgr, worker: worker}
+	var shared api.Service = worker
+	if cfg.ManagementSocket != "" {
+		shared = api.NewSharedOCIService(worker)
+	}
+	m := &Module{cfg: cfg, mgr: mgr, ociMgr: ociMgr, worker: worker, service: shared}
+	if cfg.ManagementSocket != "" {
+		management, err := api.ListenManagement(cfg.ManagementSocket, shared)
+		if err != nil {
+			worker.Close()
+			ociMgr.Close()
+			return nil, fmt.Errorf("image management socket: %w", err)
+		}
+		m.management = management
+	}
 	m.healthy.Store(true)
 	return m, nil
 }
 
 // Service returns the in-process Service implementation, satisfying the
 // 4-call-site sandboxd contract previously fronted by api.NewHttpClient().
-func (m *Module) Service() api.Service { return m.worker }
+func (m *Module) Service() api.Service { return m.service }
 
 // Start currently has nothing to drive because the manager and worker start
 // their background goroutines during NewModule.
@@ -157,6 +173,9 @@ func (m *Module) ReconcileRecoveredDaemons() error {
 func (m *Module) Stop() {
 	m.closedOnce.Do(func() {
 		m.healthy.Store(false)
+		if m.management != nil {
+			m.management.Close()
+		}
 		if m.worker != nil {
 			m.worker.Close()
 		}

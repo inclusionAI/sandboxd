@@ -1,5 +1,11 @@
 # Checkpoint and restore
 
+## Experimental runtime image collections
+
+The optional `[plugin.image].management_socket` exposes immutable OCI image preparation to a trusted node runtime adapter over a private Unix socket (0700 parent, 0600 socket). It is never mounted into a sandbox. The adapter exports ROFS through an operator-owned read-only collection and registers its checked metadata with inner containerd; Docker lower content remains outside the writable checkpoint. Arbitrary sandbox host-path access is not authorized by this API.
+
+When enabled, managed preparation, ordinary rootfs use and image mounts share OCI reference counting: deleting one rootfs cannot stop a ROFS daemon still held by the managed runtime. Repeated preparation of one immutable reference holds one management lease. Management leases remain until the owned service shuts down; callers must delete all dependent sandboxes and retained snapshots before removing the collection or stopping its image service. This preview does not persist dynamic collection leases across a node/service restart or authorize tenants through the platform catalog. Durable lease recovery, multi-node restore and artifact garbage collection are not implied by same-node sandbox checkpoint/restore tests. With the management socket unset, the existing image-service path is unchanged.
+
 ## Managed file-backed tmpfs
 
 The runsc Start API accepts `extra_config` JSON with `fileBackedTmpfsMounts`, for example `{"fileBackedTmpfsMounts":[{"target":"/var/lib/akernel-image-snapshots","sizeMB":2048}]}`. Each mount uses a sandbox-owned anonymous filestore rather than guest-memory-backed file contents. This is intended for private Docker/containerd writable upper/work directories above shared read-only image roots; Dockerfiles and Compose definitions do not change.

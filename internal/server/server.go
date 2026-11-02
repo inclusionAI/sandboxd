@@ -786,6 +786,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	// rootfs consumers share one Service. Initialization is fatal because
 	// sandboxd cannot manage rootfs or S3/OCI mounts without it.
 	imgMod, err := imagemanager.NewModule(imagemanager.Config{
+		ManagementSocket:  cfg.ManagementSocket,
 		Root:              cfg.ImageManagerRoot,
 		DistillFsBin:      cfg.DistillFsBin,
 		OSSTemplate:       cfg.OSSTemplate,
