@@ -677,18 +677,11 @@ func resetMetadataIfResourceStateIncompatible(storePath string) error {
 	return nil
 }
 
-func memoryLimitDistillReserve(cfg config.Config) ([]int64, error) {
-	if !cfg.MemoryLimit.Enabled {
-		return nil, nil
+func validateMemoryLimitConfig(cfg config.Config) error {
+	if cfg.MemoryLimit.Enabled && (cfg.DisableCgroup || cfg.CgroupCacheSize <= 0) {
+		return fmt.Errorf("memory_limit requires enabled cgroup management and a positive cgroup_cache_size")
 	}
-	if cfg.DisableCgroup || cfg.CgroupCacheSize <= 0 {
-		return nil, fmt.Errorf("memory_limit requires enabled cgroup management and a positive cgroup_cache_size")
-	}
-	reserve, err := imagemanager.ParseCgroupMemoryLimit(cfg.CgroupMemoryLimit)
-	if err != nil || reserve <= 0 {
-		return nil, fmt.Errorf("memory_limit requires a positive finite plugin.image.cgroup_memory_limit, got %q", cfg.CgroupMemoryLimit)
-	}
-	return []int64{reserve}, nil
+	return nil
 }
 
 func NewSandboxService(root, configPath string) (result SandboxService, retErr error) {
@@ -721,8 +714,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("resource configuration: %w", err)
 	}
 	cfg.CPULimitMode = cpuLimitMode
-	distillReserve, err := memoryLimitDistillReserve(cfg)
-	if err != nil {
+	if err := validateMemoryLimitConfig(cfg); err != nil {
 		return nil, fmt.Errorf("resource configuration: %w", err)
 	}
 
@@ -858,19 +850,19 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	maxSandboxLimit := networkmanager.MaxSandboxLimit(cfg.MaxInstanceNum)
 	var cgroupMgr *cgroupmanager.CgroupManager
 	if !cfg.DisableCgroup && cfg.CgroupCacheSize > 0 {
-		cgroupMgr, err = cgroupmanager.NewCgroupManager(s.store, cfg.ResourceConfig, maxSandboxLimit, distillReserve...)
+		cgroupMgr, err = cgroupmanager.NewCgroupManager(s.store, cfg.ResourceConfig, maxSandboxLimit)
 		if err != nil {
 			return nil, err
 		}
 		s.cgroupMgr = cgroupMgr
 		if cfg.MemoryLimit.Enabled && nodeResMod != nil {
-			maxBytes, headroomBytes := cgroupMgr.MemoryLimit()
+			maxBytes := cgroupMgr.MemoryLimit()
 			root := cfg.CgroupRootName
 			if root == "" {
 				root = config.DefaultCgroupRoot
 			}
 			root = filepath.Clean("/" + strings.TrimPrefix(root, "/"))
-			if err := nodeResMod.SetMemoryLimit(root, maxBytes, headroomBytes); err != nil {
+			if err := nodeResMod.SetMemoryLimit(root, maxBytes); err != nil {
 				_ = cgroupMgr.ShutDown()
 				return nil, fmt.Errorf("node-resource memory limit: %w", err)
 			}
@@ -878,6 +870,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		metrics.RecordResourceGauge("cgroup", float64(cgroupMgr.CacheSizeLimit()))
 		if nodeResMod != nil {
 			nodeResMod.SetCgroupStatsReader(cgroupMgr.Stats)
+			nodeResMod.SetParentMemoryReader(cgroupMgr.ReadParentMemory)
 		}
 		defer func() {
 			if retErr != nil {

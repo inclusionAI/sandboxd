@@ -172,7 +172,7 @@ func (m *Module) Stop() {
 // transition right now.
 func (m *Module) Healthy() bool { return m.healthy.Load() }
 
-// ParseCgroupMemoryLimit parses the same budget used to cap distill-fs.
+// ParseCgroupMemoryLimit parses the independent distill-fs cgroup limit.
 func ParseCgroupMemoryLimit(value string) (int64, error) {
 	return parseMemorySize(value)
 }

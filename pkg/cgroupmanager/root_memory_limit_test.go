@@ -15,7 +15,6 @@
 package cgroupmanager
 
 import (
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,17 +34,14 @@ func memoryLimitFixture(t *testing.T) (*cgroupV2, string, string, config.MemoryL
 	root := "/pool/sandbox"
 	group := filepath.Join(mountpoint, root)
 	require.NoError(t, os.MkdirAll(group, 0755))
-	require.NoError(t, os.MkdirAll(filepath.Join(mountpoint, "system.slice"), 0755))
 	writeTestFile(t, filepath.Join(mountpoint, "pool", "memory.max"), "max\n")
-	writeTestFile(t, filepath.Join(mountpoint, "system.slice", "memory.max"), "134217728\n")
 	writeTestFile(t, filepath.Join(group, "memory.max"), "max\n")
 	writeTestFile(t, filepath.Join(group, "cgroup.events"), "populated 0\nfrozen 0\n")
 	writeTestFile(t, filepath.Join(group, "memory.current"), "0\n")
 	meminfo := filepath.Join(t.TempDir(), "meminfo")
 	writeTestFile(t, meminfo, "MemTotal: 1048576 kB\nMemAvailable: 1 kB\n")
 	return &cgroupV2{mountpoint: mountpoint}, root, meminfo, config.MemoryLimitConfig{
-		Enabled: true, SystemReserve: "64MiB", ControlReserve: "128MiB",
-		OtherReserve: "32MiB", SafetyBuffer: "64MiB", RuntimeHeadroom: "16MiB",
+		Enabled: true, TotalReserve: "288MiB",
 	}
 }
 
@@ -53,25 +49,21 @@ func TestRootMemoryLimitCapacity(t *testing.T) {
 	for _, test := range []struct {
 		name, old            string
 		ancestor, mountpoint int64
-		auto, populated      bool
+		populated            bool
 		want                 int64
 	}{
-		{name: "manual", old: "max", want: 608},
-		{name: "automatic control", old: "max", auto: true, want: 608},
-		{name: "finite ancestor", old: "max", ancestor: 768, want: 352},
-		{name: "visible mountpoint cap", old: "max", mountpoint: 640, want: 224},
-		{name: "MemTotal remains upper bound", old: "max", ancestor: 2048, want: 608},
-		{name: "restart excludes old root cap", old: "637534208", populated: true, want: 608},
+		{name: "total reserve", old: "max", want: 736},
+		{name: "finite ancestor", old: "max", ancestor: 768, want: 480},
+		{name: "visible mountpoint cap", old: "max", mountpoint: 640, want: 352},
+		{name: "MemTotal remains upper bound", old: "max", ancestor: 2048, want: 736},
+		{name: "restart excludes old root cap", old: "771751936", populated: true, want: 736},
 		{name: "stricter existing cap", old: "536870912", populated: true, want: 512},
-		{name: "lower existing cap", old: "805306368", want: 608},
+		{name: "lower existing cap", old: "805306368", want: 736},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ops, root, meminfo, cfg := memoryLimitFixture(t)
 			group := filepath.Join(ops.mountpoint, root)
 			writeTestFile(t, filepath.Join(group, "memory.max"), test.old+"\n")
-			if test.auto {
-				cfg.ControlReserve = "auto"
-			}
 			if test.ancestor != 0 {
 				writeTestFile(t, filepath.Join(ops.mountpoint, "pool", "memory.max"), strconv.FormatInt(test.ancestor*memoryMiB, 10))
 			}
@@ -81,10 +73,9 @@ func TestRootMemoryLimitCapacity(t *testing.T) {
 			if test.populated {
 				writeTestFile(t, filepath.Join(group, "cgroup.events"), "populated 1\n")
 			}
-			max, headroom, err := configureRootMemoryLimit(ops, root, cfg, []int64{128 * memoryMiB}, meminfo, writeRootMemoryMax)
+			max, err := configureRootMemoryLimit(ops, root, cfg, meminfo, writeRootMemoryMax)
 			require.NoError(t, err)
 			assert.Equal(t, test.want*memoryMiB, max)
-			assert.Equal(t, 16*memoryMiB, headroom)
 			actual, err := readMemoryMax(filepath.Join(group, "memory.max"))
 			require.NoError(t, err)
 			assert.Equal(t, max, actual)
@@ -94,30 +85,26 @@ func TestRootMemoryLimitCapacity(t *testing.T) {
 
 func TestRootMemoryLimitRoundsConservatively(t *testing.T) {
 	ops, root, meminfo, cfg := memoryLimitFixture(t)
-	cfg.SystemReserve, cfg.ControlReserve, cfg.SafetyBuffer = "1B", "1B", "1B"
-	cfg.OtherReserve, cfg.RuntimeHeadroom = "", ""
+	cfg.TotalReserve = "1B"
 	writeTestFile(t, meminfo, "MemTotal: 1024 kB\n")
-	max, headroom, err := configureRootMemoryLimit(ops, root, cfg, []int64{1}, meminfo, writeRootMemoryMax)
+	max, err := configureRootMemoryLimit(ops, root, cfg, meminfo, writeRootMemoryMax)
 	require.NoError(t, err)
 	page := int64(os.Getpagesize())
-	assert.Equal(t, (memoryMiB-page-3)/page*page, max)
-	assert.Zero(t, headroom)
+	assert.Equal(t, (memoryMiB-1)/page*page, max)
 	assert.Zero(t, max%page)
 }
 
 func TestRootMemoryLimitOffAndV1(t *testing.T) {
-	cfg := config.MemoryLimitConfig{SystemReserve: "bad", ControlReserve: "bad"}
-	max, headroom, err := configureRootMemoryLimit(&cgroupV1{}, "/", cfg, []int64{-1, -2}, "missing", nil)
+	cfg := config.MemoryLimitConfig{TotalReserve: "bad"}
+	max, err := configureRootMemoryLimit(&cgroupV1{}, "/", cfg, "missing", nil)
 	require.NoError(t, err)
 	assert.Zero(t, max)
-	assert.Zero(t, headroom)
 	cfg.Enabled = true
-	_, _, err = configureRootMemoryLimit(&cgroupV1{}, "/sandbox", cfg, nil, "missing", nil)
+	_, err = configureRootMemoryLimit(&cgroupV1{}, "/sandbox", cfg, "missing", nil)
 	require.ErrorContains(t, err, "requires cgroup v2")
-	manager := &CgroupManager{memoryMax: 1234, memoryHeadroom: 12}
-	max, headroom = manager.MemoryLimit()
+	manager := &CgroupManager{memoryMax: 1234}
+	max = manager.MemoryLimit()
 	assert.Equal(t, int64(1234), max)
-	assert.Equal(t, int64(12), headroom)
 }
 
 func TestNewCgroupManagerValidatesMemoryPolicyBeforePreparation(t *testing.T) {
@@ -148,77 +135,74 @@ func TestNewCgroupManagerValidatesMemoryPolicyBeforePreparation(t *testing.T) {
 	}
 }
 
+func TestRootMemoryLimitIgnoresSiblingLimits(t *testing.T) {
+	for _, limit := range []string{"max", "1", "68719476736"} {
+		t.Run(limit, func(t *testing.T) {
+			ops, root, meminfo, cfg := memoryLimitFixture(t)
+			for _, sibling := range []string{"distillfs", "system.slice"} {
+				directory := filepath.Join(ops.mountpoint, sibling)
+				require.NoError(t, os.MkdirAll(directory, 0755))
+				writeTestFile(t, filepath.Join(directory, "memory.max"), limit)
+			}
+			max, err := configureRootMemoryLimit(ops, root, cfg, meminfo, writeRootMemoryMax)
+			require.NoError(t, err)
+			assert.Equal(t, 736*memoryMiB, max, "only total_reserve is deducted")
+			for _, sibling := range []string{"distillfs", "system.slice"} {
+				assertFileContents(t, filepath.Join(ops.mountpoint, sibling, "memory.max"), limit)
+			}
+		})
+	}
+}
+
+func TestRootMemoryLimitRejectsInvalidTotalReserve(t *testing.T) {
+	for _, value := range []string{"", "0", "0B", "-1B", "1.5GiB", "auto", "max", "9223372036854775808B"} {
+		t.Run(value, func(t *testing.T) {
+			ops, root, meminfo, cfg := memoryLimitFixture(t)
+			cfg.TotalReserve = value
+			_, err := configureRootMemoryLimit(ops, root, cfg, meminfo, func(string, int64) error {
+				t.Fatal("invalid reserve attempted write")
+				return nil
+			})
+			require.ErrorContains(t, err, "total_reserve")
+		})
+	}
+}
+
 func TestRootMemoryLimitRejectsUnsafePolicies(t *testing.T) {
 	for _, test := range []struct {
 		name   string
-		modify func(*testing.T, *cgroupV2, *string, string, *config.MemoryLimitConfig, *[]int64)
+		modify func(*testing.T, *cgroupV2, *string, string, *config.MemoryLimitConfig)
 		want   string
 	}{
-		{"missing distill", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, _ *config.MemoryLimitConfig, d *[]int64) {
-			*d = nil
-		}, "distill-fs"},
-		{"zero distill", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, _ *config.MemoryLimitConfig, d *[]int64) {
-			*d = []int64{0}
-		}, "distill-fs"},
-		{"distill page overflow", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, _ *config.MemoryLimitConfig, d *[]int64) {
-			*d = []int64{math.MaxInt64}
-		}, "overflows"},
-		{"zero system", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.SystemReserve = "0B"
-		}, "system_reserve"},
-		{"fractional reserve", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.OtherReserve = "1.5GiB"
-		}, "other_reserve"},
-		{"negative headroom", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.RuntimeHeadroom = "-1"
-		}, "runtime_headroom"},
-		{"zero safety", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.SafetyBuffer = "0"
-		}, "safety_buffer"},
-		{"zero manual control", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.ControlReserve = "0"
-		}, "control_reserve"},
-		{"unlimited automatic control", func(t *testing.T, o *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.ControlReserve = "auto"
-			writeTestFile(t, filepath.Join(o.mountpoint, "system.slice", "memory.max"), "max")
-		}, "control_reserve"},
-		{"missing automatic control", func(t *testing.T, o *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.ControlReserve = "auto"
-			require.NoError(t, os.Remove(filepath.Join(o.mountpoint, "system.slice", "memory.max")))
-		}, "control_reserve"},
-		{"exhausted reserves", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.SystemReserve = "1GiB"
+		{"exhausted reserve", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig) {
+			c.TotalReserve = "1GiB"
 		}, "exhaust"},
-		{"reserve arithmetic overflow", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.SystemReserve = "9223372036854775807B"
+		{"reserve arithmetic overflow", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig) {
+			c.TotalReserve = "9223372036854775807B"
 		}, "exhaust"},
-		{"headroom equals cap", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig, _ *[]int64) {
-			c.RuntimeHeadroom = "608MiB"
-		}, "headroom"},
-		{"headroom exceeds old stricter cap", func(t *testing.T, o *cgroupV2, r *string, _ string, _ *config.MemoryLimitConfig, _ *[]int64) {
-			writeTestFile(t, filepath.Join(o.mountpoint, *r, "memory.max"), "16777216")
-		}, "headroom"},
-		{"missing MemTotal", func(t *testing.T, _ *cgroupV2, _ *string, m string, _ *config.MemoryLimitConfig, _ *[]int64) {
+		{"less than one page", func(_ *testing.T, _ *cgroupV2, _ *string, _ string, c *config.MemoryLimitConfig) {
+			c.TotalReserve = strconv.FormatInt(1024*memoryMiB-int64(os.Getpagesize())+1, 10)
+		}, "less than one page"},
+		{"missing MemTotal", func(t *testing.T, _ *cgroupV2, _ *string, m string, _ *config.MemoryLimitConfig) {
 			writeTestFile(t, m, "MemAvailable: 1 kB")
 		}, "MemTotal"},
-		{"invalid MemTotal", func(t *testing.T, _ *cgroupV2, _ *string, m string, _ *config.MemoryLimitConfig, _ *[]int64) {
+		{"invalid MemTotal", func(t *testing.T, _ *cgroupV2, _ *string, m string, _ *config.MemoryLimitConfig) {
 			writeTestFile(t, m, "MemTotal: 4 MB")
 		}, "MemTotal"},
-		{"root hierarchy", func(_ *testing.T, _ *cgroupV2, r *string, _ string, _ *config.MemoryLimitConfig, _ *[]int64) {
+		{"root hierarchy", func(_ *testing.T, _ *cgroupV2, r *string, _ string, _ *config.MemoryLimitConfig) {
 			*r = "/"
 		}, "non-root"},
-		{"control overlap", func(_ *testing.T, _ *cgroupV2, r *string, _ string, _ *config.MemoryLimitConfig, _ *[]int64) {
+		{"control overlap", func(_ *testing.T, _ *cgroupV2, r *string, _ string, _ *config.MemoryLimitConfig) {
 			*r = "/system.slice/sandboxes"
 		}, "overlaps"},
-		{"distill overlap", func(_ *testing.T, _ *cgroupV2, r *string, _ string, _ *config.MemoryLimitConfig, _ *[]int64) {
+		{"distill overlap", func(_ *testing.T, _ *cgroupV2, r *string, _ string, _ *config.MemoryLimitConfig) {
 			*r = "/distillfs"
 		}, "overlaps"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ops, root, meminfo, cfg := memoryLimitFixture(t)
-			distill := []int64{128 * memoryMiB}
-			test.modify(t, ops, &root, meminfo, &cfg, &distill)
-			_, _, err := configureRootMemoryLimit(ops, root, cfg, distill, meminfo, func(string, int64) error { t.Fatal("unsafe policy attempted write"); return nil })
+			test.modify(t, ops, &root, meminfo, &cfg)
+			_, err := configureRootMemoryLimit(ops, root, cfg, meminfo, func(string, int64) error { t.Fatal("unsafe policy attempted write"); return nil })
 			require.ErrorContains(t, err, test.want)
 		})
 	}
@@ -231,7 +215,7 @@ func TestRootMemoryLimitRequiresEmptySubtreeAndControls(t *testing.T) {
 	}{
 		{"populated descendant", "cgroup.events", "populated 1\n", "empty", false},
 		{"missing populated field", "cgroup.events", "frozen 0\n", "empty", false},
-		{"residual above cap", "memory.current", "637534209", "residual", false},
+		{"residual above cap", "memory.current", "771751937", "residual", false},
 		{"negative current", "memory.current", "-1", "residual", false},
 		{"missing root max", "memory.max", "", "memory.max", true},
 		{"missing current", "memory.current", "", "memory.current", true},
@@ -246,21 +230,21 @@ func TestRootMemoryLimitRequiresEmptySubtreeAndControls(t *testing.T) {
 			} else {
 				writeTestFile(t, filename, test.value)
 			}
-			_, _, err := configureRootMemoryLimit(ops, root, cfg, []int64{128 * memoryMiB}, meminfo, func(string, int64) error { t.Fatal("unsafe state attempted write"); return nil })
+			_, err := configureRootMemoryLimit(ops, root, cfg, meminfo, func(string, int64) error { t.Fatal("unsafe state attempted write"); return nil })
 			require.ErrorContains(t, err, test.want)
 		})
 	}
 	// Empty descendants can retain page cache that fits under the new ceiling.
 	ops, root, meminfo, cfg := memoryLimitFixture(t)
-	writeTestFile(t, filepath.Join(ops.mountpoint, root, "memory.current"), "637534208")
-	_, _, err := configureRootMemoryLimit(ops, root, cfg, []int64{128 * memoryMiB}, meminfo, writeRootMemoryMax)
+	writeTestFile(t, filepath.Join(ops.mountpoint, root, "memory.current"), "771751936")
+	_, err := configureRootMemoryLimit(ops, root, cfg, meminfo, writeRootMemoryMax)
 	require.NoError(t, err)
 }
 
 func TestRootMemoryMaxRecheckAndReadback(t *testing.T) {
 	ops, root, meminfo, cfg := memoryLimitFixture(t)
 	group := filepath.Join(ops.mountpoint, root)
-	_, _, err := configureRootMemoryLimit(ops, root, cfg, []int64{128 * memoryMiB}, meminfo, func(group string, candidate int64) error {
+	_, err := configureRootMemoryLimit(ops, root, cfg, meminfo, func(group string, candidate int64) error {
 		writeTestFile(t, filepath.Join(group, "cgroup.events"), "populated 1\n")
 		return writeRootMemoryMax(group, candidate)
 	})

@@ -52,15 +52,12 @@ interface_cache_size = 1
 cgroup_root_name = "/sandboxd"
 max_instance_num = 32
 
-# Optional cgroup v2 parent limit; all values below are illustrative budgets.
+# Optional cgroup v2 parent limit; this is an illustrative total reserve.
 # See doc/node-memory-limit.md before enabling on a drained node.
+# Component limits, including distill-fs, are not automatically deducted.
 # [plugin.resource.memory_limit]
 # enabled = true
-# system_reserve = "4GiB"
-# control_reserve = "auto" # requires a finite visible system.slice/memory.max
-# other_reserve = "8GiB"  # checkpoint and other components outside the parent
-# safety_buffer = "8GiB"
-# runtime_headroom = "2GiB" # only deducted from scheduling, not memory.max
+# total_reserve = "22GiB"
 
 [plugin.runtime]
 # Managed DNS upstreams and search/options; also the default direct resolver.

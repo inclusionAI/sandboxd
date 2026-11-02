@@ -102,6 +102,7 @@ type Collector struct {
 
 	cgroupStatsMu sync.RWMutex
 	cgroupStats   func(string) (cgroupmanager.Stats, error)
+	parentMemory  func() (cgroupmanager.ParentMemoryStats, error)
 
 	capacity CapacityProvider
 
@@ -333,7 +334,7 @@ func (c *Collector) registerMetrics(meter metric.Meter) error {
 		return err
 	}
 
-	return nil
+	return c.registerParentMemoryMetrics(meter)
 }
 
 func (c *Collector) readSandboxStats(cgroupPath string) (sandboxStats, error) {

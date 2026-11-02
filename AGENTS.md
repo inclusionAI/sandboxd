@@ -89,3 +89,7 @@ The optional `[plugin.image].chunk_db_size` is node-wide and must reach every di
 `make distillfs-test` runs real FUSE mount, read, stats, GC, and daemon recovery checks in a private mount namespace. It requires sudo, `/dev/fuse`, and `mkfs.erofs`; `DISTILL_FS_BINARY` selects the production executable (default `output/distill-fs/distill_fs`). The storage CI job downloads and verifies the formal release pinned in `third_party/runtime-versions.env` before running it. Explicitly enabled integration must fail when prerequisites are missing, never silently skip.
 
 Runtime inventory failures are isolated per handler: failed classes leave advertisements and new admission until a successful bounded poll; cleanup and other backends remain available. Preserve that isolation and tracked sandbox state when changing housekeeping or runtime availability. Process readiness continues to cover local reconciliation and core modules.
+
+# Parent Memory Metrics Contract
+
+The configured sandbox parent's live cgroup v2 `memory.current` and finite `memory.max` are exported as `sandbox.parent.memory.current` and `sandbox.parent.memory.max` through the existing OTel pipeline. Keep this read-only observation separate from budget configuration, schedulable capacity, host pressure and individual sandbox usage. Use the configured root and backend mountpoint, preserve paired source identity, and never turn unavailable data into idle zero. See `doc/node-memory-limit.md#parent-memory-metrics` for unsupported/unlimited limits and consumer freshness requirements.
