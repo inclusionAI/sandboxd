@@ -73,6 +73,9 @@ var _ SandboxService = &sandboxService{}
 
 // sandboxService implements SandboxService.
 type sandboxService struct {
+	startMu         sync.Mutex
+	startOperations map[string]*startOperation
+
 	// config is the sandbox service config
 	config         config.Config
 	serviceHandler cmap.ConcurrentMap[string, svc.Handler]
@@ -378,13 +381,12 @@ func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) er
 }
 
 func (h *sandboxService) List(ctx context.Context, request *runtime.ListSandboxesRequest) (*runtime.ListSandboxesResponse, error) {
+	h.startMu.Lock()
+	defer h.startMu.Unlock()
 	var sandboxes []*sandbox.Sandbox
 	response := new(runtime.ListSandboxesResponse)
 	if request.ID != "" {
 		sandboxes = h.sandboxManager.List(sandbox.ListFilterById(request.ID))
-		if len(sandboxes) == 0 {
-			return response, errord.ToGRPC(errord.ErrNotFound)
-		}
 	} else {
 		sandboxes = h.sandboxManager.List(sandbox.ListFilterByLabels(request.Selector))
 	}
@@ -406,6 +408,18 @@ func (h *sandboxService) List(ctx context.Context, request *runtime.ListSandboxe
 			Stdout:       c.Metadata.Stdout,
 			Stderr:       c.Metadata.Stderr,
 		})
+	}
+	seen := make(map[string]bool)
+	for _, s := range response.Sandboxes {
+		seen[s.ID] = true
+	}
+	for _, pending := range h.pendingInventoryLocked(request) {
+		if !seen[pending.ID] {
+			response.Sandboxes = append(response.Sandboxes, pending)
+		}
+	}
+	if request.ID != "" && len(response.Sandboxes) == 0 {
+		return response, errord.ToGRPC(errord.ErrNotFound)
 	}
 	return response, nil
 }
@@ -1053,7 +1067,18 @@ func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
 }
 
 func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequest) (response *runtime.DeleteResponse, err error) {
+	if request != nil && request.StartKey != "" {
+		return h.deleteStart(ctx, request)
+	}
+	if request != nil && request.ID != "" {
+		if key := h.activeStartKey(request.ID); key != "" {
+			return h.deleteStart(ctx, &runtime.DeleteRequest{StartKey: key})
+		}
+	}
 	err = h.deleteSandbox(ctx, request.ID)
+	if err == nil {
+		h.forgetSettledStart(request.ID)
+	}
 	return response, err
 }
 
@@ -1182,13 +1207,27 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		err := fmt.Errorf("start request is nil")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
+	if _, reserved := request.Labels[startKeyLabel]; reserved {
+		return nil, status.Error(codes.InvalidArgument, "start key label is managed by sandboxd")
+	}
+	if _, reserved := request.Labels[startKeyLabel]; reserved {
+		return nil, status.Error(codes.InvalidArgument, "start key label is managed by sandboxd")
+	}
+	startCtx, finishStart, err := h.beginStart(ctx, request.StartKey)
+	if err != nil {
+		return nil, err
+	}
+	defer finishStart()
+	ctx = startCtx
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
 	if !h.recoveryReady.Load() {
 		err := errord.ToGRPCf(errord.ErrUnavailable, "distillfs recovery is incomplete")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
 	checkpointDir := ""
-	var err error
 	if startReq.CheckpointInfo != nil {
 		checkpointDir, err = validateCheckpointInputDirectory(
 			startReq.CheckpointInfo.CheckpointDir,
@@ -1370,6 +1409,14 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}, errord.ToGRPC(err)
 	}
 	startReq.SandboxID = sandboxID
+	h.setStartSandbox(request.StartKey, sandboxID)
+	if startReq.StartKey != "" {
+		if startReq.Labels == nil {
+			startReq.Labels = make(map[string]string)
+		}
+		startReq.Labels[startKeyLabel] = startReq.StartKey
+	}
+	h.setStartInventory(startReq)
 	startSucceeded := false
 	var preparedFilesystem *preparedFS
 	var preparedResources *preparedStartResources

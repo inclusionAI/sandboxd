@@ -273,6 +273,9 @@ message StartRequest {
   // rootfs. Empty disables injection. It does not replace the sandbox's own
   // command.
   string inject_entrypoint = 22;
+  // StartKey identifies one start attempt independently of the generated sandbox ID.
+  // Never reuse a key for another execution. Delete can fence a timed-out attempt.
+  string start_key = 23;
 }
 
 // StartResponse is returned after sandbox start.
@@ -316,6 +319,9 @@ message DeleteRequest {
   // Timeout is reserved for graceful deletion. v0.1.0 ignores it and always
   // force-deletes the sandbox.
   int64 timeout = 2;
+  // StartKey cancels and fences this start attempt, waits for its handler to settle,
+  // then deletes its sandbox. ID must be empty when this field is set.
+  string start_key = 3;
 }
 
 // DeleteResponse is returned after sandbox delete.

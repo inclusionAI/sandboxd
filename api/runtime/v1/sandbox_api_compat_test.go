@@ -35,10 +35,10 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	// Rolled for StartResponse.sandbox_ip (field 4), required for YuanRong
-	// Node Proxy route registration; existing response fields are unchanged.
+	// Rolled for StartRequest.start_key (field 23) and DeleteRequest.start_key
+	// (field 3). Existing message fields and RPC method identities are unchanged.
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "21eb701d4c16828d5f4ac42d6a50d6f644e038b6b967b4c5165a9dd025aed67b"
+	const want = "ded3c4d3b93e665cbe947cfa85052115d6cf264c5d1e7b4cc987707bcfd2b91e"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}
