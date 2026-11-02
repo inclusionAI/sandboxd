@@ -38,10 +38,6 @@ E2E_STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
 E2E_STRESS_ROOTFS_HOST="${E2E_STRESS_ROOTFS_HOST:-}"
 E2E_STRESS_CHECKPOINT="${E2E_STRESS_CHECKPOINT:-0}"
 E2E_STRESS_ONLY="${E2E_STRESS_ONLY:-0}"
-E2E_HOSTS_ONLY="${E2E_HOSTS_ONLY:-0}"
-E2E_HOSTS_REGRESSION="${E2E_HOSTS_REGRESSION:-}"
-E2E_HOSTS_NYDUS_IMAGE_HOST="${E2E_HOSTS_NYDUS_IMAGE_HOST:-}"
-E2E_HOSTS_DISTILL_FS_HOST="${E2E_HOSTS_DISTILL_FS_HOST:-}"
 E2E_CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
 E2E_RUNTIME="${E2E_RUNTIME:-all}"
 E2E_RUNC_ONLY="${E2E_RUNC_ONLY:-0}"
@@ -268,28 +264,6 @@ case "${E2E_FIRECRACKER_VIRTIOFS}" in
     0|1) ;;
     *) fail "E2E_FIRECRACKER_VIRTIOFS must be 0 or 1" ;;
 esac
-configure_hosts_suite() {
-    [[ "${E2E_HOSTS_ONLY}" =~ ^[01]$ ]] || fail "E2E_HOSTS_ONLY must be 0 or 1"
-    case "${E2E_HOSTS_REGRESSION}" in
-        ""|nydus|relative-bind) ;;
-        *) fail "E2E_HOSTS_REGRESSION must be empty, nydus, or relative-bind" ;;
-    esac
-    if [ "${E2E_HOSTS_ONLY}" = 1 ] || [ -n "${E2E_HOSTS_REGRESSION}" ]; then
-        [ "${E2E_RUNTIME}" = runsc ] || fail "writable hosts modes require E2E_RUNTIME=runsc"
-        [ "${E2E_NETWORK_SOAK}" = 0 ] && [ "${E2E_STRESS_ONLY:-0}" = 0 ] || fail "hosts specialized modes cannot be combined with other suite-only modes"
-        if [ "${E2E_HOSTS_ONLY}" = 1 ]; then
-            [ -z "${E2E_HOSTS_REGRESSION}" ] || fail "select one hosts specialized mode"
-        fi
-        E2E_RUN_CGROUP_DISABLED=0
-    fi
-}
-configure_hosts_suite
-if [ "${E2E_HOSTS_REGRESSION}" = nydus ]; then
-    for tool_path in "${E2E_HOSTS_NYDUS_IMAGE_HOST}" "${E2E_HOSTS_DISTILL_FS_HOST}"; do
-        [[ "${tool_path}" = /* ]] && [ -f "${tool_path}" ] && [ -x "${tool_path}" ] || fail "Nydus regression requires absolute executable tool paths"
-    done
-    [ -c /dev/fuse ] || fail "Nydus regression requires /dev/fuse"
-fi
 case "${E2E_STRESS_CHECKPOINT}" in
     0|1) ;;
     *) fail "E2E_STRESS_CHECKPOINT must be 0 or 1" ;;
@@ -486,13 +460,6 @@ SANDBOXD_HOME_FIXTURE_DIR="$(prepare_sandboxd_home_fixture)"
 container_network_args=(--net bridge)
 network_soak_args=(-e E2E_NETWORK_SOAK=0)
 stress_rootfs_args=()
-hosts_regression_args=()
-if [ "${E2E_HOSTS_REGRESSION}" = nydus ]; then
-    hosts_regression_args=(
-        -v "${E2E_HOSTS_NYDUS_IMAGE_HOST}:/opt/hosts-regression/bin/nydus-image:ro"
-        -v "${E2E_HOSTS_DISTILL_FS_HOST}:/opt/hosts-regression/bin/distill_fs:ro"
-    )
-fi
 if [ -n "${E2E_STRESS_ROOTFS_HOST}" ]; then
     stress_rootfs_args=(
         -e E2E_STRESS_ROOTFS=/e2e-stress-rootfs
@@ -523,8 +490,6 @@ set +e
     -e "E2E_STRESS_CONCURRENCY=${E2E_STRESS_CONCURRENCY}" \
     -e "E2E_STRESS_CHECKPOINT=${E2E_STRESS_CHECKPOINT}" \
     -e "E2E_STRESS_ONLY=${E2E_STRESS_ONLY}" \
-    -e "E2E_HOSTS_ONLY=${E2E_HOSTS_ONLY}" \
-    -e "E2E_HOSTS_REGRESSION=${E2E_HOSTS_REGRESSION}" \
     -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
     -e "E2E_CGROUP_ROOT=${CGROUP_ROOT}" \
     -e "E2E_RUNTIME=${E2E_RUNTIME}" \
@@ -536,7 +501,6 @@ set +e
     -e "E2E_OCI_REGISTRY_SCHEME=${E2E_OCI_REGISTRY_SCHEME:-https}" \
     "${network_soak_args[@]}" \
     "${stress_rootfs_args[@]}" \
-    "${hosts_regression_args[@]}" \
     -v "${SANDBOXD_HOME_FIXTURE_DIR}:/home/akernel:rw" \
     --tmpfs /e2e:rw,exec,size=512m \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \

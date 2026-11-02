@@ -38,8 +38,6 @@ type options struct {
 	sandboxID                string
 	targetID                 string
 	requestFile              string
-	responseFile             string
-	rootfsReadonly           bool
 	checkpointDir            string
 	timeout                  time.Duration
 	checkpointTimeoutSeconds uint
@@ -74,8 +72,6 @@ func main() {
 	flag.StringVar(&value.sandboxID, "sandbox-id", "", "source sandbox ID")
 	flag.StringVar(&value.targetID, "target-id", "", "restored sandbox ID")
 	flag.StringVar(&value.requestFile, "request-file", "", "persisted StartRequest JSON")
-	flag.StringVar(&value.responseFile, "response-file", "", "optional StartResponse JSON, including assigned sandbox IP")
-	flag.BoolVar(&value.rootfsReadonly, "rootfs-readonly", false, "request a readonly root (use --storage-mb=0 to avoid the writable quota override)")
 	flag.StringVar(&value.checkpointDir, "checkpoint-dir", "", "caller-owned checkpoint directory")
 	flag.DurationVar(&value.timeout, "timeout", 5*time.Minute, "client operation timeout")
 	flag.UintVar(
@@ -162,8 +158,7 @@ func start(
 		SandboxID: value.sandboxID,
 		Runtime:   value.runtime,
 		Rootfs: &runtime.RootfsConfig{
-			Readonly: value.rootfsReadonly,
-			Type:     runtime.RootfsSrcType_LOCAL,
+			Type: runtime.RootfsSrcType_LOCAL,
 			Source: &runtime.RootfsConfig_Path{
 				Path: value.rootfs,
 			},
@@ -202,9 +197,6 @@ func start(
 	}
 	if response.Code != 0 || response.ID != value.sandboxID {
 		return fmt.Errorf("start response = %+v", response)
-	}
-	if err := writeStartResponse(value.responseFile, response); err != nil {
-		return err
 	}
 	fmt.Println(response.ID)
 	return nil
@@ -315,9 +307,6 @@ func restore(
 	if response.Code != 0 || response.ID != value.targetID {
 		return fmt.Errorf("restore response = %+v", response)
 	}
-	if err := writeStartResponse(value.responseFile, response); err != nil {
-		return err
-	}
 	fmt.Println(response.ID)
 	return nil
 }
@@ -339,17 +328,4 @@ func deleteSandbox(
 		return fmt.Errorf("delete: %w", err)
 	}
 	return nil
-}
-
-// writeStartResponse keeps the existing stdout ID contract while exposing the
-// server-assigned IP for first-process initialization assertions.
-func writeStartResponse(path string, response *runtime.StartResponse) error {
-	if path == "" {
-		return nil
-	}
-	data, err := (protojson.MarshalOptions{UseProtoNames: true}).Marshal(response)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(data, '\n'), 0600)
 }

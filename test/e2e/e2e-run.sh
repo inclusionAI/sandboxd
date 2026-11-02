@@ -63,15 +63,6 @@ STRESS_CONCURRENCY="${E2E_STRESS_CONCURRENCY:-8}"
 STRESS_ROOTFS="${E2E_STRESS_ROOTFS:-}"
 STRESS_CHECKPOINT="${E2E_STRESS_CHECKPOINT:-0}"
 STRESS_ONLY="${E2E_STRESS_ONLY:-0}"
-HOSTS_ONLY="${E2E_HOSTS_ONLY:-0}"
-HOSTS_REGRESSION="${E2E_HOSTS_REGRESSION:-}"
-HOSTS_NYDUS_IMAGE="${E2E_HOSTS_NYDUS_IMAGE:-/opt/hosts-regression/bin/nydus-image}"
-HOSTS_DISTILL_FS="${E2E_HOSTS_DISTILL_FS:-/opt/hosts-regression/bin/distill_fs}"
-HOSTS_BASIC_SPEC=""
-HOSTS_DAEMON_CWD=""
-NYDUS_PID=""
-NYDUS_MOUNT=""
-NYDUS_BOOTSTRAP=""
 DISABLE_CGROUP="${E2E_DISABLE_CGROUP:-0}"
 CPU_LIMIT_MODE="${E2E_CPU_LIMIT_MODE:-quota}"
 E2E_RUNTIME="${E2E_RUNTIME:-all}"
@@ -80,7 +71,6 @@ RUNSC_PLATFORM="${E2E_RUNSC_PLATFORM:-systrap}"
 export RUNSC_IGNORE_CGROUPS="${DISABLE_CGROUP}"
 
 SANDBOXD_PID=""
-HOSTS_CHILD_PID=""
 HTTPD_PID=""
 DIRECT_DNS_PID=""
 DIRECT_DNS_ALIAS_ADDED=0
@@ -170,10 +160,6 @@ cleanup() {
     for stress_id in "${STRESS_IDS[@]}"; do
         /usr/local/bin/sbox --address "${SOCKET}" --timeout 20s delete "${stress_id}" >/dev/null 2>&1
     done
-    if [ -n "${HOSTS_CHILD_PID}" ]; then
-        kill "${HOSTS_CHILD_PID}" >/dev/null 2>&1
-        wait "${HOSTS_CHILD_PID}" >/dev/null 2>&1
-    fi
     if [ -n "${HTTPD_PID}" ]; then
         kill "${HTTPD_PID}" >/dev/null 2>&1
         wait "${HTTPD_PID}" >/dev/null 2>&1
@@ -188,13 +174,6 @@ cleanup() {
     if [ -n "${SANDBOXD_PID}" ]; then
         kill "${SANDBOXD_PID}" >/dev/null 2>&1
         wait "${SANDBOXD_PID}" >/dev/null 2>&1
-    fi
-    if [ -n "${NYDUS_MOUNT}" ] && mountpoint -q "${NYDUS_MOUNT}"; then
-        umount "${NYDUS_MOUNT}" || status=1
-    fi
-    if [ -n "${NYDUS_PID}" ]; then
-        kill "${NYDUS_PID}" >/dev/null 2>&1
-        wait "${NYDUS_PID}" >/dev/null 2>&1
     fi
     cleanup_cgroups
 
@@ -224,13 +203,11 @@ cleanup() {
             tail -200 "${runsc_log}" >&2
         done < <(find /home/akernel/logs/runsc -type f | sort)
     fi
-    trap - EXIT
-    exit "${status}"
 }
 trap cleanup EXIT
 
 check_direct_dns_dependencies() {
-    if [ "${1:-e2e}" != "e2e" ] || [ "${DISABLE_CGROUP}" = "1" ] || [ "${HOSTS_ONLY:-0}" = "1" ] || [ -n "${HOSTS_REGRESSION:-}" ]; then
+    if [ "${1:-e2e}" != "e2e" ] || [ "${DISABLE_CGROUP}" = "1" ]; then
         return
     fi
     case "${E2E_RUNTIME}" in
@@ -252,23 +229,6 @@ preflight() {
         fail "E2E_STRESS_CHECKPOINT must be 0 or 1"
     [[ "${STRESS_ONLY}" =~ ^[01]$ ]] ||
         fail "E2E_STRESS_ONLY must be 0 or 1"
-    [[ "${HOSTS_ONLY}" =~ ^[01]$ ]] || fail "E2E_HOSTS_ONLY must be 0 or 1"
-    case "${HOSTS_REGRESSION}" in ""|nydus|relative-bind) ;; *) fail "E2E_HOSTS_REGRESSION must be empty, nydus, or relative-bind" ;; esac
-    if [ "${HOSTS_ONLY}" = 1 ] || [ -n "${HOSTS_REGRESSION}" ]; then
-        [ "${E2E_RUNTIME}" = runsc ] || fail "writable hosts modes require E2E_RUNTIME=runsc"
-        [ "${STRESS_ONLY}" = 0 ] && [ "${NETWORK_SOAK}" = 0 ] || fail "hosts specialized modes cannot be combined with other suite-only modes"
-        if [ "${HOSTS_ONLY}" = 1 ]; then
-            [ -z "${HOSTS_REGRESSION}" ] || fail "select one hosts specialized mode"
-        fi
-    fi
-    if [ -n "${HOSTS_REGRESSION}" ]; then
-        command -v python3 >/dev/null || fail "hosts regressions require python3"
-        if [ "${HOSTS_REGRESSION}" = nydus ]; then
-            [ -c /dev/fuse ] || fail "Nydus regression requires /dev/fuse"
-            [ -x "${HOSTS_NYDUS_IMAGE}" ] || fail "missing Nydus fixture builder: ${HOSTS_NYDUS_IMAGE}"
-            [ -x "${HOSTS_DISTILL_FS}" ] || fail "missing distill-fs: ${HOSTS_DISTILL_FS}"
-        fi
-    fi
     [[ "${DISABLE_CGROUP}" =~ ^[01]$ ]] || fail "E2E_DISABLE_CGROUP must be 0 or 1"
     [[ "${NETWORK_SOAK}" =~ ^[01]$ ]] || fail "E2E_NETWORK_SOAK must be 0 or 1"
     [[ "${FIRECRACKER_VIRTIOFS}" =~ ^[01]$ ]] ||
@@ -658,19 +618,10 @@ EOF
 nameserver 8.8.8.8
 EOF
 
-    if [ "${E2E_RUNTIME}" = runsc ] || [ "${E2E_RUNTIME}" = all ]; then
-        # Readonly gVisor roots need mountpoints present in the immutable lower.
-        : > "${ROOTFS}/etc/hostname"
-        : > "${ROOTFS}/etc/resolv.conf"
-    fi
     echo "host-mount-ok" > "${HOST_MOUNT}/input.txt"
     echo "sandboxd-network-ok" > "${WWW_ROOT}/health.txt"
     echo "erofs-mount-ok" > "${EROFS_MOUNT_ROOT}/input.txt"
-    if [ "${E2E_RUNTIME}" = runsc ] || [ "${E2E_RUNTIME}" = all ]; then
-        mkfs.erofs -E noinline_data "${EROFS_ROOTFS}" "${ROOTFS}" >/dev/null
-    else
-        mkfs.erofs "${EROFS_ROOTFS}" "${ROOTFS}" >/dev/null
-    fi
+    mkfs.erofs "${EROFS_ROOTFS}" "${ROOTFS}" >/dev/null
     mkfs.erofs "${EROFS_MOUNT_IMAGE}" "${EROFS_MOUNT_ROOT}" >/dev/null
 
     if [ "${NETWORK_SOAK}" = "1" ]; then
@@ -725,16 +676,13 @@ crash_and_restart_sandboxd() {
 
 start_sandboxd() {
     log "starting sandboxd"
-    (
-        if [ -n "${HOSTS_DAEMON_CWD}" ]; then cd "${HOSTS_DAEMON_CWD}"; fi
-        exec /usr/local/bin/sandboxd \
-            --root "${SANDBOXD_HOME}" \
-            --config "${CONFIG_FILE}" \
-            --socket "${SOCKET}" \
-            --log-level debug \
-            --log-file "${LOG_FILE}" \
-            --http-address "127.0.0.1:23001"
-    ) &
+    /usr/local/bin/sandboxd \
+        --root "${SANDBOXD_HOME}" \
+        --config "${CONFIG_FILE}" \
+        --socket "${SOCKET}" \
+        --log-level debug \
+        --log-file "${LOG_FILE}" \
+        --http-address "127.0.0.1:23001" &
     SANDBOXD_PID=$!
 
     local i
@@ -966,42 +914,6 @@ run_host_mount_rw_check() {
     RUNTIME="${runtime}" ROOTFS="${rootfs}" SOCKET="${SOCKET}" \
         CASE_ID="${suffix}-rw" TEST_DIR="${SANDBOXD_HOME}/${suffix}-rw" \
         KEEP_RUNNING=0 bash /usr/local/bin/sandboxd-host-mount-rw
-}
-
-run_writable_hosts_check() {
-    local runtime="$1" rootfs="$2" suffix="$3"
-    [ "${runtime}" = runsc ] || fail "writable hosts require runsc"
-    log "testing ${suffix} managed hosts through server checkpoint/restore RPC"
-    local test_dir="${SANDBOXD_HOME}/${suffix}-hosts" child_pid status=0
-    RUNTIME="${runtime}" ROOTFS="${rootfs}" SOCKET="${SOCKET}" \
-        SANDBOXD_ROOT="${SANDBOXD_ROOT}" CASE_ID="${suffix}-hosts" \
-        TEST_DIR="${test_dir}" RESTART_HANDSHAKE=1 \
-        bash /usr/local/bin/sandboxd-writable-hosts &
-    child_pid=$!
-    HOSTS_CHILD_PID="${child_pid}"
-    while kill -0 "${child_pid}" 2>/dev/null; do
-        if [ -f "${test_dir}/restart.request" ] && [ ! -f "${test_dir}/restart.done" ]; then
-            # Resource leases checkpoint periodically. Restart only this runner's
-            # daemon, after its restored target is recorded durably.
-            sleep 6
-            crash_and_restart_sandboxd
-            touch "${test_dir}/restart.done"
-        fi
-        sleep 0.1
-    done
-    wait "${child_pid}" || status=$?
-    HOSTS_CHILD_PID=""
-    return "${status}"
-}
-
-run_writable_hosts_suite() {
-    case "${E2E_RUNTIME}" in
-        all|runsc)
-            run_writable_hosts_check runsc "${EROFS_ROOTFS}" "runsc-${RUNSC_PLATFORM}-erofs"
-            run_writable_hosts_check runsc "${ROOTFS}" "runsc-${RUNSC_PLATFORM}-directory"
-            ;;
-        *) fail "writable hosts are only qualified for runsc" ;;
-    esac
 }
 
 checkpoint_memory_mb() {
@@ -2675,7 +2587,6 @@ run_runsc_checks() {
     run_dnat_check runsc "runsc" "${ROOTFS}" "${memory_mb}"
     run_checkpoint_restore_check runsc "${ROOTFS}"
     run_host_mount_rw_check runsc "${ROOTFS}" "runsc-${RUNSC_PLATFORM}"
-    run_writable_hosts_suite
     run_storage_quota_check
 
     run_partial_oom_check
@@ -2800,92 +2711,12 @@ run_cgroup_disabled_checks() {
     fi
 }
 
-# Build these fixtures inside the test container; no host mount propagation or
-# registry is needed.
-prepare_hosts_regression() {
-    [ -n "${HOSTS_REGRESSION}" ] || return 0
-    local fixture="${SANDBOXD_HOME}/hosts-regression"
-    mkdir "${fixture}"
-    if [ "${HOSTS_REGRESSION}" = relative-bind ]; then
-        HOSTS_BASIC_SPEC="${fixture}/base-spec.json"
-        HOSTS_DAEMON_CWD="${fixture}/daemon-cwd"
-        mkdir "${HOSTS_DAEMON_CWD}"
-        cat > "${HOSTS_BASIC_SPEC}" <<'JSON'
-{
-  "ociVersion": "1.0.0",
-  "process": {
-    "user": {"uid": 0, "gid": 0}, "args": ["/bin/sh"],
-    "env": ["PATH=/bin:/usr/bin"], "cwd": "/"
-  },
-  "root": {"path": "rootfs", "readonly": true},
-  "hostname": "akernel",
-  "mounts": [
-    {"destination": "/proc", "type": "proc", "source": "proc"},
-    {"destination": "/dev", "type": "tmpfs", "source": "tmpfs"},
-    {"destination": "/sys", "type": "sysfs", "source": "sysfs", "options": ["nosuid", "noexec", "nodev", "ro"]},
-    {"destination": "/relative-proof", "type": "bind", "source": "../hosts-relative-shared", "options": ["rbind", "ro"]}
-  ],
-  "linux": {"namespaces": [{"type": "pid"}, {"type": "network"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}]}
-}
-JSON
-        python3 - "${CONFIG_FILE}" "${HOSTS_BASIC_SPEC}" <<'PYTHON'
-import json
-import pathlib
-import sys
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-old = '[plugin.runtime.basic_spec]\nrunsc = ""'
-assert text.count(old) == 1, "missing or ambiguous base spec setting"
-path.write_text(text.replace(old, '[plugin.runtime.basic_spec]\nrunsc = ' + json.dumps(sys.argv[2])))
-PYTHON
-        return
-    fi
-    local artifacts="${fixture}/artifacts" cache="${fixture}/cache" attempt
-    NYDUS_BOOTSTRAP="${artifacts}/bootstrap"
-    NYDUS_MOUNT="${fixture}/root"
-    mkdir "${artifacts}" "${cache}" "${NYDUS_MOUNT}"
-    "${HOSTS_NYDUS_IMAGE}" create --fs-version 5 --bootstrap "${NYDUS_BOOTSTRAP}" \
-        --blob-dir "${artifacts}" --output-json "${fixture}/build.json" "${ROOTFS}" \
-        >"${fixture}/build.log" 2>&1
-    jq -n --arg dir "${artifacts}" '{type: "localfs", localfs: {dir: $dir}}' > "${fixture}/backend.json"
-    "${HOSTS_DISTILL_FS}" mount --src nydus --name hosts-no-xattr \
-        --bootstrap "${NYDUS_BOOTSTRAP}" --cfg "${fixture}/backend.json" \
-        --cache-dir "${cache}" --mountpoint "${NYDUS_MOUNT}" >"${fixture}/distill-fs.log" 2>&1 &
-    NYDUS_PID=$!
-    for attempt in $(seq 1 100); do
-        kill -0 "${NYDUS_PID}" 2>/dev/null || fail "Nydus mount process exited; see ${fixture}/distill-fs.log"
-        if mountpoint -q "${NYDUS_MOUNT}" && [ -x "${NYDUS_MOUNT}/bin/sh" ]; then return; fi
-        sleep 0.1
-    done
-    fail "Nydus mount did not become ready"
-}
-
-run_hosts_regression() {
-    CASE_MODE="${HOSTS_REGRESSION}" CASE_ID="${HOSTS_REGRESSION}-${RUNSC_PLATFORM}" \
-        TEST_DIR="${SANDBOXD_HOME}/hosts-regression/results" \
-        ROOTFS="${NYDUS_MOUNT:-${ROOTFS}}" SOCKET="${SOCKET}" \
-        SANDBOXD_ROOT="${SANDBOXD_ROOT}" SANDBOXD_PID="${SANDBOXD_PID}" \
-        DISTILL_FS_PID="${NYDUS_PID}" NYDUS_BOOTSTRAP="${NYDUS_BOOTSTRAP}" BASIC_SPEC="${HOSTS_BASIC_SPEC}" \
-        bash /usr/local/bin/sandboxd-writable-hosts-regressions
-}
-
 run_e2e() {
     preflight
     cleanup_cgroups
     write_config
     prepare_rootfs
-    prepare_hosts_regression
     start_sandboxd
-    if [ -n "${HOSTS_REGRESSION}" ]; then
-        run_hosts_regression
-        log "writable hosts ${HOSTS_REGRESSION} regression passed"
-        return
-    fi
-    if [ "${HOSTS_ONLY}" = 1 ]; then
-        run_writable_hosts_suite
-        log "writable hosts RPC e2e passed"
-        return
-    fi
     if [ "${DISABLE_CGROUP}" = "0" ] && {
         [ "${E2E_RUNTIME}" = "all" ] || [ "${E2E_RUNTIME}" = "runsc" ];
     }; then

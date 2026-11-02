@@ -48,8 +48,6 @@ symbolic links. Its parent must already exist. The leaf may be absent, in which
 case sandboxd creates it, or it may be an existing empty directory. sandboxd
 never overwrites a non-empty directory.
 
-Within one daemon, runsc rejects checkpoint outputs overlapping the source bundle or another active output directory, and restore inputs overlapping the target bundle. Output reservations remain held through failure cleanup. Other runtimes retain sandbox-level exclusion.
-
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
 
@@ -67,15 +65,7 @@ Sharing applies to writable-file extents, not the independently saved applicatio
 
 Save and restore must use matching runtime builds. Drain sandboxes before replacing the runtime bundle; do not assume old saved state remains compatible across a gVisor upgrade. Install the complete checksum-pinned gVisor archive with its matching helpers, rather than replacing runsc alone.
 
-## Managed hosts state
-
-Runsc checkpoints preserve managed `/etc/hosts` contents and existence, including truncation and deletion. Restore does not regenerate entries for a new IP address. [Caller-owned mounts](runtime.md#sandbox-hosts-file) retain their external-storage contract.
-
-The versioned `managed-hosts.json` records runtime, root mode and layout. Private-rootfs checkpoints also keep immutable `rootfs-seed.tar` with its SHA-256. The seed is an initialization dependency, not live hosts content. Keep both artifacts with the checkpoint, outside `filestores/`; restore copies the seed into each target bundle and loads native state without replay, supporting source deletion and repeated checkpoints.
-
-Creation rejects symlink/non-directory parents, unrepresentable metadata and metadata errors. Directory lowers may lack `listxattr` support; direct EROFS inspection stays strict. Managed seed/restore annotations and flags cannot be overridden by callers or providers. OCI relative mount sources remain bundle-relative.
-
-Old snapshots retain hosts preparation and mount priority. Missing sidecars are only legacy candidates: strict native spec validation rejects stripped new-layout metadata. Invalid artifacts, digest failures or incompatible runtime, root mode or mount ownership fail explicitly. New-layout snapshots are not guaranteed to work with older sandboxd; matching runtime builds remain required.
+Runsc checkpoints preserve managed `/etc/hosts` contents and existence, including empty or deleted files, without replay or regeneration for a new IP. For the writable layout, retain top-level `managed-hosts.json` and SHA-256-verified `rootfs-seed.tar` with the native checkpoint; the source sandbox may be deleted. Corrupt artifacts, incompatible layouts, checkpoint outputs overlapping the source bundle or another active output, and restore inputs overlapping the target bundle are rejected; output reservations last through cleanup. Old snapshots keep their original hosts layout; new-layout snapshots are not guaranteed to work with older sandboxd. Caller-owned mounts remain external.
 
 ## Checkpoint output synchronization
 

@@ -67,11 +67,7 @@ The default runtime release manifest still selects an ordinary KVM archive. Exis
 
 The optional nested-host DEBUGCTL optimization moves `vcpu->arch.host_debugctl = get_debugctlmsr();` from common `vcpu_enter_guest()` into VMX/SVM source paths, since PVM maintains its own saved value. It is an OOT module-source change, separate from sandboxd and the guest bundle: rebuild/install the matched modules against the unchanged distribution kernel. The OOT build excludes VMX/SVM backends; restore stock hardware KVM by unloading both OOT modules and loading the complete stock pair. AKernel's `deploy/pvm-runtime.md` and `deploy/pvm/kvm-debugctl-backend-scope.patch` explain the optional patch and the limits of the earlier performance experiment. Current OOT runtime qualification uses the unoptimized module pair. See [checkpoint compatibility](checkpoint-restore.md) for backend identity and PVM TSC-frequency restore gates.
 
-## Sandbox hosts file
-
-Runsc initializes platform-managed `/etc/hosts` as an ordinary file in each private writable root before workload execution, with mode `0644`, UID/GID 0, localhost/IPv6 aliases and the sandbox IP/hostname. Root can modify, replace or remove it without changing the host or image; normal file permissions apply. No public option is required.
-
-Caller/base-spec mounts covering the target take priority. Effective read-only roots keep read-only hosts; positive writable-layer limits take writable-root precedence. Private hosts reject directory roots with an explicit OCI user namespace, including provider fallback from EROFS, because ownership/ACLs differ from the host view. This feature is runsc-only; other runtimes, hostname and resolver behavior are unchanged. See [managed hosts state](checkpoint-restore.md#managed-hosts-state) for initialization and snapshot compatibility.
+Runsc initializes platform-managed `/etc/hosts` as an ordinary `root:root`/`0644` file in each private writable root before workload execution; root may edit, replace or delete it without changing the host or lower image. Caller/base-spec mounts take priority and effective read-only roots keep read-only hosts. No option is required. Directory roots with explicit OCI user namespaces are unsupported for private hosts; other runtimes, hostname and resolver behavior are unchanged. See [checkpoint compatibility](checkpoint-restore.md).
 
 ## Resolver sources
 

@@ -110,10 +110,6 @@ case "${E2E_CASE}" in
         ;;
 esac
 
-if [ "${E2E_HOSTS_ONLY:-0}" = 1 ] || [ -n "${E2E_HOSTS_REGRESSION:-}" ]; then
-    [ "${runtime}" = runsc ] || fail "writable hosts modes require E2E_RUNTIME=runsc"
-fi
-
 if [[ "${runtime}" = firecracker-pvm ]]; then
     candidate_args=()
     if [[ -n "${PVM_CANDIDATE_ARCHIVE:-}" ]]; then
@@ -168,11 +164,6 @@ log "building targeted image ${image}"
     -t "${image}" \
     .
 
-network_soak=1
-if [ -n "${E2E_HOSTS_REGRESSION:-}" ] || [ "${E2E_HOSTS_ONLY:-0}" = 1 ]; then
-    network_soak=0
-    run_cgroup_disabled=0
-fi
 log "running ${E2E_CASE}"
 SANDBOXD_E2E_IMAGE="${image}" \
     SANDBOXD_E2E_CONTAINER="${SANDBOXD_E2E_CONTAINER:-sandboxd-e2e-${E2E_CASE}}" \
@@ -183,7 +174,7 @@ SANDBOXD_E2E_IMAGE="${image}" \
     E2E_RUN_CGROUP_DISABLED="${run_cgroup_disabled}" \
     E2E_FIRECRACKER_CHECKPOINT_MODE="${fc_checkpoint_mode:-}" \
     E2E_FIRECRACKER_VIRTIOFS="${fc_virtiofs:-0}" \
-    E2E_NETWORK_SOAK="${network_soak}" \
+    E2E_NETWORK_SOAK=1 \
     E2E_SKIP_BUILD=1 \
     RUN_UNIT_TESTS=0 \
     bash test/e2e/run.sh

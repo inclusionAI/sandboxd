@@ -15,32 +15,9 @@
 package util
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 )
-
-func TestRestoreDirectoriesCannotOverlap(t *testing.T) {
-	root := t.TempDir()
-	source := filepath.Join(root, "checkpoint")
-	if err := os.Mkdir(source, 0700); err != nil {
-		t.Fatal(err)
-	}
-	alias := filepath.Join(root, "alias")
-	if err := os.Symlink(source, alias); err != nil {
-		t.Fatal(err)
-	}
-	for _, target := range []string{source, root, filepath.Join(source, "missing", "child"), alias, filepath.Join(alias, "child")} {
-		if err := ValidateRestoreDirectorySeparation(source, target); err == nil {
-			t.Fatalf("overlapping target accepted: %s", target)
-		}
-	}
-	for _, target := range []string{filepath.Join(root, "target"), source + "-suffix"} {
-		if err := ValidateRestoreDirectorySeparation(source, target); err != nil {
-			t.Fatalf("disjoint target rejected: %v", err)
-		}
-	}
-}
 
 func TestJoinWithinRoot(t *testing.T) {
 	root := t.TempDir()
