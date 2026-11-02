@@ -10,7 +10,6 @@ package networkacl
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -22,6 +21,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/google/uuid"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/sirupsen/logrus"
@@ -57,6 +57,8 @@ type Binding struct {
 }
 
 type persistedEntry struct {
+	Incarnation  string                 `json:"incarnation,omitempty"`
+	Revision     uint64                 `json:"revision,omitempty"`
 	IP           string                 `json:"ip"`
 	HostVeth     string                 `json:"host_veth"`
 	IfIndex      int                    `json:"ifindex"`
@@ -64,6 +66,9 @@ type persistedEntry struct {
 	Policy       Policy                 `json:"policy"`
 	DomainGrants []persistedDomainGrant `json:"domain_grants,omitempty"`
 	Orphaned     bool                   `json:"orphaned,omitempty"`
+	// True only for a fresh empty policy that has never attempted kernel rules.
+	// Missing in older records means cleanup must conservatively inspect rules.
+	KernelPolicyAbsent bool `json:"kernel_policy_absent,omitempty"`
 }
 
 type persistedDomainGrant struct {
@@ -217,7 +222,15 @@ const (
 )
 
 type Manager struct {
-	mu sync.RWMutex
+	closeMu     sync.Mutex
+	mu          sync.RWMutex
+	operations  map[string]*entryOperation
+	persistMu   sync.Mutex
+	durable     map[string]persistedEntry
+	qdiscMu     sync.Mutex
+	lifecycleMu sync.RWMutex
+	closed      bool
+	removals    map[string]*removal
 
 	store         store.DbStore
 	bridgeIP      net.IP
@@ -271,6 +284,9 @@ func New(config Config) (*Manager, error) {
 	failed := true
 	defer func() {
 		if failed {
+			if manager.iptables != nil && manager.iptables.conntrack != nil {
+				manager.iptables.conntrack.Close()
+			}
 			_ = manager.objects.close()
 			if manager.iptables != nil && len(manager.entries) == 0 {
 				_ = manager.iptables.close()
@@ -355,41 +371,15 @@ func ensureBPFFS() error {
 	return nil
 }
 
-func (m *Manager) loadState() error {
-	if m.store == nil {
-		return nil
-	}
-	data, err := m.store.LoadRaw(stateStoreKey)
-	if errors.Is(err, errord.ErrNotFound) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("load network ACL state: %w", err)
-	}
-	var state persistedState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return fmt.Errorf("decode network ACL state: %w", err)
-	}
-	for sandboxID, entry := range state.Entries {
-		m.entries[sandboxID] = entry
-	}
-	return nil
-}
-
-func (m *Manager) persistLocked() error {
-	if m.store == nil {
-		return nil
-	}
-	data, err := json.Marshal(persistedState{Entries: m.entries})
-	if err != nil {
-		return err
-	}
-	return m.store.StoreRaw(stateStoreKey, data)
-}
-
 func (m *Manager) Restore(active map[string]Binding) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return errord.ErrUnavailable
+	}
+	m.operations = make(map[string]*entryOperation)
 	resolved := make(map[string]persistedEntry, len(active))
 	entryRestoreOld := make(map[string]persistedEntry, len(active))
 	for sandboxID, binding := range active {
@@ -406,6 +396,8 @@ func (m *Manager) Restore(active map[string]Binding) error {
 		entry.HostVeth = binding.HostVeth
 		entry.IfIndex = link.Attrs().Index
 		entry.Orphaned = false
+		entry.Incarnation = uuid.NewString()
+		entry.Revision++
 		if !entry.Policy.Empty() {
 			if m.iptables == nil {
 				// Pinned BPF state continues to enforce the old generation while
@@ -460,8 +452,8 @@ func (m *Manager) Restore(active map[string]Binding) error {
 }
 
 func (m *Manager) Register(binding Binding, policy Policy) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
 	if binding.SandboxID == "" || binding.IP.To4() == nil || binding.HostVeth == "" {
 		return fmt.Errorf("network ACL binding requires sandbox ID, IPv4 address, and host endpoint")
 	}
@@ -469,79 +461,105 @@ func (m *Manager) Register(binding Binding, policy Policy) error {
 	if err != nil {
 		return fmt.Errorf("find host endpoint %s: %w", binding.HostVeth, err)
 	}
-	reconciled := make(map[string]persistedEntry)
-	for sandboxID, existing := range m.entries {
-		conflicts := sandboxID == binding.SandboxID ||
-			existing.IfIndex == link.Attrs().Index ||
-			existing.IP == binding.IP.String() ||
-			existing.HostVeth == binding.HostVeth
-		if !conflicts {
+	// Reserve all endpoint identities before crossing either the durable or kernel
+	// barrier. No index lock is held while a prior orphan is reclaimed.
+	for {
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return errord.ErrUnavailable
+		}
+		if m.removals[binding.SandboxID] != nil || (m.operations[binding.SandboxID] != nil && m.operations[binding.SandboxID].users != 0) {
+			m.mu.Unlock()
+			return errord.ErrUnavailable
+		}
+		orphan := ""
+		for id, entry := range m.entries {
+			if id != binding.SandboxID && entry.IP != binding.IP.String() && entry.HostVeth != binding.HostVeth && entry.IfIndex != link.Attrs().Index {
+				continue
+			}
+			if m.removals[id] != nil || (m.operations[id] != nil && m.operations[id].users != 0) {
+				m.mu.Unlock()
+				return fmt.Errorf("network ACL endpoint is being changed: %w", errord.ErrUnavailable)
+			}
+			if !entry.Orphaned {
+				m.mu.Unlock()
+				return fmt.Errorf("network ACL state for sandbox %s conflicts with active sandbox %s", binding.SandboxID, id)
+			}
+			orphan = id
+			break
+		}
+		if orphan != "" {
+			m.mu.Unlock()
+			if err := m.remove(orphan); err != nil {
+				return fmt.Errorf("reconcile orphaned network ACL: %w", err)
+			}
 			continue
 		}
-		if !existing.Orphaned {
-			return fmt.Errorf("network ACL state for sandbox %s conflicts with active sandbox %s", binding.SandboxID, sandboxID)
+		entry := persistedEntry{Incarnation: uuid.NewString(), Revision: 1, IP: binding.IP.String(), HostVeth: binding.HostVeth, IfIndex: link.Attrs().Index, Policy: policy, KernelPolicyAbsent: policy.Empty()}
+		if !policy.Empty() {
+			entry.Generation = 1
 		}
-		reconciled[sandboxID] = existing
+		op := m.operationLocked(binding.SandboxID)
+		op.users++
+		op.mu.Lock() // A newly reserved identity has no existing operation.
+		m.entries[binding.SandboxID] = entry
+		m.mu.Unlock()
+		defer m.releaseOperation(binding.SandboxID, op)
+		if err := m.persistEntry(binding.SandboxID, &entry); err != nil {
+			m.mu.Lock()
+			delete(m.entries, binding.SandboxID)
+			m.mu.Unlock()
+			return fmt.Errorf("persist initial network ACL for %s: %w", binding.SandboxID, err)
+		}
+		// A link may have disappeared while waiting for storage. Revalidate before
+		// installing rules; a reused ifindex must not receive the old policy.
+		current, err := netlink.LinkByName(binding.HostVeth)
+		if err == nil && current.Attrs().Index != entry.IfIndex {
+			err = fmt.Errorf("network ACL endpoint changed during registration")
+		}
+		if err == nil {
+			err = m.applyLocked(persistedEntry{}, entry)
+		}
+		if err != nil {
+			return errors.Join(err, m.removeEntry(binding.SandboxID, entry))
+		}
+		m.mu.Lock()
+		m.sourceIndex[entry.IP] = binding.SandboxID
+		m.mu.Unlock()
+		return nil
 	}
-	if err := m.reconcileOrphansLocked(reconciled); err != nil {
-		return fmt.Errorf("reconcile orphaned network ACL: %w", err)
-	}
-	generation := uint64(0)
-	if !policy.Empty() {
-		generation = 1
-	}
-	entry := persistedEntry{
-		IP:         binding.IP.String(),
-		HostVeth:   binding.HostVeth,
-		IfIndex:    link.Attrs().Index,
-		Generation: generation,
-		Policy:     policy,
-	}
-	m.entries[binding.SandboxID] = entry
-	m.sourceIndex[entry.IP] = binding.SandboxID
-	if err := m.persistLocked(); err != nil {
-		delete(m.entries, binding.SandboxID)
-		delete(m.sourceIndex, entry.IP)
-		return fmt.Errorf("persist initial network ACL for %s: %w", binding.SandboxID, err)
-	}
-	if err := m.applyLocked(persistedEntry{}, entry); err != nil {
-		cleanupErr := m.reconcileOrphansLocked(map[string]persistedEntry{
-			binding.SandboxID: entry,
-		})
-		return errors.Join(err, cleanupErr)
-	}
-	return nil
 }
 
 func (m *Manager) SetPolicy(sandboxID string, policy Policy) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	old, ok := m.entries[sandboxID]
-	if !ok || old.Orphaned {
-		return errord.ErrNotFound
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	op, old, err := m.acquireOperation(sandboxID, false)
+	if err != nil {
+		return err
 	}
+	defer m.releaseOperation(sandboxID, op)
 	next := old
 	next.Policy = policy
+	next.KernelPolicyAbsent = false
 	next.DomainGrants = nil
 	next.Generation++
 	if next.Generation == 0 {
 		next.Generation = 1
 	}
-	m.entries[sandboxID] = next
-	if err := m.persistLocked(); err != nil {
-		m.entries[sandboxID] = old
+	next.Revision++
+	if err := m.persistEntry(sandboxID, &next); err != nil {
 		return fmt.Errorf("persist network ACL update for %s: %w", sandboxID, err)
 	}
 	if err := m.applyLocked(old, next); err != nil {
-		m.entries[sandboxID] = old
+		old.KernelPolicyAbsent = false
+		old.Revision = next.Revision + 1
 		rollbackErr := m.rollbackApplyLocked(old, next)
-		persistErr := m.persistLocked()
-		return errors.Join(
-			err,
-			wrapOptionalError("roll back network ACL update", rollbackErr),
-			wrapOptionalError("persist rolled-back network ACL update", persistErr),
-		)
+		persistErr := m.persistEntry(sandboxID, &old)
+		m.publishEntry(sandboxID, old)
+		return errors.Join(err, wrapOptionalError("roll back network ACL update", rollbackErr), wrapOptionalError("persist rolled-back network ACL update", persistErr))
 	}
+	m.publishEntry(sandboxID, next)
 	return nil
 }
 
@@ -557,16 +575,6 @@ func wrapOptionalError(message string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("%s: %w", message, err)
-}
-
-func (m *Manager) Remove(sandboxID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	entry, ok := m.entries[sandboxID]
-	if !ok {
-		return nil
-	}
-	return m.reconcileOrphansLocked(map[string]persistedEntry{sandboxID: entry})
 }
 
 // reconcileOrphansLocked persists cleanup intent before changing kernel state.
@@ -648,16 +656,13 @@ func (m *Manager) reconcileOrphansLocked(candidates map[string]persistedEntry) e
 }
 
 func (m *Manager) cleanupEntryLocked(sandboxID string, entry persistedEntry) error {
-	for otherID, other := range m.entries {
-		if otherID == sandboxID || other.Orphaned || other.IfIndex != entry.IfIndex {
-			continue
-		}
-		return fmt.Errorf(
-			"refusing cleanup of ifindex %d owned by active sandbox %s",
-			entry.IfIndex,
-			otherID,
-		)
+	if err := m.checkCleanupOwnershipLocked(sandboxID, entry); err != nil {
+		return err
 	}
+	return m.cleanupKernel(entry)
+}
+
+func (m *Manager) cleanupKernel(entry persistedEntry) error {
 	if m.iptables != nil {
 		return m.iptables.cleanup(entry)
 	}
@@ -1009,7 +1014,9 @@ func (m *Manager) attachOneLocked(link netlink.Link, parent uint32, handle uint1
 		return err
 	}
 	if created {
+		m.qdiscMu.Lock()
 		m.ownedQdiscs[link.Attrs().Index] = struct{}{}
+		m.qdiscMu.Unlock()
 	}
 	wantedHandle := netlink.MakeHandle(0, handle)
 	filter := &netlink.BpfFilter{
@@ -1090,7 +1097,10 @@ func ensureClsact(link netlink.Link) (bool, error) {
 }
 
 func (m *Manager) removeOwnedQdiscLocked(link netlink.Link) error {
-	if _, owned := m.ownedQdiscs[link.Attrs().Index]; !owned {
+	m.qdiscMu.Lock()
+	_, owned := m.ownedQdiscs[link.Attrs().Index]
+	m.qdiscMu.Unlock()
+	if !owned {
 		return nil
 	}
 	ingress, ingressErr := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
@@ -1110,27 +1120,29 @@ func (m *Manager) removeOwnedQdiscLocked(link netlink.Link) error {
 			break
 		}
 	}
+	m.qdiscMu.Lock()
 	delete(m.ownedQdiscs, link.Attrs().Index)
+	m.qdiscMu.Unlock()
 	return nil
 }
 
-func (m *Manager) authorizeDNS(source net.IP, names []string) bool {
+func (m *Manager) authorizeDNS(source net.IP, names []string) (dnsAuthorization, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	sandboxID, ok := m.sourceIndex[source.String()]
 	if !ok {
-		return false
+		return dnsAuthorization{}, false
 	}
 	entry, ok := m.entries[sandboxID]
 	if !ok || entry.Orphaned {
-		return false
+		return dnsAuthorization{}, false
 	}
 	for _, name := range names {
 		if !entry.Policy.AllowDNS(name) {
-			return false
+			return dnsAuthorization{}, false
 		}
 	}
-	return true
+	return dnsAuthorization{SandboxID: sandboxID, Incarnation: entry.Incarnation, Generation: entry.Generation}, true
 }
 
 func (m *Manager) sweepDomainGrants() {
@@ -1150,52 +1162,68 @@ func (m *Manager) sweepDomainGrants() {
 }
 
 func (m *Manager) expireDomainGrants() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now().UnixNano()
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	m.mu.RLock()
+	ids := make([]string, 0)
+	for id, entry := range m.entries {
+		if !entry.Orphaned && len(entry.DomainGrants) != 0 {
+			ids = append(ids, id)
+		}
+	}
+	m.mu.RUnlock()
 	var errs []error
-	for sandboxID, current := range m.entries {
-		if current.Orphaned || len(current.DomainGrants) == 0 {
-			continue
-		}
-		next := current
-		next.DomainGrants = make([]persistedDomainGrant, 0, len(current.DomainGrants))
-		for _, grant := range current.DomainGrants {
-			if grant.ExpiresAt > now {
-				next.DomainGrants = append(next.DomainGrants, grant)
-			}
-		}
-		if len(next.DomainGrants) == len(current.DomainGrants) {
-			continue
-		}
-		if err := m.applyDomainGrantsLocked(current, next); err != nil {
-			rollbackErr := m.applyDomainGrantsLocked(next, current)
-			errs = append(errs, errors.Join(
-				fmt.Errorf("apply expired grants for %s: %w", sandboxID, err),
-				rollbackErr,
-			))
-			continue
-		}
-		m.entries[sandboxID] = next
-		if err := m.persistLocked(); err != nil {
-			m.entries[sandboxID] = current
-			rollbackErr := m.applyDomainGrantsLocked(next, current)
-			errs = append(errs, errors.Join(
-				fmt.Errorf("persist expired grants for %s: %w", sandboxID, err), rollbackErr,
-			))
+	for _, id := range ids {
+		if err := m.expireEntryGrants(id); err != nil && !errors.Is(err, errord.ErrNotFound) {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
+func (m *Manager) expireEntryGrants(id string) error {
+	op, current, err := m.acquireOperation(id, false)
+	if err != nil {
+		return err
+	}
+	defer m.releaseOperation(id, op)
+	now := time.Now().UnixNano()
+	next := current
+	next.DomainGrants = make([]persistedDomainGrant, 0, len(current.DomainGrants))
+	for _, grant := range current.DomainGrants {
+		if grant.ExpiresAt > now {
+			next.DomainGrants = append(next.DomainGrants, grant)
+		}
+	}
+	if len(next.DomainGrants) == len(current.DomainGrants) {
+		return nil
+	}
+	next.Revision++
+	if err := m.applyDomainGrantsLocked(current, next); err != nil {
+		return errors.Join(err, m.applyDomainGrantsLocked(next, current))
+	}
+	if err := m.persistEntry(id, &next); err != nil {
+		return errors.Join(fmt.Errorf("persist expired grants for %s: %w", id, err), m.applyDomainGrantsLocked(next, current))
+	}
+	m.publishEntry(id, next)
+	return nil
+}
+
 const maxDerivedDomainGrants = 4096
 
 func (m *Manager) observeDNS(
+	authorization dnsAuthorization,
 	source net.IP, queryNames, grantNames []string, response []byte,
 ) ([]byte, error) {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
 	m.mu.RLock()
 	sandboxID, ok := m.sourceIndex[source.String()]
 	entry, entryOK := m.entries[sandboxID]
+	if !ok || !entryOK || sandboxID != authorization.SandboxID || entry.Incarnation != authorization.Incarnation || entry.Generation != authorization.Generation {
+		m.mu.RUnlock()
+		return nil, fmt.Errorf("network endpoint or policy changed while resolving DNS for %s", source)
+	}
 	hasDomainRules := entryOK && !entry.Orphaned && policyHasDomainRules(entry.Policy)
 	queryAllowed := entryOK && !entry.Orphaned
 	if queryAllowed {
@@ -1227,11 +1255,12 @@ func (m *Manager) observeDNS(
 		replacedQuestions[canonicalDNSName(name)] = struct{}{}
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	sandboxID, ok = m.sourceIndex[source.String()]
-	current, ok := m.entries[sandboxID]
-	if !ok || current.Orphaned || current.Generation != entry.Generation {
+	op, current, err := m.acquireOperation(sandboxID, false)
+	if err != nil {
+		return nil, err
+	}
+	defer m.releaseOperation(sandboxID, op)
+	if current.Incarnation != entry.Incarnation || current.Generation != entry.Generation || current.IP != source.String() {
 		return nil, fmt.Errorf("network policy changed while resolving DNS for %s", source)
 	}
 	for _, name := range queryNames {
@@ -1274,12 +1303,12 @@ func (m *Manager) observeDNS(
 		rollbackErr := m.applyDomainGrantsLocked(next, previous)
 		return nil, errors.Join(err, rollbackErr)
 	}
-	m.entries[sandboxID] = next
-	if err := m.persistLocked(); err != nil {
-		m.entries[sandboxID] = previous
+	next.Revision++
+	if err := m.persistEntry(sandboxID, &next); err != nil {
 		rollbackErr := m.applyDomainGrantsLocked(next, previous)
 		return nil, errors.Join(fmt.Errorf("persist DNS grants for %s: %w", sandboxID, err), rollbackErr)
 	}
+	m.publishEntry(sandboxID, next)
 	return rewritten, nil
 }
 
@@ -1605,16 +1634,31 @@ func (m *Manager) deleteConnectionsForPeersLocked(ifindex int, generation uint64
 }
 
 func (m *Manager) Close() error {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
 	var errs []error
-	m.grantStopOnce.Do(func() { close(m.grantStop) })
+	m.grantStopOnce.Do(func() {
+		if m.grantStop != nil {
+			close(m.grantStop)
+		}
+	})
 	m.grantWG.Wait()
 	if m.dns != nil {
 		if err := m.dns.close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	if m.iptables != nil && m.iptables.conntrack != nil {
+		m.iptables.conntrack.Close()
+	}
 	if err := m.objects.close(); err != nil {
 		errs = append(errs, err)
 	}

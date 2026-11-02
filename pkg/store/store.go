@@ -19,12 +19,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/typeurl/v2"
 	"github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/proto"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
-	"github.com/sirupsen/logrus"
 	bolt "go.etcd.io/bbolt"
 	"google.golang.org/protobuf/types/known/anypb"
 )
@@ -38,30 +38,86 @@ type DbStore interface {
 
 var _ DbStore = &BboltStoreImp{}
 
+// BboltStoreImp owns one database handle. Close drains active transactions and
+// prevents subsequent operations from reopening the file.
 type BboltStoreImp struct {
-	path string
+	path       string
+	mu         sync.RWMutex
+	db         *bolt.DB
+	closed     bool
+	batchOnce  sync.Once
+	batchSlots chan struct{}
 }
 
-func NewStoreImp(path string) *BboltStoreImp {
-	// check if parent dir exists, if not, create it
-	if _, err := os.Stat(filepath.Dir(path)); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(path), 0777); err != nil {
-			logrus.WithError(err).Fatalf("create parent dir for db file failed: %v", err)
-		}
-	}
+// NewStoreImp retains lazy construction for callers that handle I/O errors on
+// their first operation. Server construction uses Open to fail before startup.
+func NewStoreImp(path string) *BboltStoreImp { return &BboltStoreImp{path: path} }
 
-	return &BboltStoreImp{
-		path: path,
+func Open(path string) (*BboltStoreImp, error) {
+	s := NewStoreImp(path)
+	if err := s.withDB(func(*bolt.DB) error { return nil }); err != nil {
+		return nil, err
 	}
+	return s, nil
+}
+
+func (f *BboltStoreImp) withDB(fn func(*bolt.DB) error) error {
+	for {
+		f.mu.RLock()
+		if f.closed {
+			f.mu.RUnlock()
+			return bolt.ErrDatabaseNotOpen
+		}
+		if f.db != nil {
+			defer f.mu.RUnlock()
+			return fn(f.db)
+		}
+		f.mu.RUnlock()
+		f.mu.Lock()
+		if f.closed {
+			f.mu.Unlock()
+			return bolt.ErrDatabaseNotOpen
+		}
+		if f.db == nil {
+			if err := os.MkdirAll(filepath.Dir(f.path), 0777); err != nil {
+				f.mu.Unlock()
+				return err
+			}
+			db, err := bolt.Open(f.path, 0777, &bolt.Options{Timeout: time.Second})
+			if err != nil {
+				f.mu.Unlock()
+				return err
+			}
+			db.MaxBatchDelay = time.Millisecond
+			db.MaxBatchSize = 128
+			f.db = db
+		}
+		f.mu.Unlock()
+	}
+}
+
+func (f *BboltStoreImp) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return nil
+	}
+	f.closed = true
+	if f.db != nil {
+		return f.db.Close()
+	}
+	return nil
+}
+
+func (f *BboltStoreImp) update(fn func(*bolt.Tx) error) error {
+	return f.withDB(func(db *bolt.DB) error { return db.Update(fn) })
+}
+func (f *BboltStoreImp) view(fn func(*bolt.Tx) error) error {
+	return f.withDB(func(db *bolt.DB) error { return db.View(fn) })
 }
 
 func (f *BboltStoreImp) Store(key string, data interface{}) error {
-	db, err := bolt.Open(f.path, 0777, nil)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	return db.Update(func(tx *bolt.Tx) error {
+	return f.update(func(tx *bolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(key))
 		if err != nil {
 			return err
@@ -86,12 +142,7 @@ type DecodeType struct {
 }
 
 func (f *BboltStoreImp) StoreRaw(key string, data []byte) error {
-	db, err := bolt.Open(f.path, 0777, nil)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	return db.Update(func(tx *bolt.Tx) error {
+	return f.update(func(tx *bolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(key))
 		if err != nil {
 			return err
@@ -101,14 +152,9 @@ func (f *BboltStoreImp) StoreRaw(key string, data []byte) error {
 }
 
 func (f *BboltStoreImp) Load(key string) (*types.Any, error) {
-	db, err := bolt.Open(f.path, 0666, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
 
 	out := types.Any{}
-	return &out, db.View(func(tx *bolt.Tx) error {
+	return &out, f.view(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(key))
 		if bucket == nil {
 			return errord.ErrNotFound
@@ -124,14 +170,9 @@ func (f *BboltStoreImp) Load(key string) (*types.Any, error) {
 }
 
 func (f *BboltStoreImp) LoadRaw(key string) ([]byte, error) {
-	db, err := bolt.Open(f.path, 0666, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
 
 	var out []byte
-	if err := db.View(func(tx *bolt.Tx) error {
+	if err := f.view(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(key))
 		if bucket == nil {
 			return errord.ErrNotFound
