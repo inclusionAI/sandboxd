@@ -914,16 +914,16 @@ func TestIntegrationDNSProxy(t *testing.T) {
 		resolver.Name(),
 		1,
 		1,
-		func(source net.IP, names []string) (dnsAuthorization, bool) {
+		func(source net.IP, names []string) bool {
 			if !source.Equal(net.ParseIP("127.0.0.1")) {
-				return dnsAuthorization{}, false
+				return false
 			}
 			for _, name := range names {
 				if name == "blocked.example." {
-					return dnsAuthorization{}, false
+					return false
 				}
 			}
-			return dnsAuthorization{}, true
+			return true
 		},
 		nil,
 	)

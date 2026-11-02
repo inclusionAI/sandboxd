@@ -246,7 +246,6 @@ func TestObserveDNSRechecksCurrentDNSPolicyBeforeGranting(t *testing.T) {
 	}
 
 	_, err := manager.observeDNS(
-		dnsAuthorization{SandboxID: "sandbox", Generation: 2},
 		source,
 		[]string{"blocked.example."},
 		[]string{"blocked.example"},
