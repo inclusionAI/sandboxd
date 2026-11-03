@@ -42,6 +42,7 @@ func TestManagedProfileCannotOverridePlatformMountsOrUpper(t *testing.T) {
 	} {
 		h := managedTestService(t)
 		request.Runtime = "runsc"
+		request.WritableLayerLimitBytes = 8192 << 20
 		request.Labels = map[string]string{"adx.tenant_id": "allowed"}
 		if _, err := h.prepareManagedRuntime(request, ""); err == nil {
 			t.Fatal("platform profile override accepted")
@@ -57,7 +58,7 @@ func TestManagedCheckpointRejectsForeignOrChangedProfile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(directory, managedCheckpointFile), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	req := &runtime.StartRequest{Runtime: "runsc", ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
+	req := &runtime.StartRequest{Runtime: "runsc", WritableLayerLimitBytes: 8192 << 20, ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
 	if _, err := h.prepareManagedRuntime(req, directory); err == nil {
 		t.Fatal("cross-tenant collection restored")
 	}
@@ -95,7 +96,10 @@ func TestManagedCheckpointReusesAuthorizedCollectionWithoutFreshMounts(t *testin
 	if err := writePrivateJSON(filepath.Join(root, "records", id+".json"), record, 0600); err != nil {
 		t.Fatal(err)
 	}
-	req := &runtime.StartRequest{Runtime: "runsc", ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
+	// Current authorization may expand without changing a saved runtime's ABI.
+	profile.AllowedTenants = []string{"new-tenant", "allowed"}
+	h.config.ManagedRuntimeProfiles["compose-v1"] = profile
+	req := &runtime.StartRequest{Runtime: "runsc", WritableLayerLimitBytes: 8192 << 20, ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
 	rollback, err := h.prepareManagedRuntime(req, directory)
 	if err != nil {
 		t.Fatal(err)
@@ -106,5 +110,43 @@ func TestManagedCheckpointReusesAuthorizedCollectionWithoutFreshMounts(t *testin
 	}
 	if _, err := os.Stat(filepath.Join(root, "records", id+".json")); err != nil {
 		t.Fatal("failed restore rollback destroyed retained snapshot collection")
+	}
+	profile.AllowedTenants = []string{"new-tenant"}
+	h.config.ManagedRuntimeProfiles["compose-v1"] = profile
+	denied := &runtime.StartRequest{Runtime: "runsc", WritableLayerLimitBytes: 8192 << 20, ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
+	if _, err := h.prepareManagedRuntime(denied, directory); !errors.Is(err, errord.ErrPermissionDenied) {
+		t.Fatalf("revoked tenant restored: %v", err)
+	}
+}
+
+func TestManagedStorageFloorBeforeFilesystemChanges(t *testing.T) {
+	for _, total := range []uint64{0, 4096, 4097, 8191} {
+		h := managedTestService(t)
+		req := &runtime.StartRequest{Runtime: "runsc", WritableLayerLimitBytes: total << 20, ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
+		_, err := h.prepareManagedRuntime(req, "")
+		if err == nil || !strings.Contains(err.Error(), "8192 MiB") {
+			t.Fatalf("total %d: %v", total, err)
+		}
+		entries, _ := os.ReadDir(h.config.ManagedRuntimeRoot)
+		if len(entries) != 0 {
+			t.Fatal("storage rejection changed node state")
+		}
+	}
+}
+
+func TestManagedFingerprintStillRejectsRuntimeChanges(t *testing.T) {
+	p := managedTestService(t).config.ManagedRuntimeProfiles["compose-v1"]
+	original := profileFingerprint(p)
+	for _, change := range []func(*config.ManagedRuntimeProfile){
+		func(p *config.ManagedRuntimeProfile) { p.Image += "changed" },
+		func(p *config.ManagedRuntimeProfile) { p.BootstrapRoot += "changed" },
+		func(p *config.ManagedRuntimeProfile) { p.WritableMB++ },
+		func(p *config.ManagedRuntimeProfile) { p.MinimumRootMB = 8192 },
+	} {
+		changed := p
+		change(&changed)
+		if profileFingerprint(changed) == original {
+			t.Fatal("runtime change retained compatibility fingerprint")
+		}
 	}
 }

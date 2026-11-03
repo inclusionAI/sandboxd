@@ -520,6 +520,8 @@ unlisted tenants are rejected before node state is created. Clients select only
 `extra_config.managedRuntimeProfile` and cannot replace reserved mounts, labels
 or file-backed upper configuration.
 
+The total writable quota must cover `writable_mb` plus `minimum_root_mb` (4096 MiB when omitted or zero). For the example 4096 MiB upper, the platform advertises an 8192 MiB minimum through ADXlet node resource labels. The SDK reserves this floor and restricts placement before creating an environment; explicit undersized requests or limits fail early. Sandboxd independently rejects a smaller total quota before creating any collection state, leaving a usable root layer rather than accepting a one-MiB remainder. Regenerate node metadata from the same profile when changing geometry.
+
 Fresh environments acquire different opaque image collections. Sandboxd injects
 read-only collection/configuration mounts into the outer sandbox and configures
 the private file-backed upper. The node broker authenticates a private capability
@@ -533,6 +535,8 @@ requires a matching operator profile and existing collection, otherwise it fails
 closed. This file participates in the existing checkpoint directory durability
 and ADX storage contract. The server does not create an empty replacement
 collection on restore, and the SDK must not restart daemons/Compose services.
+
+The compatibility fingerprint excludes `allowed_tenants`, which is checked against current policy before restore. Adding or reordering allowed tenants preserves existing authorized snapshots; revoking a tenant still denies recovery. Other captured profile fields remain part of compatibility, including tools, bootstrap and storage geometry. The earlier preview fingerprint format is incompatible with this version: drain its snapshots before upgrade. This change does not solve service-restart dependency reconstruction.
 
 Collection and OCI management references remain pinned until the isolated
 managed service is drained. This preview qualifies same-node recovery only;

@@ -66,6 +66,9 @@ func managedProfileSelection(request *runtime.StartRequest) (string, error) {
 }
 
 func profileFingerprint(profile config.ManagedRuntimeProfile) string {
+	// Authorization is checked against current policy before compatibility.
+	// Adding/reordering tenants must not invalidate another tenant's snapshot.
+	profile.AllowedTenants = nil
 	data, _ := json.Marshal(profile)
 	value := sha256.Sum256(data)
 	return hex.EncodeToString(value[:])
@@ -115,6 +118,13 @@ func (h *sandboxService) prepareManagedRuntime(request *runtime.StartRequest, ch
 	}
 	if request.Runtime != config.RuntimeNameRunsc {
 		return nil, fmt.Errorf("managed Docker runtime requires runsc")
+	}
+	minimumMB, err := profile.MinimumStorageMB()
+	if err != nil {
+		return nil, err
+	}
+	if request.WritableLayerLimitBytes < minimumMB<<20 {
+		return nil, fmt.Errorf("managed runtime profile %q requires at least %d MiB total writable storage (upper plus root)", profileName, minimumMB)
 	}
 	if _, err := name.NewDigest(profile.Image); err != nil {
 		return nil, fmt.Errorf("managed runtime requires a pinned tool image: %w", err)

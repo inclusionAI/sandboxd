@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	runtimeapi "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"os"
@@ -25,6 +26,19 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestManagedProfileFloorLeavesUsableRootStorage(t *testing.T) {
+	profile := config.ManagedRuntimeProfile{WritableMB: 4096}
+	total, err := profile.MinimumStorageMB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := Handler{sandboxRoot: t.TempDir()}
+	got, enabled, err := h.prepareFileBackedTmpfs(runtimecore.StartConfig{ID: "managed-default", WritableLayerLimitBytes: total << 20, ExtraConfig: `{"fileBackedTmpfsMounts":[{"target":"/var/lib/akernel-image-snapshots","sizeMB":4096}]}`})
+	if err != nil || !enabled || got.WritableLayerLimitBytes != 4096<<20 {
+		t.Fatalf("profile floor does not preserve usable root: %d, %v", got.WritableLayerLimitBytes, err)
+	}
+}
 
 func TestFileBackedTmpfsStorageBudget(t *testing.T) {
 	h := Handler{sandboxRoot: t.TempDir()}
