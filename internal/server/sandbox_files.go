@@ -25,6 +25,7 @@ import (
 	"unicode"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
+	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/util"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageconfig"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
@@ -43,8 +44,27 @@ var defaultSandboxFileDestinations = []string{
 }
 
 type preparedSandboxFiles struct {
-	root   string
-	mounts []*runtime.Mount
+	root         string
+	mounts       []*runtime.Mount
+	initialFiles []svc.InitialFile
+	managedHosts *svc.ManagedHostsState
+}
+
+type sandboxHostsPolicy struct {
+	runtime       string
+	rootReadonly  bool
+	checkpointDir string
+}
+
+func (h *sandboxService) validateRestoreTarget(runtimeName, id, checkpointDir string) error {
+	if runtimeName != config.RuntimeNameRunsc || checkpointDir == "" {
+		return nil
+	}
+	target, err := util.JoinWithinRoot(h.config.RootDir, "containers", id)
+	if err != nil {
+		return err
+	}
+	return util.ValidateRestoreDirectorySeparation(checkpointDir, target)
 }
 
 type imageProcessSpec struct {
@@ -98,6 +118,46 @@ func (p *preparedSandboxFiles) Mounts() []*runtime.Mount {
 	return p.mounts
 }
 
+func (p *preparedSandboxFiles) InitialFiles() []svc.InitialFile {
+	if p == nil {
+		return nil
+	}
+	return p.initialFiles
+}
+
+func (p *preparedSandboxFiles) ManagedHosts() *svc.ManagedHostsState {
+	if p == nil {
+		return nil
+	}
+	return p.managedHosts
+}
+
+func selectManagedHostsState(policy sandboxHostsPolicy, ownsHosts bool) (*svc.ManagedHostsState, error) {
+	if policy.runtime != config.RuntimeNameRunsc {
+		return nil, nil
+	}
+	if policy.checkpointDir != "" {
+		state, err := svc.ReadManagedHostsState(policy.checkpointDir)
+		if err != nil || state == nil {
+			return state, err
+		}
+		if err := svc.ValidateManagedHostsCompatibility(state, policy.runtime, policy.rootReadonly, ownsHosts); err != nil {
+			return nil, err
+		}
+		return state, nil
+	}
+	layout := svc.HostsLayoutPrivateRootfs
+	if ownsHosts {
+		layout = svc.HostsLayoutExternal
+	} else if policy.rootReadonly {
+		layout = svc.HostsLayoutLegacy
+	}
+	return &svc.ManagedHostsState{
+		Version: svc.ManagedHostsVersion, Layout: layout,
+		Runtime: policy.runtime, RootReadonly: policy.rootReadonly,
+	}, nil
+}
+
 func (p *preparedSandboxFiles) Rollback() {
 	if p == nil || p.root == "" {
 		return
@@ -113,6 +173,7 @@ func (h *sandboxService) prepareSandboxFiles(
 	mounts []*runtime.Mount,
 	imageProcess *imageProcessSpec,
 	imageProcessTarget string,
+	hostsPolicy sandboxHostsPolicy,
 ) (*preparedSandboxFiles, error) {
 	hostname := defaults.Hostname
 	if hostname == "" {
@@ -137,6 +198,15 @@ func (h *sandboxService) prepareSandboxFiles(
 		return nil, fmt.Errorf("mount target conflicts with managed image process config at %s", imageProcessTarget)
 	}
 	needsHosts := !mountDestinationsOwn(owners, "/etc/hosts")
+	prepared.managedHosts, err = selectManagedHostsState(hostsPolicy, !needsHosts)
+	if err != nil {
+		return nil, fmt.Errorf("prepare managed hosts layout: %w", err)
+	}
+	privateHosts := prepared.managedHosts != nil && prepared.managedHosts.Layout == svc.HostsLayoutPrivateRootfs
+	if privateHosts && hostsPolicy.checkpointDir != "" {
+		// Saved filesystem state owns existence and content, including deletion.
+		needsHosts = false
+	}
 	needsHostname := !mountDestinationsOwn(owners, "/etc/hostname")
 	needsResolver := managedDNS || !mountDestinationsOwn(owners, "/etc/resolv.conf")
 	if !needsHosts && !needsHostname && !needsResolver && imageProcess == nil {
@@ -162,11 +232,15 @@ func (h *sandboxService) prepareSandboxFiles(
 			"127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n%s %s\n",
 			networkIP.String(), hostname,
 		)
-		source := filepath.Join(root, "hosts")
-		if err := atomicWriteSandboxFile(source, []byte(content)); err != nil {
-			return nil, fmt.Errorf("write sandbox hosts: %w", err)
+		if privateHosts {
+			prepared.initialFiles = []svc.InitialFile{{Path: "/etc/hosts", Content: []byte(content), Mode: 0644}}
+		} else {
+			source := filepath.Join(root, "hosts")
+			if err := atomicWriteSandboxFile(source, []byte(content)); err != nil {
+				return nil, fmt.Errorf("write sandbox hosts: %w", err)
+			}
+			prepared.mounts = append(prepared.mounts, sandboxFileMount("/etc/hosts", source))
 		}
-		prepared.mounts = append(prepared.mounts, sandboxFileMount("/etc/hosts", source))
 	}
 	if needsHostname {
 		source := filepath.Join(root, "hostname")

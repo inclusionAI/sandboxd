@@ -229,3 +229,71 @@ func TestRunscHandlerResolvesWritableLayerOverlay(t *testing.T) {
 	assert.Equal(t, "root:dir=/home/akernel/xfs,size=10G", overlay)
 	assert.Equal(t, "10G", size)
 }
+
+// Checkpoint dependencies must outlive the source bundle and remain reusable.
+func TestManagedHostsCheckpointDependencies(t *testing.T) {
+	check := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	bundles, lower := t.TempDir(), t.TempDir()
+	check(os.Mkdir(filepath.Join(lower, "etc"), 0755))
+	fixture := func(id string) (*Handler, runtimecore.StartConfig, string) {
+		t.Helper()
+		bundle := filepath.Join(bundles, id)
+		check(os.Mkdir(bundle, 0755))
+		h := &Handler{
+			runsc: successfulRunscClient{}, sandboxRoot: bundles, filestoreDir: t.TempDir(),
+			ociLoader: staticOciLoader{bundlePath: bundle, spec: &runtimecore.Spec{Root: &runtimecore.Root{Path: lower}}},
+		}
+		start := runtimecore.StartConfig{
+			ID: id, Network: &networkmanager.NetResource{},
+			ManagedHosts: &runtimecore.ManagedHostsState{Version: runtimecore.ManagedHostsVersion, Runtime: "runsc", Layout: runtimecore.HostsLayoutPrivateRootfs},
+			InitialFiles: []runtimecore.InitialFile{{Path: "/etc/hosts", Content: []byte("initial-host\n"), Mode: 0644}},
+		}
+		return h, start, bundle
+	}
+	h, start, bundle := fixture("source")
+	check(h.Start(ctx, start))
+	assert.Nil(t, start.ManagedHosts.Seed, "Start must not mutate caller state")
+	original, err := runtimecore.ReadManagedHostsState(bundle)
+	check(err)
+	seed, err := readHostsSeed(bundle, original)
+	check(err)
+	checkpoint := filepath.Join(t.TempDir(), "first")
+	// A replacement Handler must recover all initialization state from disk.
+	restarted := &Handler{runsc: successfulRunscClient{}, sandboxRoot: bundles}
+	check(restarted.Checkpoint(ctx, runtimecore.CheckpointConfig{ID: start.ID, Directory: checkpoint}))
+	saved, err := runtimecore.ReadManagedHostsState(checkpoint)
+	check(err)
+	assert.Equal(t, original, saved)
+	check(os.RemoveAll(bundle))
+
+	target, restore, targetBundle := fixture("target")
+	restore.InitialFiles, restore.ManagedHosts, restore.CheckpointDir = nil, nil, checkpoint
+	check(target.Restore(ctx, restore))
+	restored, err := runtimecore.ReadManagedHostsState(targetBundle)
+	check(err)
+	assert.Equal(t, saved, restored)
+	restoredSeed, err := readHostsSeed(targetBundle, restored)
+	check(err)
+	assert.Equal(t, seed, restoredSeed, "Restore must copy the saved seed without initialization")
+	second := filepath.Join(t.TempDir(), "second")
+	check(restarted.Checkpoint(ctx, runtimecore.CheckpointConfig{ID: restore.ID, Directory: second}))
+	repeated, err := runtimecore.ReadManagedHostsState(second)
+	check(err)
+	assert.Equal(t, saved, repeated)
+	repeatedSeed, err := readHostsSeed(second, repeated)
+	check(err)
+	assert.Equal(t, seed, repeatedSeed)
+
+	check(os.WriteFile(filepath.Join(checkpoint, runtimecore.RootfsSeedName), []byte("corrupted"), 0600))
+	rejected, badRestore, rejectedBundle := fixture("rejected")
+	badRestore.InitialFiles, badRestore.ManagedHosts, badRestore.CheckpointDir = nil, nil, checkpoint
+	assert.ErrorContains(t, rejected.Restore(ctx, badRestore), "SHA-256 mismatch")
+	_, err = os.Lstat(filepath.Join(rejectedBundle, runtimecore.RootfsSeedName))
+	assert.ErrorIs(t, err, os.ErrNotExist, "failed restore must not leave seed artifacts")
+}

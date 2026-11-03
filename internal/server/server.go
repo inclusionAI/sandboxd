@@ -104,7 +104,7 @@ type sandboxService struct {
 	runtimeDeleteTimeout              time.Duration
 	aclMu                             sync.Mutex
 	checkpointMu                      sync.Mutex
-	checkpointing                     map[string]struct{}
+	checkpointing                     map[string]string
 	firecrackerCheckpointMemorySlotMu sync.Mutex
 	firecrackerCheckpointMemorySlot   chan struct{}
 }
@@ -189,6 +189,9 @@ func (h *sandboxService) startSandboxRuntime(
 	runtimeName string,
 	startConfig svc.StartConfig,
 ) (err error) {
+	if err := h.validateRestoreTarget(runtimeName, startConfig.ID, startConfig.CheckpointDir); err != nil {
+		return errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
+	}
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
 	defer func() {
@@ -1363,6 +1366,10 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}, errord.ToGRPC(err)
 	}
 	startReq.SandboxID = sandboxID
+	if err := h.validateRestoreTarget(startReq.Runtime, sandboxID, checkpointDir); err != nil {
+		h.sandboxManager.ReleaseID(sandboxID)
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
+	}
 	startSucceeded := false
 	var preparedFilesystem *preparedFS
 	var preparedResources *preparedStartResources
@@ -1572,6 +1579,11 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		preparedFilesystem.Mounts(),
 		imageProcess,
 		startReq.InjectEntrypoint,
+		sandboxHostsPolicy{
+			runtime:       startReq.Runtime,
+			rootReadonly:  svc.EffectiveRootReadonly(startReq.Rootfs.GetReadonly(), startReq.WritableLayerLimitBytes, specUpdates),
+			checkpointDir: checkpointDir,
+		},
 	)
 	if err != nil {
 		return &runtime.StartResponse{
@@ -1600,6 +1612,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		ExtraConfig:             startReq.ExtraConfig,
 		EnableKVM:               extraConfig.EnableKVM,
 		CheckpointDir:           checkpointDir,
+		InitialFiles:            sandboxFiles.InitialFiles(),
+		ManagedHosts:            sandboxFiles.ManagedHosts(),
 	}
 	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
 		return &runtime.StartResponse{

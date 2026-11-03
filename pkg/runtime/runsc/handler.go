@@ -128,7 +128,7 @@ func (r *Handler) CheckpointRestoreCapabilities() runtimecore.CheckpointRestoreC
 	}
 }
 
-func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) error {
+func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) (retErr error) {
 	traceID, _ := trace.GetContextID(ctx)
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
@@ -149,6 +149,15 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 	if err != nil {
 		return fmt.Errorf("generate OCI bundle: %w", err)
 	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, removeManagedHostsFiles(bundlePath), cleanupHostsMetadataMount(bundlePath))
+		}
+	}()
+	managedHosts, err := r.prepareFreshManagedHosts(bundlePath, ociSpec, config)
+	if err != nil {
+		return fmt.Errorf("prepare managed hosts: %w", err)
+	}
 	mountTargetsReady, err := runtimecore.RootfsMountTargetsReady(bundlePath, ociSpec)
 	if err != nil {
 		return fmt.Errorf("inspect rootfs mount targets: %w", err)
@@ -167,13 +176,20 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 			return fmt.Errorf("prepare private runsc rootfs: %w", err)
 		}
 	}
+	if err := finalizeManagedHosts(bundlePath, ociSpec, managedHosts); err != nil {
+		if cleanupNVProxyRootfs != nil {
+			err = errors.Join(err, cleanupNVProxyRootfs())
+		}
+		return fmt.Errorf("persist managed hosts: %w", err)
+	}
 
 	startArgs := StartArgs{
-		ID:          config.ID,
-		BundleDir:   bundlePath,
-		UserStdout:  config.Stdout,
-		UserStderr:  config.Stderr,
-		RootOverlay: rootOverlay,
+		ID:           config.ID,
+		BundleDir:    bundlePath,
+		UserStdout:   config.Stdout,
+		UserStderr:   config.Stderr,
+		RootOverlay:  rootOverlay,
+		SeededRootfs: privateManagedHosts(managedHosts),
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
 			LinkAddress: config.Network.GuestHardwareAddr(),
@@ -201,13 +217,41 @@ func (r *Handler) Start(ctx context.Context, config runtimecore.StartConfig) err
 }
 
 func (r *Handler) Checkpoint(ctx context.Context, config runtimecore.CheckpointConfig) error {
-	return r.runsc.Checkpoint(
+	bundle, err := util.JoinWithinRoot(r.sandboxRoot, config.ID)
+	if err != nil {
+		return err
+	}
+	if err := util.ValidateRestoreDirectorySeparation(config.Directory, bundle); err != nil {
+		return err
+	}
+	state, seed, err := managedHostsCheckpointMaterial(bundle)
+	if err != nil {
+		return fmt.Errorf("prepare hosts checkpoint materials: %w", err)
+	}
+	if err := r.runsc.Checkpoint(
 		ctx,
 		config.ID,
 		config.Directory,
 		config.Compress,
 		config.LeaveRunning,
-	)
+	); err != nil {
+		return err
+	}
+	if state == nil {
+		return nil
+	}
+	if err := os.MkdirAll(config.Directory, 0700); err != nil {
+		return err
+	}
+	if privateManagedHosts(state) {
+		if err := writeHostsSeed(config.Directory, seed); err != nil {
+			return errors.Join(err, removeManagedHostsFiles(config.Directory))
+		}
+	}
+	if err := runtimecore.WriteManagedHostsState(config.Directory, state); err != nil {
+		return errors.Join(err, removeManagedHostsFiles(config.Directory))
+	}
+	return nil
 }
 
 func (r *Handler) Restore(
@@ -217,6 +261,15 @@ func (r *Handler) Restore(
 	traceID, _ := trace.GetContextID(ctx)
 	if config.Network == nil {
 		return fmt.Errorf("network is required")
+	}
+	if r.sandboxRoot != "" {
+		target, err := util.JoinWithinRoot(r.sandboxRoot, config.ID)
+		if err != nil {
+			return err
+		}
+		if err := util.ValidateRestoreDirectorySeparation(config.CheckpointDir, target); err != nil {
+			return err
+		}
 	}
 	adoptDir, err := filestoreRestoreDirectory(config.CheckpointDir)
 	if err != nil {
@@ -238,6 +291,20 @@ func (r *Handler) Restore(
 	})
 	if err != nil {
 		return fmt.Errorf("generate OCI bundle: %w", err)
+	}
+	// Check an overridden/custom loader's actual destination before installing
+	// failure cleanup; an input checkpoint must never become cleanup-owned.
+	if err := util.ValidateRestoreDirectorySeparation(config.CheckpointDir, bundlePath); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, removeManagedHostsFiles(bundlePath))
+		}
+	}()
+	managedHosts, err := prepareRestoredManagedHosts(bundlePath, ociSpec, config)
+	if err != nil {
+		return fmt.Errorf("prepare restored hosts: %w", err)
 	}
 	mountTargetsReady, err := runtimecore.RootfsMountTargetsReady(bundlePath, ociSpec)
 	if err != nil {
@@ -269,6 +336,12 @@ func (r *Handler) Restore(
 		}
 		return cleanupErr
 	}
+	if err := finalizeManagedHosts(bundlePath, ociSpec, managedHosts); err != nil {
+		if cleanupNVProxyRootfs != nil {
+			err = errors.Join(err, cleanupNVProxyRootfs())
+		}
+		return fmt.Errorf("persist restored hosts: %w", err)
+	}
 
 	startArgs := StartArgs{
 		ID:                config.ID,
@@ -276,6 +349,7 @@ func (r *Handler) Restore(
 		UserStdout:        config.Stdout,
 		UserStderr:        config.Stderr,
 		RootOverlay:       rootOverlay,
+		SeededRootfs:      privateManagedHosts(managedHosts),
 		FilestoreAdoptDir: adoptDir,
 		Network: NetworkConfig{
 			Interface:   config.Network.Interface,
@@ -323,6 +397,9 @@ func (r *Handler) Delete(ctx context.Context, sandboxID string) error {
 		return fmt.Errorf("resolve runsc sandbox bundle: %w", err)
 	}
 	if err := cleanupRunscNVProxyRootfs(bundlePath); err != nil {
+		return err
+	}
+	if err := cleanupHostsMetadataMount(bundlePath); err != nil {
 		return err
 	}
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Debugf("call runsc delete, cost: %v", time.Since(start))
