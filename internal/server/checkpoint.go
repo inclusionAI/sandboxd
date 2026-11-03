@@ -83,12 +83,12 @@ func (h *sandboxService) Checkpoint(
 			sandbox.Metadata.RuntimeHandler,
 		)
 	}
-	if !h.beginCheckpoint(request.ID) {
-		return nil, errord.ToGRPCf(
-			errord.ErrFailedPrecondition,
-			"checkpoint is already in progress for sandbox %s",
-			request.ID,
-		)
+	reservedDirectory := ""
+	if sandbox.Metadata.RuntimeHandler == config.RuntimeNameRunsc {
+		reservedDirectory = request.CheckpointDir
+	}
+	if err := h.beginCheckpoint(request.ID, reservedDirectory); err != nil {
+		return nil, errord.ToGRPC(err)
 	}
 	defer h.finishCheckpoint(request.ID)
 
@@ -264,17 +264,37 @@ func checkpointGuestMemoryResources(
 	return resources
 }
 
-func (h *sandboxService) beginCheckpoint(id string) bool {
+// Reserve the sandbox and, for runsc, its output path before directory preparation.
+// Keep the reservation through failure cleanup, which owns everything written
+// into that directory. Disjoint checkpoints do not hold this mutex while running.
+func (h *sandboxService) beginCheckpoint(id, directory string) error {
+	clean := ""
+	if directory != "" {
+		var err error
+		clean, err = validateCheckpointPath(directory, false)
+		if err != nil {
+			return err
+		}
+	}
 	h.checkpointMu.Lock()
 	defer h.checkpointMu.Unlock()
-	if h.checkpointing == nil {
-		h.checkpointing = make(map[string]struct{})
-	}
 	if _, ok := h.checkpointing[id]; ok {
-		return false
+		return fmt.Errorf("checkpoint is already in progress for sandbox %s: %w", id, errord.ErrFailedPrecondition)
 	}
-	h.checkpointing[id] = struct{}{}
-	return true
+	separator := string(filepath.Separator)
+	for _, active := range h.checkpointing {
+		if clean == "" || active == "" {
+			continue
+		}
+		if clean == active || strings.HasPrefix(clean, active+separator) || strings.HasPrefix(active, clean+separator) {
+			return fmt.Errorf("checkpoint directory %s overlaps directory %s already in use: %w", clean, active, errord.ErrFailedPrecondition)
+		}
+	}
+	if h.checkpointing == nil {
+		h.checkpointing = make(map[string]string)
+	}
+	h.checkpointing[id] = clean
+	return nil
 }
 
 func (h *sandboxService) finishCheckpoint(id string) {

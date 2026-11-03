@@ -992,6 +992,10 @@ run_checkpoint_restore_check() {
     fi
     sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
         'echo checkpoint-state-ok > /var/checkpoint-persist'
+    if [ "${runtime}" = "runsc" ]; then
+        sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
+            'printf "192.0.2.10 hosts-checkpoint\n" > /etc/hosts'
+    fi
     if [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; then
         local native_fstype
         native_fstype="$(sbox_cmd exec "${SANDBOX_ID}" /bin/awk \
@@ -1114,6 +1118,10 @@ run_checkpoint_restore_check() {
     local persisted
     persisted="$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /var/checkpoint-persist)"
     assert_eq "${persisted}" "checkpoint-state-ok" "${suffix} restored writable state"
+    if [ "${runtime}" = "runsc" ]; then
+        assert_eq "$(sbox_cmd exec "${SANDBOX_ID}" /bin/cat /etc/hosts)" \
+            "192.0.2.10 hosts-checkpoint" "${suffix} restored hosts content"
+    fi
     if { [ "${runtime}" = "firecracker" ] || [ "${runtime}" = "firecracker-pvm" ]; } &&
         [ "${FIRECRACKER_VIRTIOFS}" = "1" ]; then
         local restored_mount
@@ -1187,6 +1195,35 @@ run_checkpoint_restore_check() {
     fi
     if [ "${runtime}" = "runsc" ] && [ "${RUNSC_CHECKPOINT_MODE:-}" = "reflink" ]; then
         run_runsc_filestore_clone_check "${checkpoint_dir}" "${request_file}"
+    fi
+
+    if [ "${runtime}" = "runsc" ]; then
+        local hosts_state hosts_dir restored_hosts_id
+        for hosts_state in empty deleted; do
+            log "testing ${suffix} ${hosts_state} hosts checkpoint/restore"
+            if [ "${hosts_state}" = "empty" ]; then
+                sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c ': > /etc/hosts'
+            else
+                sbox_cmd exec "${SANDBOX_ID}" /bin/rm /etc/hosts
+            fi
+            hosts_dir="${checkpoint_root}/hosts-${hosts_state}"
+            checkpoint-restore --action checkpoint --socket "${SOCKET}" \
+                --sandbox-id "${SANDBOX_ID}" --checkpoint-dir "${hosts_dir}" \
+                --checkpoint-timeout-seconds 180 --leave-running=true
+            sbox_cmd delete "${SANDBOX_ID}"
+            SANDBOX_ID="${target_id}-hosts-${hosts_state}"
+            restored_hosts_id="$(checkpoint-restore --action restore --socket "${SOCKET}" \
+                --target-id "${SANDBOX_ID}" --request-file "${request_file}" \
+                --checkpoint-dir "${hosts_dir}")"
+            assert_eq "${restored_hosts_id}" "${SANDBOX_ID}" "${suffix} ${hosts_state} hosts restore ID"
+            wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING" 300
+            if [ "${hosts_state}" = "empty" ]; then
+                sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c 'test -f /etc/hosts && test ! -L /etc/hosts && test ! -s /etc/hosts'
+            else
+                sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c 'test ! -e /etc/hosts && test ! -L /etc/hosts'
+            fi
+            log "${suffix} ${hosts_state} hosts survived checkpoint/restore"
+        done
     fi
 
     rm -rf -- "${checkpoint_root}"
