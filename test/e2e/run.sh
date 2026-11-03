@@ -544,6 +544,8 @@ case "${E2E_RUNTIME}" in
         "${DOCKER}" run --name "${CONTAINER}-mount-contract" --init --privileged \
             --cgroupns=host --net bridge \
             -e "E2E_RUNTIME=${E2E_RUNTIME}" -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
+            -e "E2E_RUNSC_CHECKPOINT_MODE=${E2E_RUNSC_CHECKPOINT_MODE}" \
+            -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
             -e "E2E_CGROUP_ROOT=${CGROUP_ROOT}-mount-contract" \
             -v "${MOUNT_CONTRACT_HOME_FIXTURE_DIR}:/home/akernel:rw" \
             --tmpfs /e2e:rw,exec,size=512m -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
