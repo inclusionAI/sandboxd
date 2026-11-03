@@ -53,7 +53,26 @@ type PluginConfig struct {
 
 	NodeResourceConfig `toml:"node_resource" json:"nodeResource"`
 
-	ImageManagerConfig `toml:"image" json:"image"`
+	ImageManagerConfig   `toml:"image" json:"image"`
+	ManagedRuntimeConfig `toml:"managed_runtime" json:"managedRuntime"`
+}
+
+// ManagedRuntimeConfig is deployment-owned. Guests select a profile name only.
+type ManagedRuntimeConfig struct {
+	ManagedRuntimeRoot     string                           `toml:"root" json:"root"`
+	ManagedRuntimeProfiles map[string]ManagedRuntimeProfile `toml:"profiles" json:"profiles"`
+}
+
+type ManagedRuntimeProfile struct {
+	Image            string   `toml:"image" json:"image"`
+	Registry         string   `toml:"registry" json:"registry"`
+	RepositoryPrefix string   `toml:"repository_prefix" json:"repositoryPrefix"`
+	RegistryAuthFile string   `toml:"registry_auth_file" json:"registryAuthFile"`
+	RegistryInsecure bool     `toml:"registry_insecure" json:"registryInsecure"`
+	BuildkitEndpoint string   `toml:"buildkit_endpoint" json:"buildkitEndpoint"`
+	ProviderURL      string   `toml:"provider_url" json:"providerURL"`
+	AllowedTenants   []string `toml:"allowed_tenants" json:"allowedTenants"`
+	WritableMB       int      `toml:"writable_mb" json:"writableMB"`
 }
 
 // ImageManagerConfig configures image and mount lifecycle management.

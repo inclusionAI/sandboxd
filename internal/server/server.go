@@ -1215,6 +1215,16 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	if startReq.Runtime == "" {
 		startReq.Runtime = config.RuntimeNameRunsc
 	}
+	managedRollback, err := h.prepareManagedRuntime(startReq, checkpointDir)
+	if err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+	}
+	managedCommitted := false
+	defer func() {
+		if !managedCommitted && managedRollback != nil {
+			managedRollback()
+		}
+	}()
 	networkPolicy, err := networkacl.NormalizePolicy(startReq.NetworkPolicy)
 	if err != nil {
 		wrapped := errord.ToGRPC(fmt.Errorf("invalid network policy: %v: %w", err, errord.ErrInvalidArgument))
@@ -1681,6 +1691,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		SandboxID: sandboxID,
 	})
 	startSucceeded = true
+	managedCommitted = true
 	return &runtime.StartResponse{
 		Code:      0,
 		Message:   "Succeed",

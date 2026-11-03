@@ -507,3 +507,35 @@ The destination host must support the saved I/O engine. In particular, direct en
 The Firecracker completion log keeps `layout`, `flush`, `pause`, `snapshot`, `overlay`, `resume`, `seal` and `total` timings, and splits the `seal` interval into `manifest`, `adopt`, `persist` and `writeback_queue`. The debug log separates manifest component hashing from publication, native snapshot time from both cgroup moves, and atomic state-file creation, writing, `fsync`, closing and rename. `seal` includes instance-state persistence and queue submission; it is not a measurement of guest-memory hashing or an assurance that all checkpoint data reached stable storage. Collect these timings alongside I/O and CPU-pressure measurements before attributing nested checkpoint latency to the virtualization backend.
 
 When profiling nested PVM, keep the VMM and its vCPU threads outside ptrace. Following sandboxd forks can otherwise perturb guest startup even with a narrow displayed syscall filter. For example, `strace -f -b execve` follows sandboxd threads but detaches children when they execute another program; verify the running Firecracker process reports `TracerPid: 0`. Record outer block-I/O limits as well as CPU/memory limits. Separate virtual disks or ext4/XFS filesystems can still share one capped backing device. Memory-backed checkpoint controls are diagnostics and do not replace persistent-storage or restore qualification.
+
+## Managed Docker runtime collections (opt-in local preview)
+
+An operator may configure `[plugin.managed_runtime]` with an absolute private
+`root`, and named `[plugin.managed_runtime.profiles.<name>]` profiles. Each
+profile specifies a digest-pinned tool `image`, `registry`, `repository_prefix`,
+`registry_auth_file`, `registry_insecure`, `buildkit_endpoint`, `provider_url`,
+`allowed_tenants` and the private upper's `writable_mb` quota. It is disabled
+without an explicit profile. ADX supplies the trusted `adx.tenant_id` label;
+unlisted tenants are rejected before node state is created. Clients select only
+`extra_config.managedRuntimeProfile` and cannot replace reserved mounts, labels
+or file-backed upper configuration.
+
+Fresh environments acquire different opaque image collections. Sandboxd injects
+read-only collection/configuration mounts into the outer sandbox and configures
+the private file-backed upper. The node broker authenticates a private capability
+against Sandboxd's operator-owned record. It permits immutable references under
+that collection's Registry repository prefix. Docker startup flags, Registry
+credentials and node paths are not part of the Harbor job or SDK handle.
+
+Before the output durability barrier, checkpoint writes `managed-runtime.json`
+containing only the collection ID, tenant and profile fingerprint. Restore
+requires a matching operator profile and existing collection, otherwise it fails
+closed. This file participates in the existing checkpoint directory durability
+and ADX storage contract. The server does not create an empty replacement
+collection on restore, and the SDK must not restart daemons/Compose services.
+
+Collection and OCI management references remain pinned until the isolated
+managed service is drained. This preview qualifies same-node recovery only;
+persistent sandbox/snapshot leases, cross-node recovery, node-restart recovery,
+Registry repository-scoped token issuance and artifact GC remain release work.
+A Basic-auth experiment Registry account is not a production tenant boundary.

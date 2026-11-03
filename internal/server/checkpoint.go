@@ -157,6 +157,10 @@ func (h *sandboxService) Checkpoint(
 		return nil, errord.ToGRPC(operationErr)
 	}
 	captureDuration := time.Since(captureStarted)
+	if err := h.writeManagedRuntimeCheckpoint(request.ID, directory.path); err != nil {
+		cleanupErr := directory.cleanup()
+		return nil, errord.ToGRPC(errors.Join(fmt.Errorf("persist managed runtime checkpoint: %w", err), cleanupErr))
+	}
 	syncStarted := time.Now()
 	if h.config.PluginConfig.RuntimeConfig.CheckpointSync.SyncOutput {
 		if err := syncCheckpointOutput(checkpointCtx, directory.path); err != nil {
