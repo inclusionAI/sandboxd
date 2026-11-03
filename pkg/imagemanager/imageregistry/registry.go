@@ -55,6 +55,8 @@ const (
 
 // Client handles image fetching from container registries with authentication.
 type Client struct {
+	metadataMu         sync.Mutex
+	metadataAuth       map[string]http.RoundTripper
 	keychain           authn.Keychain
 	transportCache     map[string]*registryTransport
 	transportCacheLock sync.RWMutex

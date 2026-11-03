@@ -782,16 +782,16 @@ func TestDaemon_StartDaemonProcess_StatfsErrorWarnsAndWaits(t *testing.T) {
 	if mock.getState() != DaemonStateMounting {
 		t.Errorf("State = %v, want %v", mock.getState(), DaemonStateMounting)
 	}
-	if !strings.Contains(buf.String(), "mount readiness statfs failed, keep waiting") {
-		t.Fatalf("warning log missing, got %q", buf.String())
-	}
-
 	close(mock.stopChan)
 
 	select {
 	case <-done:
 	case <-time.After(1 * time.Second):
 		t.Fatal("startDaemonProcess() did not exit after stopChan closed")
+	}
+	// Read the non-concurrent buffer only after the logging goroutine exited.
+	if !strings.Contains(buf.String(), "mount readiness statfs failed, keep waiting") {
+		t.Fatalf("warning log missing, got %q", buf.String())
 	}
 
 	if mock.getState() != DaemonStateStopped {

@@ -8,10 +8,102 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type managementMounter struct{ calls int }
+
+func TestManagementParallelImagesAndShutdownJoin(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	var active atomic.Int32
+	path := filepath.Join(t.TempDir(), "private", "management.sock")
+	service := &blockingImageService{mount: func(ctx context.Context, _ *OCIMountRequest) (*OCIMountResponse, error) {
+		active.Add(1)
+		defer active.Add(-1)
+		entered <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	server, err := ListenManagement(path, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
+	}}}
+	defer client.CloseIdleConnections()
+	done := make(chan struct{}, 2)
+	for _, c := range []string{"a", "b"} {
+		go func(c string) {
+			defer func() { done <- struct{}{} }()
+			response, err := client.Post("http://unix/oci_mount", "application/json", strings.NewReader(`{"image_url":"registry.test/managed/`+c+`@sha256:`+strings.Repeat(c, 64)+`"}`))
+			if err == nil {
+				response.Body.Close()
+			}
+		}(c)
+	}
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("management lock serialized different images")
+		}
+	}
+	server.Close()
+	if active.Load() != 0 {
+		t.Fatal("shutdown returned while preparation survived")
+	}
+	for range 2 {
+		<-done
+	}
+}
+
+type metadataReader struct{ calls int }
+
+func (m *metadataReader) Metadata(context.Context, string, string, bool) ([]byte, string, error) {
+	m.calls++
+	return []byte(`{"config":"verified"}`), "application/json", nil
+}
+
+func TestPrivateMetadataDelegatesOnlyValidatedReferences(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private", "management.sock")
+	reader := &metadataReader{}
+	server, err := ListenManagement(path, &managementMounter{}, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
+	}}}
+	defer client.CloseIdleConnections()
+	ref := "registry.test/managed/main@sha256:" + strings.Repeat("a", 64)
+	for _, test := range []struct {
+		body   string
+		status int
+	}{
+		{`{"reference":"registry.test/managed/main:tag","kind":"manifests"}`, 400},
+		{`{"reference":"` + ref + `","kind":"files"}`, 400},
+		{`{"reference":"` + ref + `","kind":"manifests","auth":"client-secret"}`, 400},
+		{`{"reference":"` + ref + `","kind":"manifests"} {}`, 400},
+		{`{"reference":"` + ref + `","kind":"manifests","insecure":true}`, 200},
+	} {
+		response, err := client.Post("http://unix/registry_metadata", "application/json", strings.NewReader(test.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != test.status {
+			t.Fatalf("got %d want %d", response.StatusCode, test.status)
+		}
+		response.Body.Close()
+	}
+	if reader.calls != 1 {
+		t.Fatalf("unvalidated metadata read: %d", reader.calls)
+	}
+}
 
 func (m *managementMounter) UmountOCI(*OCIUmountRequest) error { return nil }
 

@@ -141,7 +141,7 @@ func NewModule(cfg Config) (*Module, error) {
 	}
 	m := &Module{cfg: cfg, mgr: mgr, ociMgr: ociMgr, worker: worker, service: shared}
 	if cfg.ManagementSocket != "" {
-		management, err := api.ListenManagement(cfg.ManagementSocket, shared)
+		management, err := api.ListenManagement(cfg.ManagementSocket, shared, sharedRegistryClient)
 		if err != nil {
 			worker.Close()
 			ociMgr.Close()

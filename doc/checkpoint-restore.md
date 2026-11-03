@@ -6,6 +6,8 @@ The optional `[plugin.image].management_socket` exposes immutable OCI image prep
 
 When enabled, managed preparation, ordinary rootfs use and image mounts share OCI reference counting: deleting one rootfs cannot stop a ROFS daemon still held by the managed runtime. Repeated preparation of one immutable reference holds one management lease. Management leases remain until the owned service shuts down; callers must delete all dependent sandboxes and retained snapshots before removing the collection or stopping its image service. This preview does not persist dynamic collection leases across a node/service restart or authorize tenants through the platform catalog. Durable lease recovery, multi-node restore and artifact garbage collection are not implied by same-node sandbox checkpoint/restore tests. With the management socket unset, the existing image-service path is unchanged.
 
+Image acquire/release serializes per reference; unrelated images do not hold a global lock across Registry or mount I/O. A waiting caller may cancel without dropping another owner's reference. Bootstrap, daemon launch and readiness share the acquire's bounded context (at most the existing 60-second preparation limit). On cancellation or timeout, preparation is joined and any launched daemon is rolled back before failure returns; a late bootstrap cannot create an unowned mount. Cleanup may extend beyond the preparation budget and cleanup errors are retained. A canceled leader does not publish a lease; live followers may retry after its rollback. Closing the management service cancels and joins its handlers before releasing service-owned leases. Snapshot durability barriers and fsync behavior are unchanged.
+
 ## Managed file-backed tmpfs
 
 The runsc Start API accepts `extra_config` JSON with `fileBackedTmpfsMounts`, for example `{"fileBackedTmpfsMounts":[{"target":"/var/lib/akernel-image-snapshots","sizeMB":2048}]}`. Each mount uses a sandbox-owned anonymous filestore rather than guest-memory-backed file contents. This is intended for private Docker/containerd writable upper/work directories above shared read-only image roots; Dockerfiles and Compose definitions do not change.
@@ -541,5 +543,7 @@ The compatibility fingerprint excludes `allowed_tenants`, which is checked again
 Collection and OCI management references remain pinned until the isolated
 managed service is drained. This preview qualifies same-node recovery only;
 persistent sandbox/snapshot leases, cross-node recovery, node-restart recovery,
-Registry repository-scoped token issuance and artifact GC remain release work.
-A Basic-auth experiment Registry account is not a production tenant boundary.
+per-tenant credential issuance/revocation and artifact GC remain release work.
+The private Registry may use standard scoped Bearer tokens with separate build-publisher and node pull-only accounts. Shared profile accounts are not a production tenant boundary.
+
+The node-private Registry metadata endpoint uses the image manager's own keychain and standard Registry Bearer challenge/refresh client. Runtime brokers receive bounded digest-verified metadata bytes, not Registry credentials, and retain their collection prefix authorization check before requesting metadata. Operators should separate the build publisher account from the node's pull-only account. Registry tokens are short-lived access credentials; neither their expiry nor a refreshed token replaces the snapshot's immutable image dependency or collection retention contract.
