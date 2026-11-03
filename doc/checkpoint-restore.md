@@ -85,6 +85,8 @@ Sharing applies to writable-file extents, not the independently saved applicatio
 
 Save and restore must use matching runtime builds. Drain sandboxes before replacing the runtime bundle; do not assume old saved state remains compatible across a gVisor upgrade. Install the complete checksum-pinned gVisor archive with its matching helpers, rather than replacing runsc alone.
 
+Runsc checkpoints preserve managed `/etc/hosts` contents and existence, including empty or deleted files, without replay or regeneration for a new IP. For the writable layout, retain top-level `managed-hosts.json` and SHA-256-verified `rootfs-seed.tar` with the native checkpoint; the source sandbox may be deleted. Corrupt artifacts, incompatible layouts, checkpoint outputs overlapping the source bundle or another active output, and restore inputs overlapping the target bundle are rejected; output reservations last through cleanup. Old snapshots keep their original hosts layout; new-layout snapshots are not guaranteed to work with older sandboxd. Caller-owned mounts remain external.
+
 ## Checkpoint output synchronization
 
 Runsc's per-execution host staging overlay uses the Linux 5.10+ `volatile` mount option. Its upper directory holds disposable mount targets and host-hook output, is recreated for each execution, and is never a recovery artifact. Without this option, tearing down one overlay synchronizes the shared backing filesystem and can block behind other sandboxes' checkpoint writes. This does not change runsc's separate guest writable filestore or the checkpoint output synchronization below. Do not reuse a volatile staging upper directory after a host crash; normal preparation removes and recreates it.

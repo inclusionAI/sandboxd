@@ -148,6 +148,12 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		ociSpec.Root.Readonly = false
 	}
 
+	if options.UseGVisorRootfsImageAnnotations && options.Config.SpecUpdates != nil && options.Config.SpecUpdates.RequiresHostWritableRootfs {
+		// Runsc prepares the provider-owned writable root after OCI generation.
+		// Hosts initialization must already use that final mode.
+		ociSpec.Root.Readonly = false
+	}
+
 	ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, options.Config.Annotations)
 
 	bundleDir, err := util.JoinWithinRoot(r.bundleParentDir, options.SandboxID)
@@ -194,6 +200,14 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 			ociSpec.Hooks.Prestart = append(ociSpec.Hooks.Prestart, updates.Prestart...)
 		}
 		ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, updates.Annotations)
+	}
+
+	if options.UseGVisorRootfsImageAnnotations {
+		for key := range ociSpec.Annotations {
+			if ManagedRootfsAnnotation(key) {
+				return "", ociSpec, fmt.Errorf("annotation %q is managed by sandboxd", key)
+			}
+		}
 	}
 
 	ociFile := filepath.Join(bundleDir, config.SandboxSpecFile)

@@ -110,6 +110,7 @@ func TestPrepareSandboxFilesInjectsImageProcessConfig(t *testing.T) {
 		nil,
 		want,
 		target,
+		sandboxHostsPolicy{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -148,6 +149,7 @@ func TestPrepareSandboxFilesRejectsImageProcessMountConflict(t *testing.T) {
 			[]*runtime.Mount{{Target: target}},
 			&imageProcessSpec{Version: 1, Args: []string{}, Cwd: "/"},
 			configTarget,
+			sandboxHostsPolicy{},
 		)
 		if err == nil || !strings.Contains(err.Error(), "managed image process config") {
 			t.Fatalf("mount target %q error = %v", target, err)
@@ -199,6 +201,7 @@ func TestPrepareSandboxFiles(t *testing.T) {
 		nil,
 		nil,
 		"",
+		sandboxHostsPolicy{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +242,7 @@ func TestPrepareSandboxFilesHonorsParentMount(t *testing.T) {
 		[]*runtime.Mount{explicit},
 		nil,
 		"",
+		sandboxHostsPolicy{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -261,6 +265,7 @@ func TestPrepareSandboxFilesHonorsBaseResolverMount(t *testing.T) {
 		nil,
 		nil,
 		"",
+		sandboxHostsPolicy{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -298,6 +303,7 @@ func TestPrepareSandboxFilesUsesManagedResolverForNetworkACL(t *testing.T) {
 		nil,
 		nil,
 		"",
+		sandboxHostsPolicy{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -371,6 +377,7 @@ func TestPrepareSandboxFilesSelectsResolverByDNSMode(t *testing.T) {
 				nil,
 				nil,
 				"",
+				sandboxHostsPolicy{},
 			)
 			if test.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), test.wantError) {
@@ -482,6 +489,7 @@ func TestPrepareSandboxFilesWithoutNetworkACLOnACLNode(t *testing.T) {
 				mounts,
 				nil,
 				"",
+				sandboxHostsPolicy{},
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -527,6 +535,7 @@ func TestPrepareSandboxFilesRejectsInvalidHostname(t *testing.T) {
 		[]*runtime.Mount{{Target: "/etc"}},
 		nil,
 		"",
+		sandboxHostsPolicy{},
 	)
 	if err == nil || !strings.Contains(err.Error(), "invalid character") {
 		t.Fatalf("invalid hostname error = %v", err)

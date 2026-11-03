@@ -101,6 +101,10 @@ type StartConfig struct {
 	ExtraConfig             string
 	EnableKVM               bool
 	CheckpointDir           string
+	// InitialFiles are platform-owned gVisor files installed before the first process.
+	// Restore must use the saved filesystem state instead of replaying them.
+	InitialFiles []InitialFile
+	ManagedHosts *ManagedHostsState
 }
 
 // SpecUpdates contains provider-resolved OCI changes. Device providers use
