@@ -17,6 +17,7 @@ import (
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/registryauth"
 	"golang.org/x/sys/unix"
 )
 
@@ -72,6 +73,15 @@ func profileFingerprint(profile config.ManagedRuntimeProfile) string {
 	data, _ := json.Marshal(profile)
 	value := sha256.Sum256(data)
 	return hex.EncodeToString(value[:])
+}
+
+func managedRegistryAuth(path, host string) (string, error) {
+	auths, err := registryauth.Load(path)
+	if err != nil || auths[host].Auth == "" {
+		// Do not expose file contents or credentials in admission failures.
+		return "", fmt.Errorf("managed Registry credential is unavailable")
+	}
+	return auths[host].Auth, nil
 }
 
 func writePrivateJSON(path string, value any, mode os.FileMode) error {
@@ -249,16 +259,10 @@ func (h *sandboxService) prepareManagedRuntime(request *runtime.StartRequest, ch
 			rollback()
 			return nil, err
 		}
-		var auths map[string]struct {
-			Auth string `json:"Auth"`
-		}
-		data, err := os.ReadFile(profile.RegistryAuthFile)
-		if err == nil {
-			err = json.Unmarshal(data, &auths)
-		}
-		if err != nil || auths[profile.Registry].Auth == "" {
+		auth, err := managedRegistryAuth(profile.RegistryAuthFile, profile.Registry)
+		if err != nil {
 			rollback()
-			return nil, fmt.Errorf("managed Registry credential is unavailable")
+			return nil, err
 		}
 		profileData := map[string]any{"registry": profile.Registry, "registry_insecure": profile.RegistryInsecure, "prefix": prefix + "/" + id, "endpoint": profile.BuildkitEndpoint, "builder": "akernel-remote", "provider": profile.ProviderURL, "token_file": "/run/akernel-build/token", "plan": "/opt/akernel-images/.metadata/plan.json", "writable_mb": profile.WritableMB}
 		if err := writePrivateJSON(filepath.Join(guest, "profile.json"), profileData, 0400); err != nil {
@@ -269,7 +273,7 @@ func (h *sandboxService) prepareManagedRuntime(request *runtime.StartRequest, ch
 			rollback()
 			return nil, err
 		}
-		if err := writePrivateJSON(filepath.Join(guest, "docker-config.json"), map[string]any{"auths": map[string]any{profile.Registry: map[string]string{"auth": auths[profile.Registry].Auth}}}, 0400); err != nil {
+		if err := writePrivateJSON(filepath.Join(guest, "docker-config.json"), map[string]any{"auths": map[string]any{profile.Registry: map[string]string{"auth": auth}}}, 0400); err != nil {
 			rollback()
 			return nil, err
 		}

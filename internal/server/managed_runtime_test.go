@@ -23,6 +23,22 @@ func managedTestService(t *testing.T) *sandboxService {
 	}}}}
 }
 
+func TestManagedRegistryAuthUsesSharedParser(t *testing.T) {
+	for _, input := range []string{`{"registry.test":{"Auth":"test-value"}}`, `{"auths":{"registry.test":{"auth":"test-value"}}}`, `{"auths":{"https://registry.test/v1/":{"auth":"test-value"}}}`} {
+		path := filepath.Join(t.TempDir(), "auth.json")
+		if err := os.WriteFile(path, []byte(input), 0600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := managedRegistryAuth(path, "registry.test")
+		if err != nil || got != "test-value" {
+			t.Fatalf("shared auth parser was not used: %v", err)
+		}
+		if _, err := managedRegistryAuth(path, "other.test"); err == nil || strings.Contains(err.Error(), "test-value") {
+			t.Fatalf("missing credential did not fail safely: %v", err)
+		}
+	}
+}
+
 func TestManagedProfileAuthorizationPrecedesFilesystemChanges(t *testing.T) {
 	h := managedTestService(t)
 	_, err := h.prepareManagedRuntime(&runtime.StartRequest{Runtime: "runsc", ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "other"}}, "")
