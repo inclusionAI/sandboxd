@@ -82,6 +82,7 @@ COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
 COPY third_party/firecracker-candidate/ /tmp/firecracker-candidate/
 COPY third_party/install-gvisor.sh /usr/local/libexec/install-gvisor.sh
 COPY test/e2e/host-mount-rw.sh /usr/local/bin/sandboxd-host-mount-rw
+COPY test/e2e/mount-overrides.sh /usr/local/libexec/sandboxd-mount-overrides.sh
 COPY --from=virtiofsd-runtime /virtiofsd/ /
 
 ARG E2E_RUNTIME

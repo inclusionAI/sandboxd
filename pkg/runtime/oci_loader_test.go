@@ -124,7 +124,6 @@ func TestGenerateOciOverridesMountDestinations(t *testing.T) {
 				Config: StartConfig{
 					Rootfs: t.TempDir(), Resources: &runtime.LinuxSandboxResources{},
 					Mounts: []*runtime.Mount{
-						{Target: "/app/logs", Type: "bind", Source: &runtime.Mount_HostPath{HostPath: "/discarded"}, Options: []string{"rw"}},
 						{Target: "/app/logs", Type: "bind", Source: &runtime.Mount_HostPath{HostPath: "/explicit-logs"}, Options: []string{mode, "rbind"}},
 					},
 				},
@@ -133,8 +132,8 @@ func TestGenerateOciOverridesMountDestinations(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := []Mount{
-				baseline.Mounts[1],
 				{Destination: "/app/logs", Source: "/explicit-logs", Type: "bind", Options: []string{mode, "rbind"}},
+				baseline.Mounts[1],
 			}
 			if !reflect.DeepEqual(spec.Mounts, want) {
 				t.Fatalf("mounts = %#v, want %#v", spec.Mounts, want)

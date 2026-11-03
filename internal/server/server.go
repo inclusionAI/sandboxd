@@ -1196,6 +1196,14 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	if startReq.Runtime == "" {
 		startReq.Runtime = config.RuntimeNameRunsc
 	}
+	mountDestinations := make([]string, len(startReq.Mounts))
+	for i, mount := range startReq.Mounts {
+		mountDestinations[i] = mount.GetTarget()
+	}
+	if err := svc.ValidateMountDestinations(mountDestinations); err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()},
+			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
+	}
 	networkPolicy, err := networkacl.NormalizePolicy(startReq.NetworkPolicy)
 	if err != nil {
 		wrapped := errord.ToGRPC(fmt.Errorf("invalid network policy: %v: %w", err, errord.ErrInvalidArgument))

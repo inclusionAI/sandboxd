@@ -82,6 +82,10 @@ func NewBundleLoader(baseFile, bundleDir string) (*BundleLoader, error) {
 		}
 	}
 
+	if err := validateOCIMountDestinations(bs.Mounts); err != nil {
+		return nil, fmt.Errorf("invalid base spec mounts: %w", err)
+	}
+
 	// check bundle dir
 	if _, err := os.Stat(bundleDir); os.IsNotExist(err) {
 		if err = os.MkdirAll(bundleDir, 0755); err != nil {
@@ -127,28 +131,20 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		ociSpec.Process.Env = combineEnvs(ociSpec.Process.Env, options.Config.Envs)
 	}
 
+	requestedMounts := make([]Mount, 0, len(options.Config.Mounts))
 	for _, mnt := range options.Config.Mounts {
-		ociSpec.Mounts = append(ociSpec.Mounts, Mount{
+		requestedMounts = append(requestedMounts, Mount{
 			Destination: mnt.GetTarget(),
 			Type:        mnt.GetType(),
 			Source:      mnt.GetHostPath(),
 			Options:     mnt.GetOptions(),
 		})
 	}
-	// A requested mount replaces a baseline mount at the same destination.
-	// Keep the order of the last occurrences (including parent/child mounts),
-	// but do not leave conflicting duplicates for runsc's restore validation.
-	lastMount := make(map[string]int, len(ociSpec.Mounts))
-	for i, mnt := range ociSpec.Mounts {
-		lastMount[mnt.Destination] = i
+	mergedMounts, err := mergeOCIMounts(ociSpec.Mounts, requestedMounts)
+	if err != nil {
+		return "", ociSpec, err
 	}
-	mounts := ociSpec.Mounts[:0]
-	for i, mnt := range ociSpec.Mounts {
-		if lastMount[mnt.Destination] == i {
-			mounts = append(mounts, mnt)
-		}
-	}
-	ociSpec.Mounts = mounts
+	ociSpec.Mounts = mergedMounts
 
 	if ociSpec.Root == nil {
 		ociSpec.Root = &Root{}

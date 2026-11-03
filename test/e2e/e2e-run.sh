@@ -2812,7 +2812,11 @@ case "${1:-e2e}" in
     serve)
         serve_sandboxd
         ;;
+    mount-contract)
+        source /usr/local/libexec/sandboxd-mount-overrides.sh
+        run_mount_contract_e2e
+        ;;
     *)
-        fail "unknown mode $1; expected e2e or serve"
+        fail "unknown mode $1; expected e2e, serve or mount-contract"
         ;;
 esac

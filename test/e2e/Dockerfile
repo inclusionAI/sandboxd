@@ -51,6 +51,7 @@ COPY output/network-policy-client /usr/local/bin/network-policy-client
 COPY output/checkpoint-restore /usr/local/bin/checkpoint-restore
 COPY test/e2e/e2e-run.sh /usr/local/bin/sandboxd-e2e-run
 COPY test/e2e/host-mount-rw.sh /usr/local/bin/sandboxd-host-mount-rw
+COPY test/e2e/mount-overrides.sh /usr/local/libexec/sandboxd-mount-overrides.sh
 
 RUN chmod 0755 \
         /usr/local/bin/sandboxd \
