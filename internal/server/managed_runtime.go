@@ -120,14 +120,22 @@ func (h *sandboxService) prepareManagedRuntime(request *runtime.StartRequest, ch
 		return nil, fmt.Errorf("managed runtime requires a pinned tool image: %w", err)
 	}
 	root := h.config.ManagedRuntimeRoot
+	if !filepath.IsAbs(profile.BootstrapRoot) {
+		return nil, fmt.Errorf("managed runtime requires an operator-owned bootstrap root")
+	}
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root || root == "/" || profile.WritableMB < 1 || profile.ProviderURL == "" || profile.BuildkitEndpoint == "" || profile.Registry == "" {
 		return nil, fmt.Errorf("managed runtime operator profile is incomplete")
 	}
+	hasBootstrap := false
 	for _, mount := range request.Mounts {
+		if mount.Target == "/__adx" && mount.Type == "erofs" && mount.GetHostPath() == profile.BootstrapRoot && slices.Contains(mount.Options, "ro") {
+			hasBootstrap = true
+			continue
+		}
 		if mount.GetHostPath() != "" {
 			return nil, fmt.Errorf("managed runtime does not accept client-selected node paths")
 		}
-		for _, target := range []string{"/opt/akernel-images", "/run/akernel-build", "/root/.docker/config.json", "/var/lib/akernel-image-snapshots"} {
+		for _, target := range []string{"/__adx", "/opt/akernel-images", "/run/akernel-build", "/root/.docker/config.json", "/var/lib/akernel-image-snapshots"} {
 			requested := filepath.Clean(mount.Target)
 			if requested == "/" || requested == target || strings.HasPrefix(target, requested+"/") || strings.HasPrefix(requested, target+"/") {
 				return nil, fmt.Errorf("managed runtime mount target is platform-owned: %s", target)
@@ -265,6 +273,9 @@ func (h *sandboxService) prepareManagedRuntime(request *runtime.StartRequest, ch
 	guest := filepath.Join(root, "guests", id)
 	collection := filepath.Join(root, "collections", id)
 	request.Rootfs = &runtime.RootfsConfig{Readonly: false, Type: runtime.RootfsSrcType_IMAGE, Source: &runtime.RootfsConfig_ImageUrl{ImageUrl: profile.Image}}
+	if !hasBootstrap {
+		request.Mounts = append(request.Mounts, &runtime.Mount{Type: "erofs", Target: "/__adx", Options: []string{"ro"}, Source: &runtime.Mount_HostPath{HostPath: profile.BootstrapRoot}})
+	}
 	for _, mount := range [][2]string{{collection, "/opt/akernel-images"}, {guest, "/run/akernel-build"}, {filepath.Join(guest, "docker-config.json"), "/root/.docker/config.json"}} {
 		request.Mounts = append(request.Mounts, &runtime.Mount{Type: "bind", Target: mount[1], Options: []string{"ro", "rbind"}, Source: &runtime.Mount_HostPath{HostPath: mount[0]}})
 	}

@@ -18,7 +18,7 @@ func managedTestService(t *testing.T) *sandboxService {
 	return &sandboxService{config: config.Config{PluginConfig: config.PluginConfig{ManagedRuntimeConfig: config.ManagedRuntimeConfig{
 		ManagedRuntimeRoot: t.TempDir(), ManagedRuntimeProfiles: map[string]config.ManagedRuntimeProfile{"compose-v1": {
 			Image: "registry.test/tools@sha256:" + strings.Repeat("a", 64), Registry: "registry.test", ProviderURL: "http://node.internal:8840",
-			BuildkitEndpoint: "tcp://builder.internal:9094", AllowedTenants: []string{"allowed"}, WritableMB: 4096,
+			BuildkitEndpoint: "tcp://builder.internal:9094", BootstrapRoot: "/operator/runtime.img", AllowedTenants: []string{"allowed"}, WritableMB: 4096,
 		}},
 	}}}}
 }
@@ -101,7 +101,7 @@ func TestManagedCheckpointReusesAuthorizedCollectionWithoutFreshMounts(t *testin
 		t.Fatal(err)
 	}
 	rollback()
-	if req.Labels[managedCollectionLabel] != id || len(req.Mounts) != 3 || req.Rootfs.GetImageUrl() != profile.Image {
+	if req.Labels[managedCollectionLabel] != id || len(req.Mounts) != 4 || req.Rootfs.GetImageUrl() != profile.Image {
 		t.Fatal("restore did not rebind the authorized runtime")
 	}
 	if _, err := os.Stat(filepath.Join(root, "records", id+".json")); err != nil {

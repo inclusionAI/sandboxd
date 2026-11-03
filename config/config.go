@@ -65,6 +65,7 @@ type ManagedRuntimeConfig struct {
 
 type ManagedRuntimeProfile struct {
 	Image            string   `toml:"image" json:"image"`
+	BootstrapRoot    string   `toml:"bootstrap_root" json:"bootstrapRoot"`
 	Registry         string   `toml:"registry" json:"registry"`
 	RepositoryPrefix string   `toml:"repository_prefix" json:"repositoryPrefix"`
 	RegistryAuthFile string   `toml:"registry_auth_file" json:"registryAuthFile"`
