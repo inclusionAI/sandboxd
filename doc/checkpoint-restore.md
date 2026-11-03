@@ -513,7 +513,7 @@ When profiling nested PVM, keep the VMM and its vCPU threads outside ptrace. Fol
 An operator may configure `[plugin.managed_runtime]` with an absolute private
 `root`, and named `[plugin.managed_runtime.profiles.<name>]` profiles. Each
 profile specifies a digest-pinned tool `image`, `registry`, `repository_prefix`,
-`registry_auth_file`, `registry_insecure`, `buildkit_endpoint`, `provider_url`,
+`registry_auth_file`, `registry_insecure`, `bootstrap_root`, `buildkit_endpoint`, `provider_url`,
 `allowed_tenants` and the private upper's `writable_mb` quota. It is disabled
 without an explicit profile. ADX supplies the trusted `adx.tenant_id` label;
 unlisted tenants are rejected before node state is created. Clients select only
