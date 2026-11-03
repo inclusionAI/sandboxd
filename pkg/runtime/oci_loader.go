@@ -135,6 +135,20 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 			Options:     mnt.GetOptions(),
 		})
 	}
+	// A requested mount replaces a baseline mount at the same destination.
+	// Keep the order of the last occurrences (including parent/child mounts),
+	// but do not leave conflicting duplicates for runsc's restore validation.
+	lastMount := make(map[string]int, len(ociSpec.Mounts))
+	for i, mnt := range ociSpec.Mounts {
+		lastMount[mnt.Destination] = i
+	}
+	mounts := ociSpec.Mounts[:0]
+	for i, mnt := range ociSpec.Mounts {
+		if lastMount[mnt.Destination] == i {
+			mounts = append(mounts, mnt)
+		}
+	}
+	ociSpec.Mounts = mounts
 
 	if ociSpec.Root == nil {
 		ociSpec.Root = &Root{}
