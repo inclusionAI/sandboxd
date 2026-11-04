@@ -106,6 +106,45 @@ func TestGenerateOciPreservesEntrypoint(t *testing.T) {
 	}
 }
 
+func TestGenerateOciOverridesMountDestinations(t *testing.T) {
+	for _, mode := range []string{"ro", "rw"} {
+		t.Run(mode, func(t *testing.T) {
+			loader, err := NewBundleLoader("", t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			loader.baseSpec.Mounts = []Mount{
+				{Destination: "/app/logs", Source: "/default-logs", Type: "bind", Options: []string{"rw", "rbind", "rprivate"}},
+				{Destination: "/app/logs/nested", Source: "/nested", Type: "bind", Options: []string{"ro"}},
+			}
+			baseline := loader.baseSpec.DeepCopy()
+			_, spec, err := loader.GenerateOci(OciLoadOptions{
+				SandboxID:  "sandbox-mount-override",
+				CgroupPath: "/sandbox/mount-override",
+				Config: StartConfig{
+					Rootfs: t.TempDir(), Resources: &runtime.LinuxSandboxResources{},
+					Mounts: []*runtime.Mount{
+						{Target: "/app/logs", Type: "bind", Source: &runtime.Mount_HostPath{HostPath: "/explicit-logs"}, Options: []string{mode, "rbind"}},
+					},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []Mount{
+				{Destination: "/app/logs", Source: "/explicit-logs", Type: "bind", Options: []string{mode, "rbind"}},
+				baseline.Mounts[1],
+			}
+			if !reflect.DeepEqual(spec.Mounts, want) {
+				t.Fatalf("mounts = %#v, want %#v", spec.Mounts, want)
+			}
+			if !reflect.DeepEqual(loader.baseSpec.Mounts, baseline.Mounts) {
+				t.Fatal("per-sandbox override changed the shared baseline")
+			}
+		})
+	}
+}
+
 func TestGenerateOciAppliesRequestedRootfsMode(t *testing.T) {
 	tests := []struct {
 		name               string

@@ -52,6 +52,8 @@ Both runsc platforms test `plugin.runtime.direct_resolv_conf_path` with network 
 
 `go test ./test/e2e` checks the DNS dependency preflight and bounded shutdown helpers without privileged workloads. It covers missing tools, paths that do not use the DNS fixture, shutdown failures and timeouts, and residual network resources.
 
+The runsc and runc cases also launch a separate `mount-contract` phase with its own container, cgroup and disk fixture. A custom baseline binds a parent and read-only child; explicit `ro` and `rw` parent replacements must retain the child, preserve access modes and leave later baseline-only sandboxes unchanged. Runsc additionally checkpoints each mode, deletes the source, rejects an incompatible mode change, restores the original binding and verifies caller-owned data survives cleanup. Both systrap and KVM run this phase through the normal matrix entry points.
+
 ## Commands
 
 Run the default runsc and runc suite:

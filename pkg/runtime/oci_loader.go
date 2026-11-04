@@ -82,6 +82,10 @@ func NewBundleLoader(baseFile, bundleDir string) (*BundleLoader, error) {
 		}
 	}
 
+	if err := validateOCIMountDestinations(bs.Mounts); err != nil {
+		return nil, fmt.Errorf("invalid base spec mounts: %w", err)
+	}
+
 	// check bundle dir
 	if _, err := os.Stat(bundleDir); os.IsNotExist(err) {
 		if err = os.MkdirAll(bundleDir, 0755); err != nil {
@@ -127,14 +131,20 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		ociSpec.Process.Env = combineEnvs(ociSpec.Process.Env, options.Config.Envs)
 	}
 
+	requestedMounts := make([]Mount, 0, len(options.Config.Mounts))
 	for _, mnt := range options.Config.Mounts {
-		ociSpec.Mounts = append(ociSpec.Mounts, Mount{
+		requestedMounts = append(requestedMounts, Mount{
 			Destination: mnt.GetTarget(),
 			Type:        mnt.GetType(),
 			Source:      mnt.GetHostPath(),
 			Options:     mnt.GetOptions(),
 		})
 	}
+	mergedMounts, err := mergeOCIMounts(ociSpec.Mounts, requestedMounts)
+	if err != nil {
+		return "", ociSpec, err
+	}
+	ociSpec.Mounts = mergedMounts
 
 	if ociSpec.Root == nil {
 		ociSpec.Root = &Root{}
