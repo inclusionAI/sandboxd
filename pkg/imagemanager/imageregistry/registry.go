@@ -126,7 +126,8 @@ func NormalizeImageRef(imageRef string) string {
 	return ref
 }
 
-// FetchImageWithFallback fetches image with optional HTTP proxy and HTTPS fallback.
+// FetchImageWithFallback fetches through an optional proxy, then the origin.
+// Both attempts obey explicit operator transport policy when configured.
 func (c *Client) FetchImageWithFallback(ctx context.Context, imageRef string, proxyURL string) (v1.Image, error) {
 	normalized := NormalizeImageRef(imageRef)
 
@@ -138,7 +139,7 @@ func (c *Client) FetchImageWithFallback(ctx context.Context, imageRef string, pr
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		logrus.Warnf("failed to fetch image %s via HTTP proxy, fallback to HTTPS: %v", imageRef, err)
+		logrus.Warnf("failed to fetch image %s via proxy, fallback to origin: %v", imageRef, err)
 	}
 
 	return c.FetchImage(ctx, normalized, "", false)
@@ -152,8 +153,8 @@ func (c *Client) FetchImage(ctx context.Context, imageRef string, proxyURL strin
 
 	stageStart := time.Now()
 	parseOpts := []name.Option{}
-	if scheme, ok := c.RegistryScheme(imageRef); ok && scheme == "http" {
-		useHTTP = true
+	if scheme, ok := c.RegistryScheme(imageRef); ok {
+		useHTTP = scheme == "http"
 	}
 	if useHTTP {
 		parseOpts = append(parseOpts, name.Insecure)
@@ -207,7 +208,7 @@ func (c *Client) getOrCreateTransport(proxyURL string) *registryTransport {
 		return transport
 	}
 
-	transport := &registryTransport{base: newRegistryBaseTransport(proxyURL)}
+	transport := &registryTransport{base: newRegistryBaseTransport(proxyURL), registrySchemes: c.registrySchemes}
 	c.transportCache[cacheKey] = transport
 	return transport
 }
@@ -236,8 +237,9 @@ func newRegistryBaseTransport(proxyURL string) *http.Transport {
 }
 
 type registryTransport struct {
-	base         *http.Transport
-	roundTripper http.RoundTripper
+	base            *http.Transport
+	roundTripper    http.RoundTripper
+	registrySchemes map[string]string
 }
 
 func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -248,6 +250,13 @@ func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		},
 	}
 	req = req.Clone(httptrace.WithClientTrace(req.Context(), trace))
+	// The upstream name/transport library probes HTTPS even for name.Insecure,
+	// and permits HTTP fallback for private IPs and loopback. Enforce explicit
+	// operator policy at the wire boundary, including lazy reads and retries.
+	// Clone preserves the caller's request; other authorities keep their defaults.
+	if scheme, ok := t.registrySchemes[req.URL.Host]; ok {
+		req.URL.Scheme = scheme
+	}
 
 	roundTripper := t.roundTripper
 	if roundTripper == nil {

@@ -9,9 +9,87 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// Exercise the real Registry client, including lazy config and metadata reads.
+// Private IPs and loopback are HTTP-capable in the upstream name library even
+// without name.Insecure; an explicit operator policy must override that hint.
+func TestExplicitRegistrySchemeOverridesHeuristics(t *testing.T) {
+	for _, tlsEnabled := range []bool{false, true} {
+		t.Run("tls="+strconv.FormatBool(tlsEnabled), func(t *testing.T) {
+			server := httptest.NewUnstartedServer(registry.New())
+			if tlsEnabled {
+				server.StartTLS()
+			} else {
+				server.Start()
+			}
+			defer server.Close()
+			port := strings.Split(server.Listener.Addr().String(), ":")[1]
+			for _, hostname := range []string{"127.0.0.1", "172.20.0.2", "registry-policy.test"} {
+				t.Run(hostname, func(t *testing.T) {
+					host := hostname + ":" + port
+					transport := server.Client().Transport.(*http.Transport).Clone()
+					transport.Proxy = nil
+					if tlsEnabled {
+						transport.TLSClientConfig.ServerName = "127.0.0.1" // Alias routes to the fixture's certified address.
+					}
+					transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+						return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+					}
+					defer transport.CloseIdleConnections()
+					tag, err := name.NewTag(host+"/probe:latest", name.Insecure)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := remote.Write(tag, empty.Image, remote.WithTransport(transport)); err != nil {
+						t.Fatal(err)
+					}
+					digest, _ := empty.Image.Digest()
+					ref := host + "/probe@" + digest.String()
+					for _, scheme := range []string{"", "http", "https"} {
+						for _, insecure := range []bool{false, true} {
+							t.Run("policy="+scheme+"/insecure="+strconv.FormatBool(insecure), func(t *testing.T) {
+								policy := map[string]string{}
+								if scheme != "" {
+									policy[host] = scheme
+								}
+								client, err := NewClientWithRegistrySchemes("", policy)
+								if err != nil {
+									t.Fatal(err)
+								}
+								client.getOrCreateTransport("").base = transport
+								wantFetch := (scheme == "https" && tlsEnabled) || (scheme == "http" && !tlsEnabled)
+								if scheme == "" {
+									wantFetch = tlsEnabled || hostname != "registry-policy.test" || insecure
+								}
+								image, err := client.FetchImage(context.Background(), ref, "", insecure)
+								if (err == nil) != wantFetch {
+									t.Fatalf("fetch success=%t, want %t: %v", err == nil, wantFetch, err)
+								}
+								if err == nil {
+									if _, err = image.RawConfigFile(); err != nil {
+										t.Fatal(err)
+									}
+								}
+								// Unconfigured metadata retains its legacy URL behavior;
+								// the explicit operator choices are authoritative for both APIs.
+								if scheme != "" || !tlsEnabled {
+									body, _, err := client.Metadata(context.Background(), ref, "manifests", insecure)
+									if (err == nil) != wantFetch || (err == nil && len(body) == 0) {
+										t.Fatalf("metadata success=%t, want %t: %v", err == nil, wantFetch, err)
+									}
+								}
+							})
+						}
+					}
+				})
+			}
+		})
+	}
+}
 
 func TestOperatorHTTPRegistryTransport(t *testing.T) {
 	server := httptest.NewServer(registry.New())

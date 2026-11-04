@@ -25,8 +25,9 @@ func (c *Client) Metadata(ctx context.Context, reference, kind string, insecure 
 		return nil, "", fmt.Errorf("invalid Registry metadata kind")
 	}
 	opts := []name.Option{}
-	if scheme, ok := c.RegistryScheme(reference); ok && scheme == "http" {
-		insecure = true
+	policyScheme, configured := c.RegistryScheme(reference)
+	if configured {
+		insecure = policyScheme == "http"
 	}
 	if insecure {
 		opts = append(opts, name.Insecure)
@@ -36,7 +37,11 @@ func (c *Client) Metadata(ctx context.Context, reference, kind string, insecure 
 		return nil, "", fmt.Errorf("immutable sha256 metadata reference required")
 	}
 	repo := ref.Context()
-	key := repo.Scheme() + "://" + repo.Name()
+	scheme := repo.Scheme()
+	if configured {
+		scheme = policyScheme
+	}
+	key := scheme + "://" + repo.Name()
 	c.metadataMu.Lock()
 	transport := c.metadataAuth[key]
 	c.metadataMu.Unlock()
@@ -70,7 +75,7 @@ func (c *Client) Metadata(ctx context.Context, reference, kind string, insecure 
 		}
 		c.metadataMu.Unlock()
 	}
-	url := repo.Scheme() + "://" + repo.RegistryStr() + "/v2/" + repo.RepositoryStr() + "/" + kind + "/" + ref.DigestStr()
+	url := scheme + "://" + repo.RegistryStr() + "/v2/" + repo.RepositoryStr() + "/" + kind + "/" + ref.DigestStr()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, "", err
