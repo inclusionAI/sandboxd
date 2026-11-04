@@ -69,6 +69,18 @@ The optional nested-host DEBUGCTL optimization moves `vcpu->arch.host_debugctl =
 
 Runsc initializes platform-managed `/etc/hosts` as an ordinary `root:root`/`0644` file in each private writable root before workload execution; root may edit, replace or delete it without changing the host or lower image. Caller/base-spec mounts take priority and effective read-only roots keep read-only hosts. No option is required. Directory roots with explicit OCI user namespaces are unsupported for private hosts; other runtimes, hostname and resolver behavior are unchanged. See [checkpoint compatibility](checkpoint-restore.md).
 
+## Mount overrides
+
+Sandboxd treats the mounts in `plugin.runtime.basic_spec` and `StartRequest.mounts` as two layers of mount declarations. An instance mount at the same container destination replaces the entire baseline entry, including its source, type and options. Options are not combined with baseline options. Each sandbox receives a private copy of the resulting OCI configuration; overrides never mutate the shared baseline.
+
+Destinations must be canonical absolute container paths, such as `/app/logs`. Empty or relative targets, trailing slashes other than `/`, repeated separators, NUL bytes and `.` or `..` components are rejected. Duplicate destinations within either layer are errors, including identical duplicates; a baseline entry and an instance entry may share a destination because that is an explicit override. Request validation runs before image preparation or resource allocation, and invalid baseline mounts fail loader initialization. These rules apply only to container destinations: host source paths keep their original resolution, including relative paths, symlinks and trailing separators.
+
+Effective mounts are emitted before their descendants. Traversal starts with unreplaced baseline entries, then instance entries; each retained entry first emits any retained ancestors. Entries otherwise keep their declaration order. Replacing `/app/logs` therefore preserves an independently declared `/app/logs/nested` mount, which is attached after the replacement parent and remains visible. A path such as `/app/logs-other` is not a descendant. This declarative model does not support using duplicate destinations to describe an ordered mount/remount program.
+
+For example, a baseline parent at `/app/logs` and read-only child at `/app/logs/nested`, plus an instance read-only or writable replacement parent, produce exactly two mounts: the replacement parent followed by the original child. The child stays read-only in either case. Platform-managed file ownership and resolver restrictions are validated separately; supplying an override does not bypass them.
+
+When upgrading custom base specs or callers that previously relied on duplicate destinations or noncanonical spellings, supply one canonical entry per layer. Caller-owned bind data remains external to checkpoints and must be rebound during restore; see [checkpoint compatibility](checkpoint-restore.md).
+
 ## Resolver sources
 
 Sandbox DNS has two modes: managed and direct. With network ACLs enabled, supported runtimes use managed DNS even when an individual sandbox has no policy. Runc uses direct DNS. When network ACLs are disabled, all runtimes use direct DNS.

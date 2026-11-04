@@ -60,6 +60,7 @@ REDIS_FIXTURE_DIR=""
 REDIS_HOST=""
 SANDBOXD_HOME_FIXTURE_DIR=""
 DISABLED_HOME_FIXTURE_DIR=""
+MOUNT_CONTRACT_HOME_FIXTURE_DIR=""
 
 log() {
     printf '[e2e-run] %s\n' "$*"
@@ -94,6 +95,7 @@ cleanup_container() {
     for name in \
         "${CONTAINER}" \
         "${DISABLED_CONTAINER}" \
+        "${CONTAINER}-mount-contract" \
         "${REDIS_CONTAINER}" \
         "${REDIS_ROOTFS_CONTAINER}"; do
         if "${DOCKER}" ps -a --format '{{.Names}}' | grep -qx "${name}"; then
@@ -120,6 +122,14 @@ cleanup_container() {
             cleanup_disk_fixture "${DISABLED_HOME_FIXTURE_DIR}"
         fi
         DISABLED_HOME_FIXTURE_DIR=""
+    fi
+    if [ -n "${MOUNT_CONTRACT_HOME_FIXTURE_DIR}" ]; then
+        if [ "${E2E_KEEP_HOME_FIXTURE}" = "1" ]; then
+            log "retained mount-contract fixture: ${MOUNT_CONTRACT_HOME_FIXTURE_DIR}"
+        else
+            cleanup_disk_fixture "${MOUNT_CONTRACT_HOME_FIXTURE_DIR}"
+        fi
+        MOUNT_CONTRACT_HOME_FIXTURE_DIR=""
     fi
     if [ "${E2E_SKIP_BUILD}" = "0" ] && [ "${E2E_RUNTIME}" = "kata" ]; then
         rm -rf -- "${ROOT_DIR}/output/kata"
@@ -525,6 +535,29 @@ if [ "${status}" -ne 0 ]; then
     "${DOCKER}" logs "${CONTAINER}" >&2 || true
     exit "${status}"
 fi
+
+case "${E2E_RUNTIME}" in
+    all|runsc|runc)
+        MOUNT_CONTRACT_HOME_FIXTURE_DIR="$(prepare_sandboxd_home_fixture)"
+        log "running mount-contract container ${CONTAINER}-mount-contract"
+        set +e
+        "${DOCKER}" run --name "${CONTAINER}-mount-contract" --init --privileged \
+            --cgroupns=host --net bridge \
+            -e "E2E_RUNTIME=${E2E_RUNTIME}" -e "E2E_RUNSC_PLATFORM=${E2E_RUNSC_PLATFORM}" \
+            -e "E2E_RUNSC_CHECKPOINT_MODE=${E2E_RUNSC_CHECKPOINT_MODE}" \
+            -e "E2E_CPU_LIMIT_MODE=${E2E_CPU_LIMIT_MODE}" \
+            -e "E2E_CGROUP_ROOT=${CGROUP_ROOT}-mount-contract" \
+            -v "${MOUNT_CONTRACT_HOME_FIXTURE_DIR}:/home/akernel:rw" \
+            --tmpfs /e2e:rw,exec,size=512m -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            "${IMAGE}" mount-contract
+        status=$?
+        set -e
+        if [ "${status}" -ne 0 ]; then
+            "${DOCKER}" logs "${CONTAINER}-mount-contract" >&2 || true
+            exit "${status}"
+        fi
+        ;;
+esac
 
 if [ "${E2E_RUN_CGROUP_DISABLED}" = "0" ] ||
     [ "${E2E_RUNTIME}" = "runc" ] ||
