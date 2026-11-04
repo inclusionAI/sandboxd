@@ -789,7 +789,12 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	// Construct the in-process image manager before sandboxService so mount and
 	// rootfs consumers share one Service. Initialization is fatal because
 	// sandboxd cannot manage rootfs or S3/OCI mounts without it.
+	registrySchemes, err := cfg.ManagedRuntimeConfig.RegistrySchemes()
+	if err != nil {
+		return nil, err
+	}
 	imgMod, err := imagemanager.NewModule(imagemanager.Config{
+		RegistrySchemes:   registrySchemes,
 		ManagementSocket:  cfg.ManagementSocket,
 		Root:              cfg.ImageManagerRoot,
 		DistillFsBin:      cfg.DistillFsBin,

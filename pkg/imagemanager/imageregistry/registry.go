@@ -55,6 +55,7 @@ const (
 
 // Client handles image fetching from container registries with authentication.
 type Client struct {
+	registrySchemes    map[string]string // Immutable operator-selected transport by registry authority.
 	metadataMu         sync.Mutex
 	metadataAuth       map[string]http.RoundTripper
 	keychain           authn.Keychain
@@ -64,10 +65,32 @@ type Client struct {
 
 // NewClient creates a registry client by loading credentials from registry_auths.json.
 func NewClient(registryAuthsPath string) (*Client, error) {
+	return NewClientWithRegistrySchemes(registryAuthsPath, nil)
+}
+
+// NewClientWithRegistrySchemes applies only operator-owned, exact-authority policy.
+// It does not accept guest-selected transport or change unrelated registries.
+func NewClientWithRegistrySchemes(registryAuthsPath string, schemes map[string]string) (*Client, error) {
+	policy := make(map[string]string, len(schemes))
+	for host, scheme := range schemes {
+		if host == "" || strings.ContainsAny(host, "/@?#") || (scheme != "http" && scheme != "https") {
+			return nil, fmt.Errorf("invalid operator Registry transport policy")
+		}
+		registry, err := name.NewRegistry(host, name.StrictValidation)
+		if err != nil {
+			return nil, err
+		}
+		key := registry.Name()
+		if previous, ok := policy[key]; ok && previous != scheme {
+			return nil, fmt.Errorf("conflicting Registry transport for %s", key)
+		}
+		policy[key] = scheme
+	}
 	if registryAuthsPath == "" {
 		return &Client{
-			keychain:       &registryKeychain{},
-			transportCache: make(map[string]*registryTransport),
+			registrySchemes: policy,
+			keychain:        &registryKeychain{},
+			transportCache:  make(map[string]*registryTransport),
 		}, nil
 	}
 
@@ -77,9 +100,23 @@ func NewClient(registryAuthsPath string) (*Client, error) {
 	}
 
 	return &Client{
-		keychain:       &registryKeychain{auths: auths},
-		transportCache: make(map[string]*registryTransport),
+		registrySchemes: policy,
+		keychain:        &registryKeychain{auths: auths},
+		transportCache:  make(map[string]*registryTransport),
 	}, nil
+}
+
+// RegistryScheme returns an explicit operator policy, never a hostname heuristic.
+func (c *Client) RegistryScheme(imageRef string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	ref, err := name.ParseReference(NormalizeImageRef(imageRef))
+	if err != nil {
+		return "", false
+	}
+	scheme, ok := c.registrySchemes[ref.Context().RegistryStr()]
+	return scheme, ok
 }
 
 // NormalizeImageRef removes protocol prefixes and returns a canonical image reference.
@@ -115,6 +152,9 @@ func (c *Client) FetchImage(ctx context.Context, imageRef string, proxyURL strin
 
 	stageStart := time.Now()
 	parseOpts := []name.Option{}
+	if scheme, ok := c.RegistryScheme(imageRef); ok && scheme == "http" {
+		useHTTP = true
+	}
 	if useHTTP {
 		parseOpts = append(parseOpts, name.Insecure)
 	}

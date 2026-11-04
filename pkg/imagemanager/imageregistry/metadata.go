@@ -25,6 +25,9 @@ func (c *Client) Metadata(ctx context.Context, reference, kind string, insecure 
 		return nil, "", fmt.Errorf("invalid Registry metadata kind")
 	}
 	opts := []name.Option{}
+	if scheme, ok := c.RegistryScheme(reference); ok && scheme == "http" {
+		insecure = true
+	}
 	if insecure {
 		opts = append(opts, name.Insecure)
 	}

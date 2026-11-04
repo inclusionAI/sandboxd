@@ -36,8 +36,9 @@ import (
 
 // Config corresponds to the [plugin.image] sandboxd configuration section.
 type Config struct {
-	ManagementSocket  string // Optional private Unix API for trusted runtime image preparation.
-	ChunkDBSize       string // ChunkDB map capacity; empty uses the distill-fs default.
+	RegistrySchemes   map[string]string // Trusted exact-authority policy derived from managed profiles.
+	ManagementSocket  string            // Optional private Unix API for trusted runtime image preparation.
+	ChunkDBSize       string            // ChunkDB map capacity; empty uses the distill-fs default.
 	Root              string
 	DistillFsBin      string
 	OSSTemplate       string
@@ -88,10 +89,13 @@ func NewModule(cfg Config) (*Module, error) {
 
 	var sharedRegistryClient *imageregistry.Client
 	var nydusClient *nydus.RegistryClient
-	if cfg.RegistryAuthsPath != "" {
+	if cfg.RegistryAuthsPath != "" || len(cfg.RegistrySchemes) > 0 {
 		var rerr error
-		sharedRegistryClient, rerr = imageregistry.NewClient(cfg.RegistryAuthsPath)
+		sharedRegistryClient, rerr = imageregistry.NewClientWithRegistrySchemes(cfg.RegistryAuthsPath, cfg.RegistrySchemes)
 		if rerr != nil {
+			if len(cfg.RegistrySchemes) > 0 {
+				return nil, fmt.Errorf("managed Registry client: %w", rerr)
+			}
 			logrus.Warnf("imagemanager: registry client init failed (%v); proceeding without registry auth", rerr)
 		} else {
 			nydusClient = nydus.NewRegistryClientFromShared(sharedRegistryClient)
