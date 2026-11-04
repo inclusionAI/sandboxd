@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
+
+	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 )
 
 // ManagedImageMounter reuses the node's in-process ROFS provider. Only trusted
@@ -103,7 +105,7 @@ func ListenManagement(path string, service ManagedImageMounter, readers ...Regis
 		})
 	}
 	var mu sync.Mutex
-	var operations imageOperationLocks
+	var operations keyedlock.Locks
 	held := make(map[string]*OCIMountResponse)
 	mux.HandleFunc("/oci_mount", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -127,7 +129,7 @@ func ListenManagement(path string, service ManagedImageMounter, readers ...Regis
 			http.Error(w, "immutable sha256 image reference required", http.StatusBadRequest)
 			return
 		}
-		unlock, err := operations.lock(r.Context(), request.ImageURL)
+		unlock, err := operations.Acquire(r.Context(), request.ImageURL)
 		if err != nil {
 			http.Error(w, "image request canceled", http.StatusRequestTimeout)
 			return

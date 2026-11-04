@@ -91,8 +91,9 @@ type Manager struct {
 	isHousekeepingRunning atomic.Bool
 
 	// Runtime poll failures are local to that backend, not process health.
-	runtimePollErrors sync.Map // runtime name -> error
-	runtimePollBusy   sync.Map // runtime name -> *atomic.Bool
+	runtimePollErrors    sync.Map    // runtime name -> error
+	runtimePollBusy      sync.Map    // runtime name -> *atomic.Bool
+	runscRecoveryPending atomic.Bool // startup cleanup stays closed until a complete retry
 }
 
 // exitNotifier is a one-shot broadcast channel used to wake up any number of
@@ -146,7 +147,10 @@ func NewManager(
 		return nil, err
 	}
 	if err := m.reconcileStoppedRunscOrphans(); err != nil {
-		return nil, err
+		// Inventory/cleanup failure belongs to runsc admission, not process
+		// readiness. Housekeeping retries through the same bounded poll lane.
+		m.runtimePollErrors.Store(config.RuntimeNameRunsc, err)
+		logrus.WithError(err).Warn("runsc startup recovery incomplete; backend admission closed")
 	}
 	for sandboxID := range m.sandboxes.Items() {
 		m.idGenerator.Reserve(sandboxID)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"sync"
+
+	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 )
 
 // SharedOCIService keeps rootfs, image mounts and managed Docker consumers in
@@ -12,7 +14,7 @@ type SharedOCIService struct {
 	Service
 	mu         sync.Mutex
 	images     map[string]*sharedOCI
-	operations imageOperationLocks
+	operations keyedlock.Locks
 }
 
 type sharedOCI struct {
@@ -28,7 +30,7 @@ func (s *SharedOCIService) MountOCI(ctx context.Context, request *OCIMountReques
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	unlock, err := s.operations.lock(ctx, request.ImageURL)
+	unlock, err := s.operations.Acquire(ctx, request.ImageURL)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +77,7 @@ func (s *SharedOCIService) MountOCI(ctx context.Context, request *OCIMountReques
 }
 
 func (s *SharedOCIService) UmountOCI(request *OCIUmountRequest) error {
-	unlock, _ := s.operations.lock(context.Background(), request.ImageURL)
+	unlock, _ := s.operations.Acquire(context.Background(), request.ImageURL)
 	defer unlock()
 	s.mu.Lock()
 	image := s.images[request.ImageURL]

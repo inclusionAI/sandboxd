@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,6 +24,8 @@ import (
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	imgApi "github.com/inclusionAI/sandboxd/pkg/imagemanager/api"
 	"github.com/sirupsen/logrus"
+
+	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 )
 
 // imageMountEntry tracks a shared image mount with reference counting.
@@ -206,10 +209,11 @@ func (m *s3MountManager) cleanupAllS3Unmounts() {
 // Similar to s3MountManager, it ensures OCI images are only unmounted when
 // no sandbox references them.
 type ociMountManager struct {
-	mu       sync.Mutex
-	entries  map[string]*imageMountEntry // key: image URL
-	svc      imgApi.Service              // in-process image-manager (nil falls back to HttpClient)
-	unmountF ociUnmountFunc              // for testing injection
+	operations keyedlock.Locks
+	mu         sync.Mutex
+	entries    map[string]*imageMountEntry // key: image URL
+	svc        imgApi.Service              // in-process image-manager (nil falls back to HttpClient)
+	unmountF   ociUnmountFunc              // for testing injection
 }
 
 func newOciMountManager(svc imgApi.Service) *ociMountManager {
@@ -241,75 +245,79 @@ func (m *ociMountManager) mountOCIWithContext(ctx context.Context, imageURL stri
 		return "", fmt.Errorf("image_url is empty")
 	}
 
-	key := imageURL
-
+	// One upper entry owns exactly one lower acquire. Serialize that image's
+	// full acquire/release lifecycle, including the backend call, without
+	// holding the entries mutex across registry or filesystem I/O.
+	unlock, err := m.operations.Acquire(ctx, imageURL)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	m.mu.Lock()
-	if entry, ok := m.entries[key]; ok {
+	entry := m.entries[imageURL]
+	if entry != nil && entry.refcount > 0 {
 		entry.refcount++
+		path := entry.path
 		m.mu.Unlock()
-		logrus.Debugf("ocimount: reuse existing mount for %s, refcount=%d", imageURL, entry.refcount)
-		return entry.path, nil
+		return path, nil
 	}
 	m.mu.Unlock()
-
-	// First caller: mount via in-process image-manager.
-	resp, err := m.svc.MountOCI(ctx, &imgApi.OCIMountRequest{
-		ImageURL: imageURL,
-	})
+	if entry != nil {
+		// A canceled first acquire could not roll back its lower ownership.
+		// Retain it and finish release before acquiring a new lower reference.
+		if err := m.unmountF(imageURL); err != nil {
+			return "", err
+		}
+		m.mu.Lock()
+		delete(m.entries, imageURL)
+		m.mu.Unlock()
+	}
+	resp, err := m.svc.MountOCI(ctx, &imgApi.OCIMountRequest{ImageURL: imageURL})
 	if err != nil {
 		return "", fmt.Errorf("failed to mount OCI image %s: %w", imageURL, err)
 	}
-
+	if err := ctx.Err(); err != nil {
+		cleanupErr := m.unmountF(imageURL)
+		if cleanupErr != nil {
+			m.mu.Lock()
+			m.entries[imageURL] = &imageMountEntry{path: resp.MountPath}
+			m.mu.Unlock()
+		}
+		return "", errors.Join(err, cleanupErr)
+	}
 	m.mu.Lock()
-	// Double-check: another goroutine might have mounted while we were unlocked.
-	if existing, ok := m.entries[key]; ok {
-		existing.refcount++
-		m.mu.Unlock()
-		logrus.Debugf("ocimount: race detected for %s, reusing existing", imageURL)
-		return existing.path, nil
-	}
-	m.entries[key] = &imageMountEntry{
-		refcount: 1,
-		path:     resp.MountPath,
-	}
+	m.entries[imageURL] = &imageMountEntry{refcount: 1, path: resp.MountPath}
 	m.mu.Unlock()
-
 	logrus.Infof("ocimount: mounted %s at %s", imageURL, resp.MountPath)
 	return resp.MountPath, nil
 }
 
-// unmountOCI releases a reference to a shared OCI image mount.
-// The image is only unmounted when refcount reaches zero.
+// unmountOCI releases one upper owner. Keep the final lower acquire visible
+// until its release succeeds so failed deletion can be retried safely.
 func (m *ociMountManager) unmountOCI(imageURL string) error {
 	if imageURL == "" {
 		return fmt.Errorf("image_url is empty")
 	}
-
-	key := imageURL
-
+	unlock, _ := m.operations.Acquire(context.Background(), imageURL)
+	defer unlock()
 	m.mu.Lock()
-	entry, ok := m.entries[key]
-	if !ok {
+	entry := m.entries[imageURL]
+	if entry == nil {
 		m.mu.Unlock()
-		logrus.Warnf("ocimount: unmount called for unknown image %s", imageURL)
 		return nil
 	}
-
-	entry.refcount--
-	if entry.refcount > 0 {
+	if entry.refcount > 1 {
+		entry.refcount--
 		m.mu.Unlock()
-		logrus.Debugf("ocimount: released one ref for %s, refcount=%d", imageURL, entry.refcount)
 		return nil
 	}
-
-	delete(m.entries, key)
 	m.mu.Unlock()
-
-	logrus.Infof("ocimount: last ref released for %s, unmounting", imageURL)
 	if err := m.unmountF(imageURL); err != nil {
-		logrus.Warnf("ocimount: failed to unmount OCI image %s: %v", imageURL, err)
 		return err
 	}
+	m.mu.Lock()
+	delete(m.entries, imageURL)
+	m.mu.Unlock()
 	return nil
 }
 
@@ -317,17 +325,25 @@ func (m *ociMountManager) unmountOCI(imageURL string) error {
 // Called during shutdown.
 func (m *ociMountManager) cleanupAllOciUnmounts() {
 	m.mu.Lock()
-	entries := make(map[string]*imageMountEntry, len(m.entries))
-	for k, v := range m.entries {
-		entries[k] = v
+	keys := make([]string, 0, len(m.entries))
+	for key := range m.entries {
+		keys = append(keys, key)
 	}
-	m.entries = make(map[string]*imageMountEntry)
 	m.mu.Unlock()
-
-	for key, entry := range entries {
-		logrus.Infof("ocimount: cleanup remaining mount refcount=%d at %s", entry.refcount, entry.path)
-		if err := m.unmountF(key); err != nil {
-			logrus.Warnf("ocimount: cleanup failed for %s: %v", key, err)
+	for _, key := range keys {
+		unlock, _ := m.operations.Acquire(context.Background(), key)
+		m.mu.Lock()
+		entry := m.entries[key]
+		m.mu.Unlock()
+		if entry != nil {
+			if err := m.unmountF(key); err != nil {
+				logrus.Warnf("ocimount: cleanup failed for %s: %v", key, err)
+			} else {
+				m.mu.Lock()
+				delete(m.entries, key)
+				m.mu.Unlock()
+			}
 		}
+		unlock()
 	}
 }

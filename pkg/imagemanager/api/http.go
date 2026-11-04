@@ -36,6 +36,8 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageconfig"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/nydus"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/oci"
+
+	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 )
 
 const DefaultHttpSockPath = "/var/run/image_mgr.sock"
@@ -93,7 +95,7 @@ type HttpWorker struct {
 	nydusCache  *NydusImageCache
 	mountStore  *MountStore
 
-	nydusOperations imageOperationLocks
+	nydusOperations keyedlock.Locks
 }
 
 // Close releases resources held by the HttpWorker (e.g., mount store DB).
@@ -489,7 +491,7 @@ func (w *HttpWorker) mountNydusOnce(imageURL string, fn func() (nydusMountAttemp
 }
 
 func (w *HttpWorker) mountNydusOnceContext(ctx context.Context, imageURL string, fn func() (nydusMountAttempt, error)) (nydusMountAttempt, error) {
-	unlock, err := w.nydusOperations.lock(ctx, imageURL)
+	unlock, err := w.nydusOperations.Acquire(ctx, imageURL)
 	if err != nil {
 		return nydusMountAttempt{}, err
 	}

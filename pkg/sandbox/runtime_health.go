@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/inclusionAI/sandboxd/config"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/sirupsen/logrus"
 )
@@ -91,6 +92,15 @@ func (m *Manager) pollRuntime(name string, handler svc.Handler, timeout time.Dur
 	go func() {
 		defer busy.Store(false)
 		states, err := handler.List(ctx)
+		if err == nil && name == config.RuntimeNameRunsc && m.runscRecoveryPending.Load() {
+			err = m.reconcileStoppedRunscStates(ctx, handler, states)
+			if err == nil {
+				err = ctx.Err()
+				if err == nil {
+					m.runscRecoveryPending.Store(false)
+				}
+			}
+		}
 		done <- result{states, err}
 	}()
 	// The wrapper is bounded even when a handler ignores cancellation. At

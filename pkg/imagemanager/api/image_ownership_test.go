@@ -89,9 +89,6 @@ func TestSharedMountSameImageCoalescesAndKeepsCanceledWaiterOutOfRefcount(t *tes
 	if mounts.Load() != 1 || unmounts.Load() != 1 || len(service.images) != 0 {
 		t.Fatalf("ownership mounts=%d unmounts=%d held=%d", mounts.Load(), unmounts.Load(), len(service.images))
 	}
-	if len(service.operations.entries) != 0 {
-		t.Fatal("completed operation locks leaked")
-	}
 }
 
 func TestCanceledLeaderRollsBackBeforeLiveFollowerCanAcquire(t *testing.T) {

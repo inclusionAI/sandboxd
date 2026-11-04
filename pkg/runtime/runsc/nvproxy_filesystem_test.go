@@ -315,6 +315,16 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 	}
 	for _, hostWritable := range []bool{false, true} {
 		t.Run(fmt.Sprintf("host-writable=%t", hostWritable), func(t *testing.T) {
+			originalMount := mountRunscOverlayFilesystem
+			t.Cleanup(func() { mountRunscOverlayFilesystem = originalMount })
+			mountedVolatile := false
+			mountRunscOverlayFilesystem = func(source, target, fstype string, flags uintptr, data string) error {
+				err := originalMount(source, target, fstype, flags, data)
+				if err == nil {
+					mountedVolatile = strings.Contains(","+data+",", ",volatile,")
+				}
+				return err
+			}
 			bundle := t.TempDir()
 			lower := t.TempDir()
 			if err := os.WriteFile(filepath.Join(lower, "image-file"), []byte("image"), 0644); err != nil {
@@ -340,8 +350,8 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 				fields := strings.Fields(line)
 				if len(fields) > 6 && fields[4] == merged {
 					found = true
-					if !strings.Contains(","+fields[len(fields)-1]+",", ",volatile,") {
-						t.Fatalf("disposable staging overlay can synchronize unrelated host writes: %s", line)
+					if strings.Contains(","+fields[len(fields)-1]+",", ",volatile,") != mountedVolatile {
+						t.Fatalf("staging overlay options differ from successful mount: %s", line)
 					}
 				}
 			}
@@ -365,6 +375,52 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 				if _, err := os.Lstat(filepath.Join(bundle, name)); !errors.Is(err, os.ErrNotExist) {
 					t.Fatalf("staging path remains after cleanup: %s, %v", name, err)
 				}
+			}
+		})
+	}
+}
+
+// Exercise the kernel mount boundary, including hosts predating overlay volatile.
+func TestPrivateRootfsOverlayCapabilityFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		first, fallback error
+		calls           int
+	}{
+		{name: "supported", calls: 1},
+		{name: "unsupported", first: syscall.EINVAL, calls: 2},
+		{name: "unsupported-and-invalid-base", first: syscall.EINVAL, fallback: syscall.ENOENT, calls: 2},
+		{name: "permission-denied", first: syscall.EPERM, calls: 1},
+		{name: "busy", first: syscall.EBUSY, calls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := mountRunscOverlayFilesystem
+			t.Cleanup(func() { mountRunscOverlayFilesystem = original })
+			calls := 0
+			mountRunscOverlayFilesystem = func(source, target, fstype string, flags uintptr, data string) error {
+				calls++
+				if source != "overlay" || target != "/target" || fstype != "overlay" || flags != 0 {
+					t.Fatalf("changed mount boundary: %s %s %s %d", source, target, fstype, flags)
+				}
+				expected := "lowerdir=/lower,upperdir=/upper,workdir=/work"
+				if calls == 1 {
+					expected += ",volatile"
+				}
+				if data != expected {
+					t.Fatalf("options = %q, want %q", data, expected)
+				}
+				if calls == 1 {
+					return tc.first
+				}
+				return tc.fallback
+			}
+			err := mountRunscNVProxyOverlay("/lower", "/upper", "/work", "/target")
+			expectedErr := tc.first
+			if tc.calls == 2 {
+				expectedErr = tc.fallback
+			}
+			if !errors.Is(err, expectedErr) || calls != tc.calls {
+				t.Fatalf("mount: %v (%d calls), want %v (%d calls)", err, calls, expectedErr, tc.calls)
 			}
 		})
 	}

@@ -24,12 +24,14 @@ func (m *Manager) reconcileStoppedRunscOrphans() error {
 	if !ok {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	states, err := handler.List(ctx)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("list runsc state during startup recovery: %w", err)
-	}
+	m.runscRecoveryPending.Store(true)
+	_, err := m.pollRuntime(config.RuntimeNameRunsc, handler, 10*time.Second)
+	return err
+}
+
+// Called only inside runsc's single in-flight poll. A failed cleanup is retried
+// on the next successful inventory, before runsc can be advertised again.
+func (m *Manager) reconcileStoppedRunscStates(ctx context.Context, handler svc.Handler, states []*svc.State) error {
 	for _, state := range states {
 		if state == nil || !config.IsValidSandboxID(state.ID) || m.sandboxes.Has(state.ID) {
 			continue
@@ -37,10 +39,10 @@ func (m *Manager) reconcileStoppedRunscOrphans() error {
 		if state.Status != svc.SandboxStatusExited || state.InitProcessPid > 0 {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		err := handler.Delete(ctx, state.ID)
-		cancel()
-		if err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := handler.Delete(ctx, state.ID); err != nil {
 			return fmt.Errorf("delete stopped orphan runsc sandbox %s: %w", state.ID, err)
 		}
 		logrus.Infof("retired stopped orphan runsc sandbox %s during startup recovery", state.ID)

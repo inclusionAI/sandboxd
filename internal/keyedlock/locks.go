@@ -1,34 +1,36 @@
-package api
+package keyedlock
 
 import (
 	"context"
 	"sync"
 )
 
-// imageOperationLocks serializes one image's acquire/release without holding a
+// Locks serializes one image's acquire/release without holding a
 // global lock during registry or filesystem I/O. Waiters retain their own
 // cancellation; entries cannot be evicted while any waiter still references them.
-type imageOperationLocks struct {
+type Locks struct {
 	mu      sync.Mutex
-	entries map[string]*imageOperationLock
+	entries map[string]*operationLock
 }
 
-type imageOperationLock struct {
+type operationLock struct {
 	gate  chan struct{}
 	users int
 }
 
-func (l *imageOperationLocks) lock(ctx context.Context, key string) (func(), error) {
+// Acquire waits for the key or caller cancellation. The returned release must
+// be called exactly once; the zero value is ready for use.
+func (l *Locks) Acquire(ctx context.Context, key string) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	l.mu.Lock()
 	if l.entries == nil {
-		l.entries = make(map[string]*imageOperationLock)
+		l.entries = make(map[string]*operationLock)
 	}
 	entry := l.entries[key]
 	if entry == nil {
-		entry = &imageOperationLock{gate: make(chan struct{}, 1)}
+		entry = &operationLock{gate: make(chan struct{}, 1)}
 		l.entries[key] = entry
 	}
 	entry.users++
