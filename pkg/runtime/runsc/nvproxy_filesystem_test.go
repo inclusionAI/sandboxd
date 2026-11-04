@@ -321,7 +321,7 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 			mountRunscOverlayFilesystem = func(source, target, fstype string, flags uintptr, data string) error {
 				err := originalMount(source, target, fstype, flags, data)
 				if err == nil {
-					mountedVolatile = strings.Contains(","+data+",", ",volatile,")
+					mountedVolatile = overlayOptionsVolatile(data)
 				}
 				return err
 			}
@@ -350,7 +350,7 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 				fields := strings.Fields(line)
 				if len(fields) > 6 && fields[4] == merged {
 					found = true
-					if strings.Contains(","+fields[len(fields)-1]+",", ",volatile,") != mountedVolatile {
+					if overlayOptionsVolatile(fields[len(fields)-1]) != mountedVolatile {
 						t.Fatalf("staging overlay options differ from successful mount: %s", line)
 					}
 				}
@@ -421,6 +421,30 @@ func TestPrivateRootfsOverlayCapabilityFallback(t *testing.T) {
 			}
 			if !errors.Is(err, expectedErr) || calls != tc.calls {
 				t.Fatalf("mount: %v (%d calls), want %v (%d calls)", err, calls, expectedErr, tc.calls)
+			}
+		})
+	}
+}
+
+func overlayOptionsVolatile(options string) bool {
+	return strings.Contains(","+options+",", ",volatile,") || strings.Contains(","+options+",", ",fsync=volatile,")
+}
+
+func TestPrivateRootfsOverlayMountinfoVolatileAliases(t *testing.T) {
+	for _, tc := range []struct {
+		options  string
+		volatile bool
+	}{
+		{"rw,lowerdir=/lower,volatile", true},
+		{"rw,lowerdir=/lower,fsync=volatile", true},
+		{"rw,fsync=auto", false},
+		{"rw,fsync=strict", false},
+		{"rw,lowerdir=/volatile,upperdir=/fsync=volatile", false},
+		{"rw,notvolatile,fsync=volatile-extra", false},
+	} {
+		t.Run(tc.options, func(t *testing.T) {
+			if got := overlayOptionsVolatile(tc.options); got != tc.volatile {
+				t.Fatalf("mountinfo %q volatile=%t, want %t", tc.options, got, tc.volatile)
 			}
 		})
 	}

@@ -46,22 +46,51 @@ func (m *Manager) WaitRuntimeHealth(ctx context.Context, name string) error {
 	}
 }
 
+// SetRuntimeReconciler registers backend-specific startup recovery in the same
+// bounded, single-in-flight lane as inventory. Admission stays closed until the
+// whole poll and recovery callback succeed. A nil callback removes the hook;
+// only a subsequent successful poll can reopen admission.
+func (m *Manager) SetRuntimeReconciler(name string, reconcile func(context.Context, []*svc.State) error) {
+	if reconcile == nil {
+		m.runtimeReconcilers.Delete(name)
+		return
+	}
+	m.runtimeReconcilers.Store(name, reconcile)
+	m.runtimePollErrors.LoadOrStore(name, fmt.Errorf("runtime recovery pending"))
+}
+
+// RuntimeInventory shares housekeeping's bounded poll lane and health state.
+// Failure is never returned as a successful empty inventory.
+func (m *Manager) RuntimeInventory(name string, timeout time.Duration) ([]*svc.State, error) {
+	handler, ok := m.serviceHandler.Get(name)
+	if !ok {
+		err := fmt.Errorf("runtime handler %q is unavailable", name)
+		m.runtimePollErrors.Store(name, err)
+		return nil, err
+	}
+	result, err := m.pollRuntime(name, handler, timeout)
+	if err != nil {
+		m.runtimePollErrors.Store(name, err)
+		logrus.WithError(err).Warnf("runtime %s reconciliation unavailable", name)
+		return nil, err
+	}
+	m.runtimePollErrors.Delete(name)
+	return result, nil
+}
+
 func (m *Manager) collectRuntimeStates(timeout time.Duration) (map[string]*svc.State, map[string]bool) {
 	states := make(map[string]*svc.State)
 	polled := make(map[string]bool)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for name, handler := range m.serviceHandler.Items() {
+	for name := range m.serviceHandler.Items() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := m.pollRuntime(name, handler, timeout)
+			result, err := m.RuntimeInventory(name, timeout)
 			if err != nil {
-				m.runtimePollErrors.Store(name, err)
-				logrus.WithError(err).Warnf("runtime %s reconciliation unavailable", name)
 				return
 			}
-			m.runtimePollErrors.Delete(name)
 			mu.Lock()
 			defer mu.Unlock()
 			polled[name] = true
@@ -100,6 +129,17 @@ func (m *Manager) pollRuntime(name string, handler svc.Handler, timeout time.Dur
 					m.runscRecoveryPending.Store(false)
 				}
 			}
+		}
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err == nil {
+			if reconcile, ok := m.runtimeReconcilers.Load(name); ok {
+				err = reconcile.(func(context.Context, []*svc.State) error)(ctx, states)
+			}
+		}
+		if err == nil {
+			err = ctx.Err()
 		}
 		done <- result{states, err}
 	}()

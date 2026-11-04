@@ -133,3 +133,56 @@ func TestSlowRuntimeListDoesNotCloseProcessReadiness(t *testing.T) {
 	require.Error(t, m.RuntimeHealthError("runsc"))
 	require.NoError(t, m.RuntimeHealthError("firecracker-pvm"))
 }
+
+func TestRuntimeRecoveryHookMustSucceedBeforeAdmissionReopens(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	m := &Manager{serviceHandler: cmap.New[svc.Handler]()}
+	m.serviceHandler.Set("runsc", svc.NewFakeRuntimeHandler())
+	m.serviceHandler.Set("runc", svc.NewFakeRuntimeHandler())
+	recoveryErr := errors.New("ACL recovery unavailable")
+	m.SetRuntimeReconciler("runsc", func(ctx context.Context, _ []*svc.State) error {
+		if _, ok := ctx.Deadline(); !ok {
+			return errors.New("missing recovery deadline")
+		}
+		if fail.Load() {
+			return recoveryErr
+		}
+		return nil
+	})
+	require.Error(t, m.RuntimeHealthError("runsc"))
+	_, polled := m.collectRuntimeStates(time.Second)
+	require.True(t, polled["runc"])
+	require.False(t, polled["runsc"])
+	require.ErrorIs(t, m.RuntimeHealthError("runsc"), recoveryErr)
+	require.NoError(t, m.RuntimeHealthError("runc"))
+	fail.Store(false)
+	require.Eventually(t, func() bool { _, p := m.collectRuntimeStates(time.Second); return p["runsc"] }, time.Second, time.Millisecond)
+	require.NoError(t, m.RuntimeHealthError("runsc"))
+}
+
+func TestRuntimeRecoveryHookSharesTheSingleBoundedPollLane(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var calls atomic.Int32
+	m := &Manager{serviceHandler: cmap.New[svc.Handler]()}
+	m.serviceHandler.Set("runsc", svc.NewFakeRuntimeHandler())
+	m.serviceHandler.Set("runc", svc.NewFakeRuntimeHandler())
+	m.SetRuntimeReconciler("runsc", func(context.Context, []*svc.State) error { calls.Add(1); <-release; return nil })
+	for range 3 {
+		_, p := m.collectRuntimeStates(20 * time.Millisecond)
+		require.True(t, p["runc"])
+		require.False(t, p["runsc"])
+	}
+	require.EqualValues(t, 1, calls.Load())
+	require.Error(t, m.RuntimeHealthError("runsc"))
+	close(release)
+	require.Eventually(t, func() bool { _, p := m.collectRuntimeStates(time.Second); return p["runsc"] }, time.Second, time.Millisecond)
+	require.NoError(t, m.RuntimeHealthError("runsc"))
+}

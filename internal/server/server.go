@@ -103,6 +103,7 @@ type sandboxService struct {
 	deleteGroup                       singleflight.Group
 	runtimeDeleteTimeout              time.Duration
 	aclMu                             sync.Mutex
+	runscACLRecoveryPending           atomic.Bool
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]string
 	restoreAdmissionMu                sync.Mutex
@@ -977,11 +978,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("restore sandbox filesystem state: %w", err)
 	}
 	if s.aclMgr != nil {
-		bindings, bindErr := s.activeACLBindings()
-		if bindErr != nil {
-			return nil, bindErr
-		}
-		if err := s.aclMgr.Restore(bindings); err != nil {
+		if err := s.restoreACLState(s.aclMgr.RestoreRetaining, s.aclMgr.OwnerIDs()); err != nil {
 			return nil, fmt.Errorf("restore network ACL state: %w", err)
 		}
 	}
@@ -1006,53 +1003,6 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}()
 
 	return s, nil
-}
-
-func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, error) {
-	bindings := make(map[string]networkacl.Binding)
-	var stoppedRunsc map[string]bool
-	for _, current := range h.sandboxManager.List() {
-		if current == nil || current.Metadata == nil {
-			continue
-		}
-		if current.Metadata.RuntimeHandler == config.RuntimeNameRunc {
-			continue
-		}
-		if current.Metadata.RuntimeHandler == config.RuntimeNameRunsc {
-			if stoppedRunsc == nil {
-				var err error
-				stoppedRunsc, err = h.stoppedRunscForACLRecovery()
-				if err != nil {
-					return nil, err
-				}
-			}
-			if stoppedRunsc[current.Metadata.ID] {
-				continue
-			}
-		}
-		sandboxID := current.Metadata.ID
-		resources, err := h.sandboxManager.CollectResourceByID(sandboxID)
-		if err != nil {
-			return nil, fmt.Errorf("collect network resource for sandbox %s: %w", sandboxID, err)
-		}
-		encoded, ok := resources.Resources[config.ResourceNameInterface]
-		if !ok {
-			return nil, fmt.Errorf("sandbox %s has no network resource", sandboxID)
-		}
-		network, err := networkmanager.NewNetResource(encoded)
-		if err != nil {
-			return nil, fmt.Errorf("decode network resource for sandbox %s: %w", sandboxID, err)
-		}
-		if network.Interface == nil || network.Interface.Name == "" {
-			return nil, fmt.Errorf("sandbox %s network endpoint is missing", sandboxID)
-		}
-		bindings[sandboxID] = networkacl.Binding{
-			SandboxID: sandboxID,
-			IP:        network.Ip,
-			HostVeth:  network.Interface.Name,
-		}
-	}
-	return bindings, nil
 }
 
 func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
@@ -1101,6 +1051,9 @@ func (h *sandboxService) SetNetworkPolicy(
 			"network ACL is not supported by runtime runc: %w",
 			errord.ErrFailedPrecondition,
 		))
+	}
+	if current.Metadata != nil && current.Metadata.RuntimeHandler == config.RuntimeNameRunsc && h.runscACLRecoveryPending.Load() {
+		return nil, errord.ToGRPCf(errord.ErrUnavailable, "runsc network ACL recovery is incomplete")
 	}
 	if current.Status == nil || current.Status.Get().State() != runtime.SandboxState_SANDBOX_STATE_RUNNING {
 		return nil, errord.ToGRPC(fmt.Errorf("sandbox %s is not running: %w", request.SandboxID, errord.ErrFailedPrecondition))

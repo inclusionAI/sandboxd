@@ -93,6 +93,7 @@ type Manager struct {
 	// Runtime poll failures are local to that backend, not process health.
 	runtimePollErrors    sync.Map    // runtime name -> error
 	runtimePollBusy      sync.Map    // runtime name -> *atomic.Bool
+	runtimeReconcilers   sync.Map    // runtime name -> func(context.Context, []*svc.State) error
 	runscRecoveryPending atomic.Bool // startup cleanup stays closed until a complete retry
 }
 

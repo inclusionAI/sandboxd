@@ -387,12 +387,35 @@ func (m *Manager) persistLocked() error {
 	return m.store.StoreRaw(stateStoreKey, data)
 }
 
+// OwnerIDs snapshots persisted ACL owners, including records whose sandbox
+// metadata is unavailable. Startup inventory failure must retain these too.
+func (m *Manager) OwnerIDs() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ids := make([]string, 0, len(m.entries))
+	for id := range m.entries {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func (m *Manager) Restore(active map[string]Binding) error {
+	return m.RestoreRetaining(active, nil)
+}
+
+// RestoreRetaining leaves unverified owners' existing policy, generation and
+// endpoint state intact. Retained IDs are neither activated nor treated as
+// orphans, even if their current endpoint cannot be inspected. The caller must
+// keep their runtime admission closed and retry authoritative reconciliation.
+func (m *Manager) RestoreRetaining(active map[string]Binding, retained map[string]bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	resolved := make(map[string]persistedEntry, len(active))
 	entryRestoreOld := make(map[string]persistedEntry, len(active))
 	for sandboxID, binding := range active {
+		if retained[sandboxID] {
+			continue
+		}
 		entry, ok := m.entries[sandboxID]
 		if !ok {
 			return fmt.Errorf("active sandbox %s has no managed network ACL state; drain the node before enabling ACL", sandboxID)
@@ -435,6 +458,9 @@ func (m *Manager) Restore(active map[string]Binding) error {
 	inactive := make(map[string]persistedEntry)
 	for sandboxID, entry := range m.entries {
 		if _, ok := resolved[sandboxID]; ok {
+			continue
+		}
+		if retained[sandboxID] {
 			continue
 		}
 		inactive[sandboxID] = entry
