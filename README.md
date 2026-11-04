@@ -68,6 +68,10 @@ cgroup-disabled execution is selected.
 See [test/e2e/README.md](test/e2e/README.md#gpu-debug-image) for the validated
 GPU debug image and manual CUDA test.
 
+## OCI image cache
+
+`[plugin.image].oci_zero_ref_ttl` configures node-wide retention of unreferenced OCI layers and lowerdirs. Omit it for the existing 30-minute TTL, or set it to `"0s"` to retain idle cache until disk-pressure GC needs the space. See [OCI cache retention](doc/oci-cache.md) for configuration and cleanup semantics.
+
 ## Network backends
 
 Sandboxd supports two NAT backends:

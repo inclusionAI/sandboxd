@@ -92,6 +92,9 @@ func (p ManagedRuntimeProfile) MinimumStorageMB() (uint64, error) {
 
 // ImageManagerConfig configures image and mount lifecycle management.
 type ImageManagerConfig struct {
+	// OCIZeroRefTTL controls time-based GC of unreferenced OCI layers and lowerdirs.
+	// Empty uses 30m; zero disables TTL GC without disabling disk-pressure GC.
+	OCIZeroRefTTL     string `toml:"oci_zero_ref_ttl" json:"ociZeroRefTTL"`
 	ManagementSocket  string `toml:"management_socket" json:"managementSocket"`
 	ChunkDBSize       string `toml:"chunk_db_size" json:"chunkDbSize"`
 	ImageManagerRoot  string `toml:"root" json:"root"`

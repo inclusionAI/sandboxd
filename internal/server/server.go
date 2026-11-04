@@ -796,6 +796,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	imgMod, err := imagemanager.NewModule(imagemanager.Config{
 		RegistrySchemes:   registrySchemes,
 		ManagementSocket:  cfg.ManagementSocket,
+		OCIZeroRefTTL:     cfg.OCIZeroRefTTL,
 		Root:              cfg.ImageManagerRoot,
 		DistillFsBin:      cfg.DistillFsBin,
 		OSSTemplate:       cfg.OSSTemplate,
