@@ -98,6 +98,11 @@ func (h *sandboxService) Checkpoint(
 	if err != nil {
 		return nil, errord.ToGRPC(err)
 	}
+	releaseManagedCapture, err := h.holdManagedCheckpoint(ctx, request.ID)
+	if err != nil {
+		return nil, errord.ToGRPC(errors.Join(err, directory.cleanup()))
+	}
+	defer releaseManagedCapture()
 
 	checkpointCtx, cancel := context.WithTimeout(
 		ctx,
@@ -157,7 +162,7 @@ func (h *sandboxService) Checkpoint(
 		return nil, errord.ToGRPC(operationErr)
 	}
 	captureDuration := time.Since(captureStarted)
-	if err := h.writeManagedRuntimeCheckpoint(request.ID, directory.path); err != nil {
+	if err := h.writeManagedRuntimeCheckpoint(checkpointCtx, request.ID, directory.path); err != nil {
 		cleanupErr := directory.cleanup()
 		return nil, errord.ToGRPC(errors.Join(fmt.Errorf("persist managed runtime checkpoint: %w", err), cleanupErr))
 	}
