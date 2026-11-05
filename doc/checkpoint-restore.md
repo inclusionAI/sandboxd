@@ -435,6 +435,20 @@ resume the source. The caller decides how to handle the source sandbox.
 sandboxd only cleans partial checkpoint output: it removes a leaf directory it
 created, or empties a caller-provided leaf directory while preserving it.
 
+## Delete waiting and incomplete shutdown
+
+Deleting a sandbox, including a checkpoint source or restored target, uses the normal `Delete` RPC. Calls for the same sandbox share one cleanup worker. Each RPC waiter has a default 60-second budget, including waiting for runtime deletion and synchronous host cleanup; an earlier caller deadline or cancellation ends that caller's wait sooner. Caller cancellation does not cancel the shared worker or another waiter. The worker has its own default 60-second context budget, independent of the caller. Each runtime deletion attempt is limited to 30 seconds within that worker budget; after a runtime deadline, an allocated cgroup may be drained before one retry. Joining an existing worker does not restart it or extend its context deadline.
+
+`DeadlineExceeded` means deletion was not confirmed when that RPC returned. The worker may finish later while the daemon remains alive, so a later successful cleanup log does not contradict the earlier RPC error. An operation that ignores cancellation, including an uninterruptible kernel operation, can outlive both context budgets. The worker retains singleflight cleanup ownership until it actually returns; retries join that worker while it is still running. Once it returns an error, a later request can attempt cleanup again. A timeout is not permission to recycle resources or reuse the sandbox ID. Runtime deletion success alone does not confirm that host cleanup has finished; normal ID release is deferred until directory cleanup and exit notifications return.
+
+Shutdown closes readiness and new `Start` admission, then attempts deletion of the currently tracked sandboxes sequentially. The 60-second waiting budget applies separately to each deletion, not to shutdown as a whole. State persistence and other shutdown work can take additional time; shutdown has no global 60-second completion guarantee.
+
+If a deletion fails or sandboxes remain tracked, shutdown stops the sandbox manager's event processing and monitors, skips global teardown of the shared filesystem, image, network/interface, volume and ACL managers, and explicitly saves the cgroup manager's active allocations before returning. This preserves remaining state and resources that unfinished cleanup may still use; it does not undo cleanup steps that already completed. Cgroup snapshots and their database writes are serialized so an older periodic save cannot overwrite the explicit shutdown save.
+
+If that save fails, shutdown logs the error, leaves cgroup state dirty for a possible retry, and still returns. Dirty state exists only in the current process: a later periodic flush can help only if that process remains alive and the flush succeeds. Recovery requires successfully persisted metadata and leases plus the original runtime state and backing storage. A service restart in the same Pod and host boot uses those persisted leases; [host reboot and service restart](#host-reboot-and-service-restart) describes the separate reboot rules. This path does not provide cross-Pod or cross-node recovery, create a workload checkpoint, or guarantee recovery of allocations that were never saved. A cleanup worker does not survive daemon exit; retained state must be reconciled through recovery and subsequent deletion attempts.
+
+Already in-flight `Start` requests are not drained by this shutdown path. A request that passed admission before shutdown can still allocate resources or finish after the explicit save, and that save cannot include later allocations. Closing readiness, retaining dirty state and periodic saving do not guarantee persistence of this late state before process exit. These limits also mean that bounded RPC waiting does not force stuck kernel operations to complete or establish a fully drained shutdown.
+
 ## Restore through Start
 
 To restore, the caller sends a normal `StartRequest` for the target sandbox and
