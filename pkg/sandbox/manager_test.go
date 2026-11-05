@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	gomonkey "github.com/agiledragon/gomonkey/v2"
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/util"
@@ -264,6 +265,38 @@ func TestReserveIDIsAtomicForCustomID(t *testing.T) {
 	close(successes)
 
 	assert.Equal(t, []string{"sbox-concurrent"}, collectStrings(successes))
+}
+
+func TestDeleteKeepsIDReservedUntilCleanupFinishes(t *testing.T) {
+	m, id := newWaitForExitManager(t, "sbox-delete-reservation")
+	m.idGenerator = util.NewUUIDGenerator(config.SandboxPrefix, []string{id})
+	m.maxSandboxNum = 10
+	notifier, _ := m.exitNotifiers.Get(id)
+	monitorStop := make(chan struct{})
+	m.monitorStopChan.Set(id, monitorStop)
+
+	cleaned := false
+	patches := gomonkey.ApplyMethod(m, "CleanSandboxRoot", func(manager *Manager, sandboxID string) {
+		assert.Same(t, m, manager)
+		assert.Equal(t, id, sandboxID)
+		_, err := manager.ReserveID(sandboxID)
+		assert.ErrorIs(t, err, errord.ErrAlreadyExists, "old cleanup must not race a new sandbox with the same ID")
+		cleaned = true
+	})
+	defer patches.Reset()
+
+	m.Delete(id)
+	assert.True(t, cleaned)
+	assert.False(t, m.sandboxes.Has(id))
+	for name, done := range map[string]<-chan struct{}{"monitor": monitorStop, "exit waiter": notifier.done} {
+		select {
+		case <-done:
+		default:
+			t.Errorf("Delete returned before notifying %s", name)
+		}
+	}
+	_, err := m.ReserveID(id)
+	assert.NoError(t, err, "ID should be reusable after cleanup and notifications finish")
 }
 
 func collectStrings(values <-chan string) []string {

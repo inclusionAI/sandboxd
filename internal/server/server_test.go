@@ -16,18 +16,25 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
+	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/runtime/firecracker"
@@ -36,6 +43,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -501,6 +509,7 @@ type recordingDeleteHandler struct {
 	*svc.FakeRuntimeHandler
 	calls     int
 	sandboxID string
+	err       error
 }
 
 func (h *recordingDeleteHandler) Delete(
@@ -509,7 +518,7 @@ func (h *recordingDeleteHandler) Delete(
 ) error {
 	h.calls++
 	h.sandboxID = sandboxID
-	return nil
+	return h.err
 }
 
 func TestDeleteRoutesSandboxIDToRuntime(t *testing.T) {
@@ -539,15 +548,20 @@ func TestDeleteRoutesSandboxIDToRuntime(t *testing.T) {
 
 type blockingDeleteHandler struct {
 	*svc.FakeRuntimeHandler
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-	calls   atomic.Int32
+	started            chan struct{}
+	release            chan struct{}
+	once               sync.Once
+	calls              atomic.Int32
+	ignoreCancellation bool
 }
 
 func (h *blockingDeleteHandler) Delete(ctx context.Context, _ string) error {
 	h.calls.Add(1)
 	h.once.Do(func() { close(h.started) })
+	if h.ignoreCancellation {
+		<-h.release
+		return nil
+	}
 	select {
 	case <-h.release:
 		return nil
@@ -650,6 +664,192 @@ func TestDeleteTimeoutRetainsMetadataAndAllowsRetry(t *testing.T) {
 	_, err = s.Delete(context.Background(), &runtime.DeleteRequest{ID: id})
 	assert.NoError(t, err)
 	assert.Equal(t, int32(2), handler.calls.Load(), "retry must not join a permanently stuck singleflight")
+}
+
+func TestDeleteBudgetRetainsWorkerUntilCleanupReturns(t *testing.T) {
+	handler := &blockingDeleteHandler{
+		FakeRuntimeHandler: svc.NewFakeRuntimeHandler(),
+		started:            make(chan struct{}), release: make(chan struct{}),
+		ignoreCancellation: true,
+	}
+	s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	s.runtimeDeleteTimeout = 20 * time.Millisecond
+	const id = "sbox-uninterruptible-delete"
+	storeSandboxForDelete(t, s, id)
+	t.Cleanup(func() {
+		close(handler.release)
+		assert.Eventually(t, func() bool {
+			_, err := s.sandboxManager.Get(id)
+			return errors.Is(err, errord.ErrNotFound)
+		}, time.Second, time.Millisecond)
+	})
+
+	// No caller deadline: a synchronous operation that ignores its context
+	// must still stop holding the RPC, without allowing duplicate cleanup.
+	for range 2 {
+		done := make(chan error, 1)
+		go func() {
+			_, err := s.Delete(context.Background(), &runtime.DeleteRequest{ID: id})
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			assert.ErrorIs(t, err, context.DeadlineExceeded)
+		case <-time.After(time.Second):
+			t.Fatal("delete did not honor its cleanup budget")
+		}
+		assert.Equal(t, int32(1), handler.calls.Load())
+		_, err := s.sandboxManager.Get(id)
+		assert.NoError(t, err, "unfinished deletion must retain metadata")
+		assert.FileExists(t, filepath.Join(s.config.RootDir, "containers", id, config.SandboxMetaFile))
+	}
+}
+
+func TestShutdownPreservesResourcesAfterIncompleteDelete(t *testing.T) {
+	for _, ignoresCancellation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ignores_cancellation=%t", ignoresCancellation), func(t *testing.T) {
+			handler := &blockingDeleteHandler{
+				FakeRuntimeHandler: svc.NewFakeRuntimeHandler(),
+				started:            make(chan struct{}), release: make(chan struct{}),
+				ignoreCancellation: ignoresCancellation,
+			}
+			s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+			s.runtimeDeleteTimeout = 20 * time.Millisecond
+			const id = "sbox-shutdown-incomplete"
+			storeSandboxForDelete(t, s, id)
+			s.fsMgr = newFSManager(nil, s.store)
+			s.fsMgr.sandboxState[id] = sandboxFSState{}
+			assert.NoError(t, s.fsMgr.persistState())
+			before, err := s.store.LoadRaw(config.SandboxFSStateBucket)
+			assert.NoError(t, err)
+			done := make(chan struct{})
+			go func() { s.Shutdown(); close(done) }()
+			t.Cleanup(func() {
+				close(handler.release)
+				if ignoresCancellation {
+					assert.Eventually(t, func() bool {
+						_, err := s.sandboxManager.Get(id)
+						return errors.Is(err, errord.ErrNotFound)
+					}, time.Second, time.Millisecond)
+				}
+			})
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("shutdown kept waiting for unfinished cleanup")
+			}
+			_, err = s.sandboxManager.Get(id)
+			assert.NoError(t, err)
+			s.fsMgr.mu.Lock()
+			_, retained := s.fsMgr.sandboxState[id]
+			s.fsMgr.mu.Unlock()
+			assert.True(t, retained, "shutdown must preserve the filesystem recovery ledger")
+			after, err := s.store.LoadRaw(config.SandboxFSStateBucket)
+			assert.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after))
+			assert.False(t, s.Ready())
+		})
+	}
+}
+
+func TestShutdownCompletesAfterSuccessfulDelete(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
+	storeSandboxForDelete(t, s, "sbox-shutdown-success")
+	s.fsMgr.sandboxState["unused"] = sandboxFSState{}
+	s.Shutdown()
+	assert.Empty(t, s.sandboxManager.List())
+	assert.Empty(t, s.fsMgr.sandboxState, "successful shutdown still tears down shared resources")
+	assert.False(t, s.Ready())
+}
+
+func TestShutdownRetainsLiveCgroupLeaseIntegration(t *testing.T) {
+	if os.Getenv("SANDBOXD_RUN_CGROUP_INTEGRATION") != "1" {
+		t.Skip("set SANDBOXD_RUN_CGROUP_INTEGRATION=1 in an isolated cgroup v2 test environment")
+	}
+	const mountpoint = "/sys/fs/cgroup"
+	controls, err := os.ReadFile(filepath.Join(mountpoint, "cgroup.subtree_control"))
+	require.NoError(t, err)
+	for _, controller := range []string{"cpu", "memory"} {
+		require.Contains(t, strings.Fields(string(controls)), controller, "fixture requires pre-delegated controllers")
+	}
+	rootName := fmt.Sprintf("/sandboxd-shutdown-test-%d-%x", os.Getpid(), time.Now().UnixNano())
+	rootPath := filepath.Join(mountpoint, rootName)
+	require.NoError(t, os.Mkdir(rootPath, 0755), "fixture root must be new")
+	var manager *cgroupmanager.CgroupManager
+	var child *exec.Cmd
+	defer func() {
+		if child != nil && child.Process != nil {
+			_ = child.Process.Kill()
+			_ = child.Wait()
+		}
+		if manager != nil {
+			assert.NoError(t, manager.ShutDown())
+		}
+		entries, err := os.ReadDir(rootPath)
+		assert.NoError(t, err)
+		for _, entry := range entries {
+			if entry.IsDir() {
+				assert.NoError(t, os.Remove(filepath.Join(rootPath, entry.Name())))
+			}
+		}
+		assert.NoError(t, os.Remove(rootPath))
+	}()
+
+	db := store.NewStoreImp(filepath.Join(t.TempDir(), "leases.db"))
+	cfg := config.ResourceConfig{CgroupRootName: rootName, CgroupCacheSize: 1}
+	started := time.Now()
+	manager, err = cgroupmanager.NewCgroupManager(db, cfg, 1)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, idle := manager.Status()
+		return len(idle) == 1
+	}, time.Second, time.Millisecond)
+	lease, err := manager.Allocate()
+	require.NoError(t, err)
+	leasePath := filepath.Join(mountpoint, lease)
+	fd, err := os.Open(leasePath)
+	require.NoError(t, err)
+	child = exec.Command("sleep", "30")
+	child.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd.Fd())}
+	err = child.Start()
+	_ = fd.Close()
+	require.NoError(t, err)
+
+	handler := &recordingDeleteHandler{FakeRuntimeHandler: svc.NewFakeRuntimeHandler(), err: errors.New("injected runtime delete failure")}
+	s := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	s.cgroupMgr = manager
+	const id = "sbox-shutdown-live-lease"
+	storeSandboxForDelete(t, s, id)
+	spec := fmt.Sprintf(`{"ociVersion":"1.0.2","linux":{"cgroupsPath":%q}}`, lease)
+	require.NoError(t, os.WriteFile(filepath.Join(s.config.RootDir, "containers", id, config.SandboxSpecFile), []byte(spec), 0600))
+	_, err = db.LoadRaw(config.CgroupBucket)
+	require.ErrorIs(t, err, errord.ErrNotFound, "fixture must precede periodic persistence")
+
+	s.Shutdown()
+	require.Less(t, time.Since(started), 4*time.Second, "periodic persistence must not mask this regression")
+	data, err := db.LoadRaw(config.CgroupBucket)
+	require.NoError(t, err, "incomplete shutdown must save active leases before returning")
+	var saved struct {
+		Items []string `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(data, &saved))
+	require.Contains(t, saved.Items, lease)
+	_, err = s.sandboxManager.Get(id)
+	require.NoError(t, err)
+	procs, err := os.ReadFile(filepath.Join(leasePath, "cgroup.procs"))
+	require.NoError(t, err)
+	require.Contains(t, strings.Fields(string(procs)), fmt.Sprint(child.Process.Pid), "retained process must remain alive")
+
+	// Check the durable lease BEFORE stopping the old manager, whose own final
+	// flush would otherwise hide a missing SaveState call in server shutdown.
+	require.NoError(t, manager.ShutDown())
+	manager, err = cgroupmanager.NewCgroupManager(db, cfg, 1)
+	require.NoError(t, err)
+	using, _ := manager.Status()
+	require.Contains(t, using, lease, "restart must not recover the live lease as idle")
+	procs, err = os.ReadFile(filepath.Join(leasePath, "cgroup.procs"))
+	require.NoError(t, err)
+	require.Contains(t, strings.Fields(string(procs)), fmt.Sprint(child.Process.Pid), "recovery must not kill the retained process")
 }
 
 type timeoutThenDeleteHandler struct {

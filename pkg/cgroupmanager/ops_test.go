@@ -15,6 +15,7 @@
 package cgroupmanager
 
 import (
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -29,6 +31,7 @@ import (
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/util"
+	"github.com/inclusionAI/sandboxd/pkg/store"
 
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/cgroups/v3/cgroup2"
@@ -730,4 +733,108 @@ func assertFileContents(t *testing.T, name, expected string) {
 	data, err := os.ReadFile(name)
 	require.NoError(t, err)
 	assert.Equal(t, expected, string(data))
+}
+
+// saveStateStore overrides only raw writes while reusing the existing store.
+type saveStateStore struct {
+	store.DbStore
+	write func(string, []byte) error
+}
+
+func (s *saveStateStore) StoreRaw(key string, value []byte) error { return s.write(key, value) }
+
+func requireSavedCgroupIDs(t *testing.T, db store.DbStore, ids ...string) {
+	t.Helper()
+	data, err := db.LoadRaw(config.CgroupBucket)
+	require.NoError(t, err)
+	var saved storedCgroupIDs
+	require.NoError(t, json.Unmarshal(data, &saved))
+	require.ElementsMatch(t, ids, saved.Items)
+}
+
+func TestSaveStatePreservesActiveLeasesWithoutStopping(t *testing.T) {
+	db := store.NewMockStore()
+	ops, watcher := &fakeCgroupOps{}, newFakeOOMWatcher()
+	c := &CgroupManager{
+		db: db, usingID: cmap.New[struct{}](), ops: ops, oom: watcher,
+		stopCh: make(chan struct{}),
+	}
+	c.usingID.Set("/sandbox/live", struct{}{})
+	c.storeDirty.Store(true)
+	require.NoError(t, c.SaveState())
+	requireSavedCgroupIDs(t, db, "/sandbox/live")
+	assert.True(t, c.usingID.Has("/sandbox/live"))
+	assert.True(t, c.storeDirty.Load(), "saving must not consume a concurrent dirty mark")
+	assert.False(t, c.stopped.Load())
+	assert.Empty(t, ops.calls, "saving must not kill, reset or delete a cgroup")
+	assert.False(t, watcher.closed)
+	select {
+	case <-c.stopCh:
+		t.Fatal("saving must not stop manager workers")
+	default:
+	}
+}
+
+func TestSaveStateWriteFailureRemainsRetryable(t *testing.T) {
+	db := store.NewMockStore()
+	wantErr := errors.New("write unavailable")
+	failing := &saveStateStore{DbStore: db, write: func(string, []byte) error { return wantErr }}
+	c := &CgroupManager{db: failing, usingID: cmap.New[struct{}]()}
+	c.usingID.Set("/sandbox/live", struct{}{})
+	require.ErrorIs(t, c.SaveState(), wantErr)
+	assert.True(t, c.storeDirty.Load(), "periodic persistence must retry a failed explicit save")
+	assert.True(t, c.usingID.Has("/sandbox/live"))
+	failing.write = db.StoreRaw
+	require.NoError(t, c.SaveState())
+	requireSavedCgroupIDs(t, db, "/sandbox/live")
+}
+
+func TestSaveStateWaitsForOlderSnapshotBeforeSavingNewLease(t *testing.T) {
+	db := store.NewMockStore()
+	oldStarted, releaseOld := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOld) }) }
+	t.Cleanup(release)
+	var writes atomic.Int32
+	blocking := &saveStateStore{DbStore: db, write: func(key string, data []byte) error {
+		if writes.Add(1) == 1 {
+			close(oldStarted)
+			<-releaseOld
+		}
+		return db.StoreRaw(key, data)
+	}}
+	c := &CgroupManager{db: blocking, usingID: cmap.New[struct{}]()}
+	c.usingID.Set("/sandbox/old", struct{}{})
+	oldDone := make(chan error, 1)
+	go func() { oldDone <- c.store() }() // a periodic save with an old snapshot
+	select {
+	case <-oldStarted:
+	case <-time.After(time.Second):
+		t.Fatal("old save did not reach the store")
+	}
+	c.usingID.Set("/sandbox/new", struct{}{})
+	c.storeDirty.Store(true)
+	var saveErr error
+	saved := make(chan struct{})
+	go func() { saveErr = c.SaveState(); close(saved) }()
+	select {
+	case <-saved:
+		t.Error("new save returned while an older snapshot could still overwrite it")
+	case <-time.After(20 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-oldDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("old save did not finish")
+	}
+	select {
+	case <-saved:
+		require.NoError(t, saveErr)
+	case <-time.After(time.Second):
+		t.Fatal("new save did not finish")
+	}
+	requireSavedCgroupIDs(t, db, "/sandbox/old", "/sandbox/new")
+	assert.True(t, c.storeDirty.Load())
 }

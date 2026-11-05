@@ -882,11 +882,12 @@ func (m *Manager) CleanSandboxRoot(id string) {
 }
 
 func (m *Manager) Delete(id string) {
+	// Keep the ID reserved until root cleanup and exit notifications finish.
+	defer m.ReleaseID(id)
+
 	if sb, ok := m.sandboxes.Get(id); ok {
 		m.notifySandboxStopped(sb)
 	}
-
-	m.ReleaseID(id)
 
 	// clean root file.
 	m.CleanSandboxRoot(id)
