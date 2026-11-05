@@ -31,12 +31,13 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/singleflight"
 
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageconfig"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/nydus"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/oci"
+
+	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 )
 
 const DefaultHttpSockPath = "/var/run/image_mgr.sock"
@@ -94,7 +95,7 @@ type HttpWorker struct {
 	nydusCache  *NydusImageCache
 	mountStore  *MountStore
 
-	nydusDetectSF singleflight.Group
+	nydusOperations keyedlock.Locks
 }
 
 // Close releases resources held by the HttpWorker (e.g., mount store DB).
@@ -260,11 +261,18 @@ func (w *HttpWorker) UnmountOSS(req *OSSUmountRequest) (*MountInfo, error) {
 }
 
 func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
+	return w.mountNydusContext(w.ctx, req)
+}
+
+func (w *HttpWorker) mountNydusContext(ctx context.Context, req *NydusMountRequest) (*MountInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Generate daemon ID
 	id := generateNydusID(req.ImageURL)
 
 	// Start API timing
-	timing, _ := StartAPITimedOperation(w.ctx, "api.MountNydus", id)
+	timing, _ := StartAPITimedOperation(ctx, "api.MountNydus", id)
 	defer timing.End()
 
 	// Stage 1: Validate
@@ -297,10 +305,12 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 
 		// Mount if not already mounted
 		stageStart = time.Now()
-		if err := d.Mount(); err != nil {
+		if err := d.MountContext(ctx); err != nil {
 			timing.Fail(err)
 			return nil, fmt.Errorf("failed to mount existing daemon %s: %w", id, err)
 		}
+		info.Env = d.Env()
+		info.ImageProcess = d.ImageProcess()
 		w.mgr.SetDaemonReferenced(id, true)
 		timing.Stage("mount_existing_daemon", time.Since(stageStart))
 
@@ -357,7 +367,7 @@ func (w *HttpWorker) MountNydus(req *NydusMountRequest) (*MountInfo, error) {
 		"source_type": "nydus",
 		"image_url":   req.ImageURL,
 	}).Info("mount path begin daemon mount")
-	if err := d.Mount(); err != nil {
+	if err := d.MountContext(ctx); err != nil {
 		timing.Fail(err)
 		return nil, fmt.Errorf("failed to mount %s: %w", opts.ID, err)
 	}
@@ -437,28 +447,13 @@ type nydusMountAttempt struct {
 // tryMountNydus attempts to mount an image as Nydus format.
 // Returns mount point on success, or error if image is not Nydus or mount fails.
 func (w *HttpWorker) tryMountNydus(ctx context.Context, imageURL string) (nydusMountAttempt, error) {
-	// Check cache first
-	if isNydus, found := w.nydusCache.Get(imageURL); found {
-		if isNydus {
-			logrus.Infof("cache hit: %s is a Nydus image, routing to Nydus mount", imageURL)
-			info, err := w.MountNydus(&NydusMountRequest{ImageURL: imageURL})
-			if err != nil {
-				return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
-			}
-			return nydusMountAttempt{mountPoint: info.MountPoint, env: info.Env, imageProcess: info.ImageProcess, detected: true}, nil
-		} else {
-			logrus.Debugf("cache hit: %s is not a Nydus image", imageURL)
-			return nydusMountAttempt{}, fmt.Errorf("not a Nydus image (cached)")
-		}
-	}
-
-	return w.mountNydusOnce(imageURL, func() (nydusMountAttempt, error) {
-		// Double-check cache inside singleflight.
+	return w.mountNydusOnceContext(ctx, imageURL, func() (nydusMountAttempt, error) {
+		// Recheck the cache under this image's cancelable operation lock.
 		if isNydus, found := w.nydusCache.Get(imageURL); found {
 			if !isNydus {
 				return nydusMountAttempt{}, fmt.Errorf("not a Nydus image (cached)")
 			}
-			info, err := w.MountNydus(&NydusMountRequest{ImageURL: imageURL})
+			info, err := w.mountNydusContext(ctx, &NydusMountRequest{ImageURL: imageURL})
 			if err != nil {
 				return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
 			}
@@ -483,7 +478,7 @@ func (w *HttpWorker) tryMountNydus(ctx context.Context, imageURL string) (nydusM
 		}
 
 		logrus.Infof("detected Nydus image at %s, routing to Nydus mount", imageURL)
-		info, err := w.MountNydus(&NydusMountRequest{ImageURL: imageURL})
+		info, err := w.mountNydusContext(ctx, &NydusMountRequest{ImageURL: imageURL})
 		if err != nil {
 			return nydusMountAttempt{detected: true}, fmt.Errorf("failed to mount Nydus image: %w", err)
 		}
@@ -492,23 +487,18 @@ func (w *HttpWorker) tryMountNydus(ctx context.Context, imageURL string) (nydusM
 }
 
 func (w *HttpWorker) mountNydusOnce(imageURL string, fn func() (nydusMountAttempt, error)) (nydusMountAttempt, error) {
-	v, err, _ := w.nydusDetectSF.Do(imageURL, func() (interface{}, error) {
-		return fn()
-	})
-	attempt, ok := v.(nydusMountAttempt)
-	if ok {
-		return attempt, err
-	}
+	return w.mountNydusOnceContext(context.Background(), imageURL, fn)
+}
+
+func (w *HttpWorker) mountNydusOnceContext(ctx context.Context, imageURL string, fn func() (nydusMountAttempt, error)) (nydusMountAttempt, error) {
+	unlock, err := w.nydusOperations.Acquire(ctx, imageURL)
 	if err != nil {
 		return nydusMountAttempt{}, err
 	}
-	if v == nil {
-		return nydusMountAttempt{}, nil
-	}
-	if !ok {
-		return nydusMountAttempt{}, fmt.Errorf("invalid singleflight result type for nydus mount")
-	}
-	return nydusMountAttempt{}, nil
+	defer unlock()
+	// The callback rechecks the format cache. Canceled leaders finish rollback
+	// before releasing this image; a live follower can then retry independently.
+	return fn()
 }
 
 func (w *HttpWorker) MountOCI(ctx context.Context, req *OCIMountRequest) (*OCIMountResponse, error) {
@@ -784,7 +774,7 @@ func (w *HttpWorker) prepareHttp() *http.ServeMux {
 			return
 		}
 		start := time.Now()
-		info, err := w.MountNydus(&req)
+		info, err := w.mountNydusContext(request.Context(), &req)
 		logrus.Infof("do nydus_mount take %.6f s, err = %v", time.Since(start).Seconds(), err)
 		if err != nil {
 			writer.WriteHeader(http.StatusInternalServerError)

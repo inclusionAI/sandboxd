@@ -103,8 +103,11 @@ type sandboxService struct {
 	deleteGroup                       singleflight.Group
 	runtimeDeleteTimeout              time.Duration
 	aclMu                             sync.Mutex
+	runscACLRecoveryPending           atomic.Bool
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]string
+	restoreAdmissionMu                sync.Mutex
+	restoreAdmissionSlots             chan struct{}
 	firecrackerCheckpointMemorySlotMu sync.Mutex
 	firecrackerCheckpointMemorySlot   chan struct{}
 }
@@ -200,7 +203,7 @@ func (h *sandboxService) startSandboxRuntime(
 		}
 	}()
 
-	if err = h.checkRuntimeAdmission(runtimeName); err != nil {
+	if err = h.checkStartRuntimeAdmission(ctx, runtimeName, startConfig.CheckpointDir); err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("check runtime failed: %v", err)
 		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
 	}
@@ -706,6 +709,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	if err := validateRuntimeFilestore(cfg.RuntimeConfig); err != nil {
 		return nil, err
 	}
+	if _, err := runscRestoreConcurrency(cfg.RuntimeConfig.Runsc.RestoreConcurrency); err != nil {
+		return nil, err
+	}
 	runscPlatform, err := config.NormalizeRunscPlatform(cfg.RuntimeConfig.Runsc.Platform)
 	if err != nil {
 		return nil, fmt.Errorf("runtime configuration: %w", err)
@@ -737,6 +743,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 
 	if err := resetStateIfPodChanged(cfg.StoreDir, cfg.RootDir, cfg.ImageManagerRoot); err != nil {
 		return nil, fmt.Errorf("reset state on pod change: %w", err)
+	}
+	if err := reconcileHostBoot(cfg.StoreDir); err != nil {
+		return nil, fmt.Errorf("reconcile host boot: %w", err)
 	}
 	storePath := filepath.Join(cfg.StoreDir, "metadata.db")
 	if err := resetMetadataIfResourceStateIncompatible(storePath); err != nil {
@@ -780,7 +789,13 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	// Construct the in-process image manager before sandboxService so mount and
 	// rootfs consumers share one Service. Initialization is fatal because
 	// sandboxd cannot manage rootfs or S3/OCI mounts without it.
+	registrySchemes, err := cfg.ManagedRuntimeConfig.RegistrySchemes()
+	if err != nil {
+		return nil, err
+	}
 	imgMod, err := imagemanager.NewModule(imagemanager.Config{
+		RegistrySchemes:   registrySchemes,
+		ManagementSocket:  cfg.ManagementSocket,
 		Root:              cfg.ImageManagerRoot,
 		DistillFsBin:      cfg.DistillFsBin,
 		OSSTemplate:       cfg.OSSTemplate,
@@ -968,11 +983,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("restore sandbox filesystem state: %w", err)
 	}
 	if s.aclMgr != nil {
-		bindings, bindErr := s.activeACLBindings()
-		if bindErr != nil {
-			return nil, bindErr
-		}
-		if err := s.aclMgr.Restore(bindings); err != nil {
+		if err := s.restoreACLState(s.aclMgr.RestoreRetaining, s.aclMgr.OwnerIDs()); err != nil {
 			return nil, fmt.Errorf("restore network ACL state: %w", err)
 		}
 	}
@@ -997,40 +1008,6 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}()
 
 	return s, nil
-}
-
-func (h *sandboxService) activeACLBindings() (map[string]networkacl.Binding, error) {
-	bindings := make(map[string]networkacl.Binding)
-	for _, current := range h.sandboxManager.List() {
-		if current == nil || current.Metadata == nil {
-			continue
-		}
-		if current.Metadata.RuntimeHandler == config.RuntimeNameRunc {
-			continue
-		}
-		sandboxID := current.Metadata.ID
-		resources, err := h.sandboxManager.CollectResourceByID(sandboxID)
-		if err != nil {
-			return nil, fmt.Errorf("collect network resource for sandbox %s: %w", sandboxID, err)
-		}
-		encoded, ok := resources.Resources[config.ResourceNameInterface]
-		if !ok {
-			return nil, fmt.Errorf("sandbox %s has no network resource", sandboxID)
-		}
-		network, err := networkmanager.NewNetResource(encoded)
-		if err != nil {
-			return nil, fmt.Errorf("decode network resource for sandbox %s: %w", sandboxID, err)
-		}
-		if network.Interface == nil || network.Interface.Name == "" {
-			return nil, fmt.Errorf("sandbox %s network endpoint is missing", sandboxID)
-		}
-		bindings[sandboxID] = networkacl.Binding{
-			SandboxID: sandboxID,
-			IP:        network.Ip,
-			HostVeth:  network.Interface.Name,
-		}
-	}
-	return bindings, nil
 }
 
 func validateRuntimeFilestore(runtimeConfig config.RuntimeConfig) error {
@@ -1079,6 +1056,9 @@ func (h *sandboxService) SetNetworkPolicy(
 			"network ACL is not supported by runtime runc: %w",
 			errord.ErrFailedPrecondition,
 		))
+	}
+	if current.Metadata != nil && current.Metadata.RuntimeHandler == config.RuntimeNameRunsc && h.runscACLRecoveryPending.Load() {
+		return nil, errord.ToGRPCf(errord.ErrUnavailable, "runsc network ACL recovery is incomplete")
 	}
 	if current.Status == nil || current.Status.Get().State() != runtime.SandboxState_SANDBOX_STATE_RUNNING {
 		return nil, errord.ToGRPC(fmt.Errorf("sandbox %s is not running: %w", request.SandboxID, errord.ErrFailedPrecondition))
@@ -1204,6 +1184,16 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
 	}
+	managedRollback, err := h.prepareManagedRuntime(startReq, checkpointDir)
+	if err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+	}
+	managedCommitted := false
+	defer func() {
+		if !managedCommitted && managedRollback != nil {
+			managedRollback()
+		}
+	}()
 	networkPolicy, err := networkacl.NormalizePolicy(startReq.NetworkPolicy)
 	if err != nil {
 		wrapped := errord.ToGRPC(fmt.Errorf("invalid network policy: %v: %w", err, errord.ErrInvalidArgument))
@@ -1340,7 +1330,12 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 	}
 
-	if err := h.checkRuntimeAdmission(startReq.Runtime); err != nil {
+	releaseRestore, err := h.acquireRestoreAdmission(ctx, startReq.Runtime, checkpointDir)
+	if err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+	}
+	defer releaseRestore()
+	if err := h.checkStartRuntimeAdmission(ctx, startReq.Runtime, checkpointDir); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
 			Message: fmt.Sprintf("runtime %q is not available: %v", startReq.Runtime, err),
@@ -1676,6 +1671,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		SandboxID: sandboxID,
 	})
 	startSucceeded = true
+	managedCommitted = true
 	return &runtime.StartResponse{
 		Code:      0,
 		Message:   "Succeed",

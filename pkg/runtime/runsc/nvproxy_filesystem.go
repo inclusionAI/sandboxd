@@ -35,14 +35,27 @@ const (
 
 var mountRunscNVProxyEROFSImage = runtimecommon.MountReadOnlyEROFSImage
 
+var mountRunscOverlayFilesystem = syscall.Mount
+
 var mountRunscNVProxyOverlay = func(lowerDir, upperDir, workDir, target string) error {
 	options := fmt.Sprintf(
-		"lowerdir=%s,upperdir=%s,workdir=%s",
+		"lowerdir=%s,upperdir=%s,workdir=%s,volatile",
 		lowerDir,
 		upperDir,
 		workDir,
 	)
-	return syscall.Mount("overlay", target, "overlay", 0, options)
+	// This overlay only stages mount targets and host hook output. It is
+	// recreated for every execution; guest writes use runsc's separate
+	// filestore. Do not let teardown sync the entire shared upper filesystem
+	// while other sandboxes are persisting checkpoints (Linux 5.10 ovl_sync_fs).
+	err := mountRunscOverlayFilesystem("overlay", target, "overlay", 0, options)
+	if !errors.Is(err, syscall.EINVAL) {
+		return err
+	}
+	// Older kernels reject the unknown volatile option with EINVAL. Retry
+	// only that compatibility case with the pre-existing overlay semantics.
+	// If the base options are invalid too, preserve the fallback mount error.
+	return mountRunscOverlayFilesystem("overlay", target, "overlay", 0, strings.TrimSuffix(options, ",volatile"))
 }
 
 var unmountRunscNVProxyPath = func(target string, flags int) error {

@@ -24,12 +24,13 @@ import (
 )
 
 var (
-	layerRecordsBucket = []byte("layer_records")
-	mountRecordsBucket = []byte("mount_records")
-	mountTxnBucket     = []byte("mount_txn_records")
-	layerDirMapBucket  = []byte("layer_dir_map")
-	chainRecordsBucket = []byte("chain_records")
-	chainDirMapBucket  = []byte("chain_dir_map")
+	layerRecordsBucket    = []byte("layer_records")
+	mountRecordsBucket    = []byte("mount_records")
+	mountTxnBucket        = []byte("mount_txn_records")
+	layerDirMapBucket     = []byte("layer_dir_map")
+	chainRecordsBucket    = []byte("chain_records")
+	chainDirMapBucket     = []byte("chain_dir_map")
+	immutableImagesBucket = []byte("immutable_image_records")
 
 	ErrLayerNotFound = errors.New("layer not found")
 	ErrChainNotFound = errors.New("chain not found")
@@ -89,6 +90,9 @@ func openMetadataStore(dbPath string) (*metadataStore, error) {
 	}
 
 	err = db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists(immutableImagesBucket); err != nil {
+			return err
+		}
 		if _, err := tx.CreateBucketIfNotExists(layerRecordsBucket); err != nil {
 			return err
 		}

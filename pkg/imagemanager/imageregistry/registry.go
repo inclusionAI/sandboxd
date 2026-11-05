@@ -55,6 +55,9 @@ const (
 
 // Client handles image fetching from container registries with authentication.
 type Client struct {
+	registrySchemes    map[string]string // Immutable operator-selected transport by registry authority.
+	metadataMu         sync.Mutex
+	metadataAuth       map[string]http.RoundTripper
 	keychain           authn.Keychain
 	transportCache     map[string]*registryTransport
 	transportCacheLock sync.RWMutex
@@ -62,10 +65,32 @@ type Client struct {
 
 // NewClient creates a registry client by loading credentials from registry_auths.json.
 func NewClient(registryAuthsPath string) (*Client, error) {
+	return NewClientWithRegistrySchemes(registryAuthsPath, nil)
+}
+
+// NewClientWithRegistrySchemes applies only operator-owned, exact-authority policy.
+// It does not accept guest-selected transport or change unrelated registries.
+func NewClientWithRegistrySchemes(registryAuthsPath string, schemes map[string]string) (*Client, error) {
+	policy := make(map[string]string, len(schemes))
+	for host, scheme := range schemes {
+		if host == "" || strings.ContainsAny(host, "/@?#") || (scheme != "http" && scheme != "https") {
+			return nil, fmt.Errorf("invalid operator Registry transport policy")
+		}
+		registry, err := name.NewRegistry(host, name.StrictValidation)
+		if err != nil {
+			return nil, err
+		}
+		key := registry.Name()
+		if previous, ok := policy[key]; ok && previous != scheme {
+			return nil, fmt.Errorf("conflicting Registry transport for %s", key)
+		}
+		policy[key] = scheme
+	}
 	if registryAuthsPath == "" {
 		return &Client{
-			keychain:       &registryKeychain{},
-			transportCache: make(map[string]*registryTransport),
+			registrySchemes: policy,
+			keychain:        &registryKeychain{},
+			transportCache:  make(map[string]*registryTransport),
 		}, nil
 	}
 
@@ -75,9 +100,23 @@ func NewClient(registryAuthsPath string) (*Client, error) {
 	}
 
 	return &Client{
-		keychain:       &registryKeychain{auths: auths},
-		transportCache: make(map[string]*registryTransport),
+		registrySchemes: policy,
+		keychain:        &registryKeychain{auths: auths},
+		transportCache:  make(map[string]*registryTransport),
 	}, nil
+}
+
+// RegistryScheme returns an explicit operator policy, never a hostname heuristic.
+func (c *Client) RegistryScheme(imageRef string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	ref, err := name.ParseReference(NormalizeImageRef(imageRef))
+	if err != nil {
+		return "", false
+	}
+	scheme, ok := c.registrySchemes[ref.Context().RegistryStr()]
+	return scheme, ok
 }
 
 // NormalizeImageRef removes protocol prefixes and returns a canonical image reference.
@@ -87,7 +126,8 @@ func NormalizeImageRef(imageRef string) string {
 	return ref
 }
 
-// FetchImageWithFallback fetches image with optional HTTP proxy and HTTPS fallback.
+// FetchImageWithFallback fetches through an optional proxy, then the origin.
+// Both attempts obey explicit operator transport policy when configured.
 func (c *Client) FetchImageWithFallback(ctx context.Context, imageRef string, proxyURL string) (v1.Image, error) {
 	normalized := NormalizeImageRef(imageRef)
 
@@ -99,7 +139,7 @@ func (c *Client) FetchImageWithFallback(ctx context.Context, imageRef string, pr
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		logrus.Warnf("failed to fetch image %s via HTTP proxy, fallback to HTTPS: %v", imageRef, err)
+		logrus.Warnf("failed to fetch image %s via proxy, fallback to origin: %v", imageRef, err)
 	}
 
 	return c.FetchImage(ctx, normalized, "", false)
@@ -113,6 +153,9 @@ func (c *Client) FetchImage(ctx context.Context, imageRef string, proxyURL strin
 
 	stageStart := time.Now()
 	parseOpts := []name.Option{}
+	if scheme, ok := c.RegistryScheme(imageRef); ok {
+		useHTTP = scheme == "http"
+	}
 	if useHTTP {
 		parseOpts = append(parseOpts, name.Insecure)
 	}
@@ -165,7 +208,7 @@ func (c *Client) getOrCreateTransport(proxyURL string) *registryTransport {
 		return transport
 	}
 
-	transport := &registryTransport{base: newRegistryBaseTransport(proxyURL)}
+	transport := &registryTransport{base: newRegistryBaseTransport(proxyURL), registrySchemes: c.registrySchemes}
 	c.transportCache[cacheKey] = transport
 	return transport
 }
@@ -194,8 +237,9 @@ func newRegistryBaseTransport(proxyURL string) *http.Transport {
 }
 
 type registryTransport struct {
-	base         *http.Transport
-	roundTripper http.RoundTripper
+	base            *http.Transport
+	roundTripper    http.RoundTripper
+	registrySchemes map[string]string
 }
 
 func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -206,6 +250,13 @@ func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		},
 	}
 	req = req.Clone(httptrace.WithClientTrace(req.Context(), trace))
+	// The upstream name/transport library probes HTTPS even for name.Insecure,
+	// and permits HTTP fallback for private IPs and loopback. Enforce explicit
+	// operator policy at the wire boundary, including lazy reads and retries.
+	// Clone preserves the caller's request; other authorities keep their defaults.
+	if scheme, ok := t.registrySchemes[req.URL.Host]; ok {
+		req.URL.Scheme = scheme
+	}
 
 	roundTripper := t.roundTripper
 	if roundTripper == nil {

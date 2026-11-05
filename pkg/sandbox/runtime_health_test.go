@@ -23,6 +23,45 @@ type runtimePollFixture struct {
 
 func (h *runtimePollFixture) List(ctx context.Context) ([]*svc.State, error) { return h.list(ctx) }
 
+func TestWaitRuntimeHealthRequiresSuccessfulPollWithoutChangingDeadline(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	m := &Manager{serviceHandler: cmap.New[svc.Handler]()}
+	m.serviceHandler.Set("runsc", &runtimePollFixture{list: func(context.Context) ([]*svc.State, error) {
+		if fail.Load() {
+			return nil, errors.New("inventory unavailable")
+		}
+		return nil, nil
+	}})
+	m.collectRuntimeStates(time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	done := make(chan error, 1)
+	go func() { done <- m.WaitRuntimeHealth(ctx, "runsc") }()
+	fail.Store(false)
+	select {
+	case err := <-done:
+		t.Fatalf("health reopened before a successful poll: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	require.Error(t, m.RuntimeHealthError("runsc"))
+	m.collectRuntimeStates(time.Second)
+	require.NoError(t, <-done)
+	actual, _ := ctx.Deadline()
+	require.Equal(t, deadline, actual)
+	require.NoError(t, m.RuntimeHealthError("runsc"))
+}
+
+func TestWaitRuntimeHealthCancellationDoesNotReopenAdmission(t *testing.T) {
+	m := &Manager{}
+	m.runtimePollErrors.Store("runsc", errors.New("inventory unavailable"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, m.WaitRuntimeHealth(ctx, "runsc"), context.DeadlineExceeded)
+	require.Error(t, m.RuntimeHealthError("runsc"))
+}
+
 func TestRuntimePollTimeoutIsolatedAndRecovers(t *testing.T) {
 	var slow atomic.Bool
 	slow.Store(true)
@@ -93,4 +132,57 @@ func TestSlowRuntimeListDoesNotCloseProcessReadiness(t *testing.T) {
 	require.True(t, <-health)
 	require.Error(t, m.RuntimeHealthError("runsc"))
 	require.NoError(t, m.RuntimeHealthError("firecracker-pvm"))
+}
+
+func TestRuntimeRecoveryHookMustSucceedBeforeAdmissionReopens(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	m := &Manager{serviceHandler: cmap.New[svc.Handler]()}
+	m.serviceHandler.Set("runsc", svc.NewFakeRuntimeHandler())
+	m.serviceHandler.Set("runc", svc.NewFakeRuntimeHandler())
+	recoveryErr := errors.New("ACL recovery unavailable")
+	m.SetRuntimeReconciler("runsc", func(ctx context.Context, _ []*svc.State) error {
+		if _, ok := ctx.Deadline(); !ok {
+			return errors.New("missing recovery deadline")
+		}
+		if fail.Load() {
+			return recoveryErr
+		}
+		return nil
+	})
+	require.Error(t, m.RuntimeHealthError("runsc"))
+	_, polled := m.collectRuntimeStates(time.Second)
+	require.True(t, polled["runc"])
+	require.False(t, polled["runsc"])
+	require.ErrorIs(t, m.RuntimeHealthError("runsc"), recoveryErr)
+	require.NoError(t, m.RuntimeHealthError("runc"))
+	fail.Store(false)
+	require.Eventually(t, func() bool { _, p := m.collectRuntimeStates(time.Second); return p["runsc"] }, time.Second, time.Millisecond)
+	require.NoError(t, m.RuntimeHealthError("runsc"))
+}
+
+func TestRuntimeRecoveryHookSharesTheSingleBoundedPollLane(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var calls atomic.Int32
+	m := &Manager{serviceHandler: cmap.New[svc.Handler]()}
+	m.serviceHandler.Set("runsc", svc.NewFakeRuntimeHandler())
+	m.serviceHandler.Set("runc", svc.NewFakeRuntimeHandler())
+	m.SetRuntimeReconciler("runsc", func(context.Context, []*svc.State) error { calls.Add(1); <-release; return nil })
+	for range 3 {
+		_, p := m.collectRuntimeStates(20 * time.Millisecond)
+		require.True(t, p["runc"])
+		require.False(t, p["runsc"])
+	}
+	require.EqualValues(t, 1, calls.Load())
+	require.Error(t, m.RuntimeHealthError("runsc"))
+	close(release)
+	require.Eventually(t, func() bool { _, p := m.collectRuntimeStates(time.Second); return p["runsc"] }, time.Second, time.Millisecond)
+	require.NoError(t, m.RuntimeHealthError("runsc"))
 }

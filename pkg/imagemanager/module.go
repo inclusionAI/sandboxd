@@ -36,7 +36,9 @@ import (
 
 // Config corresponds to the [plugin.image] sandboxd configuration section.
 type Config struct {
-	ChunkDBSize       string // ChunkDB map capacity; empty uses the distill-fs default.
+	RegistrySchemes   map[string]string // Trusted exact-authority policy derived from managed profiles.
+	ManagementSocket  string            // Optional private Unix API for trusted runtime image preparation.
+	ChunkDBSize       string            // ChunkDB map capacity; empty uses the distill-fs default.
 	Root              string
 	DistillFsBin      string
 	OSSTemplate       string
@@ -62,6 +64,8 @@ type Module struct {
 	mgr        distillfs.Manager
 	ociMgr     *oci.Manager
 	worker     *api.HttpWorker
+	service    api.Service
+	management *api.ManagementServer
 	closedOnce sync.Once
 	healthy    atomic.Bool
 }
@@ -85,10 +89,13 @@ func NewModule(cfg Config) (*Module, error) {
 
 	var sharedRegistryClient *imageregistry.Client
 	var nydusClient *nydus.RegistryClient
-	if cfg.RegistryAuthsPath != "" {
+	if cfg.RegistryAuthsPath != "" || len(cfg.RegistrySchemes) > 0 {
 		var rerr error
-		sharedRegistryClient, rerr = imageregistry.NewClient(cfg.RegistryAuthsPath)
+		sharedRegistryClient, rerr = imageregistry.NewClientWithRegistrySchemes(cfg.RegistryAuthsPath, cfg.RegistrySchemes)
 		if rerr != nil {
+			if len(cfg.RegistrySchemes) > 0 {
+				return nil, fmt.Errorf("managed Registry client: %w", rerr)
+			}
 			logrus.Warnf("imagemanager: registry client init failed (%v); proceeding without registry auth", rerr)
 		} else {
 			nydusClient = nydus.NewRegistryClientFromShared(sharedRegistryClient)
@@ -132,14 +139,27 @@ func NewModule(cfg Config) (*Module, error) {
 		return nil, fmt.Errorf("imagemanager: http worker: %w", err)
 	}
 
-	m := &Module{cfg: cfg, mgr: mgr, ociMgr: ociMgr, worker: worker}
+	var shared api.Service = worker
+	if cfg.ManagementSocket != "" {
+		shared = api.NewSharedOCIService(worker)
+	}
+	m := &Module{cfg: cfg, mgr: mgr, ociMgr: ociMgr, worker: worker, service: shared}
+	if cfg.ManagementSocket != "" {
+		management, err := api.ListenManagement(cfg.ManagementSocket, shared, sharedRegistryClient)
+		if err != nil {
+			worker.Close()
+			ociMgr.Close()
+			return nil, fmt.Errorf("image management socket: %w", err)
+		}
+		m.management = management
+	}
 	m.healthy.Store(true)
 	return m, nil
 }
 
 // Service returns the in-process Service implementation, satisfying the
 // 4-call-site sandboxd contract previously fronted by api.NewHttpClient().
-func (m *Module) Service() api.Service { return m.worker }
+func (m *Module) Service() api.Service { return m.service }
 
 // Start currently has nothing to drive because the manager and worker start
 // their background goroutines during NewModule.
@@ -157,6 +177,9 @@ func (m *Module) ReconcileRecoveredDaemons() error {
 func (m *Module) Stop() {
 	m.closedOnce.Do(func() {
 		m.healthy.Store(false)
+		if m.management != nil {
+			m.management.Close()
+		}
 		if m.worker != nil {
 			m.worker.Close()
 		}

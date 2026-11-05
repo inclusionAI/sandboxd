@@ -554,19 +554,35 @@ func (d *Daemon) Mount() error {
 	return d.mount(true)
 }
 
+// MountContext ties preparation to its owner. A failed/canceled acquire joins
+// its preparation and rolls back any daemon before returning to the caller.
+func (d *Daemon) MountContext(ctx context.Context) error {
+	return d.mountContext(ctx, true)
+}
+
 // mount is the internal mount implementation.
 // When userInitiated is true (explicit Mount call), userStopped is cleared to re-enable auto-remount.
 // When userInitiated is false (auto-remount), userStopped is checked under lock and mount is
 // rejected if the daemon was explicitly unmounted, closing the race window between remount()
 // checking the flag and acquiring the lock.
 func (d *Daemon) mount(userInitiated bool) error {
+	return d.mountContext(d.ctx, userInitiated)
+}
+
+func (d *Daemon) mountContext(parent context.Context, userInitiated bool) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	// Start timing operation
-	timing, _ := StartTimedOperation(d.ctx, "daemon.Mount", d.meta.ID)
+	timing, _ := StartTimedOperation(parent, "daemon.Mount", d.meta.ID)
 	defer timing.End()
 	logrus.WithFields(d.daemonLogFields()).Info("daemon mount path started")
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := parent.Err(); err != nil {
+		return err
+	}
 
 	// Clear mountFailed: a new mount attempt supersedes any prior timeout.
 	// GC's unmountForGC checks this flag under d.mu, so they serialize correctly.
@@ -593,49 +609,49 @@ func (d *Daemon) mount(userInitiated bool) error {
 		return nil
 	}
 
-	// If already mounting, skip starting new process but wait for it to complete
-	if state != DaemonStateMounting {
-		// Set state to Mounting at the beginning
-		d.setState(DaemonStateMounting)
-
-		// Start daemon process in background
-		go d.startDaemonProcess()
-	}
-
-	// Wait for daemon to become running
-	timeout := time.NewTimer(daemonMountTimeout)
-	defer timeout.Stop()
-
+	// One bounded owner covers bootstrap, launcher and readiness. No background
+	// operation may outlive an unsuccessful acquire and mount after GC sees failure.
+	ctx, cancel := context.WithTimeout(parent, daemonMountTimeout)
+	defer cancel()
+	stop := context.AfterFunc(d.ctx, cancel)
+	defer stop()
+	d.setState(DaemonStateMounting)
+	done := make(chan struct{})
+	go func() { defer close(done); d.startDaemonProcessContext(ctx) }()
 	checkStart := time.Now()
-	for {
-		select {
-		case <-timeout.C:
-			d.mountFailed.Store(true)
-			err := fmt.Errorf("timeout waiting for daemon %s to start", d.meta.ID)
-			logrus.WithFields(d.daemonLogFields()).WithError(err).Error("daemon mount path failed")
-			timing.Fail(err)
-			return err
-		default:
-			state := d.getState()
-			if state == DaemonStateRunning {
-				timing.Stage("wait_daemon_running", time.Since(checkStart))
-				logrus.WithFields(d.daemonLogFields()).Info("daemon mount path completed")
-				return nil
-			}
-			if state == DaemonStateStopped {
-				err := fmt.Errorf("daemon %s failed to start", d.meta.ID)
-				logrus.WithFields(d.daemonLogFields()).WithError(err).Error("daemon mount path failed")
-				timing.Fail(err)
-				return err
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
+	select {
+	case <-ctx.Done():
+		// Set this before the watcher can decide to auto-remount.
+		d.userStopped.Store(true)
+		cancel()
+		<-done
+	case <-done:
 	}
+	if err := ctx.Err(); err != nil {
+		d.userStopped.Store(true)
+		d.mountFailed.Store(true)
+		cleanupErr := d.unmountLocked()
+		err = errors.Join(fmt.Errorf("daemon %s preparation canceled: %w", d.meta.ID, err), cleanupErr)
+		timing.Fail(err)
+		return err
+	}
+	if d.getState() != DaemonStateRunning {
+		err := fmt.Errorf("daemon %s failed to start", d.meta.ID)
+		timing.Fail(err)
+		return errors.Join(err, d.unmountLocked())
+	}
+	timing.Stage("wait_daemon_running", time.Since(checkStart))
+	logrus.WithFields(d.daemonLogFields()).Info("daemon mount path completed")
+	return nil
 }
 
 // startDaemonProcess starts the daemon process in background
 func (d *Daemon) startDaemonProcess() {
-	timing, ctx := StartTimedOperation(d.ctx, "daemon.startDaemonProcess", d.meta.ID)
+	d.startDaemonProcessContext(d.ctx)
+}
+
+func (d *Daemon) startDaemonProcessContext(parent context.Context) {
+	timing, ctx := StartTimedOperation(parent, "daemon.startDaemonProcess", d.meta.ID)
 	defer timing.End()
 
 	// Ensure state is reset to Stopped on error
@@ -658,6 +674,9 @@ func (d *Daemon) startDaemonProcess() {
 	logrus.WithFields(d.daemonLogFields()).Info("waiting for mount readiness via statfs zero blocks")
 	for {
 		select {
+		case <-ctx.Done():
+			timing.Fail(ctx.Err())
+			return
 		case <-d.stopChan:
 			d.setState(DaemonStateStopped)
 			logrus.WithFields(d.daemonLogFields()).Error("daemon exited abnormally")
@@ -725,6 +744,9 @@ func shouldLogMountReadiness(now, lastLog time.Time) bool {
 // - Saves metadata
 // - Initializes channels and starts watcher
 func (d *Daemon) initializeDaemon(ctx context.Context, timing *TimedOperation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// For Nydus: download bootstrap if not exists
 	if d.meta.SourceType == "nydus" && d.meta.BootstrapPath == "" {
 		if d.meta.ImageURL == "" || d.nydusClient == nil {
@@ -776,6 +798,9 @@ func (d *Daemon) initializeDaemon(ctx context.Context, timing *TimedOperation) e
 	}
 
 	// Stage 1: Clean mount point
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	stageStart := time.Now()
 	if err := d.cleanMountPoint(); err != nil {
 		logrus.WithFields(d.daemonLogFields()).WithError(err).Error("failed to clean mountpoint")
@@ -946,6 +971,14 @@ func (d *Daemon) unmountLocked() error {
 
 	// Stage 1: Signal daemon to stop
 	stageStart := time.Now()
+	// Initialization can fail after the launcher forked but before the watcher
+	// was installed (for example metadata persistence). Rollback still owns and
+	// joins that process, rather than waiting on a nil/obsolete stop channel.
+	if d.getPid() > 0 && d.IsAlive() && !d.watcherActive.Load() {
+		d.stopChan = make(chan struct{})
+		d.kickStop = NewStopper()
+		d.startWatch()
+	}
 	if d.kickStop != nil {
 		d.kickStop.Close()
 	}

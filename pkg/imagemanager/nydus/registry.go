@@ -64,6 +64,14 @@ func NewRegistryClientFromShared(shared *imageregistry.Client) *RegistryClient {
 	}
 }
 
+// RegistryScheme exposes the shared operator policy to the actual ROFS backend.
+func (c *RegistryClient) RegistryScheme(imageRef string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	return c.shared.RegistryScheme(imageRef)
+}
+
 // FetchImage fetches an image from the registry with authentication and optional proxy.
 func (c *RegistryClient) FetchImage(ctx context.Context, imageRef string, proxyURL string, useHTTP bool) (v1.Image, error) {
 	if c != nil && c.fetchImageFn != nil {

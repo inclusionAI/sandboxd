@@ -1,5 +1,25 @@
 # Checkpoint and restore
 
+## Experimental runtime image collections
+
+The optional `[plugin.image].management_socket` exposes immutable OCI image preparation to a trusted node runtime adapter over a private Unix socket (0700 parent, 0600 socket). It is never mounted into a sandbox. The adapter exports ROFS through an operator-owned read-only collection and registers its checked metadata with inner containerd; Docker lower content remains outside the writable checkpoint. Arbitrary sandbox host-path access is not authorized by this API.
+
+When enabled, managed preparation, ordinary rootfs use and image mounts share OCI reference counting: deleting one rootfs cannot stop a ROFS daemon still held by the managed runtime. Repeated preparation of one immutable reference holds one management lease. Management leases remain until the owned service shuts down; callers must delete all dependent sandboxes and retained snapshots before removing the collection or stopping its image service. This preview does not persist dynamic collection leases across a node/service restart or authorize tenants through the platform catalog. Durable lease recovery, multi-node restore and artifact garbage collection are not implied by same-node sandbox checkpoint/restore tests. With the management socket unset, the existing image-service path is unchanged.
+
+Image acquire/release serializes per reference; unrelated images do not hold a global lock across Registry or mount I/O. A waiting caller may cancel without dropping another owner's reference. Bootstrap, daemon launch and readiness share the acquire's bounded context (at most the existing 60-second preparation limit). On cancellation or timeout, preparation is joined and any launched daemon is rolled back before failure returns; a late bootstrap cannot create an unowned mount. Cleanup may extend beyond the preparation budget and cleanup errors are retained. A canceled leader does not publish a lease; live followers may retry after its rollback. Closing the management service cancels and joins its handlers before releasing service-owned leases. Snapshot durability barriers and fsync behavior are unchanged.
+
+## Managed file-backed tmpfs
+
+The runsc Start API accepts `extra_config` JSON with `fileBackedTmpfsMounts`, for example `{"fileBackedTmpfsMounts":[{"target":"/var/lib/akernel-image-snapshots","sizeMB":2048}]}`. Each mount uses a sandbox-owned anonymous filestore rather than guest-memory-backed file contents. This is intended for private Docker/containerd writable upper/work directories above shared read-only image roots; Dockerfiles and Compose definitions do not change.
+
+Mount quotas are reserved from `storage_mb` and must leave a positive root filesystem quota. Targets must be canonical absolute paths and cannot overlap reserved system paths, existing mounts or other managed targets. The source directory is an empty sandbox-owned mount identity, not caller-owned writable host storage. Runtime metadata persists the opt-in so checkpoints retain the same behavior across daemon restarts even if the node default is `full`.
+
+Checkpoints save all managed anonymous filestores with the existing reflink format and omit their file bytes from the guest memory-page stream. Restore requires the filestore manifest and clones the artifacts before adoption; source snapshots remain immutable across independent restored writers. The complete runtime bundle must support anonymous tmpfs mount hints and same-filesystem FICLONE. File backing can still incur page cache and cgroup memory charges. Guest process memory is saved separately and this feature does not implement incremental RAM snapshots. On Linux 5.10, the backing filestores and checkpoint destination must also be reached through the same mount; a second bind-mounted view can still fail FICLONE with EXDEV. Configure the checkpoint store directly beneath the filestore mount rather than binding it to a separate path, and verify a same-path clone before qualification.
+
+The mount preparation is adapted from Tianyu Zhou's `tianyuzhou95/sandboxd` commit `4ff87a3a7779ba35b9a0b737bdf92046e35052df`; it retains the current runtime adapter, filestore validation and old-kernel parent-mount-namespace handling. This opt-in does not change unrelated sandbox checkpoint defaults.
+
+The successful Checkpoint RPC logs `runtime_ms`, `sync_output_ms` and `total_ms` separately. With debug logging, each output synchronization emits `path`, `kind`, `logical_bytes`, `open_us`, `sync_us`, `close_us` and `total_us`, distinguishing state/page files, filestores and directories without changing synchronization order or durability. Runtime capture and the optional filesystem persistence barrier have different completion points; compare both with the runtime's own serialization/page-output timings rather than treating the whole API call as a stop-the-world interval. A file's fsync latency can include filesystem journal and lower-device flush dependencies; it does not by itself measure that file's exclusive write volume.
+
 sandboxd supports checkpointing a running sandbox into a caller-owned
 directory and starting a new sandbox from that checkpoint.
 
@@ -69,6 +89,8 @@ Runsc checkpoints preserve managed `/etc/hosts` contents and existence, includin
 
 ## Checkpoint output synchronization
 
+Runsc's per-execution host staging overlay first tries the Linux 5.10+ `volatile` mount option. If the kernel rejects it with `EINVAL`, preparation retries without that option for older hosts; other mount errors are returned without a compatibility retry. A failed fallback remains a preparation failure. Its upper directory holds disposable mount targets and host-hook output, is recreated for each execution, and is never a recovery artifact. Without this option, tearing down one overlay synchronizes the shared backing filesystem and can block behind other sandboxes' checkpoint writes. This does not change runsc's separate guest writable filestore or the checkpoint output synchronization below. Do not reuse a volatile staging upper directory after a host crash; normal preparation removes and recreates it.
+
 `plugin.runtime.checkpoint_sync.sync_output` defaults to `false`, preserving the existing page-cache completion contract. Set it to `true` when successful checkpoint publication must include the backing filesystem's synchronization guarantee:
 
 ```toml
@@ -79,6 +101,10 @@ sync_output = true
 The server synchronizes every regular file and directory, including the capture root's parent directory entry, after the runtime finishes capture and before acknowledging the Checkpoint RPC. In runsc reflink mode this includes the cloned files and manifest under `filestores/`. Symlinks and special files are rejected. A synchronization failure fails the RPC and cleans partial output without deleting the source sandbox; it does not roll back the runtime's checkpoint operation, so callers must reconcile source state. The request deadline and cancellation are checked between filesystem operations; an in-flight operating-system `fsync` cannot be interrupted. This option relies on the configured filesystem's persistence contract and does not configure storage replication.
 
 ## runsc background restore
+
+`plugin.runtime.runsc.restore_concurrency` optionally limits concurrent runsc restore `Start` RPCs per sandboxd process. Omitted or zero disables this concurrency limit; only an explicitly configured positive value enables it, and valid positive values are between 1 and 1024. When enabled, the permit covers filesystem/image preparation and the runtime restore call, and is acquired before sandbox ID or resource reservation. Requests queue within their existing deadline; cancellation while queued does not create a sandbox. Cold starts, cleanup, and other runtimes do not use this limit. Background page loading can continue after `Start` returns, so this bounds active restore RPCs rather than promising that all background I/O has finished.
+
+If a runsc inventory poll temporarily closes backend admission, a restore waits for a successful poll within the same caller deadline instead of immediately failing the accepted request. This health wait applies even when the concurrency limit is disabled. Runtime advertisement stays withdrawn while the poll is unavailable; the wait never substitutes an empty inventory or reopens health itself. Each admission wait from a caller without a deadline is bounded to one minute. Runtime inventory timeouts, actual backend validation, ownership checks, and cleanup remain enforced.
 
 `plugin.runtime.runsc.background_restore` defaults to `false`. Setting it to `true` forwards runsc's background page-loading option through the Restore RPC. Restore can then return before the entire memory image has been loaded. Callers must retain immutable checkpoint inputs while the runtime can still access them and measure full memory availability separately from RPC completion. This setting does not change checkpoint publication or output synchronization. It is independent of `checkpoint_mode`: full and reflink checkpoints both support this option. Private restored filestore copies do not release the memory-image and split-page inputs needed by background loading.
 
@@ -462,6 +488,18 @@ Incremental checkpoint scheduling (which generations a caller takes and when),
 deterministic replay, migration orchestration, and automatic recovery of a
 source after checkpoint failure are outside this design.
 
+### Host reboot and service restart
+
+Sandboxd uses the Linux boot ID to distinguish a host reboot from a service restart in the same Pod. A changed boot ID retires the old kernel's cgroup and TAP lease caches before resource managers start. It preserves sandbox metadata, image-manager state, and checkpoint files for normal reconciliation; it does not resume processes, select a checkpoint, or guarantee that node-local files survive disk loss. Callers still orchestrate restore and satisfy the runtime and storage compatibility requirements above.
+
+During the same boot, persisted leases remain authoritative and active TAP recovery continues to fail if a device is missing or has been replaced. An unstamped legacy store is adopted without clearing its leases. Unreadable boot identity, invalid persisted identity, or an unreadable lease database fails startup rather than deleting authoritative sandbox state.
+
+If a crash leaves a runsc record without readable sandbox metadata, startup recovery deletes it through runsc only when it explicitly reports stopped and has no positive process ID. Tracked records and live, created, or unknown states are preserved. Runtime inspection or deletion failure closes only runsc admission and advertisement; Sandboxd startup, healthy backends, and tracked sandbox state remain available. Housekeeping retries inventory and orphan cleanup in the same bounded, single-in-flight runsc poll lane. A successful inventory alone cannot reopen runsc while orphan deletion still fails; reopening requires the entire recovery pass to succeed within its poll deadline. This does not delete caller-owned checkpoint inputs or recover their contents.
+
+When runsc confirms a tracked instance is stopped without a positive PID, ACL recovery retires its stale binding instead of requiring the previous kernel's TAP. Its sandbox metadata is retained for the normal runtime, filesystem, and resource deletion path. Live, absent, or ambiguous state from a successful inventory keeps strict active endpoint recovery. If inventory is unavailable, ACL initialization retains the affected runsc owners without reactivating or orphan-cleaning their policy, generation, endpoint state or interface leases. Healthy backends still restore their ACLs and remain available. Runsc admission stays closed until inventory, orphan cleanup and the pending ACL restore all succeed in the same bounded poll lane; inventory success alone cannot reopen it. Recovery retries only runsc bindings, preserving other runtimes' active policies. Missing endpoint metadata for an unverified runsc owner stays quarantined until authoritative recovery; it is not permission to drop that owner. Existing ACL owners without sandbox metadata are retained during inventory failure too; a still-live untracked owner prevents runsc reopening until its ownership can be recovered. Policy updates for quarantined runsc owners return Unavailable; explicit deletion/cleanup remains available. This check uses current runtime state on every startup, including after a previous attempt advanced the boot stamp.
+
+OCI-image mount entries own one lower ROFS acquire regardless of how many ordinary sandboxes share the entry. First acquisition and final release serialize per image, including backend I/O, while unrelated images proceed independently. With managed-image sharing enabled, this ownership composes with the managed consumers' references rather than replacing them. A failed final release, including cancellation rollback, retains retryable ownership; it must not silently drop the entry or unmount another consumer's lower.
+
 ## Writable block I/O policy
 
 New sandboxes default to `writable_io_engine = "AsyncDirect"` and `writable_cache_type = "Writeback"` in `plugin.runtime.firecracker`. The pinned Firecracker runtime bundle includes direct-I/O alignment support. Operators using an older VMM must explicitly select `Async` or `Sync`. The writable policy applies to the private ext4 disk, including native writable mounts. It does not change EROFS root disks, virtio-fs exports, or checkpoint memory-file I/O.
@@ -475,3 +513,43 @@ The destination host must support the saved I/O engine. In particular, direct en
 The Firecracker completion log keeps `layout`, `flush`, `pause`, `snapshot`, `overlay`, `resume`, `seal` and `total` timings, and splits the `seal` interval into `manifest`, `adopt`, `persist` and `writeback_queue`. The debug log separates manifest component hashing from publication, native snapshot time from both cgroup moves, and atomic state-file creation, writing, `fsync`, closing and rename. `seal` includes instance-state persistence and queue submission; it is not a measurement of guest-memory hashing or an assurance that all checkpoint data reached stable storage. Collect these timings alongside I/O and CPU-pressure measurements before attributing nested checkpoint latency to the virtualization backend.
 
 When profiling nested PVM, keep the VMM and its vCPU threads outside ptrace. Following sandboxd forks can otherwise perturb guest startup even with a narrow displayed syscall filter. For example, `strace -f -b execve` follows sandboxd threads but detaches children when they execute another program; verify the running Firecracker process reports `TracerPid: 0`. Record outer block-I/O limits as well as CPU/memory limits. Separate virtual disks or ext4/XFS filesystems can still share one capped backing device. Memory-backed checkpoint controls are diagnostics and do not replace persistent-storage or restore qualification.
+
+## Managed Docker runtime collections (opt-in local preview)
+
+An operator may configure `[plugin.managed_runtime]` with an absolute private
+`root`, and named `[plugin.managed_runtime.profiles.<name>]` profiles. Each
+profile specifies a digest-pinned tool `image`, `registry`, `repository_prefix`,
+`registry_auth_file`, `registry_insecure`, `bootstrap_root`, `buildkit_endpoint`, `provider_url`,
+`allowed_tenants` and the private upper's `writable_mb` quota. It is disabled
+without an explicit profile. ADX supplies the trusted `adx.tenant_id` label;
+unlisted tenants are rejected before node state is created. Clients select only
+`extra_config.managedRuntimeProfile` and cannot replace reserved mounts, labels
+or file-backed upper configuration.
+
+The total writable quota must cover `writable_mb` plus `minimum_root_mb` (4096 MiB when omitted or zero). For the example 4096 MiB upper, the platform advertises an 8192 MiB minimum through ADXlet node resource labels. The SDK reserves this floor and restricts placement before creating an environment; explicit undersized requests or limits fail early. Sandboxd independently rejects a smaller total quota before creating any collection state, leaving a usable root layer rather than accepting a one-MiB remainder. Regenerate node metadata from the same profile when changing geometry.
+
+Fresh environments acquire different opaque image collections. Sandboxd injects
+read-only collection/configuration mounts into the outer sandbox and configures
+the private file-backed upper. The node broker authenticates a private capability
+against Sandboxd's operator-owned record. It permits immutable references under
+that collection's Registry repository prefix. Docker startup flags, Registry
+credentials and node paths are not part of the Harbor job or SDK handle.
+
+Before the output durability barrier, checkpoint writes `managed-runtime.json`
+containing only the collection ID, tenant and profile fingerprint. Restore
+requires a matching operator profile and existing collection, otherwise it fails
+closed. This file participates in the existing checkpoint directory durability
+and ADX storage contract. The server does not create an empty replacement
+collection on restore, and the SDK must not restart daemons/Compose services.
+
+The compatibility fingerprint excludes `allowed_tenants`, which is checked against current policy before restore. Adding or reordering allowed tenants preserves existing authorized snapshots; revoking a tenant still denies recovery. Other captured profile fields remain part of compatibility, including tools, bootstrap and storage geometry. The earlier preview fingerprint format is incompatible with this version: drain its snapshots before upgrade. This change does not solve service-restart dependency reconstruction.
+
+Collection and OCI management references remain pinned until the isolated
+managed service is drained. This preview qualifies same-node recovery only;
+persistent sandbox/snapshot leases, cross-node recovery, node-restart recovery,
+per-tenant credential issuance/revocation and artifact GC remain release work.
+The private Registry may use standard scoped Bearer tokens with separate build-publisher and node pull-only accounts. Shared profile accounts are not a production tenant boundary.
+
+The node-private Registry metadata endpoint uses the image manager's own keychain and standard Registry Bearer challenge/refresh client. Runtime brokers receive bounded digest-verified metadata bytes, not Registry credentials, and retain their collection prefix authorization check before requesting metadata. Operators should separate the build publisher account from the node's pull-only account. Registry tokens are short-lived access credentials; neither their expiry nor a refreshed token replaces the snapshot's immutable image dependency or collection retention contract.
+
+Managed profile Registry transport is operator-owned and keyed by the complete Registry authority (including port). `registry_insecure = true` selects HTTP consistently for metadata, Nydus detection/bootstrap acquisition, the actual ROFS backend and OCI fallback. Explicit `false` selects HTTPS even for private-IP/loopback authorities; it cannot be downgraded by a caller's insecure hint or the registry library's automatic HTTP fallback. Both choices are enforced at the shared client transport boundary, including lazy content reads and proxy-to-origin retries. The shared image client receives this policy at startup; guest API requests cannot change it. Profiles sharing an authority must agree on transport. Unconfigured registries retain existing behavior, including the registry library's HTTPS default for ordinary hostnames and its historical private-IP/loopback handling. A successful literal-IP smoke therefore does not qualify hostname transport; `make managed-registry-test` exercises a non-loopback hostname through a real local Registry, management Unix API, layer extraction and kernel mount in a private mount namespace. The normal storage CI job runs this regression. A profile/transport change still requires final-candidate managed checkpoint/source-deletion/restore qualification.

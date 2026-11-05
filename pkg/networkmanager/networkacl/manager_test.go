@@ -267,3 +267,50 @@ func (s *failNthStore) StoreRaw(key string, data []byte) error {
 	}
 	return s.MockStore.StoreRaw(key, data)
 }
+
+func TestRestoreRetainingUnknownBindingsPreservesPersistedPolicy(t *testing.T) {
+	stateStore := store.NewMockStore()
+	entry := persistedEntry{
+		IP: "10.88.1.20", HostVeth: "missing-unknown-tap", IfIndex: 42, Generation: 7,
+		Policy: Policy{SchemaVersion: networkPolicySchemaV2, Traffic: &TrafficPolicy{
+			IngressDefaultAction: actionDeny, EgressDefaultAction: actionDeny,
+		}},
+		DomainGrants: []persistedDomainGrant{{Question: "example.com", IP: "192.0.2.1", ExpiresAt: 1234}},
+	}
+	manager := &Manager{store: stateStore, entries: map[string]persistedEntry{"unknown": entry}, sourceIndex: map[string]string{entry.IP: "unknown"}}
+	require.NoError(t, manager.persistLocked())
+	require.ElementsMatch(t, []string{"unknown"}, manager.OwnerIDs())
+	// Invalid current binding and nil BPF objects deliberately make any attempt
+	// to activate, query or remove this unknown owner fail. Retention must leave
+	// both its in-memory and durable ownership unchanged.
+	require.NoError(t, manager.RestoreRetaining(map[string]Binding{"unknown": {SandboxID: "unknown"}}, map[string]bool{"unknown": true}))
+	require.Equal(t, entry, manager.entries["unknown"])
+	require.Equal(t, "unknown", manager.sourceIndex[entry.IP])
+	raw, err := stateStore.LoadRaw(stateStoreKey)
+	require.NoError(t, err)
+	var saved persistedState
+	require.NoError(t, json.Unmarshal(raw, &saved))
+	require.Equal(t, entry, saved.Entries["unknown"])
+	require.False(t, saved.Entries["unknown"].Orphaned)
+	// Recovery still strictly validates healthy owners; quarantine must not
+	// suppress a missing policy for a different, confirmed active sandbox.
+	require.ErrorContains(t, manager.RestoreRetaining(map[string]Binding{"healthy": {SandboxID: "healthy"}}, map[string]bool{"unknown": true}), "has no managed network ACL state")
+	require.Equal(t, entry, manager.entries["unknown"])
+}
+
+func TestRetainedBindingIsOnlyRetiredAfterAuthoritativeRecovery(t *testing.T) {
+	stateStore := store.NewMockStore()
+	entry := persistedEntry{IP: "10.88.1.20", HostVeth: "missing-unknown-tap"}
+	manager := &Manager{store: stateStore, entries: map[string]persistedEntry{"unknown": entry}, sourceIndex: map[string]string{entry.IP: "unknown"}}
+	require.NoError(t, manager.RestoreRetaining(nil, map[string]bool{"unknown": true}))
+	require.Contains(t, manager.entries, "unknown")
+	// IfIndex zero is a kernel-independent cleanup fixture. A successful
+	// authoritative recovery that omits a proven stopped instance may retire it.
+	require.NoError(t, manager.Restore(nil))
+	require.Empty(t, manager.entries)
+	raw, err := stateStore.LoadRaw(stateStoreKey)
+	require.NoError(t, err)
+	var saved persistedState
+	require.NoError(t, json.Unmarshal(raw, &saved))
+	require.Empty(t, saved.Entries)
+}

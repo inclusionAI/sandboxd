@@ -191,6 +191,8 @@ must also be restricted.
 
 ## Lifecycle and recovery
 
+When runsc inventory is temporarily unavailable during service startup, its retained ACL owners are quarantined instead of aborting all-backend initialization. Their persisted policy, generation, endpoint state and interface leases remain owned, without activation or orphan cleanup. Healthy backends complete their normal strict ACL restore. Policy updates for a quarantined runsc owner return Unavailable until it has been verified. Runsc remains unadvertised and closed to new start/restore admission until the shared bounded inventory lane completes inventory, orphan cleanup and ACL recovery; a successful list alone is insufficient. Retry touches only the affected backend, so existing policies on healthy runtimes are not regenerated. A successful inventory that still reports live, absent or ambiguous state continues to require valid endpoint metadata and managed ACL state.
+
 Policy state is persisted in sandboxd's store. Rules for a new generation are
 staged before the dataplane switches to it. Policy replacement invalidates
 existing connection state immediately, so packets from a flow admitted by an

@@ -17,6 +17,7 @@ package runsc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"os"
 	"path/filepath"
@@ -304,5 +305,147 @@ func TestCleanupRunscNVProxyRootfsDetachesBusyMount(t *testing.T) {
 	}
 	if len(flags) != 3 || flags[0] != 0 || flags[1] != syscall.MNT_DETACH || flags[2] != 0 {
 		t.Fatalf("unexpected unmount flags: %v", flags)
+	}
+}
+
+// Run in a private mount namespace with SANDBOXD_RUNSC_MOUNT_TEST=1.
+func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
+	if os.Getenv("SANDBOXD_RUNSC_MOUNT_TEST") != "1" {
+		t.Skip("requires explicit opt-in inside a private mount namespace")
+	}
+	for _, hostWritable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("host-writable=%t", hostWritable), func(t *testing.T) {
+			originalMount := mountRunscOverlayFilesystem
+			t.Cleanup(func() { mountRunscOverlayFilesystem = originalMount })
+			mountedVolatile := false
+			mountRunscOverlayFilesystem = func(source, target, fstype string, flags uintptr, data string) error {
+				err := originalMount(source, target, fstype, flags, data)
+				if err == nil {
+					mountedVolatile = overlayOptionsVolatile(data)
+				}
+				return err
+			}
+			bundle := t.TempDir()
+			lower := t.TempDir()
+			if err := os.WriteFile(filepath.Join(lower, "image-file"), []byte("image"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			spec := &runtimecore.Spec{Root: &runtimecore.Root{Path: lower, Readonly: true}}
+			cleanup, err := prepareRunscPrivateRootfs(bundle, spec, hostWritable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := cleanup(); err != nil {
+					t.Error(err)
+				}
+			})
+			merged := filepath.Join(bundle, spec.Root.Path)
+			mounts, err := os.ReadFile("/proc/self/mountinfo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, line := range strings.Split(string(mounts), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) > 6 && fields[4] == merged {
+					found = true
+					if overlayOptionsVolatile(fields[len(fields)-1]) != mountedVolatile {
+						t.Fatalf("staging overlay options differ from successful mount: %s", line)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("private rootfs is not a distinct overlay mount")
+			}
+			if spec.Root.Readonly == hostWritable {
+				t.Fatalf("unexpected guest root readonly=%t", spec.Root.Readonly)
+			}
+			if err := os.WriteFile(filepath.Join(merged, "image-file"), []byte("private"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(lower, "image-file"))
+			if err != nil || string(data) != "image" {
+				t.Fatalf("private rootfs mutated shared lower: %q, %v", data, err)
+			}
+			if err := cleanup(); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{runscNVProxyRootfsDir, runscNVProxyUpperDir, runscNVProxyWorkDir} {
+				if _, err := os.Lstat(filepath.Join(bundle, name)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("staging path remains after cleanup: %s, %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+// Exercise the kernel mount boundary, including hosts predating overlay volatile.
+func TestPrivateRootfsOverlayCapabilityFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		first, fallback error
+		calls           int
+	}{
+		{name: "supported", calls: 1},
+		{name: "unsupported", first: syscall.EINVAL, calls: 2},
+		{name: "unsupported-and-invalid-base", first: syscall.EINVAL, fallback: syscall.ENOENT, calls: 2},
+		{name: "permission-denied", first: syscall.EPERM, calls: 1},
+		{name: "busy", first: syscall.EBUSY, calls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := mountRunscOverlayFilesystem
+			t.Cleanup(func() { mountRunscOverlayFilesystem = original })
+			calls := 0
+			mountRunscOverlayFilesystem = func(source, target, fstype string, flags uintptr, data string) error {
+				calls++
+				if source != "overlay" || target != "/target" || fstype != "overlay" || flags != 0 {
+					t.Fatalf("changed mount boundary: %s %s %s %d", source, target, fstype, flags)
+				}
+				expected := "lowerdir=/lower,upperdir=/upper,workdir=/work"
+				if calls == 1 {
+					expected += ",volatile"
+				}
+				if data != expected {
+					t.Fatalf("options = %q, want %q", data, expected)
+				}
+				if calls == 1 {
+					return tc.first
+				}
+				return tc.fallback
+			}
+			err := mountRunscNVProxyOverlay("/lower", "/upper", "/work", "/target")
+			expectedErr := tc.first
+			if tc.calls == 2 {
+				expectedErr = tc.fallback
+			}
+			if !errors.Is(err, expectedErr) || calls != tc.calls {
+				t.Fatalf("mount: %v (%d calls), want %v (%d calls)", err, calls, expectedErr, tc.calls)
+			}
+		})
+	}
+}
+
+func overlayOptionsVolatile(options string) bool {
+	return strings.Contains(","+options+",", ",volatile,") || strings.Contains(","+options+",", ",fsync=volatile,")
+}
+
+func TestPrivateRootfsOverlayMountinfoVolatileAliases(t *testing.T) {
+	for _, tc := range []struct {
+		options  string
+		volatile bool
+	}{
+		{"rw,lowerdir=/lower,volatile", true},
+		{"rw,lowerdir=/lower,fsync=volatile", true},
+		{"rw,fsync=auto", false},
+		{"rw,fsync=strict", false},
+		{"rw,lowerdir=/volatile,upperdir=/fsync=volatile", false},
+		{"rw,notvolatile,fsync=volatile-extra", false},
+	} {
+		t.Run(tc.options, func(t *testing.T) {
+			if got := overlayOptionsVolatile(tc.options); got != tc.volatile {
+				t.Fatalf("mountinfo %q volatile=%t, want %t", tc.options, got, tc.volatile)
+			}
+		})
 	}
 }

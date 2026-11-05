@@ -276,3 +276,16 @@ clean: ## clean up build artifacts
 
 help: ## show this help
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "%-30s %s\n", $$1, $$2}' $(MAKEFILE_LIST) | sort
+
+.PHONY: managed-registry-test
+managed-registry-test: ## test managed HTTP hostname preparation with a real Registry and overlay mount
+	@mkdir -p output
+	@$(GO) test ${GO_TAGS} -c -o output/managed-registry.test ./pkg/imagemanager/api
+	@sudo unshare --mount --propagation private bash -euc '\
+	  fixture=$$(mktemp -d); trap '\''rm -rf "$$fixture"'\'' EXIT; \
+	  cat /etc/hosts > "$$fixture/hosts"; \
+	  echo "127.0.0.1 registry-http.test" >> "$$fixture/hosts"; \
+	  mount --bind "$$fixture/hosts" /etc/hosts; \
+	  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+	    SANDBOXD_MANAGED_REGISTRY_TEST=1 NO_PROXY="*" no_proxy="*" \
+	    "$(ROOTDIR)output/managed-registry.test" -test.v -test.timeout 120s -test.run "^TestManagedHTTPRegistryMountIntegration$$"'

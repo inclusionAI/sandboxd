@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/inclusionAI/sandboxd/config"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/sirupsen/logrus"
 )
@@ -24,22 +25,72 @@ func (m *Manager) RuntimeHealthError(name string) error {
 	return nil
 }
 
+// WaitRuntimeHealth waits for a successful inventory poll without reopening
+// runtime advertisement or treating unavailable inventory as an empty list.
+// The caller owns the deadline; cancellation does not change backend health.
+func (m *Manager) WaitRuntimeHealth(ctx context.Context, name string) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if m.RuntimeHealthError(name) == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// SetRuntimeReconciler registers backend-specific startup recovery in the same
+// bounded, single-in-flight lane as inventory. Admission stays closed until the
+// whole poll and recovery callback succeed. A nil callback removes the hook;
+// only a subsequent successful poll can reopen admission.
+func (m *Manager) SetRuntimeReconciler(name string, reconcile func(context.Context, []*svc.State) error) {
+	if reconcile == nil {
+		m.runtimeReconcilers.Delete(name)
+		return
+	}
+	m.runtimeReconcilers.Store(name, reconcile)
+	m.runtimePollErrors.LoadOrStore(name, fmt.Errorf("runtime recovery pending"))
+}
+
+// RuntimeInventory shares housekeeping's bounded poll lane and health state.
+// Failure is never returned as a successful empty inventory.
+func (m *Manager) RuntimeInventory(name string, timeout time.Duration) ([]*svc.State, error) {
+	handler, ok := m.serviceHandler.Get(name)
+	if !ok {
+		err := fmt.Errorf("runtime handler %q is unavailable", name)
+		m.runtimePollErrors.Store(name, err)
+		return nil, err
+	}
+	result, err := m.pollRuntime(name, handler, timeout)
+	if err != nil {
+		m.runtimePollErrors.Store(name, err)
+		logrus.WithError(err).Warnf("runtime %s reconciliation unavailable", name)
+		return nil, err
+	}
+	m.runtimePollErrors.Delete(name)
+	return result, nil
+}
+
 func (m *Manager) collectRuntimeStates(timeout time.Duration) (map[string]*svc.State, map[string]bool) {
 	states := make(map[string]*svc.State)
 	polled := make(map[string]bool)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for name, handler := range m.serviceHandler.Items() {
+	for name := range m.serviceHandler.Items() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := m.pollRuntime(name, handler, timeout)
+			result, err := m.RuntimeInventory(name, timeout)
 			if err != nil {
-				m.runtimePollErrors.Store(name, err)
-				logrus.WithError(err).Warnf("runtime %s reconciliation unavailable", name)
 				return
 			}
-			m.runtimePollErrors.Delete(name)
 			mu.Lock()
 			defer mu.Unlock()
 			polled[name] = true
@@ -70,6 +121,26 @@ func (m *Manager) pollRuntime(name string, handler svc.Handler, timeout time.Dur
 	go func() {
 		defer busy.Store(false)
 		states, err := handler.List(ctx)
+		if err == nil && name == config.RuntimeNameRunsc && m.runscRecoveryPending.Load() {
+			err = m.reconcileStoppedRunscStates(ctx, handler, states)
+			if err == nil {
+				err = ctx.Err()
+				if err == nil {
+					m.runscRecoveryPending.Store(false)
+				}
+			}
+		}
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err == nil {
+			if reconcile, ok := m.runtimeReconcilers.Load(name); ok {
+				err = reconcile.(func(context.Context, []*svc.State) error)(ctx, states)
+			}
+		}
+		if err == nil {
+			err = ctx.Err()
+		}
 		done <- result{states, err}
 	}()
 	// The wrapper is bounded even when a handler ignores cancellation. At

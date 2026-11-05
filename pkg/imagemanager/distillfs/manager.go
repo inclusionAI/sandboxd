@@ -472,6 +472,11 @@ func (mgr *manager) setupNydusDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 			repo := ref.Context().RepositoryStr()
 			d.config.Registry.Host = host
 			d.config.Registry.Repo = repo
+			if policy, ok := mgr.nydusClient.(interface{ RegistryScheme(string) (string, bool) }); ok {
+				if scheme, configured := policy.RegistryScheme(opts.ImageURL); configured {
+					d.config.Registry.Scheme = scheme
+				}
+			}
 			logrus.Infof("populated registry host/repo from image URL: %s/%s", host, repo)
 
 			// Try to populate registry auth from registry auths file if not already set.

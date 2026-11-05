@@ -123,6 +123,9 @@ jobs:
       - name: Run privileged storage tests
         run: make storage-test
 
+      - name: Run managed HTTP Registry mount integration
+        run: make managed-registry-test
+
       - name: Download pinned distill-fs release
         run: |
           source third_party/runtime-versions.env
