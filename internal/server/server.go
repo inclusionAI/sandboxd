@@ -542,8 +542,10 @@ func (h *sandboxService) Run() error {
 		break
 	}
 	h.recoveryReady.Store(true)
-	h.sandboxManager.Start()
+	// Manager.Start is the blocking event loop; launch collection housekeeping
+	// before entering it so cleanup also runs while the service is online.
 	h.startManagedCollectionGC()
+	h.sandboxManager.Start()
 	return nil
 }
 

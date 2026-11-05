@@ -7,11 +7,87 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/internal/managedlease"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 )
+
+func TestRunCollectsNewOrphansWhileSandboxManagerIsRunning(t *testing.T) {
+	h := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
+	h.config.ManagedRuntimeRoot = t.TempDir()
+	h.recoveryReady.Store(false)
+	module, err := imagemanager.NewModule(imagemanager.Config{
+		Root: t.TempDir(), DisableCgroup: true,
+		OSSTemplate: "../../configs/oss.json", NydusTemplate: "../../configs/registry.json",
+		OSSAuthsPath: "../../configs/oss_auths.json", RegistryAuthsPath: "../../configs/registry_auths.json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.imageMod = module
+	defer module.Stop()
+	done := make(chan error, 1)
+	go func() { done <- h.Run() }()
+	defer func() {
+		h.sandboxManager.Stop()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("sandbox manager did not stop")
+			return
+		}
+		if h.managedGCCancel != nil {
+			close(h.managedGCCancel)
+			h.managedGCWait.Wait()
+		}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for !h.recoveryReady.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("service did not complete recovery")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Create after recovery: only periodic GC can observe this orphan.
+	id := strings.Repeat("e", 32)
+	root := h.config.ManagedRuntimeRoot
+	if err := os.MkdirAll(filepath.Join(root, "records"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.managedLeases().Create(id); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "records", id+".json")
+	if err := writePrivateJSON(path, managedRecord{CollectionID: id, LifecycleVersion: managedLifecycleVersion}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(15 * time.Second)
+	for {
+		// Unprivileged CI may defer the unmount. Either successful reclamation
+		// or a durable retirement fence proves online collection actually ran.
+		_, recordErr := os.Stat(path)
+		_, retiredErr := os.Stat(filepath.Join(root, "retired", id))
+		if os.IsNotExist(recordErr) || retiredErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("orphan was not collected while sandbox manager was running")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		done <- err
+		t.Fatal("manager exited before shutdown")
+	default:
+	}
+}
 
 func TestManagedCheckpointAndCloneOwnIndependentCollectionLeases(t *testing.T) {
 	h := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
