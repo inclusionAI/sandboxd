@@ -16,6 +16,7 @@ package sandbox
 
 import (
 	"strings"
+	"sync/atomic"
 	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
@@ -33,6 +34,9 @@ type Sandbox struct {
 	// PATH is the path to the sandbox's data. Under this path, there is a config.json and metadata.pb file.
 	Spec *spec.Spec
 	PATH string
+	// A retained housekeeping snapshot belongs to this object even if its path
+	// remains visible during RemoveAll or is subsequently reused.
+	retiring atomic.Bool
 }
 
 type EventType string
