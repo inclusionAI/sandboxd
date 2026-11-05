@@ -1819,7 +1819,7 @@ func newTestManager(t *testing.T) *Manager {
 		readMnts:     func() (map[string]struct{}, bool, error) { return map[string]struct{}{}, false, nil },
 		diskUsage:    func(string) (float64, error) { return 0, nil },
 		layerWorkers: defaultGlobalLayerWorkers,
-		layerTTL:     defaultLayerZeroRefTTL,
+		layerTTL:     DefaultLayerZeroRefTTL,
 	}
 	t.Cleanup(func() {
 		mgr.layerPoolMu.Lock()

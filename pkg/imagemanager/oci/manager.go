@@ -50,8 +50,8 @@ const (
 	PruneInterval = 2 * time.Minute
 	// defaultGlobalLayerWorkers limits global concurrent layer extraction.
 	defaultGlobalLayerWorkers = 4
-	// defaultLayerZeroRefTTL is the default TTL for unreferenced layers.
-	defaultLayerZeroRefTTL = 30 * time.Minute
+	// DefaultLayerZeroRefTTL is the default TTL for unreferenced layers and lowerdirs.
+	DefaultLayerZeroRefTTL = 30 * time.Minute
 
 	diskUsageGCStart = 0.85
 	diskUsageGCStop  = 0.75
@@ -142,6 +142,16 @@ type ContainerInfo struct {
 // NewManager creates a new OCI manager.
 // sharedRegistryClient is optional. If nil, an anonymous registry client is used.
 func NewManager(rootWorkDir string, cfgTempPath string, sharedRegistryClient ...*imageregistry.Client) (*Manager, error) {
+	return NewManagerWithZeroRefTTL(rootWorkDir, cfgTempPath, DefaultLayerZeroRefTTL, sharedRegistryClient...)
+}
+
+// NewManagerWithZeroRefTTL creates an OCI manager with a node-wide zero-reference
+// TTL. Zero disables time-based GC for layers and lowerdirs; disk-pressure GC
+// remains enabled. Negative durations are rejected before starting any workers.
+func NewManagerWithZeroRefTTL(rootWorkDir string, cfgTempPath string, zeroRefTTL time.Duration, sharedRegistryClient ...*imageregistry.Client) (*Manager, error) {
+	if zeroRefTTL < 0 {
+		return nil, fmt.Errorf("OCI zero-reference TTL must be nonnegative")
+	}
 	root := filepath.Join(rootWorkDir, "oci")
 	layersDir := filepath.Join(root, "layers")
 	chainsDir := filepath.Join(root, "lowerdirs")
@@ -209,8 +219,9 @@ func NewManager(rootWorkDir string, cfgTempPath string, sharedRegistryClient ...
 			return readManagedMounts(mountsDir)
 		},
 		layerWorkers: defaultGlobalLayerWorkers,
-		layerTTL:     defaultLayerZeroRefTTL,
+		layerTTL:     zeroRefTTL,
 	}
+	logrus.Infof("OCI zero-reference TTL: %s; disk-pressure GC remains enabled", zeroRefTTL)
 
 	if err := mgr.reconcileState(); err != nil {
 		logrus.Warnf("failed to reconcile OCI metadata at startup: %v", err)

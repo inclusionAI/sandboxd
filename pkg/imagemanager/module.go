@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -38,6 +39,7 @@ import (
 type Config struct {
 	RegistrySchemes   map[string]string // Trusted exact-authority policy derived from managed profiles.
 	ManagementSocket  string            // Optional private Unix API for trusted runtime image preparation.
+	OCIZeroRefTTL     string            // Empty uses 30m; zero disables OCI TTL GC only.
 	ChunkDBSize       string            // ChunkDB map capacity; empty uses the distill-fs default.
 	Root              string
 	DistillFsBin      string
@@ -77,6 +79,10 @@ type Module struct {
 func NewModule(cfg Config) (*Module, error) {
 	if cfg.Root == "" {
 		return nil, fmt.Errorf("imagemanager: Root is required")
+	}
+	zeroRefTTL, err := parseOCIZeroRefTTL(cfg.OCIZeroRefTTL)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.DistillFsBin == "" {
 		cfg.DistillFsBin = "/usr/local/bin/distill_fs"
@@ -119,7 +125,7 @@ func NewModule(cfg Config) (*Module, error) {
 		return nil, fmt.Errorf("imagemanager: distillfs manager: %w", err)
 	}
 
-	ociMgr, err := oci.NewManager(cfg.Root, cfg.NydusTemplate, sharedRegistryClient)
+	ociMgr, err := oci.NewManagerWithZeroRefTTL(cfg.Root, cfg.NydusTemplate, zeroRefTTL, sharedRegistryClient)
 	if err != nil {
 		return nil, fmt.Errorf("imagemanager: oci manager: %w", err)
 	}
@@ -155,6 +161,17 @@ func NewModule(cfg Config) (*Module, error) {
 	}
 	m.healthy.Store(true)
 	return m, nil
+}
+
+func parseOCIZeroRefTTL(value string) (time.Duration, error) {
+	if value == "" {
+		return oci.DefaultLayerZeroRefTTL, nil
+	}
+	ttl, err := time.ParseDuration(value)
+	if err != nil || ttl < 0 {
+		return 0, fmt.Errorf("imagemanager: oci_zero_ref_ttl must be a nonnegative duration, got %q", value)
+	}
+	return ttl, nil
 }
 
 // Service returns the in-process Service implementation, satisfying the
