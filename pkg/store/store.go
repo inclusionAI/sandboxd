@@ -40,6 +40,12 @@ var _ DbStore = &BboltStoreImp{}
 
 type BboltStoreImp struct {
 	path string
+
+	openMu sync.Mutex
+	db     *bolt.DB
+
+	closeMu sync.RWMutex
+	closed  bool
 }
 
 func NewStoreImp(path string) *BboltStoreImp {
@@ -56,28 +62,25 @@ func NewStoreImp(path string) *BboltStoreImp {
 }
 
 func (f *BboltStoreImp) Store(key string, data interface{}) error {
-	db, err := bolt.Open(f.path, 0777, nil)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	return db.Update(func(tx *bolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte(key))
-		if err != nil {
-			return err
-		}
-		dataAny, err := MarshalAnyToProto(data)
-		if err != nil {
-			return err
-		}
+	return f.withDB(func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			bucket, err := tx.CreateBucketIfNotExists([]byte(key))
+			if err != nil {
+				return err
+			}
+			dataAny, err := MarshalAnyToProto(data)
+			if err != nil {
+				return err
+			}
 
-		message := FromAny(dataAny)
+			message := FromAny(dataAny)
 
-		result, err := proto.Marshal(message)
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(key), result)
+			result, err := proto.Marshal(message)
+			if err != nil {
+				return err
+			}
+			return bucket.Put([]byte(key), result)
+		})
 	})
 }
 
@@ -86,66 +89,95 @@ type DecodeType struct {
 }
 
 func (f *BboltStoreImp) StoreRaw(key string, data []byte) error {
-	db, err := bolt.Open(f.path, 0777, nil)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	return db.Update(func(tx *bolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte(key))
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(key), append([]byte(nil), data...))
+	return f.withDB(func(db *bolt.DB) error {
+		return db.Update(func(tx *bolt.Tx) error {
+			bucket, err := tx.CreateBucketIfNotExists([]byte(key))
+			if err != nil {
+				return err
+			}
+			return bucket.Put([]byte(key), append([]byte(nil), data...))
+		})
 	})
 }
 
 func (f *BboltStoreImp) Load(key string) (*types.Any, error) {
-	db, err := bolt.Open(f.path, 0666, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
 	out := types.Any{}
-	return &out, db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte(key))
-		if bucket == nil {
-			return errord.ErrNotFound
-		}
+	err := f.withDB(func(db *bolt.DB) error {
+		return db.View(func(tx *bolt.Tx) error {
+			bucket := tx.Bucket([]byte(key))
+			if bucket == nil {
+				return errord.ErrNotFound
+			}
 
-		bytes := bucket.Get([]byte(key))
-		if bytes == nil {
-			return nil
-		}
+			bytes := bucket.Get([]byte(key))
+			if bytes == nil {
+				return nil
+			}
 
-		return proto.Unmarshal(bytes, &out)
+			return proto.Unmarshal(bytes, &out)
+		})
 	})
+	return &out, err
 }
 
 func (f *BboltStoreImp) LoadRaw(key string) ([]byte, error) {
-	db, err := bolt.Open(f.path, 0666, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
 	var out []byte
-	if err := db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket([]byte(key))
-		if bucket == nil {
-			return errord.ErrNotFound
-		}
-		bytes := bucket.Get([]byte(key))
-		if bytes == nil {
-			return errord.ErrNotFound
-		}
-		out = append([]byte(nil), bytes...)
-		return nil
+	if err := f.withDB(func(db *bolt.DB) error {
+		return db.View(func(tx *bolt.Tx) error {
+			bucket := tx.Bucket([]byte(key))
+			if bucket == nil {
+				return errord.ErrNotFound
+			}
+			bytes := bucket.Get([]byte(key))
+			if bytes == nil {
+				return errord.ErrNotFound
+			}
+			out = append([]byte(nil), bytes...)
+			return nil
+		})
 	}); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// withDB keeps one bbolt handle for the lifetime of sandboxd. bbolt already
+// serializes write transactions; reopening the file for every resource update
+// adds another process-wide file-lock queue to the sandbox creation path.
+func (f *BboltStoreImp) withDB(operation func(*bolt.DB) error) error {
+	f.closeMu.RLock()
+	defer f.closeMu.RUnlock()
+	if f.closed {
+		return errord.ErrUnavailable
+	}
+	f.openMu.Lock()
+	if f.db == nil {
+		db, err := bolt.Open(f.path, 0777, nil)
+		if err != nil {
+			f.openMu.Unlock()
+			return err
+		}
+		f.db = db
+	}
+	db := f.db
+	f.openMu.Unlock()
+	return operation(db)
+}
+
+// Close releases the process-wide bbolt file lock after all store users have
+// stopped. It is idempotent so partial initialization and shutdown can share
+// the same cleanup path.
+func (f *BboltStoreImp) Close() error {
+	f.closeMu.Lock()
+	defer f.closeMu.Unlock()
+	if f.closed {
+		return nil
+	}
+	f.closed = true
+	if f.db == nil {
+		return nil
+	}
+	return f.db.Close()
 }
 
 // FromAny converts typeurl.Any to anypb.Any.
