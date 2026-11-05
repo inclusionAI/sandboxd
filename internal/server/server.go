@@ -335,12 +335,8 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 }
 
 func (h *sandboxService) deleteRuntimeBounded(ctx context.Context, id string, handler svc.Handler, resource sandbox.OccupiedResource, killCgroup func(string) error) error {
-	timeout := h.runtimeDeleteTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
 	attempt := func() error {
-		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, h.deleteAttemptTimeout())
 		defer cancel()
 		return handler.Delete(attemptCtx, id)
 	}
@@ -361,13 +357,30 @@ func (h *sandboxService) deleteRuntimeBounded(ctx context.Context, id string, ha
 	return attempt()
 }
 
+func (h *sandboxService) deleteAttemptTimeout() time.Duration {
+	if h.runtimeDeleteTimeout > 0 {
+		return h.runtimeDeleteTimeout
+	}
+	return 30 * time.Second
+}
+
 // deleteSandbox coalesces concurrent delete requests for the same sandbox.
 // Cleanup runs independently from the initiating caller's cancellation so a
 // timed-out RPC cannot leave a partially deleted sandbox for another caller to
 // release again.
 func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Cover both runtime attempts and synchronous host cleanup. An operation
+	// that ignores cancellation keeps its singleflight ownership until it really
+	// returns; timing out a waiter must never launch a second cleanup worker.
+	budget := 2 * h.deleteAttemptTimeout()
+	waitCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 	resultCh := h.deleteGroup.DoChan(sandboxID, func() (interface{}, error) {
-		cleanupCtx := context.WithoutCancel(ctx)
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), budget)
+		defer cancelCleanup()
 
 		if h.networkMgr != nil {
 			h.networkMgr.cleanupDnatRules(sandboxID)
@@ -378,8 +391,11 @@ func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) er
 	select {
 	case result := <-resultCh:
 		return result.Err
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-waitCtx.Done():
+		if ctx.Err() == nil {
+			metrics.RecordRuntimeCallResult("delete", "stuck", "")
+		}
+		return waitCtx.Err()
 	}
 }
 
@@ -523,19 +539,37 @@ func (h *sandboxService) Run() error {
 }
 
 func (h *sandboxService) Shutdown() {
+	h.ready.Store(false)
+	h.recoveryReady.Store(false)
 	logrus.Info("sandbox service shutting down: cleaning up sandboxes")
 
 	// 1. Force-delete all running sandboxes with per-sandbox timeout.
 	sandboxes := h.sandboxManager.List()
+	cleanupFailed := false
 	for _, c := range sandboxes {
 		if c == nil || c.Metadata == nil {
 			continue
 		}
 		id := c.Metadata.ID
 		if err := h.deleteSandbox(context.Background(), id); err != nil {
+			cleanupFailed = true
 			logrus.Warnf("shutdown: failed to delete sandbox %s: %v", id, err)
 		}
 
+	}
+
+	if cleanupFailed || len(h.sandboxManager.List()) != 0 {
+		// A timed-out worker may still be using these mounts and leases. Leave
+		// their persisted state intact for recovery instead of globally releasing
+		// resources that have not been confirmed safe to tear down.
+		h.sandboxManager.Stop()
+		if h.cgroupMgr != nil {
+			if err := h.cgroupMgr.SaveState(); err != nil {
+				logrus.WithError(err).Error("shutdown: failed to save retained cgroup allocations")
+			}
+		}
+		logrus.Error("sandbox service shutdown incomplete; preserving resources for unfinished cleanup")
+		return
 	}
 
 	h.fsMgr.Shutdown()

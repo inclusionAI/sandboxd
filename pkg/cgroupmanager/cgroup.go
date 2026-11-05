@@ -67,6 +67,7 @@ type CgroupManager struct {
 
 	db         store.DbStore
 	storeDirty atomic.Bool
+	storeMu    sync.Mutex
 
 	gcQueue *util.Queue[string]
 	gcWake  chan struct{}
@@ -186,6 +187,17 @@ func (c *CgroupManager) ShutDown() error {
 		}
 	})
 	return c.shutdownErr
+}
+
+// SaveState preserves active leases without stopping the manager or releasing
+// resources that may still be in use by an unfinished sandbox deletion.
+func (c *CgroupManager) SaveState() error {
+	if err := c.store(); err != nil {
+		c.storeDirty.Store(true)
+		return err
+	}
+	// Do not clear dirty: a concurrent allocation/recycle may need another flush.
+	return nil
 }
 
 func (c *CgroupManager) Status() ([]string, []string) {
@@ -563,6 +575,10 @@ func (c *CgroupManager) store() error {
 			time.Since(start).Milliseconds(),
 		)
 	}()
+	// Serialize the snapshot and write together so an older periodic save
+	// cannot overwrite a newer explicit save.
+	c.storeMu.Lock()
+	defer c.storeMu.Unlock()
 	data, err := json.Marshal(storedCgroupIDs{Items: c.usingID.Keys()})
 	if err != nil {
 		return fmt.Errorf("encode cgroup using IDs: %w", err)
