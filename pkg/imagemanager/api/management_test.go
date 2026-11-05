@@ -15,6 +15,37 @@ import (
 
 type managementMounter struct{ calls int }
 
+func TestManagementCloseCancelsAndJoinsNativeRecoveryAcquire(t *testing.T) {
+	entered := make(chan struct{})
+	service := &blockingImageService{mount: func(ctx context.Context, _ *OCIMountRequest) (*OCIMountResponse, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	server, err := ListenManagement(filepath.Join(t.TempDir(), "private", "image.sock"), service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := server.AcquireOwner(context.Background(), strings.Repeat("a", 32), "image")
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("native acquire did not enter backend")
+	}
+	server.Close()
+	if err := <-done; err == nil {
+		t.Fatal("native acquire survived shutdown")
+	}
+	if _, err := server.AcquireOwner(context.Background(), strings.Repeat("a", 32), "image"); err == nil {
+		t.Fatal("closed image service admitted native recovery")
+	}
+}
+
 func TestManagementParallelImagesAndShutdownJoin(t *testing.T) {
 	entered := make(chan struct{}, 2)
 	var active atomic.Int32
@@ -39,7 +70,7 @@ func TestManagementParallelImagesAndShutdownJoin(t *testing.T) {
 	for _, c := range []string{"a", "b"} {
 		go func(c string) {
 			defer func() { done <- struct{}{} }()
-			response, err := client.Post("http://unix/oci_mount", "application/json", strings.NewReader(`{"image_url":"registry.test/managed/`+c+`@sha256:`+strings.Repeat(c, 64)+`"}`))
+			response, err := client.Post("http://unix/oci_mount", "application/json", strings.NewReader(`{"image_url":"registry.test/managed/`+c+`@sha256:`+strings.Repeat(c, 64)+`","owner":"`+strings.Repeat(c, 32)+`"}`))
 			if err == nil {
 				response.Body.Close()
 			}
@@ -136,7 +167,8 @@ func TestPrivateManagementSocketValidatesBeforeMount(t *testing.T) {
 		{`{"image_url":"registry.test/poc/main:latest"}`, 400},
 		{`{"image_url":"` + ref + `","mount_path":"/etc"}`, 400},
 		{`{"image_url":"` + ref + `"} {}`, 400},
-		{`{"image_url":"` + ref + `"}`, 200},
+		{`{"image_url":"` + ref + `"}`, 400},
+		{`{"image_url":"` + ref + `","owner":"` + strings.Repeat("a", 32) + `"}`, 200},
 	} {
 		response, err := client.Post("http://unix/oci_mount", "application/json", strings.NewReader(test.body))
 		if err != nil {

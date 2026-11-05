@@ -9,13 +9,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
-
-	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 )
 
 // ManagedImageMounter reuses the node's in-process ROFS provider. Only trusted
@@ -38,6 +37,40 @@ type ManagementServer struct {
 	closing sync.Mutex
 	closed  bool
 	once    sync.Once
+	mounts  *managedMounts
+	ctx     context.Context
+}
+
+func (s *ManagementServer) beginOperation(ctx context.Context) (context.Context, func(), error) {
+	s.closing.Lock()
+	defer s.closing.Unlock()
+	if s.closed {
+		return nil, nil, fmt.Errorf("image service closing")
+	}
+	operation, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.ctx, cancel)
+	s.active.Add(1)
+	return operation, func() { stop(); cancel(); s.active.Done() }, nil
+}
+
+// AcquireOwner and ReleaseOwner are node-runtime operations, not guest APIs.
+// The collection lease must fence/drain broker operations before release.
+func (s *ManagementServer) AcquireOwner(ctx context.Context, owner, image string) (*OCIMountResponse, error) {
+	ctx, done, err := s.beginOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	return s.mounts.acquire(ctx, owner, &OCIMountRequest{ImageURL: image})
+}
+
+func (s *ManagementServer) ReleaseOwner(ctx context.Context, owner string) error {
+	ctx, done, err := s.beginOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return s.mounts.releaseOwner(ctx, owner)
 }
 
 // ListenManagement is opt-in and only accepts immutable image references.
@@ -104,9 +137,8 @@ func ListenManagement(path string, service ManagedImageMounter, readers ...Regis
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": data, "media_type": mediaType})
 		})
 	}
-	var mu sync.Mutex
-	var operations keyedlock.Locks
-	held := make(map[string]*OCIMountResponse)
+	mounts := newManagedMounts(service)
+	ownerPattern := regexp.MustCompile(`^[a-f0-9]{32}$`)
 	mux.HandleFunc("/oci_mount", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
@@ -115,7 +147,10 @@ func ListenManagement(path string, service ManagedImageMounter, readers ...Regis
 		r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 		decoder := json.NewDecoder(r.Body)
 		decoder.DisallowUnknownFields()
-		var request OCIMountRequest
+		var request struct {
+			OCIMountRequest
+			Owner string `json:"owner,omitempty"`
+		}
 		if err := decoder.Decode(&request); err != nil {
 			http.Error(w, "invalid image request", http.StatusBadRequest)
 			return
@@ -124,28 +159,16 @@ func ListenManagement(path string, service ManagedImageMounter, readers ...Regis
 			http.Error(w, "unexpected trailing request", http.StatusBadRequest)
 			return
 		}
+		if !ownerPattern.MatchString(request.Owner) {
+			http.Error(w, "invalid managed collection owner", http.StatusBadRequest)
+			return
+		}
 		ref, err := name.NewDigest(request.ImageURL)
 		if err != nil || !strings.HasPrefix(ref.DigestStr(), "sha256:") {
 			http.Error(w, "immutable sha256 image reference required", http.StatusBadRequest)
 			return
 		}
-		unlock, err := operations.Acquire(r.Context(), request.ImageURL)
-		if err != nil {
-			http.Error(w, "image request canceled", http.StatusRequestTimeout)
-			return
-		}
-		defer unlock()
-		mu.Lock()
-		response := held[request.ImageURL]
-		mu.Unlock()
-		if response == nil {
-			response, err = service.MountOCI(r.Context(), &request)
-			if err == nil {
-				mu.Lock()
-				held[request.ImageURL] = response
-				mu.Unlock()
-			}
-		}
+		response, err := mounts.acquire(r.Context(), request.Owner, &request.OCIMountRequest)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -154,7 +177,7 @@ func ListenManagement(path string, service ManagedImageMounter, readers ...Regis
 		_ = json.NewEncoder(w).Encode(response)
 	})
 	serverCtx, cancel := context.WithCancel(context.Background())
-	result := &ManagementServer{done: make(chan struct{}), cancel: cancel}
+	result := &ManagementServer{done: make(chan struct{}), cancel: cancel, mounts: mounts, ctx: serverCtx}
 	result.server = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		result.closing.Lock()
 		if result.closed {
@@ -167,13 +190,7 @@ func ListenManagement(path string, service ManagedImageMounter, readers ...Regis
 		defer result.active.Done()
 		mux.ServeHTTP(w, r)
 	}), BaseContext: func(net.Listener) context.Context { return serverCtx }, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
-	result.release = func() {
-		mu.Lock()
-		defer mu.Unlock()
-		for image := range held {
-			_ = service.UmountOCI(&OCIUmountRequest{ImageURL: image})
-		}
-	}
+	result.release = mounts.close
 	go func() { defer close(result.done); _ = result.server.Serve(listener) }()
 	return result, nil
 }

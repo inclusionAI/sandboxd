@@ -95,3 +95,26 @@ func (s *SharedOCIService) UmountOCI(request *OCIUmountRequest) error {
 	s.mu.Unlock()
 	return nil
 }
+
+// CleanupUnowned retries only rollback state left by a failed acquire. A new
+// ordinary rootfs/collection reference must never be decremented by this path.
+func (s *SharedOCIService) CleanupUnowned(ctx context.Context, image string) error {
+	unlock, err := s.operations.Acquire(ctx, image)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	s.mu.Lock()
+	entry := s.images[image]
+	s.mu.Unlock()
+	if entry == nil || entry.refs > 0 {
+		return nil
+	}
+	if err := s.Service.UmountOCI(&OCIUmountRequest{ImageURL: image}); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	delete(s.images, image)
+	s.mu.Unlock()
+	return nil
+}
