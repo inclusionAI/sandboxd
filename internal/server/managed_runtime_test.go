@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -41,7 +42,7 @@ func TestManagedRegistryAuthUsesSharedParser(t *testing.T) {
 
 func TestManagedProfileAuthorizationPrecedesFilesystemChanges(t *testing.T) {
 	h := managedTestService(t)
-	_, err := h.prepareManagedRuntime(&runtime.StartRequest{Runtime: "runsc", ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "other"}}, "")
+	_, err := h.prepareManagedRuntime(context.Background(), &runtime.StartRequest{Runtime: "runsc", ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "other"}}, "")
 	if !errors.Is(err, errord.ErrPermissionDenied) {
 		t.Fatalf("authorization: %v", err)
 	}
@@ -60,7 +61,7 @@ func TestManagedProfileCannotOverridePlatformMountsOrUpper(t *testing.T) {
 		request.Runtime = "runsc"
 		request.WritableLayerLimitBytes = 8192 << 20
 		request.Labels = map[string]string{"adx.tenant_id": "allowed"}
-		if _, err := h.prepareManagedRuntime(request, ""); err == nil {
+		if _, err := h.prepareManagedRuntime(context.Background(), request, ""); err == nil {
 			t.Fatal("platform profile override accepted")
 		}
 	}
@@ -75,11 +76,11 @@ func TestManagedCheckpointRejectsForeignOrChangedProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := &runtime.StartRequest{Runtime: "runsc", WritableLayerLimitBytes: 8192 << 20, ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
-	if _, err := h.prepareManagedRuntime(req, directory); err == nil {
+	if _, err := h.prepareManagedRuntime(context.Background(), req, directory); err == nil {
 		t.Fatal("cross-tenant collection restored")
 	}
 	req.ExtraConfig = ""
-	if _, err := h.prepareManagedRuntime(req, directory); err == nil {
+	if _, err := h.prepareManagedRuntime(context.Background(), req, directory); err == nil {
 		t.Fatal("managed snapshot restored without profile")
 	}
 }
@@ -87,7 +88,7 @@ func TestManagedCheckpointRejectsForeignOrChangedProfile(t *testing.T) {
 func TestPlainSandboxDoesNotAcquireManagedConfiguration(t *testing.T) {
 	h := managedTestService(t)
 	req := &runtime.StartRequest{Runtime: "runsc"}
-	rollback, err := h.prepareManagedRuntime(req, "")
+	rollback, err := h.prepareManagedRuntime(context.Background(), req, "")
 	if err != nil || rollback != nil || len(req.Mounts) != 0 {
 		t.Fatalf("plain sandbox changed: %v", err)
 	}
@@ -116,7 +117,7 @@ func TestManagedCheckpointReusesAuthorizedCollectionWithoutFreshMounts(t *testin
 	profile.AllowedTenants = []string{"new-tenant", "allowed"}
 	h.config.ManagedRuntimeProfiles["compose-v1"] = profile
 	req := &runtime.StartRequest{Runtime: "runsc", WritableLayerLimitBytes: 8192 << 20, ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
-	rollback, err := h.prepareManagedRuntime(req, directory)
+	rollback, err := h.prepareManagedRuntime(context.Background(), req, directory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +131,7 @@ func TestManagedCheckpointReusesAuthorizedCollectionWithoutFreshMounts(t *testin
 	profile.AllowedTenants = []string{"new-tenant"}
 	h.config.ManagedRuntimeProfiles["compose-v1"] = profile
 	denied := &runtime.StartRequest{Runtime: "runsc", WritableLayerLimitBytes: 8192 << 20, ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
-	if _, err := h.prepareManagedRuntime(denied, directory); !errors.Is(err, errord.ErrPermissionDenied) {
+	if _, err := h.prepareManagedRuntime(context.Background(), denied, directory); !errors.Is(err, errord.ErrPermissionDenied) {
 		t.Fatalf("revoked tenant restored: %v", err)
 	}
 }
@@ -139,7 +140,7 @@ func TestManagedStorageFloorBeforeFilesystemChanges(t *testing.T) {
 	for _, total := range []uint64{0, 4096, 4097, 8191} {
 		h := managedTestService(t)
 		req := &runtime.StartRequest{Runtime: "runsc", WritableLayerLimitBytes: total << 20, ExtraConfig: `{"managedRuntimeProfile":"compose-v1"}`, Labels: map[string]string{"adx.tenant_id": "allowed"}}
-		_, err := h.prepareManagedRuntime(req, "")
+		_, err := h.prepareManagedRuntime(context.Background(), req, "")
 		if err == nil || !strings.Contains(err.Error(), "8192 MiB") {
 			t.Fatalf("total %d: %v", total, err)
 		}

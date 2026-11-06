@@ -178,6 +178,21 @@ func parseOCIZeroRefTTL(value string) (time.Duration, error) {
 // 4-call-site sandboxd contract previously fronted by api.NewHttpClient().
 func (m *Module) Service() api.Service { return m.service }
 
+// Managed-image ownership shares ordinary rootfs reference counting.
+func (m *Module) AcquireManagedImage(ctx context.Context, owner, image string) (*api.OCIMountResponse, error) {
+	if m.management == nil {
+		return nil, fmt.Errorf("managed image service unavailable")
+	}
+	return m.management.AcquireOwner(ctx, owner, image)
+}
+
+func (m *Module) ReleaseManagedImages(ctx context.Context, owner string) error {
+	if m.management == nil {
+		return fmt.Errorf("managed image service unavailable")
+	}
+	return m.management.ReleaseOwner(ctx, owner)
+}
+
 // Start currently has nothing to drive because the manager and worker start
 // their background goroutines during NewModule.
 func (m *Module) Start() error { return nil }

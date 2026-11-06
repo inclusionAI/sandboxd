@@ -106,6 +106,8 @@ type sandboxService struct {
 	runscACLRecoveryPending           atomic.Bool
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]string
+	managedGCCancel                   chan struct{}
+	managedGCWait                     sync.WaitGroup
 	restoreAdmissionMu                sync.Mutex
 	restoreAdmissionSlots             chan struct{}
 	firecrackerCheckpointMemorySlotMu sync.Mutex
@@ -330,6 +332,9 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return err
 	}
 
+	if err := h.releaseManagedSandbox(sandboxID, c.Metadata.Labels[managedOwnerLabel]); err != nil {
+		return fmt.Errorf("release managed sandbox ownership: %w", err)
+	}
 	h.sandboxManager.Delete(sandboxID)
 	return nil
 }
@@ -525,6 +530,9 @@ func (h *sandboxService) ListAvailableRuntimes(
 
 func (h *sandboxService) Run() error {
 	logrus.Infof("sandbox service run at %s", h.config.RootDir)
+	if err := h.recoverManagedCollections(context.Background()); err != nil {
+		return fmt.Errorf("recover managed image leases: %w", err)
+	}
 	for {
 		if err := h.imageMod.ReconcileRecoveredDaemons(); err != nil {
 			logrus.WithError(err).Warn("distillfs recovery is incomplete; retrying")
@@ -534,6 +542,9 @@ func (h *sandboxService) Run() error {
 		break
 	}
 	h.recoveryReady.Store(true)
+	// Manager.Start is the blocking event loop; launch collection housekeeping
+	// before entering it so cleanup also runs while the service is online.
+	h.startManagedCollectionGC()
 	h.sandboxManager.Start()
 	return nil
 }
@@ -541,6 +552,10 @@ func (h *sandboxService) Run() error {
 func (h *sandboxService) Shutdown() {
 	h.ready.Store(false)
 	h.recoveryReady.Store(false)
+	if h.managedGCCancel != nil {
+		close(h.managedGCCancel)
+		h.managedGCWait.Wait()
+	}
 	logrus.Info("sandbox service shutting down: cleaning up sandboxes")
 
 	// 1. Force-delete all running sandboxes with per-sandbox timeout.
@@ -1219,13 +1234,17 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
 	}
-	managedRollback, err := h.prepareManagedRuntime(startReq, checkpointDir)
+	managedRollback, err := h.prepareManagedRuntime(ctx, startReq, checkpointDir)
 	if err != nil {
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
 	}
 	managedCommitted := false
+	var managedOwnerRelease func()
 	defer func() {
-		if !managedCommitted && managedRollback != nil {
+		if !managedCommitted && managedOwnerRelease != nil {
+			managedOwnerRelease()
+		}
+		if managedRollback != nil {
 			managedRollback()
 		}
 	}()
@@ -1404,6 +1423,16 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}, errord.ToGRPC(err)
 	}
 	startReq.SandboxID = sandboxID
+	owner, managedRelease, claimErr := h.claimManagedSandbox(ctx, sandboxID, startReq.Labels[managedCollectionLabel])
+	managedOwnerRelease = managedRelease
+	err = claimErr
+	if err != nil {
+		h.sandboxManager.ReleaseID(sandboxID)
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+	}
+	if owner != "" {
+		startReq.Labels[managedOwnerLabel] = owner
+	}
 	if err := h.validateRestoreTarget(startReq.Runtime, sandboxID, checkpointDir); err != nil {
 		h.sandboxManager.ReleaseID(sandboxID)
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))

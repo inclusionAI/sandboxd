@@ -97,7 +97,8 @@ func TestManagedHTTPRegistryMountIntegration(t *testing.T) {
 			}
 			defer os.RemoveAll(dir)
 			socket := filepath.Join(dir, "image.sock")
-			endpoint, err := ListenManagement(socket, NewSharedOCIService(worker), client)
+			shared := NewSharedOCIService(worker)
+			endpoint, err := ListenManagement(socket, shared, client)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -126,7 +127,7 @@ func TestManagedHTTPRegistryMountIntegration(t *testing.T) {
 			if status != 200 {
 				t.Fatalf("metadata %d: %s", status, payload)
 			}
-			status, payload = post("/oci_mount", map[string]string{"image_url": reference})
+			status, payload = post("/oci_mount", map[string]string{"image_url": reference, "owner": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 			if !enabled {
 				if status != 500 {
 					t.Fatalf("default unexpectedly accepted HTTP: %d %s", status, payload)
@@ -144,10 +145,36 @@ func TestManagedHTTPRegistryMountIntegration(t *testing.T) {
 			if err != nil || string(data) != content {
 				t.Fatalf("real mounted data: %q %v", data, err)
 			}
-			// Idempotent preparation must retain one ownership; Close must release it.
-			status, payload = post("/oci_mount", map[string]string{"image_url": reference})
+			// Idempotent preparation holds one owner; separate owners and an
+			// ordinary rootfs must survive each other's independent deletion.
+			status, payload = post("/oci_mount", map[string]string{"image_url": reference, "owner": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 			if status != 200 {
 				t.Fatalf("repeat %d: %s", status, payload)
+			}
+			status, payload = post("/oci_mount", map[string]string{"image_url": reference, "owner": strings.Repeat("b", 32)})
+			if status != 200 {
+				t.Fatalf("second owner %d: %s", status, payload)
+			}
+			if _, err := shared.MountOCI(context.Background(), &OCIMountRequest{ImageURL: reference}); err != nil {
+				t.Fatal(err)
+			}
+			for _, owner := range []string{strings.Repeat("a", 32), strings.Repeat("b", 32)} {
+				if err := endpoint.ReleaseOwner(context.Background(), owner); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if data, err := os.ReadFile(filepath.Join(response.MountPath, "witness")); err != nil || string(data) != content {
+				t.Fatalf("live rootfs lost after collection release: %q %v", data, err)
+			}
+			if err := shared.UmountOCI(&OCIUmountRequest{ImageURL: reference}); err != nil {
+				t.Fatal(err)
+			}
+			if mounts, err := manager.ListMountedDetails(); err != nil || len(mounts) != 0 {
+				t.Fatalf("last rootfs release leaked: %v %v", mounts, err)
+			}
+			status, payload = post("/oci_mount", map[string]string{"image_url": reference, "owner": strings.Repeat("c", 32)})
+			if status != 200 {
+				t.Fatalf("fresh owner %d: %s", status, payload)
 			}
 			endpoint.Close()
 			mounts, err := manager.ListMountedDetails()
