@@ -94,3 +94,33 @@ func TestPinDoesNotAdoptForeignLinkOrUnknownCollection(t *testing.T) {
 		t.Fatal("copied checkpoint marker was accepted as a lease")
 	}
 }
+
+func TestRetirementFenceSurvivesStoreRestartAndCleanupRetry(t *testing.T) {
+	root := t.TempDir()
+	s := Store{Root: root}
+	id := strings.Repeat("e", 32)
+	ctx := context.Background()
+	if err := s.Create(id); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("provider release interrupted")
+	if collected, err := s.Collect(ctx, id, func() error { return want }); collected || !errors.Is(err, want) {
+		t.Fatalf("partial cleanup: %v %v", collected, err)
+	}
+	// Reopen from disk with no process-local state. A durable retirement marker
+	// must reject new owners and remain retryable by the restarted collector.
+	restarted := Store{Root: root}
+	if err := restarted.Pin(ctx, id, filepath.Join(root, "owners", "late")); err == nil {
+		t.Fatal("restart lost the retirement fence")
+	}
+	calls := 0
+	collected, err := restarted.Collect(ctx, id, func() error { calls++; return nil })
+	if !collected || err != nil || calls != 1 {
+		t.Fatalf("restarted cleanup: %v %v calls=%d", collected, err, calls)
+	}
+	for _, path := range []string{restarted.anchor(id), restarted.retired(id)} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("cleanup retained %s: %v", path, err)
+		}
+	}
+}

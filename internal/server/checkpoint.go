@@ -123,6 +123,15 @@ func (h *sandboxService) Checkpoint(
 			resources = sandbox.Status.Get().Resources
 		}
 	}
+	// Establish the actual checkpoint lease before capture, not merely a device
+	// check: separate mount views may reject a hard link even on the same device.
+	// A non-live capture may terminate the source, so predictable metadata/lease
+	// failures must leave it untouched. The existing output cleanup owns this pin
+	// on failure; a successful capture retains it with the checkpoint directory.
+	if err := h.writeManagedRuntimeCheckpoint(checkpointCtx, request.ID, directory.path); err != nil {
+		cleanupErr := directory.cleanup()
+		return nil, errord.ToGRPC(errors.Join(fmt.Errorf("prepare managed runtime checkpoint: %w", err), cleanupErr))
+	}
 	captureStarted := time.Now()
 	err = h.withTransientFirecrackerCheckpointMemory(
 		checkpointCtx,
@@ -162,10 +171,6 @@ func (h *sandboxService) Checkpoint(
 		return nil, errord.ToGRPC(operationErr)
 	}
 	captureDuration := time.Since(captureStarted)
-	if err := h.writeManagedRuntimeCheckpoint(checkpointCtx, request.ID, directory.path); err != nil {
-		cleanupErr := directory.cleanup()
-		return nil, errord.ToGRPC(errors.Join(fmt.Errorf("persist managed runtime checkpoint: %w", err), cleanupErr))
-	}
 	syncStarted := time.Now()
 	if h.config.PluginConfig.RuntimeConfig.CheckpointSync.SyncOutput {
 		if err := syncCheckpointOutput(checkpointCtx, directory.path); err != nil {

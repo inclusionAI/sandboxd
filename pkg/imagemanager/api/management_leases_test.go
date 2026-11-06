@@ -144,3 +144,44 @@ func TestManagedRetirementRetriesFailedCancellationRollback(t *testing.T) {
 		t.Fatal("failed acquire lost its retryable rollback ownership")
 	}
 }
+
+func TestManagedRetirementRetriesOnlyRemainingImage(t *testing.T) {
+	want := errors.New("second image is busy")
+	calls := map[string]int{}
+	var failedImage string
+	attempts := 0
+	worker := &blockingImageService{
+		mount: func(context.Context, *OCIMountRequest) (*OCIMountResponse, error) {
+			return &OCIMountResponse{}, nil
+		},
+		unmount: func(request *OCIUmountRequest) error {
+			attempts++
+			calls[request.ImageURL]++
+			// Map iteration order is unspecified: fail whichever image is second.
+			if attempts == 2 {
+				failedImage = request.ImageURL
+				return want
+			}
+			return nil
+		},
+	}
+	m := newManagedMounts(NewSharedOCIService(worker))
+	ctx := context.Background()
+	for _, image := range []string{"one", "two"} {
+		if _, err := m.acquire(ctx, "owner", &OCIMountRequest{ImageURL: image}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.releaseOwner(ctx, "owner"); !errors.Is(err, want) {
+		t.Fatalf("partial retirement lost its error: %v", err)
+	}
+	if len(m.images) != 1 || m.images[failedImage] == nil {
+		t.Fatal("partial retirement did not retain only the failed image")
+	}
+	if err := m.releaseOwner(ctx, "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.images) != 0 || attempts != 3 || calls[failedImage] != 2 {
+		t.Fatalf("retry re-released a completed image or leaked a mount: %v", calls)
+	}
+}
