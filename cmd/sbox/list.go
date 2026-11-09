@@ -78,13 +78,13 @@ var ListCmd = cli.Command{
 		}
 		items := make([]item, 0, len(resp.Sandboxes))
 		for _, sb := range resp.Sandboxes {
-			age, _ := util.FormatTimeInterval(sb.StartedAt, 0)
+			age, created := sandboxListTimes(sb.StartedAt)
 			items = append(items, item{
 				ID:        sb.ID,
 				State:     sb.State,
 				Runtime:   sb.Runtime,
 				Age:       age,
-				StartedAt: util.FormatUnixTimestamp(sb.StartedAt),
+				StartedAt: created,
 
 				rawAge: sb.StartedAt,
 			})
@@ -108,6 +108,17 @@ var ListCmd = cli.Command{
 		}
 		return nil
 	},
+}
+
+func sandboxListTimes(startedAt int64) (age, created string) {
+	if startedAt <= 0 {
+		return "-", "-"
+	}
+	age, err := util.FormatTimeInterval(startedAt, 0)
+	if err != nil {
+		age = "-"
+	}
+	return age, util.FormatUnixTimestamp(startedAt)
 }
 
 // parseLabelStr convert label string to key and value, for example:

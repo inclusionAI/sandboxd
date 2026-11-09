@@ -24,6 +24,18 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestUpdateStatusPreservesCreationTimeWhenRuntimeOmitsIt(t *testing.T) {
+	const created = "2026-11-09T00:00:00Z"
+	for _, state := range []svc.SandboxStatus{svc.SandboxStatusRunning, svc.SandboxStatusExited} {
+		t.Run(string(state), func(t *testing.T) {
+			status := UpdateStatusByState(&svc.State{Status: state}, Status{StartedAt: created})
+			if status.StartedAt != created {
+				t.Fatalf("lost creation time: %+v", status)
+			}
+		})
+	}
+}
+
 func TestGenerateStatusFromState(t *testing.T) {
 	type args struct {
 		state *svc.State

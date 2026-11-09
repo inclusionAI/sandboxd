@@ -16,6 +16,7 @@ package runsc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -24,6 +25,35 @@ import (
 	"testing"
 	"time"
 )
+
+func TestListJSONIncludesPersistedCreationTime(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "runsc")
+	if err := os.WriteFile(binary, []byte(`#!/bin/sh
+printf '%s\n' '[{"id":"sandbox-1","pid":42,"status":"running","bundle":"/bundle"},{"id":"gone","status":"stopped"}]'
+`), 0755); err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(binary, dir)
+	const created = "2026-11-09T09:03:00.123456789+08:00"
+	if err := os.WriteFile(client.stateFilePath("sandbox-1"), []byte(`{"id":"sandbox-1","createdAt":"`+created+`"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := client.ListJSON(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var states []map[string]any
+	if err := json.Unmarshal(output, &states); err != nil {
+		t.Fatal(err)
+	}
+	if states[0]["created"] != created || states[0]["bundle"] != "/bundle" {
+		t.Fatalf("missing creation time or lost OCI fields: %s", output)
+	}
+	if states[1]["created"] != nil {
+		t.Fatalf("invented a creation time for a concurrently deleted container: %s", output)
+	}
+}
 
 func TestCreateUsesExactDebugLogPath(t *testing.T) {
 	tempDir := t.TempDir()

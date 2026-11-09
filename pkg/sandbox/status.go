@@ -222,14 +222,18 @@ func UpdateStatusByState(state *svc.State, status Status) Status {
 	switch state.Status {
 	case svc.SandboxStatusRunning:
 		status.Pid = state.InitProcessPid
-		status.StartedAt = state.Created
+		if state.Created != "" {
+			status.StartedAt = state.Created
+		}
 		status.FinishedAt = ""
 		status.ExitCode = -1
 		status.Unknown = false
 	case svc.SandboxStatusExited:
 		status.Unknown = false
 		status.Pid = state.InitProcessPid
-		status.StartedAt = state.Created
+		if state.Created != "" {
+			status.StartedAt = state.Created
+		}
 		if status.FinishedAt == "" {
 			status.FinishedAt = time.Now().String()
 		}
