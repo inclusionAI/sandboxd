@@ -40,6 +40,12 @@ func (h *sandboxService) Checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 ) (*runtime.CheckpointResponse, error) {
+	if h.rebootGate != nil {
+		if !h.rebootGate.enter() {
+			return nil, errord.ToGRPCf(errord.ErrUnavailable, "sandbox checkpoint is closed for node maintenance")
+		}
+		defer h.rebootGate.leave()
+	}
 	started := time.Now()
 	if request == nil {
 		return nil, errord.ToGRPCf(errord.ErrInvalidArgument, "checkpoint request is nil")

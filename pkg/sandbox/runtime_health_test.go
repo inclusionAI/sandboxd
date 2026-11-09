@@ -23,6 +23,38 @@ type runtimePollFixture struct {
 
 func (h *runtimePollFixture) List(ctx context.Context) ([]*svc.State, error) { return h.list(ctx) }
 
+func TestMaintenanceInventoryDoesNotChangeRuntimeHealth(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	var calls atomic.Int32
+	m := &Manager{serviceHandler: cmap.New[svc.Handler]()}
+	m.serviceHandler.Set("runsc", &runtimePollFixture{list: func(context.Context) ([]*svc.State, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release // This inventory ignores cancellation.
+		}
+		return nil, nil
+	}})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.InspectRuntimeInventory(ctx, "runsc")
+		done <- err
+	}()
+	<-started
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	_, err := m.InspectRuntimeInventory(t.Context(), "runsc")
+	require.ErrorIs(t, err, errRuntimePollBusy)
+	require.NoError(t, m.RuntimeHealthError("runsc"))
+	_, err = m.RuntimeInventory("runsc", time.Second)
+	require.NoError(t, err)
+	require.NoError(t, m.RuntimeHealthError("runsc"))
+	require.EqualValues(t, 2, calls.Load())
+}
+
 func TestWaitRuntimeHealthRequiresSuccessfulPollWithoutChangingDeadline(t *testing.T) {
 	var fail atomic.Bool
 	fail.Store(true)

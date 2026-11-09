@@ -70,6 +70,10 @@ func (handler *Handler) withCheckpointSnapshotMemoryCharge(
 	)
 }
 
+// CheckpointCgroupPath identifies the transient checkpoint subtree outside the
+// sandbox cgroup root.
+func CheckpointCgroupPath() string { return firecrackerCheckpointCgroup }
+
 func ensureFirecrackerCheckpointCgroup() error {
 	directory := filepath.Join(
 		firecrackerCgroupMountpoint,

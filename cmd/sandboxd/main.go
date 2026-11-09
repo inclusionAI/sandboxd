@@ -91,6 +91,15 @@ func main() {
 		logrus.WithError(err).Fatal("Failed to create Sandbox service")
 	}
 
+	var stopReboot func()
+	if handler := sandboxService.RebootHandler(); handler != nil {
+		stopReboot, err = serveRebootSocket(rebootSocket, handler)
+		if err != nil {
+			logrus.WithError(err).Fatal("Failed to serve local reboot gate")
+		}
+		defer stopReboot()
+	}
+
 	serveHTTP("metrics", httpAddress, metricsMux())
 	serveHTTP("pprof", pprofAddress, pprofMux())
 	go func() {
@@ -124,6 +133,9 @@ func main() {
 	}()
 
 	shutDownFunc := make([]func(), 0)
+	if stopReboot != nil {
+		shutDownFunc = append(shutDownFunc, stopReboot)
+	}
 	shutDownFunc = append(shutDownFunc, sandboxService.Shutdown)
 	serveGrpc(ctx, rpc, shutDownFunc)
 }
