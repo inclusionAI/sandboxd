@@ -760,7 +760,38 @@ func (c *Client) ListJSON(ctx context.Context) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("runsc list failed: %w", err)
 	}
-	return out, nil
+	// runsc's OCI State JSON omits CreatedAt. Read it from the persisted
+	// container metadata so reconciliation does not erase the creation time.
+	var states []map[string]json.RawMessage
+	if err := json.Unmarshal(out, &states); err != nil {
+		return nil, fmt.Errorf("parse runsc list: %w", err)
+	}
+	for _, state := range states {
+		var id string
+		if err := json.Unmarshal(state["id"], &id); err != nil || id == "" {
+			continue
+		}
+		data, err := os.ReadFile(c.stateFilePath(id))
+		if err != nil {
+			// A container may be deleted between list and reading metadata.
+			logrus.WithError(err).WithField("sandbox_id", id).Debug("load runsc creation time")
+			continue
+		}
+		var metadata struct {
+			CreatedAt time.Time `json:"createdAt"`
+		}
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			logrus.WithError(err).WithField("sandbox_id", id).Warn("parse runsc creation time")
+			continue
+		}
+		if !metadata.CreatedAt.IsZero() {
+			state["created"], err = json.Marshal(metadata.CreatedAt.Format(time.RFC3339Nano))
+			if err != nil {
+				return nil, fmt.Errorf("encode runsc creation time: %w", err)
+			}
+		}
+	}
+	return json.Marshal(states)
 }
 
 type containerState struct {

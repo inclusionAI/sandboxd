@@ -31,6 +31,8 @@ The inherited OCI startup contract is documented in
 
 The `sbox` binary is an administrative CLI for managing sandboxes.
 
+`sbox list` shows the runtime creation timestamp in `CREATED` and the elapsed time in `AGE`. For runsc, sandboxd reads creation time from its persisted container metadata because OCI state output does not include it. Unknown timestamps are shown as `-` rather than the Unix epoch; a future timestamp keeps its date but shows `-` for age.
+
 ### NVIDIA GPU sandboxes
 
 GPU support is experimental and currently uses gVisor runsc with nvproxy. The
