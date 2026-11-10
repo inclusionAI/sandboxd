@@ -65,6 +65,8 @@ func TestNewCgroupOpsSelectsDetectedMode(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, test.version, cgroupVersion(ops.mode()))
 		assert.Equal(t, test.mode, ops.mode())
+		manager := &CgroupManager{ops: ops}
+		assert.Equal(t, test.mode == cgroups.Unified, manager.SupportsWorkloadInventory())
 	}
 }
 

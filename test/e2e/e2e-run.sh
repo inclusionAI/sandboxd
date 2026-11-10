@@ -674,6 +674,45 @@ crash_and_restart_sandboxd() {
     start_sandboxd
 }
 
+reboot_fence_request() {
+    local method="$1" path="$2" want="$3" code
+    code="$(curl --noproxy '*' --unix-socket /run/sandboxd/reboot.sock --max-time 8 \
+        -sS -o /dev/null -w '%{http_code}' -X "${method}" "http://localhost/${path}")" ||
+        fail "reboot fence request failed: ${method} ${path}"
+    assert_eq "${code}" "${want}" "reboot fence ${method} ${path}"
+}
+
+wait_for_reboot_fence_recovery() {
+    local i
+    for i in $(seq 1 60); do
+        if /usr/local/bin/sbox --address "${SOCKET}" --timeout 1s check 2>/dev/null |
+            grep -q '^Healthz status: SERVING[[:space:]]*$'; then
+            return
+        fi
+        sleep 1
+    done
+    fail "sandboxd did not finish recovery for the reboot fence test"
+}
+
+run_reboot_fence_restart() {
+    log "testing reboot fence persistence across sandboxd restart"
+    local attempt=00000000000000000001-00000000000000000000000000000001
+    local other=00000000000000000002-00000000000000000000000000000002
+    wait_for_reboot_fence_recovery
+    reboot_fence_request GET available 204
+    reboot_fence_request PUT "close/${attempt}" 204
+    reboot_fence_request GET "drained/${attempt}" 204
+    crash_and_restart_sandboxd
+    reboot_fence_request GET available 409
+    reboot_fence_request PUT "open/${other}" 409
+    wait_for_reboot_fence_recovery
+    reboot_fence_request GET "drained/${attempt}" 204
+    reboot_fence_request PUT "open/${attempt}" 204
+    reboot_fence_request GET available 204
+    reboot_fence_request PUT "close/${attempt}" 409
+    log "reboot fence restart verified"
+}
+
 start_sandboxd() {
     log "starting sandboxd"
     /usr/local/bin/sandboxd \
@@ -2753,7 +2792,19 @@ run_e2e() {
     cleanup_cgroups
     write_config
     prepare_rootfs
+    local test_reboot_fence=0
+    if [ "${CGROUP_MODE}" = "v2" ] && [ "${E2E_RUNTIME}" = "runsc" ] &&
+        [ "${RUNSC_PLATFORM}" = "systrap" ] && [ -z "${RUNSC_CHECKPOINT_MODE}" ] &&
+        [ "${STRESS_ONLY}" = "0" ]; then
+        local -x AKERNEL_REBOOT_FENCE_PATH
+        AKERNEL_REBOOT_FENCE_PATH="$(mktemp -d "${SANDBOXD_HOME}/.reboot-fence.XXXXXX")/state" ||
+            fail "could not create reboot fence fixture"
+        test_reboot_fence=1
+    fi
     start_sandboxd
+    if [ "${test_reboot_fence}" = "1" ]; then
+        run_reboot_fence_restart
+    fi
     if [ "${DISABLE_CGROUP}" = "0" ] && {
         [ "${E2E_RUNTIME}" = "all" ] || [ "${E2E_RUNTIME}" = "runsc" ];
     }; then

@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -95,6 +97,46 @@ func TestRebootFenceRejectsPodResetDirectoryBeforeDeletingState(t *testing.T) {
 	}
 }
 
+func TestRebootFencePersistenceFailures(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fence")
+	g, err := loadRebootGate(path)
+	require.NoError(t, err)
+	const attempt = "00000000000000000001-00000000000000000000000000000001"
+	const next = "00000000000000000002-00000000000000000000000000000002"
+	require.Equal(t, http.StatusNoContent, g.change(attempt, true))
+	released := rebootFence{Attempt: attempt}
+	write := func(w io.Writer) error { return json.NewEncoder(w).Encode(released) }
+	failed := errors.New("injected I/O failure")
+
+	require.ErrorIs(t, g.save(released, func(io.Writer) error { return failed }, (*os.File).Sync), failed)
+	require.ErrorIs(t, g.save(released, write, func(*os.File) error { return failed }), failed)
+	g.path = filepath.Join(dir, "blocked")
+	require.NoError(t, os.Mkdir(g.path, 0700))
+	require.Error(t, g.save(released, write, (*os.File).Sync))
+	g.path = path
+	require.True(t, g.closedAndIdle(attempt))
+	reloaded, err := loadRebootGate(path)
+	require.NoError(t, err)
+	require.True(t, reloaded.closedAndIdle(attempt))
+
+	require.ErrorIs(t, g.save(released, write, func(file *os.File) error {
+		if file.Name() == dir {
+			return failed
+		}
+		return file.Sync()
+	}), failed)
+	require.False(t, g.enter())
+	require.False(t, g.closedAndIdle(attempt))
+	require.Equal(t, http.StatusConflict, g.change(next, true))
+	require.Equal(t, http.StatusNoContent, g.change(attempt, false))
+	require.True(t, g.enter())
+	g.leave()
+	reloaded, err = loadRebootGate(path)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, reloaded.change(attempt, true))
+}
+
 func TestRebootDrainRejectsConcurrentRelease(t *testing.T) {
 	g, err := loadRebootGate(filepath.Join(t.TempDir(), "fence"))
 	require.NoError(t, err)
@@ -108,7 +150,7 @@ func TestRebootDrainRejectsConcurrentRelease(t *testing.T) {
 	require.Equal(t, http.StatusConflict, out.Code)
 }
 
-func TestRebootInventoryRejectsUnloadedOptionalRuntime(t *testing.T) {
+func TestRebootPreflightRejectsUnavailableInventory(t *testing.T) {
 	gate, err := loadRebootGate(filepath.Join(t.TempDir(), "fence"))
 	require.NoError(t, err)
 	h := &sandboxService{
@@ -130,5 +172,8 @@ func TestRebootInventoryRejectsUnloadedOptionalRuntime(t *testing.T) {
 	h.serviceHandler.Set(config.RuntimeNameFirecracker, svc.NewFakeRuntimeHandler())
 	out = httptest.NewRecorder()
 	h.RebootHandler().ServeHTTP(out, httptest.NewRequest("GET", "/available", nil))
-	require.Equal(t, http.StatusNoContent, out.Code)
+	require.Equal(t, http.StatusServiceUnavailable, out.Code)
+	require.Contains(t, out.Body.String(), "requires a cgroup v2 hierarchy")
+	require.True(t, gate.enter())
+	gate.leave()
 }

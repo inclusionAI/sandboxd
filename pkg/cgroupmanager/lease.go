@@ -23,14 +23,21 @@ import (
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 )
 
+// SupportsWorkloadInventory reports whether the selected backend can verify
+// recursive workload emptiness.
+func (c *CgroupManager) SupportsWorkloadInventory() bool {
+	v2, _ := c.ops.(*cgroupV2)
+	return v2 != nil
+}
+
 // WorkloadsEmpty verifies that the owned cgroup v2 subtree and the optional
 // runtime sibling have no processes, including processes absent from runtime
 // inventories. A missing owned cgroup is never evidence of an empty node.
 func (c *CgroupManager) WorkloadsEmpty(sibling string) (bool, error) {
-	v2, ok := c.ops.(*cgroupV2)
-	if !ok {
+	if !c.SupportsWorkloadInventory() {
 		return false, fmt.Errorf("workload emptiness requires a cgroup v2 hierarchy")
 	}
+	v2 := c.ops.(*cgroupV2)
 	root := filepath.Join(v2.mountpoint, c.rootName)
 	populated, err := readCgroupPopulated(filepath.Join(root, "cgroup.events"))
 	if err != nil || populated || sibling == "" {

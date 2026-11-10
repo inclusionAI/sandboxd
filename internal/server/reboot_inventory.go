@@ -42,6 +42,9 @@ func (h *sandboxService) rebootInventoryAvailable() error {
 			return fmt.Errorf("runtime %s inventory unavailable: %w", name, err)
 		}
 	}
+	if !h.cgroupMgr.SupportsWorkloadInventory() {
+		return errors.New("reboot inventory requires a cgroup v2 hierarchy")
+	}
 	return nil
 }
 

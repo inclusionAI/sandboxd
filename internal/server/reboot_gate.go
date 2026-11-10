@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -125,7 +126,7 @@ func (g *rebootGate) leave() {
 
 // Persist both the close and the release before acknowledging them. Keeping
 // the last released attempt makes retries safe even after a process restart.
-func (g *rebootGate) save(fence rebootFence) error {
+func (g *rebootGate) save(fence rebootFence, write func(io.Writer) error, syncFile func(*os.File) error) error {
 	dir, err := os.Open(filepath.Dir(g.path))
 	if err != nil {
 		return err
@@ -136,9 +137,9 @@ func (g *rebootGate) save(fence rebootFence) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	err = json.NewEncoder(tmp).Encode(fence)
+	err = write(tmp)
 	if err == nil {
-		err = tmp.Sync()
+		err = syncFile(tmp)
 	}
 	closeErr := tmp.Close()
 	if err := errors.Join(err, closeErr); err != nil {
@@ -148,7 +149,7 @@ func (g *rebootGate) save(fence rebootFence) error {
 		return err
 	}
 	g.fence = fence
-	err = dir.Sync()
+	err = syncFile(dir)
 	g.uncertain = err != nil
 	return err
 }
@@ -163,7 +164,8 @@ func (g *rebootGate) change(attempt string, closed bool) int {
 	if !g.uncertain && g.fence == (rebootFence{Attempt: attempt, Closed: closed}) {
 		return http.StatusNoContent
 	}
-	if err := g.save(rebootFence{Attempt: attempt, Closed: closed}); err != nil {
+	next := rebootFence{Attempt: attempt, Closed: closed}
+	if err := g.save(next, func(w io.Writer) error { return json.NewEncoder(w).Encode(next) }, (*os.File).Sync); err != nil {
 		logrus.WithError(err).Error("persist local reboot fence")
 		return http.StatusServiceUnavailable
 	}
