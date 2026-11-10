@@ -17,9 +17,47 @@ package cgroupmanager
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 )
+
+// SupportsWorkloadInventory reports whether the selected backend can verify
+// recursive workload emptiness.
+func (c *CgroupManager) SupportsWorkloadInventory() bool {
+	v2, _ := c.ops.(*cgroupV2)
+	return v2 != nil
+}
+
+// WorkloadsEmpty verifies that the owned cgroup v2 subtree and the optional
+// runtime sibling have no processes, including processes absent from runtime
+// inventories. A missing owned cgroup is never evidence of an empty node.
+func (c *CgroupManager) WorkloadsEmpty(sibling string) (bool, error) {
+	if !c.SupportsWorkloadInventory() {
+		return false, fmt.Errorf("workload emptiness requires a cgroup v2 hierarchy")
+	}
+	v2 := c.ops.(*cgroupV2)
+	root := filepath.Join(v2.mountpoint, c.rootName)
+	populated, err := readCgroupPopulated(filepath.Join(root, "cgroup.events"))
+	if err != nil || populated || sibling == "" {
+		return err == nil && !populated, err
+	}
+	sibling, err = normalizeCgroupRoot(sibling)
+	if err != nil {
+		return false, err
+	}
+	dir := filepath.Join(v2.mountpoint, sibling)
+	populated, err = readCgroupPopulated(filepath.Join(dir, "cgroup.events"))
+	if os.IsNotExist(err) {
+		// An absent sibling is expected before the first checkpoint. A
+		// present sibling with unreadable or missing controls is unknown.
+		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+			return true, nil
+		}
+	}
+	return err == nil && !populated, err
+}
 
 // Prepare applies the per-sandbox controls to an allocated, already-clean
 // cgroup. Cleanup and OOM state reset happen when the previous owner recycles

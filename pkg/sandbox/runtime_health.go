@@ -5,6 +5,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,8 @@ import (
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/sirupsen/logrus"
 )
+
+var errRuntimePollBusy = errors.New("previous runtime list still running")
 
 // RuntimeHealthError returns the last poll failure for one backend. A newly
 // loaded handler remains eligible until its first failed poll; successful
@@ -78,6 +81,19 @@ func (m *Manager) RuntimeInventory(name string, timeout time.Duration) ([]*svc.S
 	return result, nil
 }
 
+// InspectRuntimeInventory reads the inventory under the caller's deadline.
+// A slow maintenance read cannot occupy the recovery and health poll lane.
+func (m *Manager) InspectRuntimeInventory(ctx context.Context, name string) ([]*svc.State, error) {
+	if err := m.RuntimeHealthError(name); err != nil {
+		return nil, err
+	}
+	handler, ok := m.serviceHandler.Get(name)
+	if !ok {
+		return nil, fmt.Errorf("runtime handler %q is unavailable", name)
+	}
+	return pollRuntimeOnce(ctx, &m.maintenancePollBusy, name, handler.List)
+}
+
 func (m *Manager) collectRuntimeStates(timeout time.Duration) (map[string]*svc.State, map[string]bool) {
 	states := make(map[string]*svc.State)
 	polled := make(map[string]bool)
@@ -106,20 +122,9 @@ func (m *Manager) collectRuntimeStates(timeout time.Duration) (map[string]*svc.S
 }
 
 func (m *Manager) pollRuntime(name string, handler svc.Handler, timeout time.Duration) ([]*svc.State, error) {
-	value, _ := m.runtimePollBusy.LoadOrStore(name, &atomic.Bool{})
-	busy := value.(*atomic.Bool)
-	if !busy.CompareAndSwap(false, true) {
-		return nil, fmt.Errorf("previous runtime list still running")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	type result struct {
-		states []*svc.State
-		err    error
-	}
-	done := make(chan result, 1)
-	go func() {
-		defer busy.Store(false)
+	return pollRuntimeOnce(ctx, &m.runtimePollBusy, name, func(ctx context.Context) ([]*svc.State, error) {
 		states, err := handler.List(ctx)
 		if err == nil && name == config.RuntimeNameRunsc && m.runscRecoveryPending.Load() {
 			err = m.reconcileStoppedRunscStates(ctx, handler, states)
@@ -138,13 +143,31 @@ func (m *Manager) pollRuntime(name string, handler svc.Handler, timeout time.Dur
 				err = reconcile.(func(context.Context, []*svc.State) error)(ctx, states)
 			}
 		}
-		if err == nil {
-			err = ctx.Err()
-		}
+		return states, err
+	})
+}
+
+func pollRuntimeOnce(ctx context.Context, lane *sync.Map, name string, list func(context.Context) ([]*svc.State, error)) ([]*svc.State, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	value, _ := lane.LoadOrStore(name, &atomic.Bool{})
+	busy := value.(*atomic.Bool)
+	if !busy.CompareAndSwap(false, true) {
+		return nil, errRuntimePollBusy
+	}
+	type result struct {
+		states []*svc.State
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer busy.Store(false)
+		states, err := list(ctx)
 		done <- result{states, err}
 	}()
 	// The wrapper is bounded even when a handler ignores cancellation. At
-	// most one such call per runtime survives into the next pass.
+	// most one such call per runtime in this lane survives into the next pass.
 	select {
 	case out := <-done:
 		if err := ctx.Err(); err != nil {

@@ -50,11 +50,11 @@ func ValidateRestoreDirectorySeparation(checkpointDir, targetDir string) error {
 	if checkpointDir == "" || targetDir == "" {
 		return errors.New("checkpoint and target directories are required")
 	}
-	checkpoint, err := canonicalProspectivePath(checkpointDir)
+	checkpoint, err := CanonicalProspectivePath(checkpointDir)
 	if err != nil {
 		return fmt.Errorf("resolve checkpoint directory: %w", err)
 	}
-	target, err := canonicalProspectivePath(targetDir)
+	target, err := CanonicalProspectivePath(targetDir)
 	if err != nil {
 		return fmt.Errorf("resolve restore target directory: %w", err)
 	}
@@ -65,7 +65,8 @@ func ValidateRestoreDirectorySeparation(checkpointDir, targetDir string) error {
 	return nil
 }
 
-func canonicalProspectivePath(value string) (string, error) {
+// CanonicalProspectivePath resolves existing ancestors of a path that may not exist yet.
+func CanonicalProspectivePath(value string) (string, error) {
 	current, err := filepath.Abs(value)
 	if err != nil {
 		return "", err

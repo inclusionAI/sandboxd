@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -67,6 +68,7 @@ type SandboxService interface {
 	Shutdown()
 	Ready() bool
 	RegisterServer(*grpc.Server)
+	RebootHandler() http.Handler
 }
 
 var _ SandboxService = &sandboxService{}
@@ -100,6 +102,7 @@ type sandboxService struct {
 
 	ready                             atomic.Bool
 	recoveryReady                     atomic.Bool
+	rebootGate                        *rebootGate
 	deleteGroup                       singleflight.Group
 	runtimeDeleteTimeout              time.Duration
 	aclMu                             sync.Mutex
@@ -776,6 +779,15 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("resource configuration: %w", err)
 	}
 
+	var gate *rebootGate
+	if path := os.Getenv("AKERNEL_REBOOT_FENCE_PATH"); path != "" {
+		// Validate before resetStateIfPodChanged can remove these directories.
+		gate, err = loadRebootGate(path, cfg.StoreDir, filepath.Join(cfg.RootDir, "containers"), cfg.ImageManagerRoot)
+		if err != nil {
+			return nil, fmt.Errorf("load local reboot fence: %w", err)
+		}
+	}
+
 	natBackend, err := resolveNATBackend(cfg.NatBackend)
 	if err != nil {
 		return nil, fmt.Errorf("network configuration: %w", err)
@@ -884,6 +896,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		imageSvc:                          imgSvc,
 		resourceMod:                       nodeResMod,
 		xpuMgr:                            xpuMgr,
+		rebootGate:                        gate,
 	}
 
 	// VolumeManager comes up before runtime handlers. An ordinary directory is
@@ -1204,6 +1217,13 @@ func startFailure(ctx context.Context, stage string, err error) error {
 }
 
 func (h *sandboxService) Start(ctx context.Context, request *runtime.StartRequest) (*runtime.StartResponse, error) {
+	if h.rebootGate != nil {
+		if !h.rebootGate.enter() {
+			err := errord.ToGRPCf(errord.ErrUnavailable, "sandbox admission is closed for node maintenance")
+			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+		}
+		defer h.rebootGate.leave()
+	}
 	if request == nil {
 		err := fmt.Errorf("start request is nil")
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
