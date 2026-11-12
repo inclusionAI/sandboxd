@@ -35,10 +35,10 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	// Rolled for StartResponse.sandbox_ip (field 4), required for YuanRong
-	// Node Proxy route registration; existing response fields are unchanged.
+	// Rolled for StartRequest.prefer_image_path (field 23), an opt-in flag
+	// that leaves the existing request fields and default behavior unchanged.
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "21eb701d4c16828d5f4ac42d6a50d6f644e038b6b967b4c5165a9dd025aed67b"
+	const want = "397a1f9b10afb4227fb5c23fe79ddebc96d925c03d2583c8712eee0d90c7a249"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}

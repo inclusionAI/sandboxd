@@ -273,6 +273,8 @@ message StartRequest {
   // rootfs. Empty disables injection. It does not replace the sandbox's own
   // command.
   string inject_entrypoint = 22;
+  // PreferImagePath lets the image's PATH override the request's fallback PATH.
+  bool prefer_image_path = 23;
 }
 
 // StartResponse is returned after sandbox start.

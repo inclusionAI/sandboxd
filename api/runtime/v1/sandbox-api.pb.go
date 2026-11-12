@@ -1413,8 +1413,10 @@ type StartRequest struct {
 	// rootfs. Empty disables injection. It does not replace the sandbox's own
 	// command.
 	InjectEntrypoint string `protobuf:"bytes,22,opt,name=inject_entrypoint,json=injectEntrypoint,proto3" json:"inject_entrypoint,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// PreferImagePath lets the image's PATH override the request's fallback PATH.
+	PreferImagePath bool `protobuf:"varint,23,opt,name=prefer_image_path,json=preferImagePath,proto3" json:"prefer_image_path,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *StartRequest) Reset() {
@@ -1599,6 +1601,13 @@ func (x *StartRequest) GetInjectEntrypoint() string {
 		return x.InjectEntrypoint
 	}
 	return ""
+}
+
+func (x *StartRequest) GetPreferImagePath() bool {
+	if x != nil {
+		return x.PreferImagePath
+	}
+	return false
 }
 
 // StartResponse is returned after sandbox start.
@@ -3033,7 +3042,7 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\n" +
 	"device_ids\x18\x02 \x03(\rR\tdeviceIds\"7\n" +
 	"\x0eCheckpointInfo\x12%\n" +
-	"\x0echeckpoint_dir\x18\x01 \x01(\tR\rcheckpointDir\"\xc5\t\n" +
+	"\x0echeckpoint_dir\x18\x01 \x01(\tR\rcheckpointDir\"\xf1\t\n" +
 	"\fStartRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -3059,7 +3068,8 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x1awritable_layer_limit_bytes\x18\x13 \x01(\x04R\x17writableLayerLimitBytes\x12@\n" +
 	"\x0enetwork_policy\x18\x14 \x01(\v2\x19.runtime.v1.NetworkPolicyR\rnetworkPolicy\x12C\n" +
 	"\x0fcheckpoint_info\x18\x15 \x01(\v2\x1a.runtime.v1.CheckpointInfoR\x0echeckpointInfo\x12+\n" +
-	"\x11inject_entrypoint\x18\x16 \x01(\tR\x10injectEntrypoint\x1a7\n" +
+	"\x11inject_entrypoint\x18\x16 \x01(\tR\x10injectEntrypoint\x12*\n" +
+	"\x11prefer_image_path\x18\x17 \x01(\bR\x0fpreferImagePath\x1a7\n" +
 	"\tEnvsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a<\n" +
