@@ -89,6 +89,67 @@ func newTestService(t *testing.T, handlers map[string]svc.Handler) *sandboxServi
 	return s
 }
 
+func TestMergeStartEnvsImagePath(t *testing.T) {
+	const requestPath = "/usr/bin:/bin"
+	const imagePath = "/opt/verifier-env/bin:/usr/bin:/bin"
+	requestEnvs := map[string]string{
+		"PATH": requestPath,
+		"MODE": "request",
+	}
+	for _, tc := range []struct {
+		name            string
+		imageEnvs       []string
+		preferImagePath bool
+		wantPaths       []string
+	}{
+		{
+			name:      "legacy request override",
+			imageEnvs: []string{"PATH=" + imagePath},
+			wantPaths: []string{imagePath, requestPath},
+		},
+		{
+			name:            "image path preferred",
+			imageEnvs:       []string{"PATH=" + imagePath},
+			preferImagePath: true,
+			wantPaths:       []string{imagePath},
+		},
+		{
+			name:            "empty image path preferred",
+			imageEnvs:       []string{"PATH="},
+			preferImagePath: true,
+			wantPaths:       []string{""},
+		},
+		{
+			name:            "request fallback if image has no path",
+			imageEnvs:       []string{"PATH"},
+			preferImagePath: true,
+			wantPaths:       []string{requestPath},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			imageEnvs := append(tc.imageEnvs, "MODE=image", "IMAGE_ONLY=a=b", "NVIDIA_VISIBLE_DEVICES=all")
+			envs := mergeStartEnvs(imageEnvs, requestEnvs, tc.preferImagePath)
+			var paths, modes []string
+			var imageOnly string
+			for _, env := range envs {
+				switch env.Key {
+				case "PATH":
+					paths = append(paths, env.Value)
+				case "MODE":
+					modes = append(modes, env.Value)
+				case "IMAGE_ONLY":
+					imageOnly = env.Value
+				default:
+					t.Errorf("unexpected variable %q", env.Key)
+				}
+			}
+			require.Equal(t, tc.wantPaths, paths)
+			require.Equal(t, []string{"image", "request"}, modes)
+			require.Equal(t, "a=b", imageOnly)
+		})
+	}
+}
+
 func TestWait(t *testing.T) {
 	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),

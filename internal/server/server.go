@@ -1180,6 +1180,30 @@ func resourcesToLinux(
 	return res
 }
 
+// mergeStartEnvs lists image variables first so request values override them,
+// except for PATH when the request marks it as a fallback.
+func mergeStartEnvs(imageEnvs []string, requestEnvs map[string]string, preferImagePath bool) []*runtime.KeyValue {
+	envs := make([]*runtime.KeyValue, 0, len(imageEnvs)+len(requestEnvs))
+	hasImagePath := false
+	for _, entry := range imageEnvs {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || xpumanager.ReservedEnv(key) {
+			continue
+		}
+		if key == "PATH" {
+			hasImagePath = true
+		}
+		envs = append(envs, &runtime.KeyValue{Key: key, Value: value})
+	}
+	for key, value := range requestEnvs {
+		if key == "PATH" && preferImagePath && hasImagePath {
+			continue
+		}
+		envs = append(envs, &runtime.KeyValue{Key: key, Value: value})
+	}
+	return envs
+}
+
 type ExtraConfig struct {
 	// NetworkStack selects the in-sandbox network stack. The open-source runsc
 	// adapter supports gVisor netstack only; empty is treated as netstack.
@@ -1576,28 +1600,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		xpuAcquired = specUpdates != nil
 	}
 
-	// Rootfs env (from image mount) goes first with lowest priority; request
-	// envs follow and override on key conflict because combineEnvs uses a map
-	// where later entries win.
-	rootfsEnvs := preparedFilesystem.rootfs.RootFS.Env()
-	env := make([]*runtime.KeyValue, 0, len(rootfsEnvs)+len(startReq.Envs))
-	for _, e := range rootfsEnvs {
-		if parts := strings.SplitN(e, "=", 2); len(parts) == 2 {
-			if xpumanager.ReservedEnv(parts[0]) {
-				continue
-			}
-			env = append(env, &runtime.KeyValue{
-				Key:   parts[0],
-				Value: parts[1],
-			})
-		}
-	}
-	for k, v := range startReq.Envs {
-		env = append(env, &runtime.KeyValue{
-			Key:   k,
-			Value: v,
-		})
-	}
+	env := mergeStartEnvs(preparedFilesystem.rootfs.RootFS.Env(), startReq.Envs, startReq.PreferImagePath)
 	var imageProcess *imageProcessSpec
 	if startReq.InjectEntrypoint != "" {
 		resolvedImageProcess, resolveErr := preparedFilesystem.rootfs.RootFS.ResolveImageProcess(ctx)
