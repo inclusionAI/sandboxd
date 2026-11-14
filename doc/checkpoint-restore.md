@@ -1,7 +1,5 @@
 # Checkpoint and restore
 
-Concurrent network lease persistence barriers may share one committed active-set snapshot when their mutations precede that snapshot. A lease is still handed to a runtime only after a successful durable commit covering its barrier; an earlier or failed commit cannot acknowledge a later mutation. The stored lease format, recovery ownership, rollback and quarantine behavior remain unchanged.
-
 ## Experimental runtime image collections
 
 The optional `[plugin.image].management_socket` exposes immutable OCI image preparation to a trusted node runtime adapter over a private Unix socket (0700 parent, 0600 socket). It is never mounted into a sandbox. The adapter exports ROFS through an operator-owned read-only collection and registers its checked metadata with inner containerd; Docker lower content remains outside the writable checkpoint. Arbitrary sandbox host-path access is not authorized by this API.
@@ -452,6 +450,8 @@ If that save fails, shutdown logs the error, leaves cgroup state dirty for a pos
 Already in-flight `Start` requests are not drained by this shutdown path. A request that passed admission before shutdown can still allocate resources or finish after the explicit save, and that save cannot include later allocations. Closing readiness, retaining dirty state and periodic saving do not guarantee persistence of this late state before process exit. These limits also mean that bounded RPC waiting does not force stuck kernel operations to complete or establish a fully drained shutdown.
 
 ## Restore through Start
+
+Concurrent network lease persistence barriers may share one committed active-set snapshot when their mutations precede that snapshot. A lease is still handed to a runtime only after a successful durable commit covering its barrier; an earlier or failed commit cannot acknowledge a later mutation. The stored lease format, recovery ownership, rollback and quarantine behavior remain unchanged.
 
 To restore, the caller sends a normal `StartRequest` for the target sandbox and
 sets:
