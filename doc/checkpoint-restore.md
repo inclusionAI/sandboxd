@@ -108,6 +108,8 @@ If a runsc inventory poll temporarily closes backend admission, a restore waits 
 
 `plugin.runtime.runsc.background_restore` defaults to `false`. Setting it to `true` forwards runsc's background page-loading option through the Restore RPC. Restore can then return before the entire memory image has been loaded. Callers must retain immutable checkpoint inputs while the runtime can still access them and measure full memory availability separately from RPC completion. This setting does not change checkpoint publication or output synchronization. It is independent of `checkpoint_mode`: full and reflink checkpoints both support this option. Private restored filestore copies do not release the memory-image and split-page inputs needed by background loading.
 
+`plugin.runtime.runsc.cli_gomaxprocs` separately controls the host-side runsc CLI's Go parallelism. Zero preserves the inherited environment; positive values from 1 through 1024 set its `GOMAXPROCS`. This does not increase sandbox CPU quotas, change Sentry scheduling, or change when background restore finishes. It is a node-local startup tuning option, independent of page-loading and restore-admission policies.
+
 The following Firecracker performance and durability descriptions assume the default `sync_output=false` profile. With synchronization enabled, the server adds its barrier after the runtime completes its capture, outside the runtime's guest pause window.
 
 ## Firecracker guest wall clock
