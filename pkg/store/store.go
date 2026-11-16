@@ -40,7 +40,11 @@ type DbStore interface {
 var _ DbStore = &BboltStoreImp{}
 
 type BboltStoreImp struct {
-	path string
+	// All consumers of this store share one open/update/close critical section.
+	// This avoids competing in bbolt's flock retry loop inside this process;
+	// the OS lock still protects against independent processes and instances.
+	openMu sync.Mutex
+	path   string
 }
 
 func NewStoreImp(path string) *BboltStoreImp {
@@ -57,6 +61,8 @@ func NewStoreImp(path string) *BboltStoreImp {
 }
 
 func (f *BboltStoreImp) Store(key string, data interface{}) error {
+	f.openMu.Lock()
+	defer f.openMu.Unlock()
 	db, err := bolt.Open(f.path, 0777, nil)
 	if err != nil {
 		return err
@@ -87,10 +93,13 @@ type DecodeType struct {
 }
 
 func (f *BboltStoreImp) StoreRaw(key string, data []byte) (retErr error) {
+	queued := time.Now()
+	f.openMu.Lock()
+	defer f.openMu.Unlock()
 	start := time.Now()
 	var opened, entered, updated, committed time.Time
 	defer func() {
-		logrus.WithFields(logrus.Fields{"key": key, "bytes": len(data), "open_ms": elapsedMS(start, opened), "begin_ms": elapsedMS(opened, entered), "put_ms": elapsedMS(entered, updated), "commit_ms": elapsedMS(updated, committed), "total_ms": time.Since(start).Seconds() * 1000, "success": retErr == nil}).Debug("durable raw store phases")
+		logrus.WithFields(logrus.Fields{"key": key, "bytes": len(data), "queue_ms": start.Sub(queued).Seconds() * 1000, "open_ms": elapsedMS(start, opened), "begin_ms": elapsedMS(opened, entered), "put_ms": elapsedMS(entered, updated), "commit_ms": elapsedMS(updated, committed), "total_ms": time.Since(start).Seconds() * 1000, "success": retErr == nil}).Debug("durable raw store phases")
 	}()
 	db, err := bolt.Open(f.path, 0777, nil)
 	opened = time.Now()
@@ -119,6 +128,8 @@ func elapsedMS(start, end time.Time) float64 {
 }
 
 func (f *BboltStoreImp) Load(key string) (*types.Any, error) {
+	f.openMu.Lock()
+	defer f.openMu.Unlock()
 	db, err := bolt.Open(f.path, 0666, nil)
 	if err != nil {
 		return nil, err
@@ -142,6 +153,8 @@ func (f *BboltStoreImp) Load(key string) (*types.Any, error) {
 }
 
 func (f *BboltStoreImp) LoadRaw(key string) ([]byte, error) {
+	f.openMu.Lock()
+	defer f.openMu.Unlock()
 	db, err := bolt.Open(f.path, 0666, nil)
 	if err != nil {
 		return nil, err
