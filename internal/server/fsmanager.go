@@ -45,6 +45,11 @@ type fsManager struct {
 	sandboxState    map[string]sandboxFSState
 	store           store.DbStore
 	persistMu       sync.Mutex
+	operationMu     sync.RWMutex
+	queueMu         sync.Mutex
+	pending         []*fsCommit
+	writing         bool
+	closed          bool
 }
 
 type preparedFS struct {
@@ -167,6 +172,8 @@ func (m *fsManager) Prepare(ctx context.Context, request *runtime.StartRequest) 
 }
 
 func (m *fsManager) Commit(sandboxID string, prepared *preparedFS) error {
+	m.operationMu.RLock()
+	defer m.operationMu.RUnlock()
 	if sandboxID == "" || prepared == nil {
 		return fmt.Errorf("sandbox filesystem commit requires an ID and prepared state")
 	}
@@ -174,45 +181,36 @@ func (m *fsManager) Commit(sandboxID string, prepared *preparedFS) error {
 	if err != nil {
 		return fmt.Errorf("encode filesystem state for sandbox %s: %w", sandboxID, err)
 	}
-
-	waitStart := time.Now()
-	m.persistMu.Lock()
-	locked := time.Now()
-	defer func() {
-		m.persistMu.Unlock()
-		logrus.WithFields(logrus.Fields{"sandbox": sandboxID, "lock_wait_ms": locked.Sub(waitStart).Seconds() * 1000, "held_ms": time.Since(locked).Seconds() * 1000}).Debug("filesystem commit phases")
-	}()
-	m.mu.Lock()
-	if _, exists := m.sandboxState[sandboxID]; exists {
-		m.mu.Unlock()
-		return fmt.Errorf("filesystem state for sandbox %s already exists", sandboxID)
+	request := &fsCommit{id: sandboxID, prepared: prepared, state: state, done: make(chan error, 1), queued: time.Now()}
+	m.queueMu.Lock()
+	if m.closed {
+		m.queueMu.Unlock()
+		return fmt.Errorf("filesystem manager is shut down")
 	}
-	m.sandboxRootfs[sandboxID] = prepared.rootfs
-	if len(prepared.s3) > 0 {
-		m.sandboxS3Mount[sandboxID] = append([]*runtime.S3Config(nil), prepared.s3...)
+	m.pending = append(m.pending, request)
+	if !m.writing {
+		m.writing = true
+		go m.commitLoop()
 	}
-	if len(prepared.oci) > 0 {
-		m.sandboxOCIMount[sandboxID] = append([]string(nil), prepared.oci...)
-	}
-	m.sandboxState[sandboxID] = state
-	m.mu.Unlock()
-	if err := m.persistCurrentState(); err != nil {
-		m.mu.Lock()
-		delete(m.sandboxRootfs, sandboxID)
-		delete(m.sandboxS3Mount, sandboxID)
-		delete(m.sandboxOCIMount, sandboxID)
-		delete(m.sandboxState, sandboxID)
-		m.mu.Unlock()
-		return fmt.Errorf("persist filesystem state for sandbox %s: %w", sandboxID, err)
-	}
-	return nil
+	m.queueMu.Unlock()
+	return <-request.done
 }
 
 func (m *fsManager) Release(sandboxID string) error {
+	m.operationMu.RLock()
+	defer m.operationMu.RUnlock()
+	if m.closed {
+		return fmt.Errorf("filesystem manager is shut down")
+	}
 	return m.release(sandboxID, true)
 }
 
 func (m *fsManager) Shutdown() {
+	m.operationMu.Lock()
+	defer m.operationMu.Unlock()
+	m.queueMu.Lock()
+	m.closed = true
+	m.queueMu.Unlock()
 	m.mu.Lock()
 	rootfsRefs := make([]*langrtmanager.LanguageRuntime, 0, len(m.sandboxRootfs))
 	for _, rootfs := range m.sandboxRootfs {
@@ -293,13 +291,20 @@ func (m *fsManager) persistCurrentState() error {
 	m.mu.Unlock()
 
 	copied := time.Now()
+	return m.storeFSItems(items, start, copied, 1)
+}
+
+func (m *fsManager) storeFSItems(items map[string]sandboxFSState, start, copied time.Time, batch int) error {
+	if m.store == nil {
+		return nil
+	}
 	data, err := json.Marshal(storedSandboxFSStates{Items: items})
 	encoded := time.Now()
 	if err != nil {
 		return fmt.Errorf("encode sandbox filesystem state: %w", err)
 	}
 	defer func() {
-		logrus.WithFields(logrus.Fields{"entries": len(items), "bytes": len(data), "copy_ms": copied.Sub(start).Seconds() * 1000, "encode_ms": encoded.Sub(copied).Seconds() * 1000, "store_ms": time.Since(encoded).Seconds() * 1000}).Debug("filesystem persistence phases")
+		logrus.WithFields(logrus.Fields{"entries": len(items), "batch": batch, "bytes": len(data), "copy_ms": copied.Sub(start).Seconds() * 1000, "encode_ms": encoded.Sub(copied).Seconds() * 1000, "store_ms": time.Since(encoded).Seconds() * 1000}).Debug("filesystem persistence phases")
 	}()
 	if err := m.store.StoreRaw(config.SandboxFSStateBucket, data); err != nil {
 		return fmt.Errorf("store sandbox filesystem state: %w", err)
