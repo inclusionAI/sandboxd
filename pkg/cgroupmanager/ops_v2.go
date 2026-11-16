@@ -205,6 +205,10 @@ func (o *cgroupV2) newOOMWatcher() (oomWatcher, error) {
 	return newV2OOMWatcher(o.mountpoint)
 }
 
+func (o *cgroupV2) populated(name string) (bool, error) {
+	return readCgroupPopulated(filepath.Join(o.mountpoint, name, "cgroup.events"))
+}
+
 func (o *cgroupV2) kill(name string) error {
 	group, err := cgroup2.Load(name, cgroup2.WithMountpoint(o.mountpoint))
 	if err != nil {

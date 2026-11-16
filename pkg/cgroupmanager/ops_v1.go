@@ -150,6 +150,15 @@ func (*cgroupV1) newOOMWatcher() (oomWatcher, error) {
 	return newV1OOMWatcher()
 }
 
+func (*cgroupV1) populated(name string) (bool, error) {
+	group, err := cg.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
+	if err != nil {
+		return false, err
+	}
+	processes, err := group.Processes(cg.Memory, true)
+	return len(processes) != 0, err
+}
+
 func (*cgroupV1) kill(name string) error {
 	group, err := cg.Load(cg.StaticPath(name), cg.WithHiearchy(cg.Default))
 	if err != nil {
