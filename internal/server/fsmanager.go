@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
@@ -174,8 +175,13 @@ func (m *fsManager) Commit(sandboxID string, prepared *preparedFS) error {
 		return fmt.Errorf("encode filesystem state for sandbox %s: %w", sandboxID, err)
 	}
 
+	waitStart := time.Now()
 	m.persistMu.Lock()
-	defer m.persistMu.Unlock()
+	locked := time.Now()
+	defer func() {
+		m.persistMu.Unlock()
+		logrus.WithFields(logrus.Fields{"sandbox": sandboxID, "lock_wait_ms": locked.Sub(waitStart).Seconds() * 1000, "held_ms": time.Since(locked).Seconds() * 1000}).Debug("filesystem commit phases")
+	}()
 	m.mu.Lock()
 	if _, exists := m.sandboxState[sandboxID]; exists {
 		m.mu.Unlock()
@@ -275,6 +281,7 @@ func (m *fsManager) persistState() error {
 }
 
 func (m *fsManager) persistCurrentState() error {
+	start := time.Now()
 	if m.store == nil {
 		return nil
 	}
@@ -285,10 +292,15 @@ func (m *fsManager) persistCurrentState() error {
 	}
 	m.mu.Unlock()
 
+	copied := time.Now()
 	data, err := json.Marshal(storedSandboxFSStates{Items: items})
+	encoded := time.Now()
 	if err != nil {
 		return fmt.Errorf("encode sandbox filesystem state: %w", err)
 	}
+	defer func() {
+		logrus.WithFields(logrus.Fields{"entries": len(items), "bytes": len(data), "copy_ms": copied.Sub(start).Seconds() * 1000, "encode_ms": encoded.Sub(copied).Seconds() * 1000, "store_ms": time.Since(encoded).Seconds() * 1000}).Debug("filesystem persistence phases")
+	}()
 	if err := m.store.StoreRaw(config.SandboxFSStateBucket, data); err != nil {
 		return fmt.Errorf("store sandbox filesystem state: %w", err)
 	}

@@ -264,14 +264,17 @@ func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error 
 		return fmt.Errorf("marshal sandbox metadata %s: %w", data.ID, err)
 	}
 
+	encoded := time.Now()
 	if err := util.AtomicWriteFile(dataFile, bytes, 0600); err != nil {
 		return fmt.Errorf("save sandbox metadata %s: %w", data.ID, err)
 	}
+	written := time.Now()
 	stored, err := m.loadSandbox(sandboxRoot)
 	if err != nil {
 		return fmt.Errorf("load stored sandbox metadata %s: %w", data.ID, err)
 	}
 	m.sandboxes.Set(data.ID, stored)
+	logrus.WithFields(logrus.Fields{"sandbox": id, "marshal_ms": encoded.Sub(start).Seconds() * 1000, "atomic_write_ms": written.Sub(encoded).Seconds() * 1000, "reload_ms": time.Since(written).Seconds() * 1000}).Debug("sandbox metadata phases")
 	logrus.Debugf("store sandbox %s metadata success, cost %v", data.ID, time.Since(start).String())
 	return nil
 }

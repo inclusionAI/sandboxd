@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/typeurl/v2"
 	"github.com/gogo/protobuf/types"
@@ -85,19 +86,36 @@ type DecodeType struct {
 	Content []byte `json:"content"`
 }
 
-func (f *BboltStoreImp) StoreRaw(key string, data []byte) error {
+func (f *BboltStoreImp) StoreRaw(key string, data []byte) (retErr error) {
+	start := time.Now()
+	var opened, entered, updated, committed time.Time
+	defer func() {
+		logrus.WithFields(logrus.Fields{"key": key, "bytes": len(data), "open_ms": elapsedMS(start, opened), "begin_ms": elapsedMS(opened, entered), "put_ms": elapsedMS(entered, updated), "commit_ms": elapsedMS(updated, committed), "total_ms": time.Since(start).Seconds() * 1000, "success": retErr == nil}).Debug("durable raw store phases")
+	}()
 	db, err := bolt.Open(f.path, 0777, nil)
+	opened = time.Now()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	return db.Update(func(tx *bolt.Tx) error {
+	err = db.Update(func(tx *bolt.Tx) error {
+		entered = time.Now()
+		defer func() { updated = time.Now() }()
 		bucket, err := tx.CreateBucketIfNotExists([]byte(key))
 		if err != nil {
 			return err
 		}
 		return bucket.Put([]byte(key), append([]byte(nil), data...))
 	})
+	committed = time.Now()
+	return err
+}
+
+func elapsedMS(start, end time.Time) float64 {
+	if start.IsZero() || end.IsZero() {
+		return 0
+	}
+	return end.Sub(start).Seconds() * 1000
 }
 
 func (f *BboltStoreImp) Load(key string) (*types.Any, error) {
