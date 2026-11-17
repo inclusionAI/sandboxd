@@ -35,9 +35,9 @@ const (
 
 type firecrackerProcessMover func(string, int) error
 
-// withCheckpointSnapshotMemoryCharge moves the whole paused VMM to a shared,
-// unbounded cgroup v2 leaf for the native snapshot write. Existing guest memory
-// keeps its sandbox charge while new snapshot page cache stays outside it.
+// withCheckpointSnapshotMemoryCharge moves the whole paused VMM to its snapshot
+// cgroup v2 leaf. Existing guest memory keeps its sandbox charge while new
+// snapshot page cache stays outside it, under the optional separate budget.
 func (handler *Handler) withCheckpointSnapshotMemoryCharge(
 	sandboxCgroup string,
 	instance *firecrackerInstance,
@@ -47,11 +47,16 @@ func (handler *Handler) withCheckpointSnapshotMemoryCharge(
 	if cgroups.Mode() != cgroups.Unified {
 		return snapshot()
 	}
-	if err := ensureFirecrackerCheckpointCgroup(); err != nil {
+	checkpointCgroup := handler.checkpointCgroup
+	if checkpointCgroup == "" {
+		checkpointCgroup = firecrackerCheckpointCgroup
+	}
+	if err := ensureFirecrackerCheckpointCgroup(checkpointCgroup, handler.checkpointMemoryMax); err != nil {
 		return err
 	}
 	return withFirecrackerProcessInCheckpointCgroup(
 		sandboxCgroup,
+		checkpointCgroup,
 		state.PID,
 		snapshot,
 		attachFirecrackerProcess,
@@ -74,11 +79,16 @@ func (handler *Handler) withCheckpointSnapshotMemoryCharge(
 // sandbox cgroup root.
 func CheckpointCgroupPath() string { return firecrackerCheckpointCgroup }
 
-func ensureFirecrackerCheckpointCgroup() error {
+func ensureFirecrackerCheckpointCgroup(group string, maxBytes int64) error {
 	directory := filepath.Join(
 		firecrackerCgroupMountpoint,
-		strings.TrimPrefix(firecrackerCheckpointCgroup, "/"),
+		strings.TrimPrefix(group, "/"),
 	)
+	if maxBytes > 0 {
+		// A vanished or externally loosened budget must not be bypassed by
+		// recreating an unlimited group before moving the paused VMM.
+		return verifyCheckpointMemoryLimit(directory, maxBytes)
+	}
 	if err := os.Mkdir(directory, 0755); err != nil && !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("create Firecracker checkpoint cgroup: %w", err)
 	}
@@ -87,6 +97,7 @@ func ensureFirecrackerCheckpointCgroup() error {
 
 func withFirecrackerProcessInCheckpointCgroup(
 	sandboxCgroup string,
+	checkpointCgroup string,
 	pid int,
 	snapshot func() error,
 	move firecrackerProcessMover,
@@ -94,11 +105,12 @@ func withFirecrackerProcessInCheckpointCgroup(
 ) error {
 	cleanSandboxCgroup := filepath.Clean(sandboxCgroup)
 	if sandboxCgroup == "" || cleanSandboxCgroup == firecrackerCheckpointRootCgroup ||
-		cleanSandboxCgroup == firecrackerCheckpointCgroup {
+		cleanSandboxCgroup == filepath.Clean(checkpointCgroup) ||
+		!filepath.IsAbs(checkpointCgroup) || filepath.Clean(checkpointCgroup) == "/" {
 		return fmt.Errorf("Firecracker checkpoint requires a non-root sandbox cgroup")
 	}
 	started := time.Now()
-	if err := move(firecrackerCheckpointCgroup, pid); err != nil {
+	if err := move(checkpointCgroup, pid); err != nil {
 		return fmt.Errorf("move paused Firecracker VMM to checkpoint cgroup: %w", err)
 	}
 

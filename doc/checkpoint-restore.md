@@ -184,6 +184,12 @@ reclaimable under normal host memory pressure. If the move back fails, sandboxd
 leaves the guest paused and terminates the VMM rather than running workload
 threads outside the sandbox cgroup.
 
+Set `[plugin.resource] firecracker_checkpoint_memory_max_bytes = 2147483648` to limit newly charged native snapshot memory with a 2 GiB cgroup v2 budget. The value is an integer byte count, must be positive and aligned to the host page size, and requires enabled cgroup management. Zero leaves a new installation's historical behavior unchanged. The bounded group is a stable sibling derived from the normalized `cgroup_root_name`; different sandbox roots do not change one another's limits. Hardware and PVM handlers using the same root share the budget. No guest memory size, per-sandbox limit, snapshot format or synchronization guarantee changes.
+
+The budget uses `memory.max` across all writers, rather than reserving the logical size of each snapshot as permanently resident memory. Kernel reclaim and writeback can therefore throttle concurrent buffered output and extend the capture pause; the cap is not a promise of improved latency. Previously charged pages, overlay clones, userspace control allocations and old shared-group cache do not move retroactively into this budget. Keep a finite common ancestor and include this component's allowance in the deployment's total reserve; the option neither reserves extra host RAM nor subtracts live usage from scheduler capacity.
+
+Startup preserves a stricter finite limit. Setting or lowering a limit requires an unpopulated group whose remaining `memory.current` does not exceed the requested value; failed writes or mismatched readback reject the handler. A later omission of the option continues using an existing instance group and its limit, so a configuration edit cannot silently route writes around that limit. Increasing an existing hard cap or disabling it requires a separately controlled operator change after draining; restarting alone does not raise it. A capture refuses a missing or loosened budget before moving the VMM instead of recreating an unlimited group. Maintenance emptiness checks include both the historical group and the current instance group. Sandboxd does not delete either group or evict old checkpoints to install the policy.
+
 Restore does not use that paused-snapshot window and still reserves transient
 node memory, raises the target VMM cgroup limit, and retains the raised limit
 for the sandbox lifetime. cgroup v1 and hybrid deployments also retain the
