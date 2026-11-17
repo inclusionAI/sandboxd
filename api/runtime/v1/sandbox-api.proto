@@ -275,6 +275,10 @@ message StartRequest {
   string inject_entrypoint = 22;
   // PreferImagePath lets the image's PATH override the request's fallback PATH.
   bool prefer_image_path = 23;
+  // ProcessUser overrides the OCI base user. Omitted preserves the base user;
+  // an explicit message containing zero values selects root (0:0).
+  // UID/GID 4294967295 are reserved by Linux and are rejected.
+  ProcessUser process_user = 24;
 }
 
 // StartResponse is returned after sandbox start.
@@ -392,6 +396,9 @@ message SandboxStatus {
   LinuxSandboxResources resources = 14;
   // MetricLabels contains sandbox metadata intended for metric dimensions.
   map<string, string> metric_labels = 15;
+  // ProcessUser is the initial identity configured in the persisted OCI spec,
+  // not a live observation of credentials changed by the application.
+  ProcessUser process_user = 16;
 }
 
 // KeyValue represents a string key-value pair.
@@ -502,4 +509,11 @@ message ListAvailableRuntimesResponse {
   repeated string runtime_classes = 1;
   // Runtimes contains detailed capabilities in runtime_classes order.
   repeated RuntimeInfo runtimes = 2;
+}
+
+// ProcessUser selects the numeric identity of the sandbox's initial process.
+// No passwd/group lookup or filesystem ownership change is performed.
+message ProcessUser {
+  uint32 uid = 1;
+  uint32 gid = 2;
 }

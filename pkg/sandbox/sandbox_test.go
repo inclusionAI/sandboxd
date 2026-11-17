@@ -116,13 +116,14 @@ func TestSandbox_ApiStatus(t *testing.T) {
 				PATH: "/root",
 			},
 			want: &runtime.SandboxStatus{
-				ID:        "123",
-				Command:   []string{"a", "b"},
-				Runtime:   "runsc",
-				Stdout:    "/root/stdout",
-				Stderr:    "/root/stderr",
-				ExitCode:  0,
-				StartedAt: 202308201132,
+				ProcessUser: &runtime.ProcessUser{},
+				ID:          "123",
+				Command:     []string{"a", "b"},
+				Runtime:     "runsc",
+				Stdout:      "/root/stdout",
+				Stderr:      "/root/stderr",
+				ExitCode:    0,
+				StartedAt:   202308201132,
 				Labels: map[string]string{
 					"test": "test",
 				},
@@ -183,5 +184,13 @@ func TestSandbox_ApiStatus(t *testing.T) {
 				t.Errorf("ApiStatus() = %v\nwant %v", string(b1), string(b2))
 			}
 		})
+	}
+}
+
+func TestApiStatusProcessUserFromSpec(t *testing.T) {
+	sb := &Sandbox{Metadata: &runtime.SandboxMetadata{ID: "sbox-user"}, Status: &statusStorage{}, Spec: &spec.Spec{Process: &spec.Process{User: spec.User{UID: 1000, GID: 1001}}}}
+	got := sb.ApiStatus().ProcessUser
+	if got == nil || got.Uid != 1000 || got.Gid != 1001 {
+		t.Fatalf("configured user = %v", got)
 	}
 }

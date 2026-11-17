@@ -64,6 +64,10 @@ var StartCmd = cli.Command{
 			Usage: "runtime-specific configuration as a JSON object",
 		},
 		cli.StringFlag{
+			Name:  "user",
+			Usage: "initial process numeric UID:GID (for example 1000:1000)",
+		},
+		cli.StringFlag{
 			Name:  "cwd",
 			Usage: "working directory inside the sandbox",
 			Value: "/",
@@ -155,6 +159,14 @@ var StartCmd = cli.Command{
 			return err
 		}
 
+		var processUser *runtime.ProcessUser
+		if context.IsSet("user") {
+			processUser, err = parseStartUser(context.String("user"))
+			if err != nil {
+				return err
+			}
+		}
+
 		resources := make(map[string]float64)
 		if cpu := context.Float64("cpu-millicores"); cpu > 0 {
 			resources["CPU"] = cpu
@@ -186,6 +198,7 @@ var StartCmd = cli.Command{
 			WritableLayerLimitBytes: writableLayerLimitBytes,
 			ExtraConfig:             extraConfig,
 			InjectEntrypoint:        context.String("inject-entrypoint"),
+			ProcessUser:             processUser,
 		})
 		if err != nil {
 			return err
@@ -326,4 +339,23 @@ func parseMountFlags(flags []string) ([]*runtime.Mount, error) {
 		})
 	}
 	return mounts, nil
+}
+
+func parseStartUser(value string) (*runtime.ProcessUser, error) {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("--user requires numeric UID:GID")
+	}
+	ids := [2]uint32{}
+	for i, part := range parts {
+		if part == "" || strings.IndexFunc(part, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+			return nil, fmt.Errorf("--user requires numeric UID:GID")
+		}
+		n, err := strconv.ParseUint(part, 10, 32)
+		if err != nil || n == uint64(^uint32(0)) {
+			return nil, fmt.Errorf("--user IDs must be in 0..4294967294")
+		}
+		ids[i] = uint32(n)
+	}
+	return &runtime.ProcessUser{Uid: ids[0], Gid: ids[1]}, nil
 }

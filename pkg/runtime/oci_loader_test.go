@@ -359,3 +359,37 @@ func containsString(values []string, target string) bool {
 	}
 	return false
 }
+
+func TestGenerateOciProcessUser(t *testing.T) {
+	umask := uint32(0027)
+	for _, tc := range []struct {
+		name       string
+		user       *User
+		checkpoint string
+		want       User
+	}{
+		{"omitted preserves base", nil, "", User{UID: 2000, GID: 2001, AdditionalGids: []uint32{2002}, Umask: &umask}},
+		{"numeric user clears old groups", &User{UID: 1000, GID: 1001}, "", User{UID: 1000, GID: 1001, Umask: &umask}},
+		{"explicit root overrides base", &User{}, "", User{Umask: &umask}},
+		{"restore preserves saved groups and umask", &User{UID: 1000, GID: 1001, AdditionalGids: []uint32{1002}}, "/checkpoint", User{UID: 1000, GID: 1001, AdditionalGids: []uint32{1002}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loader, err := NewBundleLoader("", t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := User{UID: 2000, GID: 2001, AdditionalGids: []uint32{2002}, Umask: &umask}
+			loader.baseSpec.Process.User = base
+			_, spec, err := loader.GenerateOci(OciLoadOptions{SandboxID: "sbox-user", CgroupPath: "/sandbox/test", Config: StartConfig{Rootfs: t.TempDir(), Resources: &runtime.LinuxSandboxResources{}, ProcessUser: tc.user, CheckpointDir: tc.checkpoint}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(spec.Process.User, tc.want) {
+				t.Fatalf("user = %#v, want %#v", spec.Process.User, tc.want)
+			}
+			if !reflect.DeepEqual(loader.baseSpec.Process.User, base) {
+				t.Fatal("base spec mutated")
+			}
+		})
+	}
+}

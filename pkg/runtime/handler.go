@@ -101,6 +101,9 @@ type StartConfig struct {
 	ExtraConfig             string
 	EnableKVM               bool
 	CheckpointDir           string
+	// ProcessUser overrides the initial OCI identity. Fresh starts retain the
+	// base umask; restores carry the complete user saved with the checkpoint.
+	ProcessUser *User
 	// InitialFiles are platform-owned gVisor files installed before the first process.
 	// Restore must use the saved filesystem state instead of replaying them.
 	InitialFiles []InitialFile

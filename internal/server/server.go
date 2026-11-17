@@ -424,6 +424,10 @@ func (h *sandboxService) List(ctx context.Context, request *runtime.ListSandboxe
 		if c == nil || c.Status == nil || c.Metadata == nil {
 			continue
 		}
+		var processUser *runtime.ProcessUser
+		if c.Spec != nil && c.Spec.Process != nil {
+			processUser = &runtime.ProcessUser{Uid: c.Spec.Process.User.UID, Gid: c.Spec.Process.User.GID}
+		}
 		response.Sandboxes = append(response.Sandboxes, &runtime.SandboxStatus{
 			ID:           c.Metadata.ID,
 			Runtime:      c.Metadata.RuntimeHandler,
@@ -435,6 +439,7 @@ func (h *sandboxService) List(ctx context.Context, request *runtime.ListSandboxe
 			MetricLabels: copyStringMap(c.Metadata.MetricLabels),
 			Stdout:       c.Metadata.Stdout,
 			Stderr:       c.Metadata.Stderr,
+			ProcessUser:  processUser,
 		})
 	}
 	return response, nil
@@ -1267,6 +1272,10 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
 		}
 	}
+	processUser, err := resolveProcessUser(startReq.ProcessUser, checkpointDir)
+	if err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+	}
 	if startReq.Runtime == "" {
 		startReq.Runtime = config.RuntimeNameRunsc
 	}
@@ -1702,6 +1711,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		ExtraConfig:             startReq.ExtraConfig,
 		EnableKVM:               extraConfig.EnableKVM,
 		CheckpointDir:           checkpointDir,
+		ProcessUser:             processUser,
 		InitialFiles:            sandboxFiles.InitialFiles(),
 		ManagedHosts:            sandboxFiles.ManagedHosts(),
 	}

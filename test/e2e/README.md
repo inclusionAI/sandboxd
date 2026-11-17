@@ -285,3 +285,13 @@ The provisioner boots the unchanged qualified distro kernel with VMX/SVM hidden,
 The isolated runner's `/opt/akernel-pvm-ci/fixtures.json` identifies its anonymous local OCI/Nydus registry and pinned image fixtures. PVM runtime CI uses its Redis OCI fixture through an explicit HTTP registry scheme; ordinary E2E retains its HTTPS/default image settings. This removes public-registry connectivity from guest boot/restore acceptance without replacing image-provider tests with directory roots. Preserve failed-run artifacts; a registry-resolution timeout does not prove a guest-agent timeout.
 
 The external Redis DNAT client waits for an explicit `ready` signal from the suite after the guest Redis responds to PING. The unchanged 300-second DNAT readiness budget starts at that stage; earlier checkpoint and host-mount tests do not consume it. The pre-stage wait is separately bounded by `E2E_REDIS_STAGE_TIMEOUT_SECONDS` (default 1800) and exits when the suite container stops. The guest-agent boot budget remains 15 seconds.
+
+## Initial process UID/GID
+
+`process-user.sh` exercises the numeric startup identity against an already running, isolated daemon. It requires `sbox`, `checkpoint-restore`, `jq`, a root filesystem containing a shell, `id` and `sleep`, and privileges to prepare a caller-owned directory with UID/GID 1000:1001. The fixture root must not contain passwd/group entries for these IDs. The tests cover default/explicit root, numeric identity, writable bind ownership, rejected writes, status, checkpoint/restore and preservation of caller-owned files on deletion.
+
+```sh
+TEST_DIR=/e2e/process-user ROOTFS=/e2e/rootfs SOCKET=/run/sandboxd/sandboxd.sock RUNTIME=runsc bash test/e2e/process-user.sh
+```
+
+Use `CHECKPOINT=0` for runc, whose adapter does not implement checkpoint/restore. Firecracker writable binds require the existing virtio-fs profile and an EROFS or directory root supported by that profile. An optional `DAEMON_RESTART_HELPER` executable can restart only the caller's isolated daemon before checkpoint; it must wait for the daemon to be ready and retain the existing resource-pool state. That optional step checks that the sandbox remains running and its initial identity survives recovery. The script does not change `sbox exec` defaults.

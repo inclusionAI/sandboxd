@@ -119,6 +119,19 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		setNetworkNamespace(ociSpec.Linux, options.NetworkNameSpace)
 	}
 
+	if user := options.Config.ProcessUser; user != nil {
+		baseUmask := ociSpec.Process.User.Umask
+		ociSpec.Process.User = *user
+		ociSpec.Process.User.AdditionalGids = append([]uint32(nil), user.AdditionalGids...)
+		if options.Config.CheckpointDir == "" {
+			// A fresh numeric override retains unrelated base policy, but does
+			// not inherit the previous user's supplementary groups or name.
+			ociSpec.Process.User.Umask = baseUmask
+			ociSpec.Process.User.AdditionalGids = nil
+			ociSpec.Process.User.Username = ""
+		}
+	}
+
 	if options.Config.Cwd != "" {
 		ociSpec.Process.Cwd = options.Config.Cwd
 	}
