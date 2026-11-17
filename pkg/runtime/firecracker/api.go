@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -127,6 +128,9 @@ func (api *firecrackerAPI) createSnapshot(
 	fsStatePath,
 	snapshotType string,
 ) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	body := map[string]any{
 		"snapshot_type": snapshotType,
 		"snapshot_path": statePath,
@@ -139,7 +143,13 @@ func (api *firecrackerAPI) createSnapshot(
 	// Checkpoint artifacts deliberately remain in the host page cache. The
 	// caller accepts that success does not imply immediate power-loss
 	// durability; avoiding a forced writeback keeps the pause path short.
-	return api.put(ctx, "/snapshot/create", body)
+	// Closing the HTTP request cannot interrupt the VMM's memory-file write.
+	// Keep the native request and its caller-owned cgroup/operation leases until
+	// the VMM replies. The RPC waiter may already have returned cancellation;
+	// the capture worker still owns cleanup and must not move the writer back
+	// into the sandbox's normal memory limit while that write is in progress.
+	err := api.put(context.WithoutCancel(ctx), "/snapshot/create", body)
+	return errors.Join(err, ctx.Err())
 }
 
 func (api *firecrackerAPI) loadSnapshot(

@@ -1690,7 +1690,8 @@ type CheckpointRequest struct {
 	ID string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	// CheckpointDir is an absolute caller-owned output directory.
 	CheckpointDir string `protobuf:"bytes,2,opt,name=checkpoint_dir,json=checkpointDir,proto3" json:"checkpoint_dir,omitempty"`
-	// TimeoutSeconds bounds the complete checkpoint operation and must be non-zero.
+	// TimeoutSeconds bounds the RPC wait and must be non-zero. Uninterruptible
+	// native work retains its resources until capture and cleanup actually finish.
 	TimeoutSeconds uint32 `protobuf:"varint,3,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
 	// Compress enables runtime-supported checkpoint compression.
 	Compress bool `protobuf:"varint,4,opt,name=compress,proto3" json:"compress,omitempty"`
