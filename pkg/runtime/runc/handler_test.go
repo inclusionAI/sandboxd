@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,31 @@ import (
 func TestRuncCgroupPathUsesRuntimeOwnedChild(t *testing.T) {
 	assert.Equal(t, "/sandbox/sbox-test/runc", runcCgroupPath("/sandbox/sbox-test"))
 	assert.Empty(t, runcCgroupPath(""))
+}
+
+func TestAbortShimStopsTheInFlightRuncLauncher(t *testing.T) {
+	bundle := t.TempDir()
+	shim := filepath.Join(bundle, "fake-shim")
+	require.NoError(t, os.WriteFile(shim, []byte(`#!/bin/sh
+sleep 30 &
+printf '%s' "$!" > "$0.child"
+wait
+`), 0700))
+	handler := &Handler{shimBinary: shim}
+	abort, err := handler.launchShim(bundle, runtimecore.StartConfig{ID: "sbox-shim-abort"})
+	require.NoError(t, err)
+	t.Cleanup(abort)
+	var child string
+	require.Eventually(t, func() bool {
+		data, err := os.ReadFile(shim + ".child")
+		child = strings.TrimSpace(string(data))
+		return err == nil && child != ""
+	}, time.Second, 10*time.Millisecond)
+	abort()
+	require.Eventually(t, func() bool {
+		data, err := os.ReadFile(filepath.Join("/proc", child, "stat"))
+		return errors.Is(err, os.ErrNotExist) || strings.Contains(string(data), ") Z ")
+	}, time.Second, 10*time.Millisecond, "runc launcher survived the shim abort")
 }
 
 type cancellingOciLoader struct {

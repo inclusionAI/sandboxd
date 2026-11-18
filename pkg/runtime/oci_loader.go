@@ -203,6 +203,7 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		if len(updates.Envs) > 0 {
 			ociSpec.Process.Env = combineEnvs(ociSpec.Process.Env, updates.Envs)
 		}
+		ociSpec.Process.Env = prependLibraryPaths(ociSpec.Process.Env, updates.PrependLibraryPaths)
 		if len(updates.Prestart) > 0 {
 			if ociSpec.Hooks == nil {
 				ociSpec.Hooks = &Hooks{}
@@ -210,6 +211,9 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 			ociSpec.Hooks.Prestart = append(ociSpec.Hooks.Prestart, updates.Prestart...)
 		}
 		ociSpec.Annotations = combineAnnotations(ociSpec.Annotations, updates.Annotations)
+		if err := applyProviderDevicesAndMounts(ociSpec, updates); err != nil {
+			return "", ociSpec, err
+		}
 	}
 
 	if options.UseGVisorRootfsImageAnnotations {
@@ -233,6 +237,69 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 	buf, _ := util.UnescapedMarshal(ociSpec)
 	logrus.Debugf("write spec to %v, content: %v", ociFile, string(buf))
 	return bundleDir, ociSpec, os.WriteFile(ociFile, buf, 0644)
+}
+
+func applyProviderDevicesAndMounts(spec *Spec, updates *SpecUpdates) error {
+	if spec.Linux == nil {
+		spec.Linux = &Linux{}
+	}
+	if len(updates.DeviceCgroupRules) > 0 && spec.Linux.Resources == nil {
+		spec.Linux.Resources = &LinuxResources{}
+	}
+	devicePaths := make(map[string]struct{}, len(spec.Linux.Devices)+len(updates.LinuxDevices))
+	for _, device := range spec.Linux.Devices {
+		devicePaths[device.Path] = struct{}{}
+	}
+	for _, device := range updates.LinuxDevices {
+		if device.Path == "" || !filepath.IsAbs(device.Path) || device.Type != "c" ||
+			device.Major < 0 || device.Minor < 0 {
+			return fmt.Errorf("invalid provider device %q", device.Path)
+		}
+		if _, duplicate := devicePaths[device.Path]; duplicate {
+			return fmt.Errorf("provider device conflicts at %s", device.Path)
+		}
+		devicePaths[device.Path] = struct{}{}
+		spec.Linux.Devices = append(spec.Linux.Devices, device)
+	}
+	for _, rule := range updates.DeviceCgroupRules {
+		if !rule.Allow || rule.Type != "c" || rule.Major == nil || rule.Minor == nil ||
+			*rule.Major < 0 || *rule.Minor < 0 || rule.Access != "rwm" {
+			return errors.New("invalid provider device cgroup rule")
+		}
+		spec.Linux.Resources.Devices = append(spec.Linux.Resources.Devices, rule)
+	}
+	mountTargets := make(map[string]struct{}, len(spec.Mounts)+len(updates.Mounts))
+	for _, mount := range spec.Mounts {
+		mountTargets[filepath.Clean(mount.Destination)] = struct{}{}
+	}
+	for _, mount := range updates.Mounts {
+		destination := mount.Destination
+		if !filepath.IsAbs(destination) || filepath.Clean(destination) != destination || destination == "/" || !filepath.IsAbs(mount.Source) ||
+			mount.Type != "bind" || !containsMountOption(mount.Options, "ro") {
+			return fmt.Errorf("invalid provider mount %s -> %s", mount.Source, mount.Destination)
+		}
+		if _, conflict := mountTargets[destination]; conflict {
+			return fmt.Errorf("provider mount conflicts at %s", destination)
+		}
+		mountTargets[destination] = struct{}{}
+	}
+	if len(updates.Mounts) != 0 {
+		mounts, err := mergeOCIMounts(spec.Mounts, updates.Mounts)
+		if err != nil {
+			return fmt.Errorf("merge provider mounts: %w", err)
+		}
+		spec.Mounts = mounts
+	}
+	return nil
+}
+
+func containsMountOption(options []string, expected string) bool {
+	for _, option := range options {
+		if option == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func setNetworkNamespace(linux *Linux, path string) {
@@ -435,6 +502,37 @@ func combineAnnotations(annotations map[string]string, annoToAdd map[string]stri
 		}
 	}
 	return annotations
+}
+
+func prependLibraryPaths(envs, providerPaths []string) []string {
+	if len(providerPaths) == 0 {
+		return envs
+	}
+	const prefix = "LD_LIBRARY_PATH="
+	var existing string
+	result := make([]string, 0, len(envs)+1)
+	for _, env := range envs {
+		if strings.HasPrefix(env, prefix) {
+			existing = strings.TrimPrefix(env, prefix)
+		} else {
+			result = append(result, env)
+		}
+	}
+	paths := make([]string, 0, len(providerPaths))
+	seen := make(map[string]bool)
+	appendPaths := func(values []string) {
+		for _, value := range values {
+			// Empty entries search the process working directory, so never
+			// introduce or retain them in the merged driver search path.
+			if value != "" && !seen[value] {
+				paths = append(paths, value)
+				seen[value] = true
+			}
+		}
+	}
+	appendPaths(providerPaths)
+	appendPaths(strings.Split(existing, ":"))
+	return append(result, prefix+strings.Join(paths, ":"))
 }
 
 func combineEnvs(envs []string, overrides []*runtime.KeyValue) []string {
