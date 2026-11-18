@@ -232,6 +232,10 @@ type RuncConfig struct {
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.
 type FirecrackerConfig struct {
+	// ShutdownGracePeriodMillis controls the wait after requesting guest
+	// shutdown, before escalating to host signals. Zero preserves 2000ms;
+	// explicit positive values are 1..10000ms.
+	ShutdownGracePeriodMillis int `toml:"shutdown_grace_period_ms" json:"shutdownGracePeriodMs"`
 	// WritableIOEngine selects Sync, Async, SyncDirect, or AsyncDirect for
 	// the private ext4 disk. Direct engines require a compatible VMM.
 	// The host must provide STATX_DIOALIGN for direct engines and io_uring
@@ -270,6 +274,14 @@ type FirecrackerConfig struct {
 
 type ResourceConfig struct {
 	MaxInstanceNum int `toml:"max_instance_num" json:"maxInstanceNum"`
+
+	// FirecrackerCheckpointConcurrency bounds memory-intensive Firecracker
+	// checkpoint and restore operations together. Zero preserves the historical
+	// single-operation limit. Existing node-memory and cgroup rules still apply.
+	FirecrackerCheckpointConcurrency int `toml:"firecracker_checkpoint_concurrency" json:"firecrackerCheckpointConcurrency"`
+	// FirecrackerRestoreConcurrency optionally gives restores an independent
+	// operation pool. Zero keeps the shared checkpoint/restore limit above.
+	FirecrackerRestoreConcurrency int `toml:"firecracker_restore_concurrency" json:"firecrackerRestoreConcurrency"`
 
 	// MemoryLimit optionally budgets and caps the sandbox parent on cgroup v2.
 	MemoryLimit MemoryLimitConfig `toml:"memory_limit" json:"memoryLimit"`

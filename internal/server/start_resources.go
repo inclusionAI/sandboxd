@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
@@ -122,6 +123,16 @@ func (h *sandboxService) allocateStartResource(
 	sandboxID,
 	name string,
 ) (string, *networkmanager.NetResource, error) {
+	started := time.Now()
+	defer func() {
+		if runtimeName == config.RuntimeNameFirecracker {
+			logrus.WithFields(logrus.Fields{
+				"sandbox_id": sandboxID,
+				"resource":   name,
+				"elapsed_us": time.Since(started).Microseconds(),
+			}).Info("firecracker start resource allocation")
+		}
+	}()
 	switch name {
 	case config.ResourceNameCgroup:
 		if h.cgroupMgr == nil {
