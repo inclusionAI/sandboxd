@@ -41,7 +41,7 @@ func TestFetchAndExtractBootstrapReusesCachedBootstrap(t *testing.T) {
 
 	client := &RegistryClient{
 		bootstrapCache: newBootstrapCache(),
-		fetchImageWithFallbackFn: func(context.Context, string, string) (v1.Image, error) {
+		fetchImageFn: func(context.Context, string, string, bool) (v1.Image, error) {
 			proxyFetches++
 			return empty.Image, nil
 		},

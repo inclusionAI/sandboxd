@@ -167,6 +167,10 @@ func (c *Client) FetchImage(ctx context.Context, imageRef string, proxyURL strin
 
 	stageStart = time.Now()
 	options := []remote.Option{remote.WithAuthFromKeychain(c.keychain), remote.WithContext(ctx)}
+	if _, ok := ctx.Value(rateLimitCancelKey{}).(context.CancelCauseFunc); ok {
+		// Bootstrap preparation owns retries and their deadline.
+		options = append(options, remote.WithRetryBackoff(remote.Backoff{Steps: 1}))
+	}
 	transport := c.getOrCreateTransport(proxyURL)
 	options = append(options, remote.WithTransport(transport))
 	transportDuration := time.Since(stageStart)
@@ -208,7 +212,9 @@ func (c *Client) getOrCreateTransport(proxyURL string) *registryTransport {
 		return transport
 	}
 
-	transport := &registryTransport{base: newRegistryBaseTransport(proxyURL), registrySchemes: c.registrySchemes}
+	transport := &registryTransport{
+		base: newRegistryBaseTransport(proxyURL), registrySchemes: c.registrySchemes, usingProxy: proxyURL != "",
+	}
 	c.transportCache[cacheKey] = transport
 	return transport
 }
@@ -233,6 +239,9 @@ func newRegistryBaseTransport(proxyURL string) *http.Transport {
 	}
 
 	transport.Proxy = http.ProxyURL(proxyURLParsed)
+	transport.OnProxyConnectResponse = func(ctx context.Context, _ *url.URL, _ *http.Request, resp *http.Response) error {
+		return cancelOnRateLimit(ctx, resp, true)
+	}
 	return transport
 }
 
@@ -240,6 +249,7 @@ type registryTransport struct {
 	base            *http.Transport
 	roundTripper    http.RoundTripper
 	registrySchemes map[string]string
+	usingProxy      bool
 }
 
 func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -273,6 +283,11 @@ func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		return nil, err
 	}
 
+	if err := cancelOnRateLimit(req.Context(), resp, t.usingProxy); err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
+
 	if shouldCloseConnOnServerError(resp) && conn != nil {
 		resp.Body = &closeConnBody{
 			ReadCloser: resp.Body,
@@ -283,6 +298,47 @@ func (t *registryTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	resp.Body = &registryResponseBody{ReadCloser: resp.Body, ctx: req.Context()}
 
 	return resp, nil
+}
+
+// RateLimitError identifies the source of a registry HTTP 429.
+type RateLimitError struct {
+	Proxy      bool
+	RetryAfter string
+}
+
+func (e *RateLimitError) Error() string {
+	source := "registry or upstream"
+	if e.Proxy {
+		source = "Dragonfly proxy"
+	}
+	if e.RetryAfter != "" {
+		return fmt.Sprintf("%s returned HTTP 429 (Retry-After: %q)", source, e.RetryAfter)
+	}
+	return source + " returned HTTP 429"
+}
+
+func (e *RateLimitError) Unwrap() error { return errord.ErrResourceExhausted }
+
+type rateLimitCancelKey struct{}
+
+// WithRateLimitCancellation scopes a pull attempt that stops at the first 429.
+// The cause survives registry authentication probes and lazy layer reads.
+func WithRateLimitCancellation(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	return context.WithValue(ctx, rateLimitCancelKey{}, cancel), func() { cancel(nil) }
+}
+
+func cancelOnRateLimit(ctx context.Context, resp *http.Response, usingProxy bool) error {
+	cancel, ok := ctx.Value(rateLimitCancelKey{}).(context.CancelCauseFunc)
+	if !ok || resp.StatusCode != http.StatusTooManyRequests {
+		return nil
+	}
+	err := &RateLimitError{
+		Proxy:      usingProxy && resp.Header.Get("X-Dragonfly-Error-Type") == "proxy",
+		RetryAfter: resp.Header.Get("Retry-After"),
+	}
+	cancel(err)
+	return err
 }
 
 // A server can finish a response body as it observes a canceled request. Keep
