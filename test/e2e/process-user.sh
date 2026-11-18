@@ -8,19 +8,21 @@ set -Eeuo pipefail
 SOCKET="${SOCKET:-/run/sandboxd/sandboxd.sock}"
 RUNTIME="${RUNTIME:-runsc}"
 CHECKPOINT="${CHECKPOINT:-1}"
-PREFIX="${SANDBOXD_USER_TEST_PREFIX:-sbox-user-${RUNTIME}}"
+RUN_ID=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+PREFIX="${SANDBOXD_USER_TEST_PREFIX:-sbox-user-${RUNTIME}}-${RUN_ID}"
+created_ids=()
 sbox_cmd() { sbox --address "${SOCKET}" --timeout 60s "$@"; }
 helper() { checkpoint-restore --socket "${SOCKET}" "$@"; }
 cleanup() {
     local status=$?
     trap - EXIT
-    for suffix in default root source restored conflict; do
-        helper --action delete --sandbox-id "${PREFIX}-${suffix}" >/dev/null 2>&1 || true
+    for id in "${created_ids[@]}"; do
+        helper --action delete --sandbox-id "${id}" >/dev/null 2>&1 || true
     done
     exit "${status}"
 }
-trap cleanup EXIT
 mkdir "${TEST_DIR}"
+trap cleanup EXIT
 mkdir "${TEST_DIR}/rw" "${TEST_DIR}/denied"
 chown 1000:1001 "${TEST_DIR}/rw"
 chmod 0700 "${TEST_DIR}/rw"
@@ -33,6 +35,7 @@ for mode in default root; do
         --rootfs "${ROOTFS}" --cwd / --cpu-millicores 1000 --memory-mb 256 \
         --stdout "${TEST_DIR}/${mode}.stdout" --stderr "${TEST_DIR}/${mode}.stderr" \
         "${args[@]}" /bin/sh -c 'echo "$(id -u):$(id -g)"; exec sleep 600'
+    created_ids+=("${PREFIX}-${mode}")
     for _ in $(seq 1 100); do
         grep -Eq '^0:0[[:space:]]*$' "${TEST_DIR}/${mode}.stdout" && break
         sleep .1
@@ -60,6 +63,7 @@ sbox_cmd start --runtime "${RUNTIME}" --sandbox-id "${PREFIX}-source" \
     --stdout "${TEST_DIR}/user.stdout" --stderr "${TEST_DIR}/user.stderr" \
     --mount "${TEST_DIR}/rw:/workspace:bind:rbind,rw" \
     --mount "${TEST_DIR}/denied:/denied:bind:rbind,rw" /bin/sh -c "${workload}"
+created_ids+=("${PREFIX}-source")
 for _ in $(seq 1 100); do
     [ -f "${TEST_DIR}/rw/ready" ] && break
     sleep .1
@@ -94,11 +98,13 @@ if [ "${CHECKPOINT}" = 1 ]; then
     if helper --action restore --target-id "${PREFIX}-conflict" \
         --request-file "${TEST_DIR}/conflict.json" --checkpoint-dir "${TEST_DIR}/checkpoint" \
         > "${TEST_DIR}/conflict.log" 2>&1; then
+        created_ids+=("${PREFIX}-conflict")
         echo 'ERROR: restore accepted conflicting UID/GID' >&2; exit 1
     fi
     grep -q 'conflicts with checkpoint identity' "${TEST_DIR}/conflict.log"
     helper --action restore --target-id "${PREFIX}-restored" \
         --request-file "${TEST_DIR}/request.json" --checkpoint-dir "${TEST_DIR}/checkpoint"
+    created_ids+=("${PREFIX}-restored")
     sbox_cmd inspect "${PREFIX}-restored" | tee "${TEST_DIR}/inspect-restored.json" |
         jq -e '.process_user == {"uid":1000,"gid":1001}' >/dev/null
     printf 'go\n' > "${TEST_DIR}/rw/proceed"

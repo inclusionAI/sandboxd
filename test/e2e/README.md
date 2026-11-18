@@ -295,3 +295,5 @@ TEST_DIR=/e2e/process-user ROOTFS=/e2e/rootfs SOCKET=/run/sandboxd/sandboxd.sock
 ```
 
 Use `CHECKPOINT=0` for runc, whose adapter does not implement checkpoint/restore. Firecracker writable binds require the existing virtio-fs profile and an EROFS or directory root supported by that profile. An optional `DAEMON_RESTART_HELPER` executable can restart only the caller's isolated daemon before checkpoint; it must wait for the daemon to be ready and retain the existing resource-pool state. That optional step checks that the sandbox remains running and its initial identity survives recovery. The script does not change `sbox exec` defaults.
+
+`process-user-handoff.sh` exercises Firecracker with UID/GID 1000:1001, reads the private initial environment, and consumes the checkpoint FIFO and updated environment across two checkpoint/restore generations. Use the same `TEST_DIR`, `ROOTFS`, and `SOCKET` variables as above. It requires virtio-fs and adds `cat` and `tr` to the rootfs prerequisites. Each identity test invocation uses a unique sandbox prefix and cleans only IDs it successfully created.
