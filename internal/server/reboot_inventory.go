@@ -69,12 +69,17 @@ func (h *sandboxService) rebootInventoryEmpty(ctx context.Context) error {
 		}
 	}
 	// Firecracker can temporarily move a VMM outside its sandbox subtree.
-	empty, err := h.cgroupMgr.WorkloadsEmpty(firecracker.CheckpointCgroupPath())
-	if err != nil {
-		return err
-	}
-	if !empty {
-		return errors.New("sandbox cgroups still contain processes")
+	for _, sibling := range []string{
+		firecracker.CheckpointCgroupPath(),
+		firecracker.CheckpointCgroupPathForRoot(h.config.CgroupRootName),
+	} {
+		empty, err := h.cgroupMgr.WorkloadsEmpty(sibling)
+		if err != nil {
+			return err
+		}
+		if !empty {
+			return errors.New("sandbox cgroups still contain processes")
+		}
 	}
 	return ctx.Err()
 }

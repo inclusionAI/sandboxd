@@ -29,6 +29,12 @@ The parent's own old limit is excluded when calculating T, so restarts do not su
 
 For example, T=64GiB and total_reserve=22GiB give candidate=42GiB, regardless of an independent distill-fs limit of 8GiB or 64GiB. If an existing parent cap is 32GiB, it is preserved and the reporting ceiling is 32GiB. A Kubernetes provider reporting 28GiB yields 28GiB: its already-reserved capacity is clipped, not reduced by the total reserve a second time. Sandbox live usage is not subtracted from this capacity; the scheduler already tracks sandbox allocations and subtracts them from capacity.
 
+## Firecracker checkpoint memory outside the sandbox parent
+
+The optional `[plugin.resource] firecracker_checkpoint_memory_max_bytes` applies a separate cgroup v2 hard limit to new native snapshot memory charges. It is independent of the sandbox parent and operation-concurrency controls. Include that allowance in `memory_limit.total_reserve` together with system, control and other outside-parent components; there is no automatic second deduction from scheduler capacity. For example, a 12 GiB common ancestor, a 4 GiB total reserve and a 2 GiB snapshot cap leave an 8 GiB sandbox parent and 2 GiB of the selected reserve for other outside-parent components. This is a deployment example, not a default or an assertion about live peaks. A shared finite ancestor is still necessary to constrain the combined consumption.
+
+The snapshot cap covers charges in the instance's separate group, not every RAM or file page associated with a checkpoint. Previously charged pages and the legacy shared group's cache keep their old ownership until ordinary reclaim; changing the limit does not migrate those charges or remove retained artifacts. See [the checkpoint contract](checkpoint-restore.md) for installation, drain, stricter-limit preservation and capture-time failure rules.
+
 ## Configuration migration
 
 The memory policy accepts only `enabled` and `total_reserve`. The removed `system_reserve`, `control_reserve`, `other_reserve`, `safety_buffer` and `runtime_headroom` fields are rejected when present, including zero or empty values and configurations with `enabled=false`. Mixed old and new fields are also rejected, so upgrades cannot silently ignore an old reserve or release a nonzero scheduling allowance. Replace the old fields before starting the upgraded daemon.

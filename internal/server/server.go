@@ -47,6 +47,7 @@ import (
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"github.com/inclusionAI/sandboxd/pkg/runtime/firecracker"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
@@ -759,6 +760,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, err
 	}
 	if err := validateRuntimeFilestore(cfg.RuntimeConfig); err != nil {
+		return nil, err
+	}
+	if err := firecracker.ValidateCheckpointMemoryLimit(cfg.FirecrackerCheckpointMemoryMaxBytes, cfg.DisableCgroup || cfg.CgroupCacheSize <= 0); err != nil {
 		return nil, err
 	}
 	if _, err := runscRestoreConcurrency(cfg.RuntimeConfig.Runsc.RestoreConcurrency); err != nil {

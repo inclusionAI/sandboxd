@@ -36,6 +36,8 @@ dns_proxy_concurrency_limit = 256
 dns_proxy_per_sandbox_concurrency_limit = 16
 
 [plugin.resource]
+# Optional cgroup v2 native snapshot-cache cap in page-aligned bytes; see doc/checkpoint-restore.md.
+firecracker_checkpoint_memory_max_bytes = 0
 # EXPERIMENTAL/DEBUG ONLY. Set true when /sys/fs/cgroup is read-only.
 # Sandboxes then inherit the sandboxd process cgroup, and per-sandbox CPU,
 # memory, and pids limits are not enforced. Only runsc is available.
