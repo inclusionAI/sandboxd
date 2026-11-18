@@ -125,7 +125,7 @@ func extractBootstrapFromLayer(ctx context.Context, layer v1.Layer, outputDir st
 
 	// Stage 2: Read tar and find bootstrap
 	stageStart = time.Now()
-	tr := tar.NewReader(rc)
+	tr := tar.NewReader(bootstrapReader{ctx: ctx, reader: rc})
 
 	for {
 		header, err := tr.Next()
@@ -143,7 +143,7 @@ func extractBootstrapFromLayer(ctx context.Context, layer v1.Layer, outputDir st
 			// Stage 3: Extract file
 			stageStart = time.Now()
 			outputPath := filepath.Join(outputDir, "bootstrap")
-			if err := extractFile(tr, outputPath); err != nil {
+			if err := extractFile(ctx, tr, outputPath); err != nil {
 				return "", err
 			}
 			extractFileDuration := time.Since(stageStart)
@@ -166,20 +166,44 @@ func extractBootstrapFromLayer(ctx context.Context, layer v1.Layer, outputDir st
 	return "", fmt.Errorf("bootstrap file not found at %s", BootstrapFileNameInLayer)
 }
 
-func extractFile(tr *tar.Reader, outputPath string) error {
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
-	}
+type bootstrapReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
 
-	f, err := os.Create(outputPath)
+func (r bootstrapReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
+func extractFile(ctx context.Context, tr *tar.Reader, outputPath string) error {
+	tempDir, err := os.MkdirTemp(filepath.Dir(outputPath), ".bootstrap-")
+	if err != nil {
+		return fmt.Errorf("failed to stage bootstrap: %w", err)
+	}
+	defer os.Remove(tempDir)
+	tempPath := filepath.Join(tempDir, "bootstrap")
+	f, err := os.Create(tempPath)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
-	defer f.Close()
+	defer os.Remove(tempPath)
 
-	if _, err := io.Copy(f, tr); err != nil {
-		return fmt.Errorf("failed to write file: %w", err)
+	_, copyErr := io.Copy(f, tr)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return fmt.Errorf("failed to write file: %w", copyErr)
 	}
-
+	if closeErr != nil {
+		return fmt.Errorf("failed to close bootstrap: %w", closeErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, outputPath); err != nil {
+		return fmt.Errorf("failed to publish bootstrap: %w", err)
+	}
 	return nil
 }

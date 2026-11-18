@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -35,6 +36,8 @@ import (
 const nydusFetchRetryAttempts = 3
 
 var (
+	nydusPrepareTimeout     = 45 * time.Second
+	nydusProxyTimeout       = 15 * time.Second
 	nydusFetchRetryDelay    = time.Second
 	nydusFetchRetryMaxDelay = 5 * time.Second
 )
@@ -47,10 +50,9 @@ type RegistryClient struct {
 	bootstrapCacheLock sync.Mutex
 
 	// The following hooks are for unit tests only.
-	fetchImageFn             func(context.Context, string, string, bool) (v1.Image, error)
-	fetchImageWithFallbackFn func(context.Context, string, string) (v1.Image, error)
-	isNydusImageFn           func(v1.Image) (bool, error)
-	extractBootstrapFn       func(context.Context, v1.Image, string) (string, error)
+	fetchImageFn       func(context.Context, string, string, bool) (v1.Image, error)
+	isNydusImageFn     func(v1.Image) (bool, error)
+	extractBootstrapFn func(context.Context, v1.Image, string) (string, error)
 }
 
 // NewRegistryClientFromShared creates a Nydus registry client wrapper from an existing shared client.
@@ -85,9 +87,6 @@ func (c *RegistryClient) FetchImage(ctx context.Context, imageRef string, proxyU
 
 // FetchImageWithFallback fetches image through shared fallback strategy.
 func (c *RegistryClient) FetchImageWithFallback(ctx context.Context, imageRef string, proxyURL string) (v1.Image, error) {
-	if c != nil && c.fetchImageWithFallbackFn != nil {
-		return c.fetchImageWithFallbackFn(ctx, imageRef, proxyURL)
-	}
 	if c == nil || c.shared == nil {
 		return nil, fmt.Errorf("registry client is not initialized")
 	}
@@ -117,10 +116,12 @@ func (c *RegistryClient) FetchAndExtractBootstrapWithImageConfig(ctx context.Con
 	timing, ctx := StartNydusTimedOperation(ctx, "nydus.FetchAndExtractBootstrap", imageURL)
 	defer timing.End()
 
+	ctx, cancel := context.WithTimeout(ctx, nydusPrepareTimeout)
+	defer cancel()
+
 	cache := c.getBootstrapCache()
+	imageRef := imageregistry.NormalizeImageRef(imageURL)
 	var result bootstrapResult
-	var attemptCount int
-	var lastAttemptErr error
 
 	stageStart := time.Now()
 	if cachePath, cachedEnv, cachedProcess, hit, err := cache.Link(imageURL, outputDir); err != nil {
@@ -135,23 +136,13 @@ func (c *RegistryClient) FetchAndExtractBootstrapWithImageConfig(ctx context.Con
 		}
 
 		// Old cache entry without complete image config — fall back to registry fetch.
-		var env []string
-		var process *imageconfig.Process
 		stageStart = time.Now()
-		if img, fetchErr := c.FetchImage(ctx, imageURL, "", false); fetchErr != nil {
-			logrus.WithError(fetchErr).Debugf("bootstrap cache hit but failed to fetch image config for env: %s", imageURL)
-		} else if img != nil {
-			if cfg, cfgErr := img.ConfigFile(); cfgErr == nil && cfg != nil {
-				env = cfg.Config.Env
-				process = imageconfig.FromOCI(cfg.Config)
-			} else if cfgErr != nil {
-				logrus.WithError(cfgErr).Debugf("bootstrap cache hit but failed to parse image config for env: %s", imageURL)
-			}
-		}
+		env, process, err := c.fetchImageProcess(ctx, imageRef)
 		timing.Stage("fetch_env_on_cache_hit", time.Since(stageStart))
-
-		if process == nil {
-			return "", nil, nil, fmt.Errorf("failed to resolve image config for %s", imageURL)
+		if err != nil {
+			err = fmt.Errorf("failed to resolve image config for %s: %w", imageURL, err)
+			timing.Fail(err)
+			return "", nil, nil, err
 		}
 		if cacheErr := cache.Store(imageURL, outputDir, result.Path, env, process); cacheErr != nil {
 			logrus.WithError(cacheErr).Warnf("failed to refresh Nydus image config cache for %s", imageURL)
@@ -159,35 +150,25 @@ func (c *RegistryClient) FetchAndExtractBootstrapWithImageConfig(ctx context.Con
 		return result.Path, env, process, nil
 	}
 
-	fetchAndExtract := func(useProxyFetch bool) (bootstrapResult, error) {
-		var r bootstrapResult
+	fetchAndExtract := func(parent context.Context, proxy string) (r bootstrapResult, retErr error) {
+		ctx, stop := imageregistry.WithRateLimitCancellation(parent)
+		defer stop()
+		defer func() {
+			if cause := context.Cause(ctx); cause != nil {
+				retErr = cause
+			}
+		}()
 
 		stageStart := time.Now()
-		var (
-			img v1.Image
-			err error
-		)
-		if useProxyFetch {
-			img, err = c.FetchImageWithFallback(ctx, imageURL, proxyURL)
-		} else {
-			img, err = c.FetchImage(ctx, imageURL, "", false)
-		}
+		img, err := c.FetchImage(ctx, imageRef, proxy, proxy != "")
 		if err != nil {
 			return r, fmt.Errorf("failed to fetch image %s: %w", imageURL, err)
 		}
 		r.FetchDuration = time.Since(stageStart)
 
-		// Extract env from image config
-		if img != nil {
-			if cfg, cfgErr := img.ConfigFile(); cfgErr == nil && cfg != nil {
-				r.Env = cfg.Config.Env
-				r.ImageProcess = imageconfig.FromOCI(cfg.Config)
-				if len(r.Env) == 0 {
-					logrus.Debugf("image config has no env vars: %s", imageURL)
-				}
-			} else if cfgErr != nil {
-				logrus.WithError(cfgErr).Warnf("failed to read image config for env extraction: %s", imageURL)
-			}
+		r.Env, r.ImageProcess, err = readImageProcess(img)
+		if err != nil {
+			return r, err
 		}
 
 		stageStart = time.Now()
@@ -203,43 +184,44 @@ func (c *RegistryClient) FetchAndExtractBootstrapWithImageConfig(ctx context.Con
 		stageStart = time.Now()
 		r.Path, err = c.extractBootstrap(ctx, img, outputDir)
 		if err != nil {
-			return r, fmt.Errorf("failed to extract bootstrap: %w", err)
+			return r, fmt.Errorf("failed to extract bootstrap: %w", imageregistry.ClassifyError(err))
 		}
 		r.ExtractDuration = time.Since(stageStart)
-
 		return r, nil
 	}
 
+	attemptCtx := ctx
+	if proxyURL != "" {
+		var stopProxy context.CancelFunc
+		attemptCtx, stopProxy = context.WithTimeout(ctx, nydusProxyTimeout)
+		defer stopProxy()
+	}
+	attemptStart := time.Now()
 	err := retry.Do(
 		func() error {
-			attemptCount++
-			r, err := fetchAndExtract(true)
-			if err != nil {
-				lastAttemptErr = err
-				return err
-			}
-			result = r
-			lastAttemptErr = nil
-			return nil
+			var err error
+			result, err = fetchAndExtract(attemptCtx, proxyURL)
+			return err
 		},
 		retry.Attempts(nydusFetchRetryAttempts),
 		retry.Delay(nydusFetchRetryDelay),
 		retry.MaxDelay(nydusFetchRetryMaxDelay),
 		retry.RetryIf(shouldRetryNydusFetch),
+		retry.LastErrorOnly(true),
 		retry.OnRetry(func(n uint, err error) {
 			logrus.Warnf("Retry attempt %d for image %s: %v", n+1, imageURL, err)
 		}),
-		retry.Context(ctx),
+		retry.Context(attemptCtx),
 	)
 
-	if err != nil && proxyURL != "" && attemptCount >= nydusFetchRetryAttempts && shouldRetryNydusFetch(lastAttemptErr) {
-		logrus.Warnf("proxy retries exhausted for image %s, retry once without proxy: %v", imageURL, err)
-		r, directErr := fetchAndExtract(false)
-		if directErr == nil {
-			result = r
-			err = nil
-		} else {
-			err = fmt.Errorf("proxy retries exhausted for image %s: %v; final non-proxy attempt failed: %w", imageURL, err, directErr)
+	if err != nil && proxyURL != "" && ctx.Err() == nil && shouldFallbackFromProxy(err) {
+		logrus.WithFields(logrus.Fields{
+			"image": imageURL, "proxy_elapsed_ms": time.Since(attemptStart).Milliseconds(),
+		}).WithError(err).Warn("Nydus bootstrap proxy failed, fallback to origin")
+		proxyErr := err
+		result, err = fetchAndExtract(ctx, "")
+		if err != nil {
+			err = fmt.Errorf("Nydus bootstrap proxy failed (%v); origin failed: %w", proxyErr, err)
 		}
 	}
 
@@ -248,11 +230,6 @@ func (c *RegistryClient) FetchAndExtractBootstrapWithImageConfig(ctx context.Con
 		return "", nil, nil, err
 	}
 
-	if result.ImageProcess == nil {
-		err := fmt.Errorf("failed to resolve image config for %s", imageURL)
-		timing.Fail(err)
-		return "", nil, nil, err
-	}
 	if cacheErr := cache.Store(imageURL, outputDir, result.Path, result.Env, result.ImageProcess); cacheErr != nil {
 		logrus.WithError(cacheErr).Warnf("failed to cache Nydus bootstrap for %s", imageURL)
 	}
@@ -264,14 +241,60 @@ func (c *RegistryClient) FetchAndExtractBootstrapWithImageConfig(ctx context.Con
 	return result.Path, result.Env, imageconfig.Clone(result.ImageProcess), nil
 }
 
+func (c *RegistryClient) fetchImageProcess(ctx context.Context, imageRef string) ([]string, *imageconfig.Process, error) {
+	ctx, stop := imageregistry.WithRateLimitCancellation(ctx)
+	defer stop()
+	img, err := c.FetchImage(ctx, imageRef, "", false)
+	var env []string
+	var process *imageconfig.Process
+	if err == nil {
+		env, process, err = readImageProcess(img)
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, nil, cause
+	}
+	return env, process, err
+}
+
+func readImageProcess(img v1.Image) ([]string, *imageconfig.Process, error) {
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read image config: %w", imageregistry.ClassifyError(err))
+	}
+	if cfg == nil {
+		return nil, nil, fmt.Errorf("empty image config")
+	}
+	return cfg.Config.Env, imageconfig.FromOCI(cfg.Config), nil
+}
+
+func shouldFallbackFromProxy(err error) bool {
+	var rateLimit *imageregistry.RateLimitError
+	if errors.As(err, &rateLimit) {
+		return rateLimit.Proxy
+	}
+	if shouldRetryNydusFetch(err) {
+		return true
+	}
+	var response *remoteTransport.Error
+	if errors.As(err, &response) {
+		return response.StatusCode >= http.StatusInternalServerError
+	}
+	var networkErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.As(err, &networkErr)
+}
+
 func shouldRetryNydusFetch(err error) bool {
 	if err == nil {
 		return false
 	}
 
 	var transportErr *remoteTransport.Error
-	if errors.As(err, &transportErr) && transportErr.StatusCode == http.StatusInternalServerError {
-		return true
+	if errors.As(err, &transportErr) {
+		switch transportErr.StatusCode {
+		case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway,
+			http.StatusServiceUnavailable, http.StatusGatewayTimeout, 499, 522:
+			return true
+		}
 	}
 
 	if errors.Is(err, io.ErrUnexpectedEOF) {
