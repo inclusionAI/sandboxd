@@ -727,7 +727,12 @@ func TestCheckpointClockBeforeHandoff(t *testing.T) {
 	for _, outcome := range []string{"resume", "restore", "error"} {
 		t.Run(outcome, func(t *testing.T) {
 			result := make(chan string, 1)
-			handoff := &checkpointHandoff{reader: result, environmentPath: filepath.Join(t.TempDir(), "environment")}
+			handoff := &checkpointHandoff{
+				reader:          result,
+				environmentPath: filepath.Join(t.TempDir(), "environment"),
+				uid:             uint32(os.Geteuid()),
+				gid:             uint32(os.Getegid()),
+			}
 			previous := state.handoff
 			state.handoff = handoff
 			defer func() { state.handoff = previous }()
@@ -748,6 +753,9 @@ func TestCheckpointClockBeforeHandoff(t *testing.T) {
 			}
 			if !called {
 				t.Fatal("guest clock not synchronized")
+			}
+			if outcome == "restore" {
+				checkCheckpointFileOwner(t, handoff.environmentPath, handoff.uid, handoff.gid)
 			}
 			select {
 			case actual := <-result:
