@@ -451,6 +451,8 @@ Already in-flight `Start` requests are not drained by this shutdown path. A requ
 
 ## Restore through Start
 
+Concurrent network lease persistence barriers may share one committed active-set snapshot when their mutations precede that snapshot. A lease is still handed to a runtime only after a successful durable commit covering its barrier; an earlier or failed commit cannot acknowledge a later mutation. The stored lease format, recovery ownership, rollback and quarantine behavior remain unchanged.
+
 To restore, the caller sends a normal `StartRequest` for the target sandbox and
 sets:
 

@@ -86,6 +86,11 @@ type InterfaceManager struct {
 	// store resource string.
 	db      store.DbStore
 	storeMu sync.Mutex
+	// Each store request is a durability barrier after its caller's mutation.
+	// A committed snapshot can satisfy concurrent requests issued before that
+	// snapshot starts. storedRequest is protected by storeMu.
+	storeRequest  atomic.Uint64
+	storedRequest uint64
 
 	// storeMark is used to mark whether the cgroup id need to be stored.
 	// If it's true, manager should not exit.
@@ -800,8 +805,17 @@ func (m *InterfaceManager) store() error {
 	if m.db == nil {
 		return nil
 	}
+	requested := m.storeRequest.Add(1)
 	m.storeMu.Lock()
 	defer m.storeMu.Unlock()
+	if requested <= m.storedRequest {
+		return nil
+	}
+	// Capture the covered requests before enumerating the active set. Every
+	// covered caller completed its mutation before publishing its request, so
+	// this snapshot includes that mutation. Requests arriving later must wait
+	// for another successful commit, even if this snapshot happens to see them.
+	covered := m.storeRequest.Load()
 	start := time.Now()
 	defer func() {
 		logrus.Debugf("store network interface %v using id cost: %v ms", m.usingInterfaces.Count(), time.Since(start).Milliseconds())
@@ -818,6 +832,7 @@ func (m *InterfaceManager) store() error {
 	if err := m.db.StoreRaw(config.BridgeIpBucket, dataToStore); err != nil {
 		return fmt.Errorf("store network interface using id: %w", err)
 	}
+	m.storedRequest = covered
 	return nil
 }
 
