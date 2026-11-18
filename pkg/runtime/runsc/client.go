@@ -59,6 +59,7 @@ type Client struct {
 }
 
 type Options struct {
+	CLIGOMAXPROCS      int
 	ExtraArgs          []string
 	Platform           string
 	FilestoreDir       string
@@ -100,6 +101,24 @@ func NewClientWithOptions(binary, rootDir string, options Options) *Client {
 			return connectRPC(path)
 		},
 	}
+}
+
+// command applies only to host-side runsc CLI invocations. Upstream clears
+// inherited environment when launching the Sentry and sets its parallelism
+// from sandbox resources, independently of this startup tuning option.
+func (c *Client) command(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	cmd.Env = os.Environ()
+	if c.Options.CLIGOMAXPROCS > 0 {
+		env := make([]string, 0, len(cmd.Env)+1)
+		for _, entry := range cmd.Env {
+			if !strings.HasPrefix(entry, "GOMAXPROCS=") {
+				env = append(env, entry)
+			}
+		}
+		cmd.Env = append(env, fmt.Sprintf("GOMAXPROCS=%d", c.Options.CLIGOMAXPROCS))
+	}
+	return cmd
 }
 
 // Create performs the single required runsc binary exec. It intentionally uses
@@ -181,7 +200,7 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		"--bundle", args.BundleDir,
 		args.ID,
 	)
-	cmd := exec.CommandContext(ctx, c.Binary, cmdArgs...)
+	cmd := c.command(ctx, cmdArgs...)
 	if args.SeededRootfs {
 		if cmd.Err == nil && !filepath.IsAbs(cmd.Path) {
 			// exec.Command resolves a bare name via the caller's PATH before
@@ -193,7 +212,6 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		}
 		cmd.Dir = args.BundleDir
 	}
-	cmd.Env = os.Environ()
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -467,7 +485,7 @@ func (c *Client) Checkpoint(
 		)
 	}
 	args = append(args, "--image-path", imageDir, id)
-	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	cmd := c.command(ctx, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -727,7 +745,7 @@ func (c *Client) Delete(ctx context.Context, id string, force bool) error {
 	}
 	args = append(args, id)
 
-	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	cmd := c.command(ctx, args...)
 	// A surviving child may inherit stdout/stderr even after the CLI is
 	// killed. Bound pipe draining as well as the command's lifetime.
 	cmd.WaitDelay = time.Second
@@ -750,7 +768,7 @@ func isRunscNotFound(output []byte) bool {
 
 func (c *Client) ListJSON(ctx context.Context) ([]byte, error) {
 	args := append(c.globalArgs(), "list", "--format", "json")
-	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	cmd := c.command(ctx, args...)
 	// Bound inherited pipes if a child outlives the canceled list process.
 	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()

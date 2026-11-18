@@ -190,6 +190,10 @@ type RuntimeConfig struct {
 
 // RunscConfig contains options passed to the gVisor runsc adapter.
 type RunscConfig struct {
+	// CLIGOMAXPROCS bounds Go parallelism in host-side runsc CLI processes.
+	// Zero inherits the environment; positive values are 1..1024. The Sentry
+	// retains its own scheduler and sandbox CPU resource settings.
+	CLIGOMAXPROCS int `toml:"cli_gomaxprocs" json:"cliGomaxprocs"`
 	// RestoreConcurrency bounds simultaneous restore Start RPCs, including
 	// filesystem preparation. Omitted or zero disables throttling; valid
 	// positive values are 1..1024.

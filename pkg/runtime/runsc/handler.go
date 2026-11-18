@@ -69,6 +69,9 @@ type runscClient interface {
 }
 
 func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*Handler, error) {
+	if value := cfg.RuntimeConfig.Runsc.CLIGOMAXPROCS; value < 0 || value > 1024 {
+		return nil, fmt.Errorf("runsc cli_gomaxprocs must be zero or between 1 and 1024: %d", value)
+	}
 	if cfg.RuntimeConfig.FilestoreDir == "" {
 		return nil, fmt.Errorf("runsc requires plugin.runtime.filestore_dir")
 	}
@@ -100,6 +103,7 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 
 	return &Handler{
 		runsc: NewClientWithOptions(bin, runscRoot, Options{
+			CLIGOMAXPROCS:     cfg.RuntimeConfig.Runsc.CLIGOMAXPROCS,
 			ExtraArgs:         cfg.RuntimeConfig.Runsc.ExtraArgs,
 			Platform:          platform,
 			FilestoreDir:      cfg.RuntimeConfig.FilestoreDir,

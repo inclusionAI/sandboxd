@@ -28,6 +28,8 @@ artifact ownership, failure semantics, and compatibility requirements.
 
 ## Selection and configuration
 
+`plugin.runtime.runsc.cli_gomaxprocs` optionally sets `GOMAXPROCS` for host-side runsc CLI invocations. Zero preserves the inherited environment; positive values from 1 through 1024 override only that variable. This can reduce process-startup overhead during concurrent restores on many-core hosts. The Sentry keeps its independent scheduler configuration, and sandbox CPU quotas and restore concurrency limits are unchanged. Measure the setting with the deployed runtime bundle and workload before choosing a node-wide value.
+
 A start request selects a runtime by name. Each adapter must have an entry
 under `plugin.runtime.runtime_binary`. Runsc uses systrap by default. Select
 the KVM platform node-wide only on a host with usable nested or hardware
