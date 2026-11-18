@@ -504,6 +504,8 @@ source after checkpoint failure are outside this design.
 
 ### Host reboot and service restart
 
+Managed cgroup allocation synchronously persists its active lease before returning it to a runtime. Concurrent allocation barriers can share a successful snapshot only when their mutations precede its capture. A failed allocation returns the group to the idle cache only after a successful rollback snapshot; an uncertain rollback leaves it quarantined. Recovery retains an unrecorded populated group, or a group whose workload state cannot be read, instead of draining it as idle. Such quarantined groups remain counted until ownership is reconciled or an operator drains them. This closes the periodic-save window for newly handed-out cgroups without weakening synchronous persistence.
+
 Sandboxd uses the Linux boot ID to distinguish a host reboot from a service restart in the same Pod. A changed boot ID retires the old kernel's cgroup and TAP lease caches before resource managers start. It preserves sandbox metadata, image-manager state, and checkpoint files for normal reconciliation; it does not resume processes, select a checkpoint, or guarantee that node-local files survive disk loss. Callers still orchestrate restore and satisfy the runtime and storage compatibility requirements above.
 
 During the same boot, persisted leases remain authoritative and active TAP recovery continues to fail if a device is missing or has been replaced. An unstamped legacy store is adopted without clearing its leases. Unreadable boot identity, invalid persisted identity, or an unreadable lease database fails startup rather than deleting authoritative sandbox state.

@@ -83,6 +83,7 @@ type cgroupOps interface {
 	update(name string, resources *specs.LinuxResources) error
 	stat(name string) (Stats, error)
 	newOOMWatcher() (oomWatcher, error)
+	populated(name string) (bool, error)
 	kill(name string) error
 	delete(name string) error
 }
