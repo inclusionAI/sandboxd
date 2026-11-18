@@ -295,7 +295,8 @@ message CheckpointRequest {
   string id = 1;
   // CheckpointDir is an absolute caller-owned output directory.
   string checkpoint_dir = 2;
-  // TimeoutSeconds bounds the complete checkpoint operation and must be non-zero.
+  // TimeoutSeconds bounds the RPC wait and must be non-zero. Uninterruptible
+  // native work retains its resources until capture and cleanup actually finish.
   uint32 timeout_seconds = 3;
   // Compress enables runtime-supported checkpoint compression.
   bool compress = 4;

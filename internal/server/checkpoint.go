@@ -29,6 +29,7 @@ import (
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 )
 
 type checkpointDirectory struct {
@@ -37,6 +38,50 @@ type checkpointDirectory struct {
 }
 
 func (h *sandboxService) Checkpoint(
+	ctx context.Context,
+	request *runtime.CheckpointRequest,
+) (*runtime.CheckpointResponse, error) {
+	if request != nil && request.ID != "" && request.TimeoutSeconds > 0 && h.sandboxManager != nil {
+		if sandbox, err := h.sandboxManager.Get(request.ID); err == nil && sandbox.Metadata != nil && config.IsFirecrackerFamily(sandbox.Metadata.RuntimeHandler) {
+			return waitForFirecrackerCapture(ctx, request, h.checkpoint)
+		}
+	}
+	return h.checkpoint(ctx, request)
+}
+
+// A caller deadline ends the RPC wait, not ownership of a native snapshot that
+// cannot be interrupted. checkpoint retains the per-source reservation,
+// maintenance gate, managed readers, output and execution permit until its
+// runtime call and cleanup really finish.
+func waitForFirecrackerCapture(
+	ctx context.Context,
+	request *runtime.CheckpointRequest,
+	capture func(context.Context, *runtime.CheckpointRequest) (*runtime.CheckpointResponse, error),
+) (*runtime.CheckpointResponse, error) {
+	operationCtx, cancel := context.WithTimeout(ctx, time.Duration(request.TimeoutSeconds)*time.Second)
+	defer cancel()
+	ownedRequest := proto.Clone(request).(*runtime.CheckpointRequest)
+	type result struct {
+		response *runtime.CheckpointResponse
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		response, err := capture(operationCtx, ownedRequest)
+		done <- result{response: response, err: err}
+	}()
+	select {
+	case result := <-done:
+		if err := operationCtx.Err(); err != nil {
+			return nil, errord.ToGRPC(err)
+		}
+		return result.response, result.err
+	case <-operationCtx.Done():
+		return nil, errord.ToGRPC(operationCtx.Err())
+	}
+}
+
+func (h *sandboxService) checkpoint(
 	ctx context.Context,
 	request *runtime.CheckpointRequest,
 ) (*runtime.CheckpointResponse, error) {

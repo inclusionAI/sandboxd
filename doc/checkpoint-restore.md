@@ -60,8 +60,10 @@ runtime again when they execute.
 | `snapshot_type` | Checkpoint flavor: empty (automatic), `Full`, `Incremental`, or `SoftDirty` |
 
 `timeout_seconds` must be greater than zero and is enforced by sandboxd.
-Caller cancellation may end the operation earlier. Only one checkpoint may be
+Caller cancellation may end the RPC wait earlier. Only one checkpoint may be
 in progress for a source sandbox at a time.
+
+For Firecracker, a timeout or cancellation ends the RPC wait but does not prove that an already-dispatched native snapshot has stopped. Firecracker cannot interrupt its memory-file write by observing an HTTP disconnect. The capture worker retains the per-source checkpoint reservation, maintenance admission, managed readers, output ownership and execution permit until the native call and cleanup actually finish; the VMM remains in its snapshot memory-charge group while that call is pending. A retry for the same source is rejected while the original capture is still owned. Cancellation before native dispatch skips the call. Cancellation after dispatch waits for the native reply in the worker, then invalidates the incremental lineage, discards unsealed output and resumes a surviving source; the next checkpoint establishes a Full base. No canceled RPC acknowledges a durable checkpoint. An uninterruptible native or filesystem operation can outlive the RPC deadline, so callers must reconcile source state and must not treat cancellation as permission to reuse the source or output directory.
 
 `checkpoint_dir` must be absolute, must not be `/`, and must not contain
 symbolic links. Its parent must already exist. The leaf may be absent, in which
