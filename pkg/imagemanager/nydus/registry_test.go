@@ -194,6 +194,7 @@ func TestNydusBootstrapProxyFallback(t *testing.T) {
 		{name: "proxy CONNECT 429", stage: "connect", rateLimitSource: "proxy", wantOrigin: 1},
 		{name: "proxy layer stalls after headers", stage: "layer", stall: true, wantOrigin: 1},
 		{name: "origin 429 after fallback", stage: "manifest", rateLimitSource: "proxy", originFailure: "429", wantOrigin: 1},
+		{name: "origin disconnect after fallback", stage: "manifest", rateLimitSource: "proxy", originFailure: "disconnect", wantOrigin: 1},
 		{name: "origin stalls after fallback", stage: "manifest", rateLimitSource: "proxy", originFailure: "stall", wantOrigin: 1},
 		{name: "upstream 429 via proxy", stage: "manifest", rateLimitSource: "backend"},
 		{name: "unattributed 429 via proxy", stage: "manifest"},
@@ -215,9 +216,15 @@ func TestNydusBootstrapProxyFallback(t *testing.T) {
 			handler := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
 			var originPulls, rejected atomic.Int32
 			originHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.originFailure == "disconnect" {
+					w.Header().Set("Connection", "close")
+				}
 				if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/") && r.Header.Get("X-Test-Route") == "" {
 					originPulls.Add(1)
 					switch tc.originFailure {
+					case "disconnect":
+						disconnectManifest(t, w)
+						return
 					case "429":
 						w.Header().Set("Retry-After", "30")
 						w.WriteHeader(http.StatusTooManyRequests)
@@ -292,6 +299,12 @@ func TestNydusBootstrapProxyFallback(t *testing.T) {
 			}
 			if got := rejected.Load(); got != 1 {
 				t.Fatalf("matched proxy requests = %d, want 1", got)
+			}
+			if tc.originFailure == "disconnect" {
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("expected EOF from the single origin attempt, got %v", err)
+				}
+				return
 			}
 			if tc.originFailure == "stall" {
 				if !errors.Is(err, context.DeadlineExceeded) {
@@ -422,6 +435,19 @@ func TestNydusBootstrapLegacyCachePreservesRateLimit(t *testing.T) {
 	client := NewRegistryClientFromShared(shared)
 	imageURL := host + "/test/legacy:latest"
 	outputDir := filepath.Join(t.TempDir(), "mount")
+	storeLegacyBootstrap(t, client, imageURL, outputDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _, _, err = client.FetchAndExtractBootstrapWithImageConfig(ctx, imageURL, outputDir, "http://127.0.0.1:1")
+	var limited *imageregistry.RateLimitError
+	if !errors.As(err, &limited) || limited.Proxy || limited.RetryAfter != "31" {
+		t.Fatalf("expected origin rate limit with Retry-After, got %v", err)
+	}
+}
+
+func storeLegacyBootstrap(t *testing.T, client *RegistryClient, imageURL, outputDir string) {
+	t.Helper()
 	path := writeBootstrapForTest(t, outputDir, "cached-bootstrap")
 	cache := client.getBootstrapCache()
 	if err := cache.Store(imageURL, outputDir, path, []string{}, testImageProcess); err != nil {
@@ -430,13 +456,70 @@ func TestNydusBootstrapLegacyCachePreservesRateLimit(t *testing.T) {
 	if err := os.Remove(cache.rootForOutput(outputDir).processPath(bootstrapCacheKey(imageURL))); err != nil {
 		t.Fatal(err)
 	}
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_, _, _, err = client.FetchAndExtractBootstrapWithImageConfig(ctx, imageURL, outputDir, "http://127.0.0.1:1")
-	var limited *imageregistry.RateLimitError
-	if !errors.As(err, &limited) || limited.Proxy || limited.RetryAfter != "31" {
-		t.Fatalf("expected origin rate limit with Retry-After, got %v", err)
+func disconnectManifest(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	conn, _, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestNydusDirectManifestDisconnectRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name, bootstrap string
+		legacyCache     bool
+	}{
+		{name: "cold pull", bootstrap: "valid-bootstrap"},
+		{name: "legacy cache config backfill", bootstrap: "cached-bootstrap", legacyCache: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
+			var armed atomic.Bool
+			var manifestReads atomic.Int32
+			origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Keep the first manifest GET on a fresh connection so net/http
+				// cannot transparently retry it on a pooled connection.
+				w.Header().Set("Connection", "close")
+				if armed.Load() && r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/") {
+					if manifestReads.Add(1) == 1 {
+						disconnectManifest(t, w)
+						return
+					}
+				}
+				handler.ServeHTTP(w, r)
+			}))
+			t.Cleanup(origin.Close)
+
+			host := strings.TrimPrefix(origin.URL, "https://")
+			imageURL := host + "/test/retry:latest"
+			seedNydusRegistry(t, origin, imageURL)
+			armed.Store(true)
+			shared, err := imageregistry.NewClientWithRegistrySchemes("", map[string]string{host: "https"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := NewRegistryClientFromShared(shared)
+			outputDir := filepath.Join(t.TempDir(), "daemon")
+			if tc.legacyCache {
+				storeLegacyBootstrap(t, client, imageURL, outputDir)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			path, _, process, err := client.FetchAndExtractBootstrapWithImageConfig(ctx, imageURL, outputDir, "")
+			if got := manifestReads.Load(); err != nil || got != 2 || process == nil {
+				t.Fatalf("manifest reads = %d, image process = %v, error = %v; want recovery on read 2", got, process, err)
+			}
+			if data, err := os.ReadFile(path); err != nil || string(data) != tc.bootstrap {
+				t.Fatalf("bootstrap = %q, error = %v; want %q", data, err, tc.bootstrap)
+			}
+		})
 	}
 }
 

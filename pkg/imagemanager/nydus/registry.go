@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/avast/retry-go/v4"
@@ -137,7 +138,13 @@ func (c *RegistryClient) FetchAndExtractBootstrapWithImageConfig(ctx context.Con
 
 		// Old cache entry without complete image config — fall back to registry fetch.
 		stageStart = time.Now()
-		env, process, err := c.fetchImageProcess(ctx, imageRef)
+		var env []string
+		var process *imageconfig.Process
+		err := retryNydusFetch(ctx, imageURL, shouldRetryDirectNydusFetch, func() error {
+			var err error
+			env, process, err = c.fetchImageProcess(ctx, imageRef)
+			return err
+		})
 		timing.Stage("fetch_env_on_cache_hit", time.Since(stageStart))
 		if err != nil {
 			err = fmt.Errorf("failed to resolve image config for %s: %w", imageURL, err)
@@ -191,28 +198,19 @@ func (c *RegistryClient) FetchAndExtractBootstrapWithImageConfig(ctx context.Con
 	}
 
 	attemptCtx := ctx
+	shouldRetry := shouldRetryDirectNydusFetch
 	if proxyURL != "" {
 		var stopProxy context.CancelFunc
 		attemptCtx, stopProxy = context.WithTimeout(ctx, nydusProxyTimeout)
 		defer stopProxy()
+		shouldRetry = shouldRetryNydusFetch
 	}
 	attemptStart := time.Now()
-	err := retry.Do(
-		func() error {
-			var err error
-			result, err = fetchAndExtract(attemptCtx, proxyURL)
-			return err
-		},
-		retry.Attempts(nydusFetchRetryAttempts),
-		retry.Delay(nydusFetchRetryDelay),
-		retry.MaxDelay(nydusFetchRetryMaxDelay),
-		retry.RetryIf(shouldRetryNydusFetch),
-		retry.LastErrorOnly(true),
-		retry.OnRetry(func(n uint, err error) {
-			logrus.Warnf("Retry attempt %d for image %s: %v", n+1, imageURL, err)
-		}),
-		retry.Context(attemptCtx),
-	)
+	err := retryNydusFetch(attemptCtx, imageURL, shouldRetry, func() error {
+		var err error
+		result, err = fetchAndExtract(attemptCtx, proxyURL)
+		return err
+	})
 
 	if err != nil && proxyURL != "" && ctx.Err() == nil && shouldFallbackFromProxy(err) {
 		logrus.WithFields(logrus.Fields{
@@ -265,6 +263,41 @@ func readImageProcess(img v1.Image) ([]string, *imageconfig.Process, error) {
 		return nil, nil, fmt.Errorf("empty image config")
 	}
 	return cfg.Config.Env, imageconfig.FromOCI(cfg.Config), nil
+}
+
+func retryNydusFetch(ctx context.Context, imageURL string, shouldRetry func(error) bool, fetch func() error) error {
+	return retry.Do(
+		func() error {
+			if err := context.Cause(ctx); err != nil {
+				return err
+			}
+			return fetch()
+		},
+		retry.Attempts(nydusFetchRetryAttempts),
+		retry.Delay(nydusFetchRetryDelay),
+		retry.MaxDelay(nydusFetchRetryMaxDelay),
+		retry.RetryIf(shouldRetry),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(n uint, err error) {
+			logrus.Warnf("Retry attempt %d for image %s: %v", n+1, imageURL, err)
+		}),
+		retry.Context(ctx),
+	)
+}
+
+func shouldRetryDirectNydusFetch(err error) bool {
+	if shouldRetryNydusFetch(err) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) && networkErr.Temporary()
 }
 
 func shouldFallbackFromProxy(err error) bool {
