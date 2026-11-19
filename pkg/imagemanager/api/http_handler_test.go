@@ -17,16 +17,21 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/distillfs"
+	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageregistry"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/nydus"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/oci"
 )
@@ -716,4 +721,81 @@ func TestHttpHandler_ListOCIMountDetails(t *testing.T) {
 			t.Fatalf("Status code = %d, want %d", w.Code, http.StatusInternalServerError)
 		}
 	})
+}
+
+func TestImageFormatProbeUsesTemplateRegistryProxy(t *testing.T) {
+	const manifestFormat = `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":2},"layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":2%s}]}`
+	for _, tc := range []struct {
+		name       string
+		annotation string
+		wantNydus  bool
+	}{
+		{name: "OCI"},
+		{name: "Nydus", annotation: `,"annotations":{"` + nydus.LayerAnnotationNydusBootstrap + `":"true"}`, wantNydus: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := fmt.Sprintf(manifestFormat, tc.annotation)
+			digest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(manifest)))
+			var originRequests, proxyManifests atomic.Int32
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				originRequests.Add(1)
+				http.Error(w, "unexpected origin request", http.StatusTeapot)
+			}))
+			defer origin.Close()
+			host := strings.TrimPrefix(origin.URL, "http://")
+
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Host != host {
+					http.Error(w, "unexpected registry host", http.StatusBadRequest)
+					return
+				}
+				switch r.URL.Path {
+				case "/v2/":
+					w.WriteHeader(http.StatusOK)
+				case "/v2/team/image/manifests/" + digest:
+					proxyManifests.Add(1)
+					w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+					_, _ = io.WriteString(w, manifest)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer proxy.Close()
+
+			template := filepath.Join(t.TempDir(), "registry.json")
+			if err := os.WriteFile(template, []byte(fmt.Sprintf(`{"registry":{"proxy":{"url":%q}}}`, proxy.URL)), 0600); err != nil {
+				t.Fatal(err)
+			}
+			client, err := imageregistry.NewClientWithRegistrySchemes("", map[string]string{host: "http"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ociManager, err := oci.NewManager(t.TempDir(), template, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ociManager.Close()
+			worker, err := NewHttpWorker(&HttpWorkerConfig{
+				Manager:     newMockManager(),
+				OCIManager:  ociManager,
+				NydusClient: nydus.NewRegistryClientFromShared(client),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer worker.Close()
+
+			image := host + "/team/image@" + digest
+			_, _ = worker.tryMountNydus(context.Background(), image)
+			if isNydus, found := worker.nydusCache.Get(image); !found || isNydus != tc.wantNydus {
+				t.Fatalf("format cache found %v, Nydus %v; want Nydus %v", found, isNydus, tc.wantNydus)
+			}
+			if got := proxyManifests.Load(); got != 1 {
+				t.Fatalf("proxy manifest reads = %d, want 1", got)
+			}
+			if got := originRequests.Load(); got != 0 {
+				t.Fatalf("origin requests = %d, want 0", got)
+			}
+		})
+	}
 }
