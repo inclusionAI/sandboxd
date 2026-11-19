@@ -462,7 +462,7 @@ func (w *HttpWorker) tryMountNydus(ctx context.Context, imageURL string) (nydusM
 
 		// Cache miss, fetch and check.
 		logrus.Debugf("cache miss for %s, fetching from registry", imageURL)
-		img, err := w.nydusClient.FetchImage(ctx, imageURL, "", false)
+		img, err := w.nydusClient.FetchImageWithFallback(ctx, imageURL, w.ociMgr.RegistryProxyURL())
 		if err != nil {
 			return nydusMountAttempt{}, fmt.Errorf("failed to fetch image: %w", err)
 		}
