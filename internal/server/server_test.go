@@ -364,7 +364,6 @@ func TestStartRejectsFirecrackerOCIImageBeforeFilesystemPrepare(t *testing.T) {
 
 func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {
 	for _, runtimeName := range []string{
-		config.RuntimeNameRunc,
 		config.RuntimeNameKata,
 		config.RuntimeNameFirecracker,
 	} {
@@ -381,6 +380,19 @@ func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {
 			assert.Contains(t, response.Message, "XPU allocations require runtime")
 		})
 	}
+}
+
+func TestStartRejectsXPUWhenManagerIsUnavailable(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunc: svc.NewFakeRuntimeHandler(),
+	})
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:        config.RuntimeNameRunc,
+		Rootfs:         &runtime.RootfsConfig{},
+		XpuAllocations: []*runtime.XpuAllocation{{Type: "npu"}},
+	})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, response.Message, "XPU manager is not configured")
 }
 
 func TestStartRejectsEnableKVMForRunsc(t *testing.T) {
@@ -935,6 +947,44 @@ func TestRuntimeDeleteTimeoutDrainsOnlyOwnedCgroupAndRetries(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, kills)
 	assert.Equal(t, 2, h.calls)
+}
+
+func TestFailedXPUStartRetainsBundleForDeleteRetry(t *testing.T) {
+	handler := &retryXPUStartDelete{fail: true}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunc: handler})
+	id, err := s.sandboxManager.ReserveID("sbox-xpu-rollback")
+	require.NoError(t, err)
+	metadata := &runtime.SandboxMetadata{ID: id, RuntimeHandler: config.RuntimeNameRunc, Labels: map[string]string{xpuStartPendingLabel: "true"}}
+	require.NoError(t, s.sandboxManager.PersistMetadata(id, metadata))
+	_, err = s.sandboxManager.Get(id)
+	require.Error(t, err, "an in-flight start must not be published")
+	spec := filepath.Join(s.config.RootDir, "containers", id, config.SandboxSpecFile)
+	require.NoError(t, os.WriteFile(spec, []byte(`{"linux":{},"annotations":{"sandbox.akernel.dev/xpu-allocation":"retained"}}`), 0600))
+
+	require.ErrorContains(t, s.rollbackXPUStart(id, metadata, sandbox.OccupiedResource{}), "runtime still live")
+	require.FileExists(t, spec, "the persisted lease must survive an incomplete rollback")
+	_, err = s.sandboxManager.Get(id)
+	require.NoError(t, err, "normal deletion must be able to find the failed start")
+	_, err = s.sandboxManager.ReserveID(id)
+	require.ErrorIs(t, err, errord.ErrAlreadyExists)
+
+	handler.fail = false
+	s.reapFailedXPUStarts()
+	require.NoFileExists(t, spec)
+	_, err = s.sandboxManager.ReserveID(id)
+	require.NoError(t, err)
+}
+
+type retryXPUStartDelete struct {
+	svc.FakeRuntimeHandler
+	fail bool
+}
+
+func (h *retryXPUStartDelete) Delete(context.Context, string) error {
+	if h.fail {
+		return errors.New("runtime still live")
+	}
+	return nil
 }
 
 func TestStart_And_Delete(t *testing.T) {
