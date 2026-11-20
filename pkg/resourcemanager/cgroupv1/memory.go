@@ -52,7 +52,11 @@ func (mi *Memory) load(memcgPath string) error {
 		}
 		key := parts[0]
 		if key == "hierarchical_memory_limit" {
-			mi.Limit, _ = strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64)
+			limit, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64)
+			if err != nil {
+				return fmt.Errorf("parse hierarchical memory limit from %s: %w", memcgPath, err)
+			}
+			mi.Limit = limit
 			continue
 		}
 		if !targetCgMemUsageFields[key] {

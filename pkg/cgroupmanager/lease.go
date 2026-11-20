@@ -20,7 +20,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containerd/cgroups/v3"
+	"github.com/containerd/cgroups/v3/cgroup2"
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 )
@@ -154,17 +154,23 @@ func (c *CgroupManager) StatsRoot() (Stats, error) {
 // as zero: sibling bookkeeping cgroups appear and disappear with runtime
 // activity, and absence simply means nothing to charge.
 func (c *CgroupManager) SiblingMemoryUsage(path string) (uint64, error) {
-	if path == "" || c.ops.mode() != cgroups.Unified {
+	v2, ok := c.ops.(*cgroupV2)
+	if path == "" || !ok {
 		return 0, nil
 	}
-	stats, err := c.ops.stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
+	if err := cgroup2.VerifyGroupPath(path); err != nil {
+		return 0, err
+	}
+	group := filepath.Join(v2.mountpoint, path)
+	usage, err := readMemoryCurrent(group)
+	// Only absence of the group is normal. A present group without a
+	// usable memory controller must not be reported as idle.
+	if errors.Is(err, os.ErrNotExist) {
+		if _, statErr := os.Stat(group); errors.Is(statErr, os.ErrNotExist) {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("stat cgroup %s: %w", path, err)
 	}
-	return stats.MemoryUsageBytes, nil
+	return usage, err
 }
 
 // ReadMemoryLimit reports the current memory.max (cgroup v2) or

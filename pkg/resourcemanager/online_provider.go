@@ -18,10 +18,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	apiresource "k8s.io/apimachinery/pkg/api/resource"
 )
 
 type CgroupConfig struct {
@@ -58,7 +59,7 @@ type NodeResourceClient interface {
 
 func (clt *nodeClient) GetNodeResource() (*NodeResource, error) {
 	nodeResource := &NodeResource{}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 
 	data, err := clt.client.RESTClient().Get().
@@ -77,13 +78,12 @@ func (clt *nodeClient) GetNodeResource() (*NodeResource, error) {
 }
 
 type onlineAvailableResourceManager interface {
-	GetAvailableResource(maxCPU uint32, maxMem int64) (int64, int64, error)
+	GetAvailableResource(maxCPUMilli, maxMem int64) (int64, int64, error)
 }
 
 type nodeResourceManager struct {
-	resourceCfg corev1.ResourceList
-	nodeClt     NodeResourceClient
-	onlineMgr   onlineAvailableResourceManager
+	nodeClt   NodeResourceClient
+	onlineMgr onlineAvailableResourceManager
 }
 
 func newOnlineCgroupResourceManager(configPath string) (*nodeResourceManager, error) {
@@ -100,67 +100,52 @@ func newOnlineCgroupResourceManager(configPath string) (*nodeResourceManager, er
 		return nil, fmt.Errorf("create Alibaba noderesource client: %w", err)
 	}
 
-	mgr := &nodeResourceManager{
-		resourceCfg: corev1.ResourceList{},
-		nodeClt:     nodeClt,
-		onlineMgr:   online,
-	}
-	if err := mgr.update(); err != nil {
-		// The cgroup policy remains usable
-		// with host limits when the optional vendor capacity ceiling is
-		// temporarily unavailable.
-		logrus.Warnf("failed to update Alibaba node resource ceiling: %v", err)
-	}
-	return mgr, nil
+	return &nodeResourceManager{nodeClt: nodeClt, onlineMgr: online}, nil
 }
 
-func (mgr *nodeResourceManager) CpuCapacity() int64 {
-	if len(mgr.resourceCfg) == 0 {
-		return 0
-	}
-	return mgr.resourceCfg.Cpu().Value()
-}
-
-func (mgr *nodeResourceManager) MemoryCapacity() int64 {
-	if len(mgr.resourceCfg) == 0 {
-		return 0
-	}
-	return mgr.resourceCfg.Memory().Value()
-}
-
-func (mgr *nodeResourceManager) update() error {
-	nodeResource, err := mgr.nodeClt.GetNodeResource()
+func (mgr *nodeResourceManager) cloudCapacity() (int64, int64, error) {
+	node, err := mgr.nodeClt.GetNodeResource()
 	if err != nil {
-		return fmt.Errorf("failed to get node resources info: %w", err)
+		return 0, 0, fmt.Errorf("failed to get node resources info: %w", err)
 	}
-	if nodeResource.Status.NodeAllocatable == nil {
-		return fmt.Errorf("Alibaba noderesource has no nodeAllocatable status")
+	if node == nil || node.Status.NodeAllocatable == nil {
+		return 0, 0, fmt.Errorf("Alibaba noderesource has no nodeAllocatable status")
 	}
-
-	prod, ok := nodeResource.Status.NodeAllocatable.AllocatableResource["Prod"]
+	alloc := node.Status.NodeAllocatable.AllocatableResource
+	prod, ok := alloc["Prod"]
 	if !ok {
-		return fmt.Errorf("failed to find Prod resource")
+		return 0, 0, fmt.Errorf("failed to find Prod resource")
 	}
-	resources := prod.ResourceList.DeepCopy()
-
-	if prodFree, ok := nodeResource.Status.NodeAllocatable.AllocatableResource["ProdFree"]; ok {
-		cpu := resources.Cpu()
-		cpu.Add(*prodFree.Cpu())
-		resources[corev1.ResourceCPU] = *cpu
-
-		memory := resources.Memory()
-		memory.Add(*prodFree.Memory())
-		resources[corev1.ResourceMemory] = *memory
+	cpu, hasCPU := prod.ResourceList[corev1.ResourceCPU]
+	memory, hasMemory := prod.ResourceList[corev1.ResourceMemory]
+	if !hasCPU || !hasMemory {
+		return 0, 0, fmt.Errorf("Prod resource requires explicit cpu and memory")
 	}
-	mgr.resourceCfg = resources
-	return nil
+	free := alloc["ProdFree"].ResourceList
+	freeCPU := free[corev1.ResourceCPU]
+	freeMemory := free[corev1.ResourceMemory]
+	if cpu.Sign() < 0 || memory.Sign() < 0 || freeCPU.Sign() < 0 || freeMemory.Sign() < 0 {
+		return 0, 0, fmt.Errorf("Prod and ProdFree resource amounts must be nonnegative")
+	}
+	// Quantity can carry a decimal backed by a pointer. Work on copies so
+	// repeated samples cannot accumulate ProdFree into the API response.
+	cpu = cpu.DeepCopy()
+	memory = memory.DeepCopy()
+	cpu.Add(freeCPU)
+	memory.Add(freeMemory)
+	maxCPU := apiresource.NewMilliQuantity(math.MaxInt64, apiresource.DecimalSI)
+	if cpu.Cmp(*maxCPU) > 0 || memory.CmpInt64(math.MaxInt64) > 0 {
+		return 0, 0, fmt.Errorf("Alibaba noderesource capacity exceeds supported units")
+	}
+	return cpu.MilliValue(), memory.Value(), nil
 }
 
 func (mgr *nodeResourceManager) GetAvailableResource() (int64, int64, error) {
-	return mgr.onlineMgr.GetAvailableResource(
-		uint32(mgr.CpuCapacity()),
-		mgr.MemoryCapacity(),
-	)
+	cpu, memory, err := mgr.cloudCapacity()
+	if err != nil {
+		return 0, 0, err
+	}
+	return mgr.onlineMgr.GetAvailableResource(cpu, memory)
 }
 
 func (mgr *nodeResourceManager) Stop() {}

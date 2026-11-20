@@ -39,8 +39,6 @@ const (
 	faasCpusetCgroupPath         = "/sys/fs/cgroup/cpuset/"
 	faasCpuCgroupPath            = "/sys/fs/cgroup/cpu/"
 	zoneinfoPath                 = "/proc/zoneinfo"
-	maxCpuCapacity               = uint32(8192)
-	maxMemoryCapacity            = uint64(1 << 50)
 )
 
 var (
@@ -59,9 +57,8 @@ var (
 
 type podInfo struct {
 	// cgroup info
-	cfs  *cgroupv1.CfsInfo
-	mem  *cgroupv1.Memory
-	pids *cgroupv1.Pids
+	cfs *cgroupv1.CfsInfo
+	mem *cgroupv1.Memory
 }
 
 type OnlineResourceConfig struct {
@@ -89,29 +86,25 @@ func collectOnlinePods(cfg *CgroupConfig, onlineRootCgroup string) ([]*podInfo, 
 		if !strings.HasPrefix(entry.Name(), "pod") {
 			continue
 		}
-		cpuCgroupPrefix := path.Join(cfg.HostCpuCgroupPath, onlineRootCgroup)
-		ci, err := cgroupv1.ReadCfsInfo(cpuCgroupPrefix, entry.Name())
+		pi, err := cgroupv1.ReadPidsInfo(path.Join(cfg.HostPidsCgroupPath, onlineRootCgroup), entry.Name())
 		if err != nil {
-			logrus.Warningf("failed to read %s/%s cfs info: %v", cpuCgroupPrefix, entry.Name(), err)
+			return nil, err
+		}
+		if pi.Current == 0 {
 			continue
 		}
-		memCgroupPrefix := path.Join(cfg.HostMemCgroupPath, onlineRootCgroup)
-		mi, err := cgroupv1.ReadMemcgV1(memCgroupPrefix, entry.Name())
+		ci, err := cgroupv1.ReadCfsInfo(path.Join(cfg.HostCpuCgroupPath, onlineRootCgroup), entry.Name())
 		if err != nil {
-			logrus.Warningf("failed to read %s/%s memory cgroup info: %v", memCgroupPrefix, entry.Name(), err)
-			continue
+			return nil, err
 		}
-		pidsCgroupPrefix := path.Join(cfg.HostPidsCgroupPath, onlineRootCgroup)
-		pi, err := cgroupv1.ReadPidsInfo(pidsCgroupPrefix, entry.Name())
+		mi, err := cgroupv1.ReadMemcgV1(path.Join(cfg.HostMemCgroupPath, onlineRootCgroup), entry.Name())
 		if err != nil {
-			logrus.Warningf("failed to read %s/%s pids cgroup info: %v", pidsCgroupPrefix, entry.Name(), err)
-			continue
+			return nil, err
 		}
-		pods = append(pods, &podInfo{
-			cfs:  ci,
-			mem:  mi,
-			pids: pi,
-		})
+		if mi.Limit == 0 {
+			return nil, fmt.Errorf("missing or zero hierarchical memory limit for active cgroup %s/%s", onlineRootCgroup, entry.Name())
+		}
+		pods = append(pods, &podInfo{cfs: ci, mem: mi})
 	}
 	return pods, nil
 }
@@ -126,15 +119,16 @@ type onlineResourceManager struct {
 	startupTime   time.Time
 }
 
-func (mgr *onlineResourceManager) listPods() []*podInfo {
+func (mgr *onlineResourceManager) listPods() ([]*podInfo, error) {
 	var pods []*podInfo
 	for _, rootCgroup := range mgr.resCfg.OnlineCgroups {
 		onlinePods, err := collectOnlinePods(&mgr.cfg, rootCgroup)
-		if err == nil {
-			pods = append(pods, onlinePods...)
+		if err != nil {
+			return nil, err
 		}
+		pods = append(pods, onlinePods...)
 	}
-	return pods
+	return pods, nil
 }
 
 func (mgr *onlineResourceManager) cpuUsage() (float64, error) {
@@ -147,8 +141,7 @@ func (mgr *onlineResourceManager) cpuUsage() (float64, error) {
 	for _, rootCgroup := range mgr.resCfg.OfflineCgroups {
 		cpuacct, err := cgroupv1.ReadCPUAcctWithoutPercpu(path.Join(mgr.cfg.HostCpuacctCgroupPath, rootCgroup), now)
 		if err != nil {
-			logrus.Warningf("failed to read %s cpuacct.usage: %v", rootCgroup, err)
-			continue
+			return 0, fmt.Errorf("failed to read %s cpuacct.usage: %w", rootCgroup, err)
 		}
 		usage -= cpuacct.Usage
 	}
@@ -172,9 +165,7 @@ func (mgr *onlineResourceManager) memUsage() (float64, error) {
 	for _, rootCgroup := range mgr.resCfg.OnlineCgroups {
 		mi, err := cgroupv1.ReadMemcgV1(mgr.cfg.HostMemCgroupPath, rootCgroup)
 		if err != nil {
-			logrus.Warningf("failed to read %s/%s mem usage: %v",
-				mgr.cfg.HostMemCgroupPath, rootCgroup, err)
-			continue
+			return 0, fmt.Errorf("failed to read %s/%s mem usage: %w", mgr.cfg.HostMemCgroupPath, rootCgroup, err)
 		}
 		usage += float64(mi.Usage)
 	}
@@ -182,22 +173,21 @@ func (mgr *onlineResourceManager) memUsage() (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to read %s mem usage: %w", mgr.cfg.FaasMemCgroupPath, err)
 	}
-	usage -= float64(faasMi.Usage)
-	return usage, nil
+	return math.Max(0, usage-float64(faasMi.Usage)), nil
 }
 
 func (mgr *onlineResourceManager) allocated() (float64, float64, error) {
-	podsInfo := mgr.listPods()
+	podsInfo, err := mgr.listPods()
+	if err != nil {
+		return 0, 0, err
+	}
 	var (
 		cpuAllocated float64
 		memAllocated float64
 	)
 	for _, pod := range podsInfo {
-		if pod.pids.Current == 0 {
-			continue
-		}
-		// pod maybe not ready, ignore it
-		if pod.mem.Usage*100/pod.mem.Limit < 10 {
+		// Ignore active pods below the existing readiness threshold.
+		if float64(pod.mem.Usage)/float64(pod.mem.Limit) < 0.10 {
 			continue
 		}
 		cpuAllocated += float64(pod.cfs.Shares) / float64(1024)
@@ -223,13 +213,7 @@ func (mgr *onlineResourceManager) smoothValue(oldValue float64, newValue float64
 	return oldValue*0.99 + newValue*0.01
 }
 
-func (mgr *onlineResourceManager) GetAvailableResource(maxCpu uint32, maxMem int64) (int64, int64, error) {
-	if maxCpu == 0 {
-		maxCpu = maxCpuCapacity
-	}
-	if maxMem == 0 {
-		maxMem = int64(maxMemoryCapacity)
-	}
+func (mgr *onlineResourceManager) GetAvailableResource(maxCPUMilli, maxMem int64) (int64, int64, error) {
 	cfsQuota, err := cgroupv1.ReadCfsInfo(mgr.cfg.FaasCpuCgroupPath, "")
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get faas cfs info %s: %w", mgr.cfg.FaasCpuCgroupPath, err)
@@ -242,7 +226,7 @@ func (mgr *onlineResourceManager) GetAvailableResource(maxCpu uint32, maxMem int
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to read zoneinfo %s: %w", mgr.cfg.ZoneinfoPath, err)
 	}
-	maxCpuFixed := math.Min(float64(len(cpusetInfo.Cpus)), float64(maxCpu))
+	maxCpuFixed := math.Min(float64(len(cpusetInfo.Cpus)), float64(maxCPUMilli)/1000)
 	maxMemFixed := math.Min(float64(maxMem), float64(memInfo.Total))
 	allocatedCpu, allocatedMem, err := mgr.allocated()
 	if err != nil {
@@ -265,8 +249,8 @@ func (mgr *onlineResourceManager) GetAvailableResource(maxCpu uint32, maxMem int
 	cpuResource := allocatedCpu*float64(mgr.resCfg.CPUMaxRatio)/float64(100) - cpuUsed +
 		notAllocatedCpu*float64(mgr.resCfg.CpuFreeOverSoldRatio)/float64(100)
 	if cfsQuota.Quota > 0 {
-		quotaCpu := cfsQuota.Quota / cfsQuota.Period
-		cpuResource = math.Min(cpuResource, float64(quotaCpu))
+		quotaCPU := float64(cfsQuota.Quota) / float64(cfsQuota.Period)
+		cpuResource = math.Min(cpuResource, quotaCPU)
 	}
 	memResource := math.Min(
 		allocatedMem*(1.0-float64(mgr.resCfg.MemoryReserveRatio)/float64(100))-memUsed,
@@ -289,7 +273,7 @@ func (mgr *onlineResourceManager) GetAvailableResource(maxCpu uint32, maxMem int
 	mgr.lastReportCpu = cpuResource
 	mgr.lastReportMem = memResource
 
-	return int64(cpuResource) * 1000, (int64(memResource) >> 30) << 30, nil
+	return int64(cpuResource * 1000), (int64(memResource) >> 30) << 30, nil
 }
 
 func readOnlineResConfig(cfgPath string) (OnlineResourceConfig, error) {

@@ -154,6 +154,7 @@ func TestModuleCapacityReportsCachedAvailable(t *testing.T) {
 	// and serves over the socket: availCpu is stored in cores and scaled back
 	// to millicores, availMem passes through as bytes.
 	m := &Module{availCpu: 47, availMem: 318 << 30}
+	m.lastRefresh.Store(time.Now().UnixNano())
 	cpuMilli, memBytes := m.Capacity()
 	assert.Equal(t, int64(47000), cpuMilli)
 	assert.Equal(t, int64(318<<30), memBytes)
@@ -170,6 +171,7 @@ func TestModuleCapacityZeroBeforeFirstRefresh(t *testing.T) {
 
 func TestTransientMemoryReservationAffectsAdvertisedCapacity(t *testing.T) {
 	m := &Module{availCpu: 4, availMem: 8 << 30}
+	m.lastRefresh.Store(time.Now().UnixNano())
 	releaseFirst, ok := m.ReserveTransientMemory("checkpoint-a", 3<<30)
 	assert.True(t, ok)
 	_, ok = m.ReserveTransientMemory("checkpoint-b", 6<<30)
@@ -266,6 +268,26 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 				DeviceIDs:    []uint32{0, 2},
 			}}, info.Xpu)
 	}, time.Second, 10*time.Millisecond)
+
+	// There is no intervening refresh. A blocked provider or memory read
+	// cannot keep stale values visible to socket or reservation consumers.
+	expired := time.Now().Add(-31 * time.Second).UnixNano()
+	m.lastRefresh.Store(expired)
+	m.lastMemSampleAt.Store(expired)
+	resp, err := client.Get("http://sandboxd/resource")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var stale resourceInfo
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&stale))
+	require.Zero(t, stale.Cpu)
+	require.Zero(t, stale.Mem)
+	require.Nil(t, stale.SandboxMemUsage)
+	cpu, memory := m.Capacity()
+	require.Zero(t, cpu)
+	require.Zero(t, memory)
+	_, reserved := m.ReserveTransientMemory("stale", 1)
+	require.False(t, reserved)
 
 	m.Stop()
 	assert.True(t, resourceManager.stopped.Load())

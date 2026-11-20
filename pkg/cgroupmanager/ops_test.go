@@ -653,6 +653,14 @@ func TestSiblingMemoryUsageMissingPresentAndError(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1<<20), usage)
 
+	require.NoError(t, os.Remove(filepath.Join(sibling, "memory.current")))
+	_, err = mgr.SiblingMemoryUsage("/sandboxd-firecracker-checkpoint")
+	require.ErrorIs(t, err, os.ErrNotExist, "an existing group must expose memory.current")
+
+	writeTestFile(t, filepath.Join(sibling, "memory.current"), "max")
+	_, err = mgr.SiblingMemoryUsage("/sandboxd-firecracker-checkpoint")
+	require.ErrorContains(t, err, "usage cannot be unlimited")
+
 	// Present sibling with an unreadable memory.current: a genuine read
 	// failure (content garbage here — permission denial behaves the same)
 	// must propagate as an error, never collapse to "nothing to charge":

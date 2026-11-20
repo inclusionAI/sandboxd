@@ -110,7 +110,7 @@ func (c *Collector) registerHostMemoryMetrics(meter metric.Meter) error {
 		if err != nil {
 			// Missing data is not an idle node. Never export a synthetic zero.
 			logrus.Warnf("metrics: failed to read host memory: %v", err)
-			return err
+			return nil
 		}
 		used := stats.total - stats.available
 		o.ObserveInt64(usage, used)

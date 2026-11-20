@@ -187,7 +187,7 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 		// cgroup2.getStatFileContentUint64): a missing or unreadable file
 		// would silently look like a genuinely idle sandbox. Read the file
 		// ourselves so callers can distinguish missing data from zero usage.
-		usage, uerr := readCgroupUintFile(filepath.Join(o.mountpoint, name, "memory.current"))
+		usage, uerr := readMemoryCurrent(filepath.Join(o.mountpoint, name))
 		if uerr != nil {
 			return Stats{}, fmt.Errorf("read memory.current for %s: %w", name, uerr)
 		}
@@ -202,6 +202,17 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 
 func (o *cgroupV2) statRoot(name string) (Stats, error) {
 	return o.stat(name)
+}
+
+func readMemoryCurrent(group string) (uint64, error) {
+	usage, err := readCgroupUintFile(filepath.Join(group, "memory.current"))
+	if err != nil {
+		return 0, err
+	}
+	if usage == ^uint64(0) {
+		return 0, fmt.Errorf("invalid memory.current in %s: usage cannot be unlimited", group)
+	}
+	return usage, nil
 }
 
 func readUintFile(filename string) uint64 {

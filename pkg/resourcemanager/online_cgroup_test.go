@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 )
@@ -154,83 +155,77 @@ func TestSmoothValue(t *testing.T) {
 	assert.InDelta(t, 101.0, lateVal, 0.0001)
 }
 
-func TestNodeResourceManagerCapacityHelpers(t *testing.T) {
-	mgr := &nodeResourceManager{}
-	assert.Equal(t, int64(0), mgr.CpuCapacity())
-	assert.Equal(t, int64(0), mgr.MemoryCapacity())
-
-	mgr.resourceCfg = corev1.ResourceList{
-		corev1.ResourceCPU:    apiresource.MustParse("6"),
-		corev1.ResourceMemory: apiresource.MustParse("12Gi"),
+func TestOnlineProviderRefreshesAndHonorsCloudCeiling(t *testing.T) {
+	prod := corev1.ResourceList{
+		corev1.ResourceCPU:    apiresource.MustParse("1250m"),
+		corev1.ResourceMemory: apiresource.MustParse("8Gi"),
 	}
-	assert.Equal(t, int64(6), mgr.CpuCapacity())
-	assert.Equal(t, int64(12<<30), mgr.MemoryCapacity())
+	alloc := map[string]ResourceMap{
+		"Prod": {ResourceList: prod},
+		"ProdFree": {ResourceList: corev1.ResourceList{
+			corev1.ResourceCPU:    apiresource.MustParse("250m"),
+			corev1.ResourceMemory: apiresource.MustParse("2Gi"),
+		}},
+	}
+	client := &stubNodeResourceClient{resp: &NodeResource{
+		Status: NodeResourceStatus{NodeAllocatable: &NodeAllocatableResource{AllocatableResource: alloc}},
+	}}
+	policy := &recordOnlineCeiling{}
+	mgr := &nodeResourceManager{nodeClt: client, onlineMgr: policy}
+	for range 2 {
+		cpu, mem, err := mgr.GetAvailableResource()
+		require.NoError(t, err)
+		require.Equal(t, int64(1500), cpu)
+		require.Equal(t, int64(10<<30), mem)
+	}
+	delete(alloc, "ProdFree")
+	prod[corev1.ResourceCPU] = apiresource.MustParse("0")
+	prod[corev1.ResourceMemory] = apiresource.MustParse("0")
+	cpu, mem, err := mgr.GetAvailableResource()
+	require.NoError(t, err)
+	require.Zero(t, cpu)
+	require.Zero(t, mem)
+	delete(prod, corev1.ResourceMemory)
+	_, _, err = mgr.GetAvailableResource()
+	require.ErrorContains(t, err, "requires explicit cpu and memory")
+	client.err = assert.AnError
+	_, _, err = mgr.GetAvailableResource()
+	require.ErrorIs(t, err, assert.AnError)
+	require.Equal(t, 3, policy.calls, "invalid or unobserved capacity cannot fall back to host limits")
 }
 
-func TestNodeResourceManagerUpdateProdAndProdFree(t *testing.T) {
-	mgr := &nodeResourceManager{nodeClt: &stubNodeResourceClient{resp: &NodeResource{
-		Status: NodeResourceStatus{
-			NodeAllocatable: &NodeAllocatableResource{
-				AllocatableResource: map[string]ResourceMap{
-					"Prod": {
-						ResourceList: corev1.ResourceList{
-							corev1.ResourceCPU:    apiresource.MustParse("4"),
-							corev1.ResourceMemory: apiresource.MustParse("8Gi"),
-						},
-					},
-					"ProdFree": {
-						ResourceList: corev1.ResourceList{
-							corev1.ResourceCPU:    apiresource.MustParse("1"),
-							corev1.ResourceMemory: apiresource.MustParse("2Gi"),
-						},
-					},
-				},
-			},
-		},
-	}}}
+type recordOnlineCeiling struct{ calls int }
 
-	err := mgr.update()
-	assert.NoError(t, err)
-	assert.Equal(t, int64(5), mgr.CpuCapacity())
-	assert.Equal(t, int64(10<<30), mgr.MemoryCapacity())
+func (r *recordOnlineCeiling) GetAvailableResource(cpuMilli, memory int64) (int64, int64, error) {
+	r.calls++
+	return cpuMilli, memory, nil
 }
 
-func TestNodeResourceManagerUpdateOnlyProd(t *testing.T) {
-	mgr := &nodeResourceManager{nodeClt: &stubNodeResourceClient{resp: &NodeResource{
-		Status: NodeResourceStatus{
-			NodeAllocatable: &NodeAllocatableResource{
-				AllocatableResource: map[string]ResourceMap{
-					"Prod": {
-						ResourceList: corev1.ResourceList{
-							corev1.ResourceCPU:    apiresource.MustParse("2"),
-							corev1.ResourceMemory: apiresource.MustParse("4Gi"),
-						},
-					},
-				},
-			},
-		},
-	}}}
-
-	err := mgr.update()
-	assert.NoError(t, err)
-	assert.Equal(t, int64(2), mgr.CpuCapacity())
-	assert.Equal(t, int64(4<<30), mgr.MemoryCapacity())
-}
-
-func TestNodeResourceManagerUpdateErrors(t *testing.T) {
-	mgr := &nodeResourceManager{nodeClt: &stubNodeResourceClient{err: assert.AnError}}
-	err := mgr.update()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to get node resources info")
-
-	mgr = &nodeResourceManager{nodeClt: &stubNodeResourceClient{resp: &NodeResource{
-		Status: NodeResourceStatus{
-			NodeAllocatable: &NodeAllocatableResource{AllocatableResource: map[string]ResourceMap{}},
-		},
-	}}}
-	err = mgr.update()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to find Prod resource")
+func TestOnlineAccountingRejectsMissingOrZeroPodLimits(t *testing.T) {
+	root := t.TempDir()
+	mgr := &onlineResourceManager{
+		cfg:    CgroupConfig{HostPidsCgroupPath: root, HostCpuCgroupPath: root, HostMemCgroupPath: root},
+		resCfg: OnlineResourceConfig{OnlineCgroups: []string{"online"}},
+	}
+	_, _, err := mgr.allocated()
+	require.ErrorIs(t, err, os.ErrNotExist)
+	pod := filepath.Join(root, "online", "pod1")
+	require.NoError(t, os.MkdirAll(pod, 0755))
+	write := func(name, value string) {
+		require.NoError(t, os.WriteFile(filepath.Join(pod, name), []byte(value), 0644))
+	}
+	write("pids.current", "1")
+	write("cpu.cfs_quota_us", "100000")
+	write("cpu.cfs_period_us", "100000")
+	write("cpu.shares", "1024")
+	write("memory.stat", "total_active_anon 512\nhierarchical_memory_limit 0\n")
+	_, _, err = mgr.allocated()
+	require.ErrorContains(t, err, "missing or zero hierarchical memory limit")
+	write("memory.stat", "total_active_anon 512\nhierarchical_memory_limit 1024\n")
+	cpu, memory, err := mgr.allocated()
+	require.NoError(t, err)
+	require.Equal(t, float64(1), cpu)
+	require.Equal(t, float64(1024), memory)
 }
 
 type stubNodeResourceClient struct {

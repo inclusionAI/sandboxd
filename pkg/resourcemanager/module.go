@@ -81,11 +81,9 @@ type Module struct {
 // reported in scheduler cores, while memory and writable storage use bytes.
 //
 // Mem keeps the historical capacity contract (provider capacity minus pod
-// requests and transient reservations): schedulers
-// ResourceViewActor already subtract instance requests from allocatable and
-// rebase on capacity deltas, so folding sandbox usage into Mem would
-// double-count every running instance. Sandbox
-// memory is instead exposed as the separate SandboxMemUsage observation
+// requests and transient reservations). Schedulers may already reserve memory
+// for running sandboxes, so folding their usage into Mem charges them twice.
+// Sandbox memory is exposed as the separate SandboxMemUsage observation
 // field; consumers must explicitly adopt it for admission. The value is
 // omitted while no fresh sample exists.
 type resourceInfo struct {
@@ -247,7 +245,7 @@ func (m *Module) MarkSandboxStopped(target sandbox.MetricsTarget) {
 }
 
 // Start launches the refresh loop and HTTP server. It returns once the
-// listener is bound so external collectors can use the socket immediately.
+// listener is bound. The socket reports zero until the first fresh sample.
 func (m *Module) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -272,13 +270,15 @@ func (m *Module) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.RLock()
+		now := time.Now()
+		cpu, mem := m.capacityLocked(now)
 		info := resourceInfo{
-			Cpu:      m.availCpu,
-			Mem:      availableAfterTransientReservations(m.availMem, m.transientMemory),
+			Cpu:      cpu,
+			Mem:      mem,
 			Xpu:      []xpumanager.Resource{},
 			Features: []string{},
 		}
-		if m.sandboxMemUsageReady {
+		if m.sandboxMemUsageReady && freshSample(now, m.lastMemSampleAt.Load(), m.stalenessLimitLocked()) {
 			usage := m.sandboxMemUsage
 			info.SandboxMemUsage = &usage
 		}
@@ -336,35 +336,32 @@ func (m *Module) Stop() {
 // sample past the same window also fails health, independently of provider
 // freshness, so a healthy capacity source cannot hide missing usage data.
 func (m *Module) Healthy() bool {
-	ts := m.lastRefresh.Load()
-	if ts == 0 {
-		return false
-	}
-	if time.Since(time.Unix(0, ts)) >= m.stalenessLimit() {
-		return false
-	}
-	m.mu.RLock()
-	usage := m.sandboxMemoryUsage
-	m.mu.RUnlock()
-	if usage != nil {
-		memTs := m.lastMemSampleAt.Load()
-		if memTs == 0 {
-			return false
-		}
-		if time.Since(time.Unix(0, memTs)) >= m.stalenessLimit() {
-			return false
-		}
-	}
-	return true
-}
-
-func (m *Module) stalenessLimit() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	now := time.Now()
+	limit := m.stalenessLimitLocked()
+	return freshSample(now, m.lastRefresh.Load(), limit) &&
+		(m.sandboxMemoryUsage == nil || freshSample(now, m.lastMemSampleAt.Load(), limit))
+}
+
+func (m *Module) stalenessLimitLocked() time.Duration {
 	if m.stalenessWindow > 0 {
 		return m.stalenessWindow
 	}
 	return 30 * time.Second
+}
+
+func freshSample(now time.Time, timestamp int64, limit time.Duration) bool {
+	return timestamp != 0 && now.Sub(time.Unix(0, timestamp)) < limit
+}
+
+// Test freshness when serving readers, even if a provider or memory read
+// blocks the refresh loop past the grace period.
+func (m *Module) capacityLocked(now time.Time) (int64, int64) {
+	if !freshSample(now, m.lastRefresh.Load(), m.stalenessLimitLocked()) {
+		return 0, 0
+	}
+	return m.availCpu, availableAfterTransientReservations(m.availMem, m.transientMemory)
 }
 
 // Capacity returns the node's currently-available CPU (millicores) and memory
@@ -384,7 +381,8 @@ func (m *Module) stalenessLimit() time.Duration {
 func (m *Module) Capacity() (int64, int64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.availCpu * 1000, availableAfterTransientReservations(m.availMem, m.transientMemory)
+	cpu, mem := m.capacityLocked(time.Now())
+	return cpu * 1000, mem
 }
 
 // ReserveTransientMemory atomically removes short-lived runtime overhead from
@@ -400,8 +398,8 @@ func (m *Module) ReserveTransientMemory(owner string, bytes int64) (func(), bool
 	if m.transientMemory == nil {
 		m.transientMemory = make(map[string]int64)
 	}
-	if _, exists := m.transientMemory[owner]; exists ||
-		bytes > availableAfterTransientReservations(m.availMem, m.transientMemory) {
+	_, mem := m.capacityLocked(time.Now())
+	if _, exists := m.transientMemory[owner]; exists || bytes > mem {
 		return func() {}, false
 	}
 	m.transientMemory[owner] = bytes
@@ -464,6 +462,7 @@ func (m *Module) refreshOnce() {
 	m.mu.RUnlock()
 
 	cpu, mem, err := m.nodeResource.GetAvailableResource()
+	providerSampleAt := time.Now()
 	if err != nil {
 		// A provider failure must not bypass the sandbox-memory staleness
 		// policy below: keep the provider cache untouched for this round but
@@ -496,26 +495,23 @@ func (m *Module) refreshOnce() {
 		sampleOK   bool
 		sampleVal  uint64
 		sampleWarn error
+		sampleAt   time.Time
 	)
 	if sandboxMemoryUsage != nil {
 		sampleVal, sampleWarn = sandboxMemoryUsage()
 		sampleOK = sampleWarn == nil
+		sampleAt = time.Now()
 	}
-	// Read the staleness limit before taking m.mu: stalenessLimit itself
-	// locks m.mu, so calling it under Lock would self-deadlock (a writer
-	// cannot recursively take the read lock on a sync.RWMutex).
-	limit := m.stalenessLimit()
 	m.mu.Lock()
+	limit := m.stalenessLimitLocked()
 	if sandboxMemoryUsage != nil {
 		switch {
 		case sampleOK:
 			m.sandboxMemUsage = sampleVal
 			m.sandboxMemUsageReady = true
-			m.lastMemSampleAt.Store(time.Now().UnixNano())
+			m.lastMemSampleAt.Store(sampleAt.UnixNano())
 		default:
-			lastSample := m.lastMemSampleAt.Load()
-			if lastSample != 0 &&
-				time.Since(time.Unix(0, lastSample)) < limit {
+			if freshSample(time.Now(), m.lastMemSampleAt.Load(), limit) {
 				logrus.Warnf(
 					"resourcemanager: read sandbox memory usage failed; keep last sample: %v",
 					sampleWarn,
@@ -536,9 +532,8 @@ func (m *Module) refreshOnce() {
 		}
 		m.availCpu = cpu
 		m.availMem = mem
-		m.lastRefresh.Store(time.Now().UnixNano())
-	} else if lastRefresh := m.lastRefresh.Load(); lastRefresh == 0 ||
-		time.Since(time.Unix(0, lastRefresh)) >= limit {
+		m.lastRefresh.Store(providerSampleAt.UnixNano())
+	} else if !freshSample(time.Now(), m.lastRefresh.Load(), limit) {
 		// Provider data is past the staleness window: publish zero capacity
 		// rather than the frozen last-successful figure. The consumer's
 		// collector caches its previous successful response on connection

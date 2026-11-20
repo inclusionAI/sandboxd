@@ -19,6 +19,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -117,12 +118,37 @@ func TestHostMemoryMetrics(t *testing.T) {
 
 	fail = true
 	data = metricdata.ResourceMetrics{}
-	require.Error(t, reader.Collect(context.Background(), &data))
+	require.NoError(t, reader.Collect(context.Background(), &data), "host read failures must not abort the periodic export")
+	capacityExported := false
 	for _, scope := range data.ScopeMetrics {
 		for _, m := range scope.Metrics {
 			if strings.HasPrefix(m.Name, "node.memory.") {
 				require.Equal(t, "node.memory.total", m.Name, "failed host read must not export zero or stale host values")
+				capacityExported = true
 			}
 		}
+	}
+	require.True(t, capacityExported, "the working capacity callback must still be exported")
+}
+
+func TestHostMemoryFailurePreservesPeriodicExport(t *testing.T) {
+	exporter := &parentMemoryTestExporter{}
+	reader := sdkmetric.NewPeriodicReader(exporter, sdkmetric.WithInterval(time.Hour))
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	ctx := context.Background()
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(ctx)) })
+	collector := &Collector{
+		capacity: fakeCapacity{cpuMilli: 2000, memBytes: 8 << 30},
+		hostMemory: func() (hostMemoryStats, error) {
+			return hostMemoryStats{}, errors.New("meminfo unreadable")
+		},
+	}
+	require.NoError(t, collector.registerMetrics(provider.Meter("host-memory-export-test")))
+	require.NoError(t, provider.ForceFlush(ctx))
+	require.Equal(t, 1, exporter.exports)
+	require.Equal(t, float64(2), exporter.cpuLimit)
+	require.Equal(t, int64(8<<30), exporter.memoryTotal)
+	for _, name := range []string{"node.memory.usage", "node.memory.available", "node.memory.physical.total", "node.memory.utilization"} {
+		require.False(t, exporter.names[name], "unavailable host metric: %s", name)
 	}
 }

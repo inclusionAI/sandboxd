@@ -42,6 +42,9 @@ func (ci *CfsInfo) load(cpuCgroupPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read period %s: %w", cpuCgroupPath, err)
 	}
+	if ci.Period <= 0 {
+		return fmt.Errorf("invalid cpu period %d at %s", ci.Period, cpuCgroupPath)
+	}
 	ci.Shares, err = rawInt(cpuCgroupPath, cfsSharesFile)
 	if err != nil {
 		return fmt.Errorf("failed to read shares %s: %w", cpuCgroupPath, err)
