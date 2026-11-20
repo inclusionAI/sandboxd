@@ -1,0 +1,9 @@
+# Node memory metrics
+
+Node memory pressure is sampled from `/proc/meminfo` as visible to sandboxd. In the bundled privileged node deployment this is host memory, not the node container's cgroup limit. This works on cgroup v1 and v2, including the unified hierarchy root where `memory.current` does not exist. A deployment that virtualizes `/proc/meminfo` must account for that scope when interpreting these metrics.
+
+`node.memory.usage` reports `MemTotal - MemAvailable` in bytes. Unlike raw cgroup charges, it excludes memory the kernel estimates can be reclaimed without swapping. `node.memory.physical.total` reports `MemTotal`, and `node.memory.available` reports `MemAvailable`. `node.memory.utilization` reports `(MemTotal - MemAvailable) / MemTotal` as a ratio in `[0, 1]`. These four metrics share one snapshot; missing or invalid input omits the sample and reports an error instead of reporting an idle node.
+
+`node.memory.total` retains its existing meaning: schedulable capacity from the resource manager, also served over the resource socket. It is not the denominator for physical memory utilization. Use `node.memory.utilization`, or divide `node.memory.usage` by `node.memory.physical.total`, for a host-pressure dashboard. Scheduling allocation and per-sandbox cgroup usage/limits are unchanged. Host pressure and reserved sandbox memory answer different questions and must not be substituted for each other.
+
+With the usual Prometheus name translation, these are `node_memory_usage_bytes`, `node_memory_physical_total_bytes`, `node_memory_available_bytes`, `node_memory_utilization_ratio`, and the existing `node_memory_total_bytes`. Consumers must explicitly adopt the host utilization metric; changing sandboxd does not by itself add memory-based decisions to an external scaling controller.
