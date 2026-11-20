@@ -228,6 +228,26 @@ func TestOnlineAccountingRejectsMissingOrZeroPodLimits(t *testing.T) {
 	require.Equal(t, float64(1024), memory)
 }
 
+func TestOnlinePodCgroupDisappearance(t *testing.T) {
+	root := t.TempDir()
+	cfg := &CgroupConfig{HostPidsCgroupPath: root, HostCpuCgroupPath: root, HostMemCgroupPath: root}
+	pod := filepath.Join(root, "online", "pod1")
+	require.NoError(t, os.MkdirAll(pod, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(pod, "pids.current"), []byte("1"), 0644))
+
+	_, err := collectOnlinePods(cfg, "online")
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.False(t, podCgroupDisappeared(pod, err), "a live pod is missing its CPU controls")
+
+	// Model deletion of the listed cgroup between enumerating and reading it.
+	require.NoError(t, os.Remove(filepath.Join(pod, "pids.current")))
+	require.NoError(t, os.Remove(pod))
+	_, err = readOnlinePod(cfg, "online", "pod1")
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.True(t, podCgroupDisappeared(pod, err))
+	require.False(t, podCgroupDisappeared(pod, os.ErrPermission))
+}
+
 type stubNodeResourceClient struct {
 	resp *NodeResource
 	err  error

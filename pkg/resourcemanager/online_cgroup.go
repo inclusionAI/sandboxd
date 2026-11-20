@@ -16,6 +16,7 @@ package resourcemanager
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -86,27 +87,46 @@ func collectOnlinePods(cfg *CgroupConfig, onlineRootCgroup string) ([]*podInfo, 
 		if !strings.HasPrefix(entry.Name(), "pod") {
 			continue
 		}
-		pi, err := cgroupv1.ReadPidsInfo(path.Join(cfg.HostPidsCgroupPath, onlineRootCgroup), entry.Name())
+		pod, err := readOnlinePod(cfg, onlineRootCgroup, entry.Name())
 		if err != nil {
+			if podCgroupDisappeared(path.Join(podParent, entry.Name()), err) {
+				continue
+			}
 			return nil, err
 		}
-		if pi.Current == 0 {
-			continue
+		if pod != nil {
+			pods = append(pods, pod)
 		}
-		ci, err := cgroupv1.ReadCfsInfo(path.Join(cfg.HostCpuCgroupPath, onlineRootCgroup), entry.Name())
-		if err != nil {
-			return nil, err
-		}
-		mi, err := cgroupv1.ReadMemcgV1(path.Join(cfg.HostMemCgroupPath, onlineRootCgroup), entry.Name())
-		if err != nil {
-			return nil, err
-		}
-		if mi.Limit == 0 {
-			return nil, fmt.Errorf("missing or zero hierarchical memory limit for active cgroup %s/%s", onlineRootCgroup, entry.Name())
-		}
-		pods = append(pods, &podInfo{cfs: ci, mem: mi})
 	}
 	return pods, nil
+}
+
+func readOnlinePod(cfg *CgroupConfig, root, name string) (*podInfo, error) {
+	pids, err := cgroupv1.ReadPidsInfo(path.Join(cfg.HostPidsCgroupPath, root), name)
+	if err != nil || pids.Current == 0 {
+		return nil, err
+	}
+	cfs, err := cgroupv1.ReadCfsInfo(path.Join(cfg.HostCpuCgroupPath, root), name)
+	if err != nil {
+		return nil, err
+	}
+	mem, err := cgroupv1.ReadMemcgV1(path.Join(cfg.HostMemCgroupPath, root), name)
+	if err != nil {
+		return nil, err
+	}
+	if mem.Limit == 0 {
+		return nil, fmt.Errorf("missing or zero hierarchical memory limit for active cgroup %s/%s", root, name)
+	}
+	return &podInfo{cfs: cfs, mem: mem}, nil
+}
+
+// Only ignore a missing control file if the listed pod cgroup itself is gone.
+func podCgroupDisappeared(podPath string, readErr error) bool {
+	if !errors.Is(readErr, os.ErrNotExist) {
+		return false
+	}
+	_, err := os.Stat(podPath)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 type onlineResourceManager struct {

@@ -331,17 +331,12 @@ func (m *Module) Stop() {
 	m.wg.Wait()
 }
 
-// Healthy reports whether the latest provider refresh was within the
-// staleness window. When sandbox-memory accounting is wired, a stale memory
-// sample past the same window also fails health, independently of provider
-// freshness, so a healthy capacity source cannot hide missing usage data.
+// Healthy reports whether the latest capacity refresh was within the
+// staleness window. Sandbox memory usage is a separate observation.
 func (m *Module) Healthy() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	now := time.Now()
-	limit := m.stalenessLimitLocked()
-	return freshSample(now, m.lastRefresh.Load(), limit) &&
-		(m.sandboxMemoryUsage == nil || freshSample(now, m.lastMemSampleAt.Load(), limit))
+	return freshSample(time.Now(), m.lastRefresh.Load(), m.stalenessLimitLocked())
 }
 
 func (m *Module) stalenessLimitLocked() time.Duration {

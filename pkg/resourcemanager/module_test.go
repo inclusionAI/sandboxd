@@ -269,17 +269,29 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 			}}, info.Xpu)
 	}, time.Second, 10*time.Millisecond)
 
-	// There is no intervening refresh. A blocked provider or memory read
-	// cannot keep stale values visible to socket or reservation consumers.
+	readResource := func() resourceInfo {
+		t.Helper()
+		resp, err := client.Get("http://sandboxd/resource")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var info resourceInfo
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&info))
+		return info
+	}
+
 	expired := time.Now().Add(-31 * time.Second).UnixNano()
-	m.lastRefresh.Store(expired)
 	m.lastMemSampleAt.Store(expired)
-	resp, err := client.Get("http://sandboxd/resource")
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	var stale resourceInfo
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&stale))
+	observationExpired := readResource()
+	require.Nil(t, observationExpired.SandboxMemUsage)
+	require.Equal(t, int64(2), observationExpired.Cpu)
+	require.Equal(t, int64(5<<30), observationExpired.Mem)
+	require.True(t, m.Healthy())
+
+	// A blocked provider cannot keep stale capacity visible to socket or
+	// reservation consumers, even without an intervening refresh.
+	m.lastRefresh.Store(expired)
+	stale := readResource()
 	require.Zero(t, stale.Cpu)
 	require.Zero(t, stale.Mem)
 	require.Nil(t, stale.SandboxMemUsage)
@@ -398,9 +410,7 @@ func TestRefreshOnceKeepsUsageFieldOnSampleFailureWithinWindow(t *testing.T) {
 }
 
 func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
-	// With no successful sample yet — or once the last one is past the
-	// staleness window — the observation field must be omitted (ready=false)
-	// and health must fail, never a fabricated or frozen figure.
+	// Omit missing or stale observations while keeping a fresh provider healthy.
 	var fail bool
 	usage := uint64(40 << 30)
 	provider := &settableNodeResourceManager{cpu: 32000, mem: 120 << 30}
@@ -416,12 +426,12 @@ func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
 	}
 
 	fail = true
-	m.refreshOnce() // no sample yet: not ready, unhealthy
+	m.refreshOnce()
 	m.mu.RLock()
 	ready := m.sandboxMemUsageReady
 	m.mu.RUnlock()
 	assert.False(t, ready, "first-sample failure published a usage figure")
-	assert.False(t, m.Healthy())
+	assert.True(t, m.Healthy(), "an unavailable observation must not fail service health")
 
 	fail = false
 	m.refreshOnce() // healthy sample
@@ -436,11 +446,12 @@ func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
 	m.mu.RUnlock()
 	assert.False(t, ready,
 		"stale memory sample kept serving a frozen usage figure")
-	assert.False(t, m.Healthy(),
-		"stale memory sample must fail the health check")
+	assert.True(t, m.Healthy(), "a stale observation must not fail service health")
+	cpu, memory := m.Capacity()
+	assert.Equal(t, int64(32000), cpu)
+	assert.Equal(t, int64(120<<30), memory)
 
-	// Sampling recovers: the observation and health come back — degradation
-	// is not a one-way latch.
+	// Sampling recovers and the observation is available again.
 	fail = false
 	usage = 70 << 30
 	m.refreshOnce()
@@ -449,7 +460,7 @@ func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
 	m.mu.RUnlock()
 	assert.True(t, ready, "recovered sample did not restore the observation")
 	assert.Equal(t, uint64(70<<30), got)
-	assert.True(t, m.Healthy(), "recovered sample did not restore health")
+	assert.True(t, m.Healthy())
 }
 
 func TestRefreshOnceProviderFailureStillRunsStalenessDegrade(t *testing.T) {
@@ -489,7 +500,7 @@ func TestRefreshOnceProviderFailureStillRunsStalenessDegrade(t *testing.T) {
 	m.mu.RUnlock()
 	assert.False(t, ready,
 		"provider failure bypassed the staleness degrade of the usage sample")
-	assert.False(t, m.Healthy())
+	assert.True(t, m.Healthy(), "the provider sample is still within its grace period")
 }
 
 // failingNodeResourceManager wraps another manager and can start failing.
