@@ -824,15 +824,21 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	// Construct the optional node-resource module first, but start reporting
 	// only after parent limits and all capacity sources are installed. Gated
 	// on [plugin.node_resource]: deployments that don't report node resources
-	// omit the section, Kubernetes deployments use the default provider, and
-	// standalone deployments can explicitly select the read-only cgroup
-	// provider. A configured provider's init/bind failure is fatal and lets
-	// systemd restart sandboxd.
+	// omit the section, Kubernetes deployments use the default provider,
+	// standalone deployments can select the read-only cgroup provider, and
+	// Alibaba Cloud deployments can opt in to online_cgroup. A configured
+	// provider's init/bind failure is fatal and lets systemd restart sandboxd.
 	// Held in a local because s.resourceMod is back-filled once s exists below.
 	var nodeResMod *resourcemanager.Module
 	if cfg.SockPath != "" {
 		sockPath := cfg.SockPath
-		mod, merr := resourcemanager.NewModule(sockPath, cfg.NodeResourceConfig.Provider)
+		mod, merr := resourcemanager.NewModule(
+			sockPath,
+			cfg.NodeResourceConfig.Provider,
+			resourcemanager.ProviderConfig{
+				OnlineConfigPath: cfg.NodeResourceConfig.OnlineCfgPath,
+			},
+		)
 		if merr != nil {
 			return nil, fmt.Errorf("node-resource module init: %w", merr)
 		}

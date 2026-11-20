@@ -89,8 +89,12 @@ const storageQuotaFeature = "storage-quota-v1"
 
 // NewModule constructs the configured node-resource module. sockPath is the
 // Unix socket exposed to the external collector.
-func NewModule(sockPath, provider string) (*Module, error) {
-	nrm, err := NewNodeResourceManager(provider)
+func NewModule(
+	sockPath string,
+	provider string,
+	providerConfig ...ProviderConfig,
+) (*Module, error) {
+	nrm, err := NewNodeResourceManager(provider, providerConfig...)
 	if err != nil {
 		return nil, err
 	}
