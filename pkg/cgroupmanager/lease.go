@@ -20,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/containerd/cgroups/v3"
+
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 )
 
@@ -132,6 +134,37 @@ func (c *CgroupManager) Stats(name string) (Stats, error) {
 		return Stats{}, fmt.Errorf("cgroup %s is outside owned root %s", name, c.rootName)
 	}
 	return c.ops.stat(name)
+}
+
+// StatsRoot returns aggregate accounting for the owned root cgroup itself —
+// every sandbox cgroup's parent. Stats(rootName) is rejected by the
+// child-only guard above, and Stats("/") supplies node CPU accounting, not
+// sandbox memory. This rollup is a usage observation, not schedulable capacity
+// or host memory pressure (which uses /proc/meminfo).
+// An unsupported or unreadable rollup returns an error: in particular, a v1
+// root without hierarchical memory accounting cannot supply aggregate usage.
+func (c *CgroupManager) StatsRoot() (Stats, error) {
+	return c.ops.statRoot(c.rootName)
+}
+
+// SiblingMemoryUsage reports memory usage of a cgroup v2 path outside the
+// manager-owned root — e.g. the transient Firecracker checkpoint subtree,
+// which node-level memory accounting must not miss just because it is a
+// sibling of the sandbox root. A missing path reads
+// as zero: sibling bookkeeping cgroups appear and disappear with runtime
+// activity, and absence simply means nothing to charge.
+func (c *CgroupManager) SiblingMemoryUsage(path string) (uint64, error) {
+	if path == "" || c.ops.mode() != cgroups.Unified {
+		return 0, nil
+	}
+	stats, err := c.ops.stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("stat cgroup %s: %w", path, err)
+	}
+	return stats.MemoryUsageBytes, nil
 }
 
 // ReadMemoryLimit reports the current memory.max (cgroup v2) or

@@ -169,9 +169,10 @@ func TestMemoryLimitValidationAndProviderStaleness(t *testing.T) {
 	require.Equal(t, mem, retained)
 	m.lastRefresh.Store(time.Now().Add(-31 * time.Second).UnixNano())
 	m.refreshOnce()
-	_, mem = m.Capacity()
-	require.Equal(t, retained, mem, "provider failures preserve the existing cached-capacity policy")
-	require.False(t, m.Healthy(), "stale capacity fails health without changing the cached value")
+	cpu, mem := m.Capacity()
+	require.Zero(t, cpu, "expired provider data withdraws CPU capacity")
+	require.Zero(t, mem, "expired provider data withdraws memory capacity even with a parent ceiling")
+	require.False(t, m.Healthy(), "stale capacity fails health")
 	provider.fail.Store(false)
 	provider.mem = 0
 	m.refreshOnce()
@@ -183,8 +184,6 @@ func TestMemoryLimitValidationAndProviderStaleness(t *testing.T) {
 	require.Equal(t, 5*gib+333, mem, "recovery must apply the ceiling again")
 }
 
-// The open-source module retains cached capacity on provider failures and uses
-// Healthy to report stale data. The memory ceiling must preserve that policy.
 type memoryLimitNodeResourceManager struct {
 	cpu, mem int64
 	fail     atomic.Bool
@@ -220,8 +219,10 @@ func TestMemoryLimitLifecycleConcurrency(t *testing.T) {
 }
 
 func TestMemoryLimitKubernetesCapacityClipsWithoutDoubleDeduction(t *testing.T) {
-	provider := &k8sWatchResourceManager{totalCPU: 4000, totalMem: 8*gib + 555,
-		allocatedCPU: 500, allocatedMem: 2*gib + 111}
+	provider := &k8sWatchResourceManager{
+		totalCPU: 4000, totalMem: 8*gib + 555, allocatedCPU: 500, allocatedMem: 2*gib + 111,
+		nodeSnapshotReady: true, podSnapshotReady: true, nodeWatching: true, podWatching: true,
+	}
 	m := &Module{nodeResource: provider}
 	const max = 7*gib + 333
 	require.NoError(t, m.SetMemoryLimit("/akernel", max))

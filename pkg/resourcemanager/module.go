@@ -48,6 +48,9 @@ type Module struct {
 	mu                        sync.RWMutex
 	availCpu                  int64
 	availMem                  int64
+	sandboxMemoryUsage        func() (uint64, error)
+	sandboxMemUsage           uint64
+	sandboxMemUsageReady      bool
 	xpu                       xpuProvider
 	ephemeralStorage          ephemeralStorageProvider
 	ephemeralStorageCapacity  uint64
@@ -58,10 +61,17 @@ type Module struct {
 	started                   bool
 
 	lastRefresh atomic.Int64 // unix-nano of most recent successful refresh
-	listener    net.Listener
-	stopCh      chan struct{}
-	closeOnce   sync.Once
-	wg          sync.WaitGroup
+	// lastMemSampleAt records the unix-nano of the most recent successful
+	// sandbox-memory sample. Zero means no sample yet. It is deliberately
+	// separate from lastRefresh: provider refreshes can keep succeeding while
+	// cgroup memory sampling fails, and availMem != 0 is not a valid success
+	// marker either (zero available memory is a legitimate published result).
+	lastMemSampleAt atomic.Int64
+	stalenessWindow time.Duration
+	listener        net.Listener
+	stopCh          chan struct{}
+	closeOnce       sync.Once
+	wg              sync.WaitGroup
 
 	collectorShutdown func(context.Context) error
 	collector         *Collector
@@ -69,12 +79,22 @@ type Module struct {
 
 // resourceInfo is the JSON payload served by the /resource endpoint. CPU is
 // reported in scheduler cores, while memory and writable storage use bytes.
+//
+// Mem keeps the historical capacity contract (provider capacity minus pod
+// requests and transient reservations): schedulers
+// ResourceViewActor already subtract instance requests from allocatable and
+// rebase on capacity deltas, so folding sandbox usage into Mem would
+// double-count every running instance. Sandbox
+// memory is instead exposed as the separate SandboxMemUsage observation
+// field; consumers must explicitly adopt it for admission. The value is
+// omitted while no fresh sample exists.
 type resourceInfo struct {
-	Cpu      int64                 `json:"cpu"`
-	Mem      int64                 `json:"mem"`
-	Xpu      []xpumanager.Resource `json:"xpu"`
-	Storage  *uint64               `json:"storage,omitempty"`
-	Features []string              `json:"features"`
+	Cpu             int64                 `json:"cpu"`
+	Mem             int64                 `json:"mem"`
+	SandboxMemUsage *uint64               `json:"sandbox_mem_usage,omitempty"`
+	Xpu             []xpumanager.Resource `json:"xpu"`
+	Storage         *uint64               `json:"storage,omitempty"`
+	Features        []string              `json:"features"`
 }
 
 type xpuProvider interface {
@@ -104,6 +124,7 @@ func NewModule(
 		sockPath:        sockPath,
 		stopCh:          make(chan struct{}),
 		transientMemory: make(map[string]int64),
+		stalenessWindow: 30 * time.Second,
 	}
 
 	// OTLP metrics push is best-effort: a missing collector at startup must
@@ -196,6 +217,28 @@ func (m *Module) SetParentMemoryReader(
 	}
 }
 
+// SetSandboxMemoryUsage supplies live aggregate sandbox-cgroup memory
+// accounting (CgroupManager.StatsRoot plus out-of-root bookkeeping cgroups
+// such as the Firecracker checkpoint subtree). When set, the refresh loop
+// samples it on the same cadence and serves it as the sandbox_mem_usage
+// observation field on /resource, alongside — not subtracted from — the Mem
+// capacity contract. Consumers that already subtract instance requests from
+// capacity must not receive usage folded into Mem, which would charge each
+// running instance twice.
+//
+// The observation carries the same failure discipline as the capacity
+// fields: a sample is kept through transient read failures only within the
+// staleness window, and the field is omitted when no fresh sample exists.
+//
+// Callers must install this before Start: the refresh goroutine launched by
+// Start must never publish an observation the first round cannot back with
+// a real sample.
+func (m *Module) SetSandboxMemoryUsage(fn func() (uint64, error)) {
+	m.mu.Lock()
+	m.sandboxMemoryUsage = fn
+	m.mu.Unlock()
+}
+
 // MarkSandboxStopped records a terminal sandbox state for asynchronous export.
 func (m *Module) MarkSandboxStopped(target sandbox.MetricsTarget) {
 	if m.collector != nil {
@@ -234,6 +277,10 @@ func (m *Module) Start() error {
 			Mem:      availableAfterTransientReservations(m.availMem, m.transientMemory),
 			Xpu:      []xpumanager.Resource{},
 			Features: []string{},
+		}
+		if m.sandboxMemUsageReady {
+			usage := m.sandboxMemUsage
+			info.SandboxMemUsage = &usage
 		}
 		if m.xpu != nil {
 			info.Xpu = m.xpu.Resources()
@@ -285,13 +332,39 @@ func (m *Module) Stop() {
 }
 
 // Healthy reports whether the latest provider refresh was within the
-// staleness window.
+// staleness window. When sandbox-memory accounting is wired, a stale memory
+// sample past the same window also fails health, independently of provider
+// freshness, so a healthy capacity source cannot hide missing usage data.
 func (m *Module) Healthy() bool {
 	ts := m.lastRefresh.Load()
 	if ts == 0 {
 		return false
 	}
-	return time.Since(time.Unix(0, ts)) < 30*time.Second
+	if time.Since(time.Unix(0, ts)) >= m.stalenessLimit() {
+		return false
+	}
+	m.mu.RLock()
+	usage := m.sandboxMemoryUsage
+	m.mu.RUnlock()
+	if usage != nil {
+		memTs := m.lastMemSampleAt.Load()
+		if memTs == 0 {
+			return false
+		}
+		if time.Since(time.Unix(0, memTs)) >= m.stalenessLimit() {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Module) stalenessLimit() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.stalenessWindow > 0 {
+		return m.stalenessWindow
+	}
+	return 30 * time.Second
 }
 
 // Capacity returns the node's currently-available CPU (millicores) and memory
@@ -386,24 +459,117 @@ func (m *Module) refreshLoop() {
 }
 
 func (m *Module) refreshOnce() {
+	m.mu.RLock()
+	sandboxMemoryUsage := m.sandboxMemoryUsage
+	m.mu.RUnlock()
+
 	cpu, mem, err := m.nodeResource.GetAvailableResource()
 	if err != nil {
+		// A provider failure must not bypass the sandbox-memory staleness
+		// policy below: keep the provider cache untouched for this round but
+		// still run the usage sampling so a stale observation drops out of
+		// the report instead of surviving forever on old provider data.
 		logrus.Errorf("resourcemanager: refresh failed: %v", err)
-		return
+		cpu = -1 // sentinel: skip publishing provider figures this round
+		mem = -1
 	}
 	// Wire format expects CPU in cores; underlying manager returns
 	// millicores (see standalone main.go for the same division).
-	cpu /= 1000
-	m.mu.Lock()
-	if m.memoryCeiling > 0 && mem > m.memoryCeiling {
-		mem = m.memoryCeiling
+	if cpu >= 0 {
+		cpu /= 1000
 	}
-	m.availCpu = cpu
-	m.availMem = mem
+
+	// Sandbox memory lives in a root cgroup outside every pod's cgroup, so
+	// no provider can see it. It is sampled on the same 5s cadence and
+	// exposed as the sandbox_mem_usage observation field next to the
+	// unchanged Mem capacity contract (see resourceInfo for why it is not
+	// subtracted from Mem). The figure includes page cache, which errs on
+	// the safe side for admission decisions that read it.
+	//
+	// Failure and staleness policy: after one successful sample, a failing
+	// sample keeps the last published usage — but only within the staleness
+	// window. Past that (or with no sample yet), the field is omitted from
+	// /resource rather than serving a frozen or fabricated figure.
+	// Sample outside the lock: the reader is an injected callback and must
+	// never run while m.mu is held.
+	var (
+		sampleOK   bool
+		sampleVal  uint64
+		sampleWarn error
+	)
+	if sandboxMemoryUsage != nil {
+		sampleVal, sampleWarn = sandboxMemoryUsage()
+		sampleOK = sampleWarn == nil
+	}
+	// Read the staleness limit before taking m.mu: stalenessLimit itself
+	// locks m.mu, so calling it under Lock would self-deadlock (a writer
+	// cannot recursively take the read lock on a sync.RWMutex).
+	limit := m.stalenessLimit()
+	m.mu.Lock()
+	if sandboxMemoryUsage != nil {
+		switch {
+		case sampleOK:
+			m.sandboxMemUsage = sampleVal
+			m.sandboxMemUsageReady = true
+			m.lastMemSampleAt.Store(time.Now().UnixNano())
+		default:
+			lastSample := m.lastMemSampleAt.Load()
+			if lastSample != 0 &&
+				time.Since(time.Unix(0, lastSample)) < limit {
+				logrus.Warnf(
+					"resourcemanager: read sandbox memory usage failed; keep last sample: %v",
+					sampleWarn,
+				)
+			} else {
+				m.sandboxMemUsageReady = false
+				m.lastMemSampleAt.Store(0)
+				logrus.Warnf(
+					"resourcemanager: sandbox memory sample missing or stale; dropping observation field: %v",
+					sampleWarn,
+				)
+			}
+		}
+	}
+	if cpu >= 0 {
+		if m.memoryCeiling > 0 && mem > m.memoryCeiling {
+			mem = m.memoryCeiling
+		}
+		m.availCpu = cpu
+		m.availMem = mem
+		m.lastRefresh.Store(time.Now().UnixNano())
+	} else if lastRefresh := m.lastRefresh.Load(); lastRefresh == 0 ||
+		time.Since(time.Unix(0, lastRefresh)) >= limit {
+		// Provider data is past the staleness window: publish zero capacity
+		// rather than the frozen last-successful figure. The consumer's
+		// collector caches its previous successful response on connection
+		// errors and non-200 replies, so an error or omitted field would not
+		// stop it from scheduling against the stale figure — only an explicit
+		// zero propagates. Zero removes the node from admission until the
+		// provider recovers and the real capacity is republished.
+		m.availCpu = 0
+		m.availMem = 0
+		logrus.Warn(
+			"resourcemanager: provider data stale; publishing zero capacity")
+	}
 	m.mu.Unlock()
-	m.lastRefresh.Store(time.Now().UnixNano())
-	logrus.Debugf("resourcemanager: avail cpu=%d cores mem=%d bytes", cpu, mem)
+	if cpu >= 0 {
+		logrus.Debugf(
+			"resourcemanager: avail cpu=%d cores mem=%d bytes sandbox_mem=%d bytes",
+			cpu, mem, sandboxMemSnapshot(m),
+		)
+	}
 	m.refreshEphemeralStorage()
+}
+
+// sandboxMemSnapshot returns the currently published sandbox-memory
+// observation for debug logging; 0 when the field is absent.
+func sandboxMemSnapshot(m *Module) uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.sandboxMemUsageReady {
+		return 0
+	}
+	return m.sandboxMemUsage
 }
 
 func (m *Module) refreshEphemeralStorage() {

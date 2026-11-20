@@ -82,6 +82,7 @@ type cgroupOps interface {
 	setPidsLimit(name string, limit int64) error
 	update(name string, resources *specs.LinuxResources) error
 	stat(name string) (Stats, error)
+	statRoot(name string) (Stats, error)
 	newOOMWatcher() (oomWatcher, error)
 	kill(name string) error
 	delete(name string) error

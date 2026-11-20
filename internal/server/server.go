@@ -47,6 +47,7 @@ import (
 	_ "github.com/inclusionAI/sandboxd/pkg/networkmanager/bridge"
 	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"github.com/inclusionAI/sandboxd/pkg/runtime/firecracker"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
@@ -958,6 +959,22 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		if nodeResMod != nil {
 			nodeResMod.SetCgroupStatsReader(cgroupMgr.Stats)
 			nodeResMod.SetParentMemoryReader(cgroupMgr.ReadParentMemory)
+			// The sandbox_mem_usage observation aggregates the managed sandbox root
+			// rollup plus the sibling Firecracker checkpoint subtree, which
+			// the sandbox root rollup cannot see. Mem itself keeps the
+			// historical capacity contract — see resourceInfo.
+			nodeResMod.SetSandboxMemoryUsage(func() (uint64, error) {
+				stats, err := cgroupMgr.StatsRoot()
+				if err != nil {
+					return 0, err
+				}
+				usage := stats.MemoryUsageBytes
+				checkpoint, cerr := cgroupMgr.SiblingMemoryUsage(firecracker.CheckpointCgroupPath())
+				if cerr != nil {
+					return 0, cerr
+				}
+				return usage + checkpoint, nil
+			})
 		}
 		defer func() {
 			if retErr != nil {
@@ -1057,7 +1074,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		}
 	}
 
-	// Reporting starts with the effective parent ceiling already installed.
+	// Reporting starts after the parent ceiling and memory readers are installed.
 	if nodeResMod != nil {
 		if err := nodeResMod.Start(); err != nil {
 			return nil, fmt.Errorf("node-resource module start: %w", err)

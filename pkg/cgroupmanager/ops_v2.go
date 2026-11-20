@@ -177,9 +177,21 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 		result.CPUUserNanos = usecToNS(metrics.CPU.UserUsec)
 		result.CPUKernelNanos = usecToNS(metrics.CPU.SystemUsec)
 	}
-	if metrics.Memory != nil {
-		result.MemoryUsageBytes = metrics.Memory.Usage
+	// The unified hierarchy root exposes CPU accounting but deliberately has
+	// no memory.current. It is used for node CPU metrics, never sandbox memory
+	// accounting. Keep memory reads strict for every non-root cgroup.
+	if metrics.Memory != nil && filepath.Clean(name) != "/" {
 		result.MemoryLimitBytes = metrics.Memory.UsageLimit
+		// The library reads memory.current through a helper that swallows
+		// read errors and reports Usage=0 (containerd/cgroups v3
+		// cgroup2.getStatFileContentUint64): a missing or unreadable file
+		// would silently look like a genuinely idle sandbox. Read the file
+		// ourselves so callers can distinguish missing data from zero usage.
+		usage, uerr := readCgroupUintFile(filepath.Join(o.mountpoint, name, "memory.current"))
+		if uerr != nil {
+			return Stats{}, fmt.Errorf("read memory.current for %s: %w", name, uerr)
+		}
+		result.MemoryUsageBytes = usage
 		result.MemoryMaxUsageBytes = readUintFile(filepath.Join(o.mountpoint, name, "memory.peak"))
 		if result.MemoryMaxUsageBytes == 0 {
 			result.MemoryMaxUsageBytes = result.MemoryUsageBytes
@@ -188,17 +200,35 @@ func (o *cgroupV2) stat(name string) (Stats, error) {
 	return result, nil
 }
 
+func (o *cgroupV2) statRoot(name string) (Stats, error) {
+	return o.stat(name)
+}
+
 func readUintFile(filename string) uint64 {
-	data, err := os.ReadFile(filename)
+	value, err := readCgroupUintFile(filename)
 	if err != nil {
 		return 0
 	}
+	return value
+}
+
+// readCgroupUintFile is the error-propagating form of readUintFile: callers
+// charging capacity from these figures must distinguish a true zero from an
+// unreadable control file instead of treating both as "idle".
+func readCgroupUintFile(filename string) (uint64, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return 0, err
+	}
 	value := strings.TrimSpace(string(data))
 	if value == "max" {
-		return ^uint64(0)
+		return ^uint64(0), nil
 	}
-	result, _ := strconv.ParseUint(value, 10, 64)
-	return result
+	result, perr := strconv.ParseUint(value, 10, 64)
+	if perr != nil {
+		return 0, fmt.Errorf("parse %q as uint from %s: %w", value, filename, perr)
+	}
+	return result, nil
 }
 
 func (o *cgroupV2) newOOMWatcher() (oomWatcher, error) {

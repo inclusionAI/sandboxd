@@ -282,6 +282,10 @@ func (f *fakeCgroupOps) update(string, *specs.LinuxResources) error {
 	return nil
 }
 func (f *fakeCgroupOps) stat(string) (Stats, error) { return f.stats, nil }
+func (f *fakeCgroupOps) statRoot(string) (Stats, error) {
+	f.calls = append(f.calls, "stat-root")
+	return f.stats, nil
+}
 func (f *fakeCgroupOps) newOOMWatcher() (oomWatcher, error) {
 	if f.oom == nil {
 		f.oom = newFakeOOMWatcher()
@@ -553,6 +557,111 @@ func TestV2ResetAndStats(t *testing.T) {
 	assert.Equal(t, uint64(4096), stats.MemoryUsageBytes)
 	assert.Equal(t, uint64(8192), stats.MemoryLimitBytes)
 	assert.Equal(t, uint64(6144), stats.MemoryMaxUsageBytes)
+}
+
+func TestV2RootStatsWithoutMemoryControllerFiles(t *testing.T) {
+	mountpoint := t.TempDir()
+	writeTestFile(t, filepath.Join(mountpoint, "cgroup.controllers"), "cpu memory")
+	writeTestFile(t, filepath.Join(mountpoint, "cpu.stat"), "usage_usec 123\nuser_usec 80\nsystem_usec 43\n")
+	// The real unified hierarchy root has no memory.current or memory.max.
+	mgr := &CgroupManager{ops: &cgroupV2{mountpoint: mountpoint}}
+	stats, err := mgr.Stats("/")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(123000), stats.CPUUsageNanos)
+	assert.Equal(t, uint64(80000), stats.CPUUserNanos)
+	assert.Equal(t, uint64(43000), stats.CPUKernelNanos)
+	assert.Zero(t, stats.MemoryUsageBytes)
+	assert.Zero(t, stats.MemoryLimitBytes)
+	assert.Zero(t, stats.MemoryMaxUsageBytes)
+}
+
+func TestV2StatPropagatesMemoryCurrentReadError(t *testing.T) {
+	// The containerd/cgroups library reads memory.current through a helper
+	// that swallows errors and reports 0; sandboxd reads it directly so an
+	// unreadable control file surfaces as an error instead of an idle-looking
+	// sandbox. Capacity accounting fails closed.
+	mountpoint := t.TempDir()
+	name := "/sandbox/lease"
+	groupPath := filepath.Join(mountpoint, name)
+	require.NoError(t, os.MkdirAll(groupPath, 0755))
+	writeTestFile(t, filepath.Join(groupPath, "cgroup.controllers"), "cpu memory")
+	writeTestFile(t, filepath.Join(groupPath, "cpu.stat"), "usage_usec 0\n")
+	writeTestFile(t, filepath.Join(groupPath, "memory.stat"), "anon 0\n")
+	writeTestFile(t, filepath.Join(groupPath, "memory.max"), "8192")
+	// memory.current intentionally absent.
+
+	ops := &cgroupV2{mountpoint: mountpoint}
+	_, err := ops.stat(name)
+	require.Error(t, err,
+		"missing memory.current must fail the stat, not read as usage 0")
+	assert.Contains(t, err.Error(), "memory.current")
+}
+
+func TestReadCgroupUintFileZeroAndMaxAndGarbage(t *testing.T) {
+	// The error-propagating reader backs capacity accounting: a genuine
+	// zero, the "max" sentinel, and unparsable content must be told apart,
+	// with only the last two producing errors (a real zero is healthy data).
+	dir := t.TempDir()
+
+	zeroFile := filepath.Join(dir, "zero")
+	writeTestFile(t, zeroFile, "0")
+	value, err := readCgroupUintFile(zeroFile)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0), value, "a genuine zero must be data, not an error")
+
+	maxFile := filepath.Join(dir, "max")
+	writeTestFile(t, maxFile, "max")
+	value, err = readCgroupUintFile(maxFile)
+	require.NoError(t, err)
+	assert.Equal(t, ^uint64(0), value)
+
+	garbageFile := filepath.Join(dir, "garbage")
+	writeTestFile(t, garbageFile, "not-a-number")
+	_, err = readCgroupUintFile(garbageFile)
+	require.Error(t, err, "unparsable content must surface as an error")
+
+	missingFile := filepath.Join(dir, "missing")
+	_, err = readCgroupUintFile(missingFile)
+	require.Error(t, err, "an unreadable file must surface as an error")
+}
+
+func TestSiblingMemoryUsageMissingPresentAndError(t *testing.T) {
+	// The sibling rollup backs the sandbox_mem_usage observation: an absent
+	// sibling (runtime checkpoint cgroup comes and goes) reads as zero, a
+	// present one reports its usage, and only genuine failures beyond
+	// "not there" propagate.
+	mountpoint := t.TempDir()
+	mgr := &CgroupManager{ops: &cgroupV2{mountpoint: mountpoint}}
+
+	// Absent sibling: zero, no error — absence means nothing to charge.
+	usage, err := mgr.SiblingMemoryUsage("/sandboxd-firecracker-checkpoint")
+	require.NoError(t, err)
+	assert.Zero(t, usage)
+
+	// Empty path short-circuits to zero without touching the filesystem.
+	usage, err = mgr.SiblingMemoryUsage("")
+	require.NoError(t, err)
+	assert.Zero(t, usage)
+
+	// Present sibling: usage read from memory.current.
+	sibling := filepath.Join(mountpoint, "/sandboxd-firecracker-checkpoint")
+	require.NoError(t, os.MkdirAll(sibling, 0755))
+	writeTestFile(t, filepath.Join(sibling, "cgroup.controllers"), "memory")
+	writeTestFile(t, filepath.Join(sibling, "memory.stat"), "anon 0\n")
+	writeTestFile(t, filepath.Join(sibling, "memory.current"), "1048576")
+	usage, err = mgr.SiblingMemoryUsage("/sandboxd-firecracker-checkpoint")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1<<20), usage)
+
+	// Present sibling with an unreadable memory.current: a genuine read
+	// failure (content garbage here — permission denial behaves the same)
+	// must propagate as an error, never collapse to "nothing to charge":
+	// only "not there" reads as zero.
+	writeTestFile(t, filepath.Join(sibling, "memory.current"), "not-a-number")
+	_, err = mgr.SiblingMemoryUsage("/sandboxd-firecracker-checkpoint")
+	require.Error(t, err,
+		"a corrupt sibling memory.current must surface as an error, not zero")
+	assert.Contains(t, err.Error(), "memory.current")
 }
 
 func TestV2OOMWatcherUsesCgroupBaseline(t *testing.T) {
