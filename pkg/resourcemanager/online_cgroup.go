@@ -132,7 +132,7 @@ func podCgroupDisappeared(podPath string, readErr error) bool {
 type onlineResourceManager struct {
 	cfg           CgroupConfig
 	resCfg        OnlineResourceConfig
-	prevCpuUsage  int64
+	prevCPUUsage  []int64
 	prevUsageTime time.Time
 	lastReportCpu float64
 	lastReportMem float64
@@ -151,33 +151,44 @@ func (mgr *onlineResourceManager) listPods() ([]*podInfo, error) {
 	return pods, nil
 }
 
-func (mgr *onlineResourceManager) cpuUsage() (float64, error) {
-	rootCpuacct, err := cgroupv1.ReadCPUAcctWithoutPercpu(path.Join(mgr.cfg.HostCpuacctCgroupPath, ""), time.Now())
+func (mgr *onlineResourceManager) cpuUsage(now time.Time) (cores float64, measured bool, err error) {
+	rootCpuacct, err := cgroupv1.ReadCPUAcctWithoutPercpu(mgr.cfg.HostCpuacctCgroupPath, now)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read root cpuacct.usage: %w", err)
+		return 0, false, fmt.Errorf("failed to read root cpuacct.usage: %w", err)
 	}
-	usage := rootCpuacct.Usage
-	now := time.Now()
+	counters := make([]int64, 0, len(mgr.resCfg.OfflineCgroups)+2)
+	counters = append(counters, rootCpuacct.Usage)
 	for _, rootCgroup := range mgr.resCfg.OfflineCgroups {
 		cpuacct, err := cgroupv1.ReadCPUAcctWithoutPercpu(path.Join(mgr.cfg.HostCpuacctCgroupPath, rootCgroup), now)
 		if err != nil {
-			return 0, fmt.Errorf("failed to read %s cpuacct.usage: %w", rootCgroup, err)
+			return 0, false, fmt.Errorf("failed to read %s cpuacct.usage: %w", rootCgroup, err)
 		}
-		usage -= cpuacct.Usage
+		counters = append(counters, cpuacct.Usage)
 	}
-	faasCpuacct, err := cgroupv1.ReadCPUAcctWithoutPercpu(path.Join(mgr.cfg.FaasCpuaactCgroupPath, ""), now)
+	faasCpuacct, err := cgroupv1.ReadCPUAcctWithoutPercpu(mgr.cfg.FaasCpuaactCgroupPath, now)
 	if err != nil {
-		return 0.0, fmt.Errorf("failed to read faas cpuacct.usage: %w", err)
+		return 0, false, fmt.Errorf("failed to read faas cpuacct.usage: %w", err)
 	}
-	usage -= faasCpuacct.Usage
-	usedCpu := 0.0
-	if mgr.prevCpuUsage != 0 {
-		delta := time.Now().Sub(mgr.prevUsageTime).Seconds()
-		usedCpu = (float64(usage) - float64(mgr.prevCpuUsage)) / (delta * 1e9)
+	counters = append(counters, faasCpuacct.Usage)
+
+	previous := mgr.prevCPUUsage
+	elapsed := now.Sub(mgr.prevUsageTime)
+	mgr.prevCPUUsage, mgr.prevUsageTime = counters, now
+	if len(previous) != len(counters) || elapsed <= 0 {
+		return 0, false, nil
 	}
-	mgr.prevCpuUsage = usage
-	mgr.prevUsageTime = now
-	return math.Max(usedCpu, 0.0), nil
+	// Check each counter before subtracting the excluded groups. A reset can
+	// be hidden by the other counters when comparing only the net total.
+	for i, counter := range counters {
+		if counter < previous[i] {
+			return 0, false, nil
+		}
+	}
+	onlineCPUTime := float64(counters[0] - previous[0])
+	for i := 1; i < len(counters); i++ {
+		onlineCPUTime -= float64(counters[i] - previous[i])
+	}
+	return math.Max(onlineCPUTime/float64(elapsed.Nanoseconds()), 0), true, nil
 }
 
 func (mgr *onlineResourceManager) memUsage() (float64, error) {
@@ -257,29 +268,34 @@ func (mgr *onlineResourceManager) GetAvailableResource(maxCPUMilli, maxMem int64
 	notAllocatedCpu := maxCpuFixed - allocatedCpu
 	notAllocatedMem := maxMemFixed - allocatedMem
 
-	cpuUsed, err := mgr.cpuUsage()
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get cpu usage: %w", err)
-	}
 	memUsed, err := mgr.memUsage()
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get mem usage: %w", err)
 	}
 	memUsed += float64(memInfo.UnReclaimableKernel)
-	cpuResource := allocatedCpu*float64(mgr.resCfg.CPUMaxRatio)/float64(100) - cpuUsed +
-		notAllocatedCpu*float64(mgr.resCfg.CpuFreeOverSoldRatio)/float64(100)
-	if cfsQuota.Quota > 0 {
-		quotaCPU := float64(cfsQuota.Quota) / float64(cfsQuota.Period)
-		cpuResource = math.Min(cpuResource, quotaCPU)
+	cpuUsed, cpuMeasured, err := mgr.cpuUsage(time.Now())
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get cpu usage: %w", err)
+	}
+	// Withdraw CPU headroom while establishing a baseline. Returning an
+	// error here would keep advertising the previous CPU value after a reset.
+	cpuResource := 0.0
+	if cpuMeasured {
+		cpuResource = allocatedCpu*float64(mgr.resCfg.CPUMaxRatio)/float64(100) - cpuUsed +
+			notAllocatedCpu*float64(mgr.resCfg.CpuFreeOverSoldRatio)/float64(100)
+		if cfsQuota.Quota > 0 {
+			quotaCPU := float64(cfsQuota.Quota) / float64(cfsQuota.Period)
+			cpuResource = math.Min(cpuResource, quotaCPU)
+		}
 	}
 	memResource := math.Min(
 		allocatedMem*(1.0-float64(mgr.resCfg.MemoryReserveRatio)/float64(100))-memUsed,
 		allocatedMem*float64(mgr.resCfg.MemoryOverSoldRatio)/float64(100),
 	) + notAllocatedMem*float64(mgr.resCfg.MemoryFreeOverSoldRatio)/float64(100)
 	logrus.Infof("report online resource info: "+
-		"cpu (alloc: %f, left: %f, used: %f, resource: %f, last: %f), "+
+		"cpu (alloc: %f, left: %f, used: %f, measured: %t, resource: %f, last: %f), "+
 		"mem (alloc: %f, left: %f, used: %f, resource: %f, last: %f)",
-		allocatedCpu, notAllocatedCpu, cpuUsed, cpuResource, mgr.lastReportCpu,
+		allocatedCpu, notAllocatedCpu, cpuUsed, cpuMeasured, cpuResource, mgr.lastReportCpu,
 		allocatedMem, notAllocatedMem, memUsed, memResource, mgr.lastReportMem)
 	cpuResource = math.Max(0.0, cpuResource)
 	memResource = math.Max(0.0, memResource)

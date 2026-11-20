@@ -17,6 +17,7 @@ package resourcemanager
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -192,6 +193,73 @@ func TestOnlineProviderRefreshesAndHonorsCloudCeiling(t *testing.T) {
 	_, _, err = mgr.GetAvailableResource()
 	require.ErrorIs(t, err, assert.AnError)
 	require.Equal(t, 3, policy.calls, "invalid or unobserved capacity cannot fall back to host limits")
+}
+
+func TestOnlineCapacityRequiresMeasuredCPU(t *testing.T) {
+	root := t.TempDir()
+	write := func(name, contents string) {
+		t.Helper()
+		file := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(file), 0755))
+		require.NoError(t, os.WriteFile(file, []byte(contents), 0644))
+	}
+	host := filepath.Join(root, "host")
+	faas := filepath.Join(root, "faas")
+	write("faas/cpu.cfs_quota_us", "-1")
+	write("faas/cpu.cfs_period_us", "100000")
+	write("faas/cpu.shares", "1024")
+	write("faas/cpuset.cpus", "0-7")
+	write("faas/memory.stat", "total_active_anon 0\n")
+	write("zoneinfo", "managed "+strconv.FormatInt((64<<30)/int64(os.Getpagesize()), 10)+"\n")
+	mgr := &onlineResourceManager{
+		cfg: CgroupConfig{
+			HostCpuacctCgroupPath: host,
+			FaasCpuaactCgroupPath: faas,
+			FaasCpuCgroupPath:     faas,
+			FaasCpusetCgroupPath:  faas,
+			FaasMemCgroupPath:     faas,
+			ZoneinfoPath:          filepath.Join(root, "zoneinfo"),
+		},
+		resCfg: OnlineResourceConfig{
+			OfflineCgroups:          []string{"offline"},
+			CpuFreeOverSoldRatio:    100,
+			MemoryFreeOverSoldRatio: 100,
+		},
+		startupTime: time.Now(),
+	}
+	for _, sample := range []struct {
+		name                string
+		host, offline, faas int64
+		hasHeadroom         bool
+	}{
+		{name: "initial zero counter is only a baseline"},
+		{name: "busy interval from zero counts as measured", host: 32e9},
+		{name: "idle sample makes headroom available", host: 32e9, hasHeadroom: true},
+		{name: "host reset withdraws headroom", host: 1e9},
+		{name: "valid interval after reset", host: 1e9, hasHeadroom: true},
+		{name: "offline and faas accrue", host: 3e9, offline: 1e9, faas: 1e9, hasHeadroom: true},
+		{name: "offline reset invalidates interval", host: 3e9, faas: 1e9},
+		{name: "valid interval after offline reset", host: 3e9, faas: 1e9, hasHeadroom: true},
+		{name: "faas reset invalidates interval", host: 3e9},
+		{name: "valid interval after faas reset", host: 3e9, hasHeadroom: true},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			write("host/cpuacct.usage", strconv.FormatInt(sample.host, 10))
+			write("host/offline/cpuacct.usage", strconv.FormatInt(sample.offline, 10))
+			write("faas/cpuacct.usage", strconv.FormatInt(sample.faas, 10))
+			if !mgr.prevUsageTime.IsZero() {
+				mgr.prevUsageTime = time.Now().Add(-time.Second)
+			}
+			cpu, memory, err := mgr.GetAvailableResource(8000, 64<<30)
+			require.NoError(t, err)
+			require.Positive(t, memory, "CPU baseline must not suppress measured memory")
+			if sample.hasHeadroom {
+				require.Positive(t, cpu)
+			} else {
+				require.Zero(t, cpu)
+			}
+		})
+	}
 }
 
 type recordOnlineCeiling struct{ calls int }
