@@ -36,6 +36,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/cgroupmanager"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
+	"github.com/inclusionAI/sandboxd/pkg/resourcemanager"
 	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/inclusionAI/sandboxd/pkg/runtime/firecracker"
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
@@ -243,6 +244,31 @@ func TestListAvailableRuntimes(t *testing.T) {
 		},
 		{RuntimeClass: "other"},
 	}, resp.Runtimes)
+}
+
+func TestListAvailableRuntimesWithUnavailableSandboxMemoryObservation(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
+	})
+	module, err := resourcemanager.NewModule(
+		filepath.Join(t.TempDir(), "resource.sock"), resourcemanager.ProviderCgroup,
+	)
+	require.NoError(t, err)
+	module.SetSandboxMemoryUsage(func() (uint64, error) {
+		return 0, errors.New("cgroup v1 hierarchical accounting is disabled")
+	})
+	require.NoError(t, module.Start())
+	t.Cleanup(module.Stop)
+	s.resourceMod = module
+	require.Eventually(t, func() bool {
+		_, memory := module.Capacity()
+		return memory > 0
+	}, 2*time.Second, 10*time.Millisecond)
+
+	require.True(t, s.Ready())
+	resp, err := s.ListAvailableRuntimes(context.Background(), &runtime.ListAvailableRuntimesRequest{})
+	require.NoError(t, err)
+	require.Equal(t, []string{config.RuntimeNameRunsc}, resp.RuntimeClasses)
 }
 
 func TestDistillFSRecoveryGatesNewSandboxTraffic(t *testing.T) {

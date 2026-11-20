@@ -15,14 +15,22 @@
 package resourcemanager
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apiresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func TestNextRetryInterval(t *testing.T) {
@@ -310,11 +318,15 @@ func TestK8sWatchResourceManagerWatchEventHandlers(t *testing.T) {
 
 func TestK8sWatchResourceManagerGetAvailableResource(t *testing.T) {
 	mgr := &k8sWatchResourceManager{
-		totalCPU:     4000,
-		totalMem:     int64(10 << 30),
-		allocatedCPU: 1500,
-		allocatedMem: int64((3 << 30) + (512 << 20)),
-		podRequests:  map[string]podResourceRequest{},
+		totalCPU:          4000,
+		totalMem:          int64(10 << 30),
+		allocatedCPU:      1500,
+		allocatedMem:      int64((3 << 30) + (512 << 20)),
+		podRequests:       map[string]podResourceRequest{},
+		nodeSnapshotReady: true,
+		podSnapshotReady:  true,
+		nodeWatching:      true,
+		podWatching:       true,
 	}
 
 	cpu, mem, err := mgr.GetAvailableResource()
@@ -351,4 +363,206 @@ func newTestPod(namespace, name, nodeName string, phase corev1.PodPhase, cpuReq,
 		},
 		Status: corev1.PodStatus{Phase: phase},
 	}
+}
+
+func newWatchTestManager(t *testing.T) (*k8sWatchResourceManager, *fake.Clientset) {
+	t.Helper()
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.NodeList{
+			ListMeta: metav1.ListMeta{ResourceVersion: "10"},
+			Items: []corev1.Node{{Status: corev1.NodeStatus{Allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:    apiresource.MustParse("4"),
+				corev1.ResourceMemory: apiresource.MustParse("10Gi"),
+			}}}},
+		}, nil
+	})
+	client.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, &corev1.PodList{
+			ListMeta: metav1.ListMeta{ResourceVersion: "20"},
+			Items:    []corev1.Pod{*newTestPod("default", "pod-a", "node-a", corev1.PodRunning, "1", "2Gi")},
+		}, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	mgr := &k8sWatchResourceManager{
+		client: client, localNodeName: "node-a", ctx: ctx, cancel: cancel,
+		podRequests: make(map[string]podResourceRequest),
+	}
+	return mgr, client
+}
+
+func startTestResourceWatch(t *testing.T, mgr *k8sWatchResourceManager, client *fake.Clientset, node bool, version string, watcher watch.Interface) <-chan error {
+	t.Helper()
+	resource := "pods"
+	if node {
+		resource = "nodes"
+	}
+	client.PrependWatchReactor(resource, func(action ktesting.Action) (bool, watch.Interface, error) {
+		assert.Equal(t, version, action.(ktesting.WatchAction).GetWatchRestrictions().ResourceVersion)
+		return true, watcher, nil
+	})
+	result := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if node {
+			_, err := mgr.watchNodeStream(version)
+			result <- err
+		} else {
+			_, err := mgr.watchPodStream(version)
+			result <- err
+		}
+	}()
+	t.Cleanup(func() {
+		mgr.cancel()
+		watcher.Stop()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("watch did not stop after cancellation")
+		}
+	})
+	require.Eventually(t, func() bool {
+		mgr.mu.RLock()
+		defer mgr.mu.RUnlock()
+		if node {
+			return mgr.nodeWatching
+		}
+		return mgr.podWatching
+	}, time.Second, time.Millisecond)
+	return result
+}
+
+func TestK8sWatchRequiresBothSnapshotsAndLiveStreams(t *testing.T) {
+	mgr, client := newWatchTestManager(t)
+	_, _, err := mgr.GetAvailableResource()
+	require.Error(t, err)
+	_, err = mgr.initNodeSnapshot()
+	require.NoError(t, err)
+	startTestResourceWatch(t, mgr, client, true, "10", watch.NewRaceFreeFake())
+	startTestResourceWatch(t, mgr, client, false, "20", watch.NewRaceFreeFake())
+	_, _, err = mgr.GetAvailableResource()
+	require.Error(t, err, "a live pod stream cannot substitute for the initial pod list")
+	_, err = mgr.initPodSnapshot()
+	require.NoError(t, err)
+	cpu, mem, err := mgr.GetAvailableResource()
+	require.NoError(t, err)
+	assert.Equal(t, int64(3000), cpu)
+	assert.Equal(t, int64(8<<30), mem)
+	// No events have arrived. Healthy quiet streams still keep the cache fresh.
+	m := &Module{nodeResource: mgr}
+	m.lastRefresh.Store(time.Now().Add(-time.Hour).UnixNano())
+	m.refreshOnce()
+	assert.True(t, m.Healthy())
+}
+
+func TestK8sWatchDisconnectsAreReportedIndependently(t *testing.T) {
+	for _, node := range []bool{true, false} {
+		for _, gone := range []bool{false, true} {
+			t.Run(fmt.Sprintf("node=%t/expired=%t", node, gone), func(t *testing.T) {
+				mgr, client := newWatchTestManager(t)
+				_, err := mgr.initNodeSnapshot()
+				require.NoError(t, err)
+				_, err = mgr.initPodSnapshot()
+				require.NoError(t, err)
+				nodeWatch, podWatch := watch.NewRaceFreeFake(), watch.NewRaceFreeFake()
+				nodeResult := startTestResourceWatch(t, mgr, client, true, "10", nodeWatch)
+				podResult := startTestResourceWatch(t, mgr, client, false, "20", podWatch)
+				failedWatch, result := podWatch, podResult
+				if node {
+					failedWatch, result = nodeWatch, nodeResult
+				}
+				if gone {
+					failedWatch.Error(&metav1.Status{Code: 410, Message: "expired resource version"})
+				} else {
+					failedWatch.Stop()
+				}
+				select {
+				case err := <-result:
+					require.Error(t, err)
+				case <-time.After(time.Second):
+					t.Fatal("closed or errored watch did not return")
+				}
+				// Updates to the surviving stream must not mask the failed one.
+				mgr.updateNodeTotal(&corev1.Node{Status: corev1.NodeStatus{Allocatable: corev1.ResourceList{
+					corev1.ResourceCPU:    apiresource.MustParse("8"),
+					corev1.ResourceMemory: apiresource.MustParse("20Gi"),
+				}}})
+				_, _, err = mgr.GetAvailableResource()
+				require.Error(t, err)
+			})
+		}
+	}
+}
+
+func TestK8sWatchEstablishmentFailureDoesNotPublishCachedCapacity(t *testing.T) {
+	for _, node := range []bool{true, false} {
+		t.Run(fmt.Sprintf("node=%t", node), func(t *testing.T) {
+			mgr, client := newWatchTestManager(t)
+			_, err := mgr.initNodeSnapshot()
+			require.NoError(t, err)
+			_, err = mgr.initPodSnapshot()
+			require.NoError(t, err)
+			version := "10"
+			if node {
+				version = "20"
+			}
+			startTestResourceWatch(t, mgr, client, !node, version, watch.NewRaceFreeFake())
+			client.PrependWatchReactor("*", func(ktesting.Action) (bool, watch.Interface, error) {
+				return true, nil, errors.New("API server unavailable")
+			})
+			if node {
+				_, err = mgr.watchNodeStream("10")
+			} else {
+				_, err = mgr.watchPodStream("20")
+			}
+			require.Error(t, err)
+			_, _, err = mgr.GetAvailableResource()
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestK8sWatchLoopRequiresSuccessfulRelistBeforeReconnect(t *testing.T) {
+	for _, initialVersion := range []string{"", "expired-version"} {
+		t.Run(initialVersion, func(t *testing.T) {
+			mgr, _ := newWatchTestManager(t)
+			var watchCalls atomic.Int32
+			mgr.watchResourceLoop("pod", initialVersion, func() (string, error) {
+				mgr.cancel()
+				return "", errors.New("API server unavailable")
+			}, func(version string) (string, error) {
+				watchCalls.Add(1)
+				assert.Equal(t, initialVersion, version)
+				return version, errors.New("expired resource version")
+			})
+			if initialVersion == "" {
+				assert.Zero(t, watchCalls.Load(), "failed initial list must not start a watch from now")
+			} else {
+				assert.Equal(t, int32(1), watchCalls.Load(), "failed relist must not reconnect an old cache")
+			}
+		})
+	}
+}
+
+func TestK8sWatchStopCancelsQuietStreams(t *testing.T) {
+	mgr, client := newWatchTestManager(t)
+	client.PrependWatchReactor("*", func(ktesting.Action) (bool, watch.Interface, error) {
+		return true, watch.NewRaceFreeFake(), nil
+	})
+	require.NoError(t, mgr.start())
+	require.Eventually(t, func() bool {
+		_, _, err := mgr.GetAvailableResource()
+		return err == nil
+	}, time.Second, time.Millisecond)
+	done := make(chan struct{})
+	go func() { mgr.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Stop blocked on a quiet stream")
+	}
+	_, _, err := mgr.GetAvailableResource()
+	require.Error(t, err)
 }

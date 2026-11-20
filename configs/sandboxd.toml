@@ -158,7 +158,9 @@ cgroup_memory_limit = "0"
 
 # The optional node-resource integration is intended for an AKernel node.
 # Kubernetes is the backward-compatible default. Standalone deployments can
-# select the read-only cgroup provider instead.
+# select the read-only cgroup provider. Alibaba Cloud deployments with cgroup v1
+# can opt in to online_cgroup with a cgroup policy JSON file.
 # [plugin.node_resource]
-# provider = "kubernetes" # or "cgroup"
+# provider = "kubernetes" # or "cgroup" / "online_cgroup"
+# online_cfg_path = "/etc/sandboxd/online_resource.json"
 # sock_path = "/run/sandboxd/resource.sock"

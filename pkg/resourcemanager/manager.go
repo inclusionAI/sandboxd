@@ -27,9 +27,16 @@ const (
 	tokenPath = "/etc/k8s_secrets/token"
 	caPath    = "/etc/k8s_secrets/ca.crt"
 
-	ProviderKubernetes = "kubernetes"
-	ProviderCgroup     = "cgroup"
+	ProviderKubernetes   = "kubernetes"
+	ProviderCgroup       = "cgroup"
+	ProviderOnlineCgroup = "online_cgroup"
 )
+
+// ProviderConfig carries provider-specific configuration without coupling the
+// common resource socket and refresh loop to a particular policy.
+type ProviderConfig struct {
+	OnlineConfigPath string
+}
 
 type NodeResourceManager interface {
 	GetAvailableResource() (int64, int64, error)
@@ -94,30 +101,48 @@ func normalizeProvider(provider string) (string, error) {
 		return ProviderKubernetes, nil
 	case ProviderCgroup:
 		return ProviderCgroup, nil
+	case ProviderOnlineCgroup:
+		return ProviderOnlineCgroup, nil
 	default:
 		return "", fmt.Errorf(
-			"unsupported node-resource provider %q (supported: %s, %s)",
+			"unsupported node-resource provider %q (supported: %s, %s, %s)",
 			provider,
 			ProviderKubernetes,
 			ProviderCgroup,
+			ProviderOnlineCgroup,
 		)
 	}
 }
 
 // NewNodeResourceManager constructs the configured CPU and memory capacity
 // source. Kubernetes remains the default for backward compatibility; cgroup
-// is the read-only provider used by standalone deployments.
-func NewNodeResourceManager(provider string) (NodeResourceManager, error) {
+// is the read-only provider used by standalone deployments; online_cgroup is
+// an opt-in cgroup v1 policy for Alibaba Cloud node resources.
+func NewNodeResourceManager(
+	provider string,
+	configs ...ProviderConfig,
+) (NodeResourceManager, error) {
+	if len(configs) > 1 {
+		return nil, fmt.Errorf("at most one node-resource provider config is allowed")
+	}
+	var providerConfig ProviderConfig
+	if len(configs) == 1 {
+		providerConfig = configs[0]
+	}
+
 	normalized, err := normalizeProvider(provider)
 	if err != nil {
 		return nil, err
 	}
-	if normalized == ProviderCgroup {
+	switch normalized {
+	case ProviderCgroup:
 		mgr, cgroupErr := newCgroupResourceManager()
 		if cgroupErr != nil {
 			return nil, fmt.Errorf("failed to create cgroup resource manager: %w", cgroupErr)
 		}
 		return mgr, nil
+	case ProviderOnlineCgroup:
+		return newOnlineCgroupResourceManager(providerConfig.OnlineConfigPath)
 	}
 
 	mgr, err := newK8sWatchResourceManager()

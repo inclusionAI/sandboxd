@@ -16,6 +16,7 @@ package resourcemanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -29,9 +30,13 @@ import (
 )
 
 const (
-	watchRetryMinInterval = time.Second
-	watchRetryMaxInterval = time.Minute
+	watchRetryMinInterval  = time.Second
+	watchRetryMaxInterval  = time.Minute
+	snapshotRequestTimeout = 10 * time.Second
+	watchRequestTimeout    = time.Minute
 )
+
+var errWatchClosed = errors.New("watch channel closed")
 
 type k8sWatchResourceManager struct {
 	client        kubernetes.Interface
@@ -48,6 +53,14 @@ type k8sWatchResourceManager struct {
 	allocatedCPU int64
 	allocatedMem int64
 	podRequests  map[string]podResourceRequest
+
+	// A watch can be quiet indefinitely without making its snapshot stale.
+	// Track complete snapshots and live streams separately from event times.
+	// Disconnected streams must not make repeated cache reads look fresh.
+	nodeSnapshotReady bool
+	podSnapshotReady  bool
+	nodeWatching      bool
+	podWatching       bool
 }
 
 type podResourceRequest struct {
@@ -119,7 +132,9 @@ func (mgr *k8sWatchResourceManager) stopped() bool {
 }
 
 func (mgr *k8sWatchResourceManager) initNodeSnapshot() (string, error) {
-	nodeList, err := mgr.client.CoreV1().Nodes().List(mgr.requestContext(), metav1.ListOptions{
+	ctx, cancel := context.WithTimeout(mgr.requestContext(), snapshotRequestTimeout)
+	defer cancel()
+	nodeList, err := mgr.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
 		FieldSelector: fields.OneTermEqualSelector("metadata.name", mgr.localNodeName).String(),
 	})
 	if err != nil {
@@ -128,17 +143,28 @@ func (mgr *k8sWatchResourceManager) initNodeSnapshot() (string, error) {
 	if len(nodeList.Items) == 0 {
 		return "", fmt.Errorf("node %s not found", mgr.localNodeName)
 	}
+	if nodeList.ResourceVersion == "" {
+		return "", fmt.Errorf("node snapshot has no resource version")
+	}
 	node := &nodeList.Items[0]
 	mgr.updateNodeTotal(node)
+	mgr.mu.Lock()
+	mgr.nodeSnapshotReady = true
+	mgr.mu.Unlock()
 	return nodeList.ResourceVersion, nil
 }
 
 func (mgr *k8sWatchResourceManager) initPodSnapshot() (string, error) {
-	podList, err := mgr.client.CoreV1().Pods(corev1.NamespaceAll).List(mgr.requestContext(), metav1.ListOptions{
+	ctx, cancel := context.WithTimeout(mgr.requestContext(), snapshotRequestTimeout)
+	defer cancel()
+	podList, err := mgr.client.CoreV1().Pods(corev1.NamespaceAll).List(ctx, metav1.ListOptions{
 		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", mgr.localNodeName).String(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to list pods on node %s: %w", mgr.localNodeName, err)
+	}
+	if podList.ResourceVersion == "" {
+		return "", fmt.Errorf("pod snapshot has no resource version")
 	}
 	podRequests := make(map[string]podResourceRequest, len(podList.Items))
 	allocatedCPU := int64(0)
@@ -157,6 +183,7 @@ func (mgr *k8sWatchResourceManager) initPodSnapshot() (string, error) {
 	mgr.podRequests = podRequests
 	mgr.allocatedCPU = allocatedCPU
 	mgr.allocatedMem = allocatedMem
+	mgr.podSnapshotReady = true
 	mgr.mu.Unlock()
 	return podList.ResourceVersion, nil
 }
@@ -185,69 +212,49 @@ func (mgr *k8sWatchResourceManager) waitForRetry(interval time.Duration) bool {
 
 func (mgr *k8sWatchResourceManager) watchNodeLoop(resourceVersion string) {
 	defer mgr.watchWG.Done()
-	currentResourceVersion := resourceVersion
-	retryInterval := watchRetryMinInterval
-	for {
-		if mgr.stopped() {
-			return
-		}
-		nextResourceVersion, err := mgr.watchNodeStream(currentResourceVersion)
-		if mgr.stopped() {
-			return
-		}
-		if err != nil {
-			logrus.Warningf("node watch loop exited, err = %v", err)
-		}
-		refreshResourceVersion, refreshErr := mgr.initNodeSnapshot()
-		if refreshErr != nil {
-			logrus.Warningf("failed to refresh node snapshot, err = %v", refreshErr)
-		} else {
-			currentResourceVersion = refreshResourceVersion
-		}
-		if currentResourceVersion == "" {
-			currentResourceVersion = nextResourceVersion
-		}
-		cycleFailed := err != nil && refreshErr != nil
-		if cycleFailed {
-			retryInterval = nextRetryInterval(retryInterval)
-		} else {
-			retryInterval = watchRetryMinInterval
-		}
-		if !mgr.waitForRetry(retryInterval) {
-			return
-		}
-	}
+	mgr.watchResourceLoop("node", resourceVersion, mgr.initNodeSnapshot, mgr.watchNodeStream)
 }
 
 func (mgr *k8sWatchResourceManager) watchPodLoop(resourceVersion string) {
 	defer mgr.watchWG.Done()
-	currentResourceVersion := resourceVersion
+	mgr.watchResourceLoop("pod", resourceVersion, mgr.initPodSnapshot, mgr.watchPodStream)
+}
+
+// Every new stream follows a complete snapshot. In particular, never start a
+// watch from "now" after a failed initial list, or treat reconnecting after an
+// expired resource version as proof that an incomplete old cache is valid.
+func (mgr *k8sWatchResourceManager) watchResourceLoop(
+	name, resourceVersion string,
+	initSnapshot func() (string, error),
+	watchStream func(string) (string, error),
+) {
 	retryInterval := watchRetryMinInterval
 	for {
 		if mgr.stopped() {
 			return
 		}
-		nextResourceVersion, err := mgr.watchPodStream(currentResourceVersion)
+		if resourceVersion == "" {
+			var err error
+			resourceVersion, err = initSnapshot()
+			if err != nil {
+				logrus.Warningf("failed to refresh %s snapshot: %v", name, err)
+				if !mgr.waitForRetry(retryInterval) {
+					return
+				}
+				retryInterval = nextRetryInterval(retryInterval)
+				continue
+			}
+		}
+		retryInterval = watchRetryMinInterval
+		_, err := watchStream(resourceVersion)
+		resourceVersion = ""
 		if mgr.stopped() {
 			return
 		}
-		if err != nil {
-			logrus.Warningf("pod watch loop exited, err = %v", err)
-		}
-		refreshResourceVersion, refreshErr := mgr.initPodSnapshot()
-		if refreshErr != nil {
-			logrus.Warningf("failed to refresh pod snapshot, err = %v", refreshErr)
-		} else {
-			currentResourceVersion = refreshResourceVersion
-		}
-		if currentResourceVersion == "" {
-			currentResourceVersion = nextResourceVersion
-		}
-		cycleFailed := err != nil && refreshErr != nil
-		if cycleFailed {
-			retryInterval = nextRetryInterval(retryInterval)
-		} else {
-			retryInterval = watchRetryMinInterval
+		if errors.Is(err, errWatchClosed) || errors.Is(err, context.DeadlineExceeded) {
+			logrus.Debugf("%s watch renewing: %v", name, err)
+		} else if err != nil {
+			logrus.Warningf("%s watch loop exited: %v", name, err)
 		}
 		if !mgr.waitForRetry(retryInterval) {
 			return
@@ -256,18 +263,34 @@ func (mgr *k8sWatchResourceManager) watchPodLoop(resourceVersion string) {
 }
 
 func (mgr *k8sWatchResourceManager) watchNodeStream(resourceVersion string) (string, error) {
-	watcher, err := mgr.client.CoreV1().Nodes().Watch(mgr.requestContext(), metav1.ListOptions{
+	ctx, cancel := context.WithTimeout(mgr.requestContext(), watchRequestTimeout)
+	defer cancel()
+	timeoutSeconds := int64(watchRequestTimeout / time.Second)
+	watcher, err := mgr.client.CoreV1().Nodes().Watch(ctx, metav1.ListOptions{
 		FieldSelector:       fields.OneTermEqualSelector("metadata.name", mgr.localNodeName).String(),
 		ResourceVersion:     resourceVersion,
 		AllowWatchBookmarks: true,
+		TimeoutSeconds:      &timeoutSeconds,
 	})
 	if err != nil {
 		return resourceVersion, fmt.Errorf("failed to watch node %s: %w", mgr.localNodeName, err)
 	}
 	defer watcher.Stop()
+	mgr.setWatching(true, true)
+	defer mgr.setWatching(true, false)
 
 	currentResourceVersion := resourceVersion
-	for event := range watcher.ResultChan() {
+	for {
+		var event watch.Event
+		select {
+		case <-ctx.Done():
+			return currentResourceVersion, ctx.Err()
+		case next, ok := <-watcher.ResultChan():
+			if !ok {
+				return currentResourceVersion, fmt.Errorf("node %w", errWatchClosed)
+			}
+			event = next
+		}
 		nextResourceVersion, eventErr := mgr.handleNodeEvent(event)
 		if nextResourceVersion != "" {
 			currentResourceVersion = nextResourceVersion
@@ -276,22 +299,37 @@ func (mgr *k8sWatchResourceManager) watchNodeStream(resourceVersion string) (str
 			return currentResourceVersion, eventErr
 		}
 	}
-	return currentResourceVersion, fmt.Errorf("node watch channel closed")
 }
 
 func (mgr *k8sWatchResourceManager) watchPodStream(resourceVersion string) (string, error) {
-	watcher, err := mgr.client.CoreV1().Pods(corev1.NamespaceAll).Watch(mgr.requestContext(), metav1.ListOptions{
+	ctx, cancel := context.WithTimeout(mgr.requestContext(), watchRequestTimeout)
+	defer cancel()
+	timeoutSeconds := int64(watchRequestTimeout / time.Second)
+	watcher, err := mgr.client.CoreV1().Pods(corev1.NamespaceAll).Watch(ctx, metav1.ListOptions{
 		FieldSelector:       fields.OneTermEqualSelector("spec.nodeName", mgr.localNodeName).String(),
 		ResourceVersion:     resourceVersion,
 		AllowWatchBookmarks: true,
+		TimeoutSeconds:      &timeoutSeconds,
 	})
 	if err != nil {
 		return resourceVersion, fmt.Errorf("failed to watch pods on node %s: %w", mgr.localNodeName, err)
 	}
 	defer watcher.Stop()
+	mgr.setWatching(false, true)
+	defer mgr.setWatching(false, false)
 
 	currentResourceVersion := resourceVersion
-	for event := range watcher.ResultChan() {
+	for {
+		var event watch.Event
+		select {
+		case <-ctx.Done():
+			return currentResourceVersion, ctx.Err()
+		case next, ok := <-watcher.ResultChan():
+			if !ok {
+				return currentResourceVersion, fmt.Errorf("pod %w", errWatchClosed)
+			}
+			event = next
+		}
 		nextResourceVersion, eventErr := mgr.handlePodEvent(event)
 		if nextResourceVersion != "" {
 			currentResourceVersion = nextResourceVersion
@@ -300,7 +338,16 @@ func (mgr *k8sWatchResourceManager) watchPodStream(resourceVersion string) (stri
 			return currentResourceVersion, eventErr
 		}
 	}
-	return currentResourceVersion, fmt.Errorf("pod watch channel closed")
+}
+
+func (mgr *k8sWatchResourceManager) setWatching(node, watching bool) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if node {
+		mgr.nodeWatching = watching
+	} else {
+		mgr.podWatching = watching
+	}
 }
 
 func (mgr *k8sWatchResourceManager) handleNodeEvent(event watch.Event) (string, error) {
@@ -520,7 +567,14 @@ func maxInt64(v int64, floor int64) int64 {
 }
 
 func (mgr *k8sWatchResourceManager) GetAvailableResource() (int64, int64, error) {
-	totalCPU, totalMem, allocatedCPU, allocatedMem := mgr.snapshot()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	if !mgr.nodeSnapshotReady || !mgr.podSnapshotReady ||
+		!mgr.nodeWatching || !mgr.podWatching {
+		return 0, 0, fmt.Errorf("kubernetes resource cache is not synchronized with both watches")
+	}
+	totalCPU, totalMem := mgr.totalCPU, mgr.totalMem
+	allocatedCPU, allocatedMem := mgr.allocatedCPU, mgr.allocatedMem
 	cpuMilli := maxInt64(totalCPU-allocatedCPU, 0)
 	memBytes := maxInt64(totalMem-allocatedMem, 0)
 	logrus.Infof("report k8s watch resource info: total(cpu: %d, mem: %d), allocated(cpu: %d, mem: %d), available(cpu: %d, mem: %d)",

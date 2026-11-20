@@ -232,6 +232,9 @@ func TestNormalizeProvider(t *testing.T) {
 	provider, err := normalizeProvider("CGROUP")
 	require.NoError(t, err)
 	assert.Equal(t, ProviderCgroup, provider)
+	provider, err = normalizeProvider(" ONLINE_CGROUP ")
+	require.NoError(t, err)
+	assert.Equal(t, ProviderOnlineCgroup, provider)
 	_, err = normalizeProvider("auto")
 	assert.Error(t, err)
 }
