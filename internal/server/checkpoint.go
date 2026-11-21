@@ -138,9 +138,6 @@ func (h *sandboxService) Checkpoint(
 		cleanupErr := directory.cleanup()
 		return nil, errord.ToGRPC(errors.Join(fmt.Errorf("prepare managed runtime checkpoint: %w", err), cleanupErr))
 	}
-	if err := writeCheckpointProcessUser(directory.path, sandbox.Spec); err != nil {
-		return nil, errord.ToGRPC(errors.Join(fmt.Errorf("prepare checkpoint process user: %w", err), directory.cleanup()))
-	}
 	captureStarted := time.Now()
 	err = h.withTransientFirecrackerCheckpointMemory(
 		checkpointCtx,

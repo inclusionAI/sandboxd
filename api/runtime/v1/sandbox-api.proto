@@ -275,7 +275,10 @@ message StartRequest {
   string inject_entrypoint = 22;
   // PreferImagePath lets the image's PATH override the request's fallback PATH.
   bool prefer_image_path = 23;
-  // ProcessUser overrides the OCI base user. Omitted preserves the base user;
+  // ProcessUser configures the numeric user in the target OCI bundle.
+  // Fresh starts use it to launch the process. Restore credentials belong to
+  // the runtime snapshot; callers supply a compatible target configuration.
+  // Omitted preserves the base user;
   // an explicit message containing zero values selects root (0:0).
   // UID/GID 4294967295 are reserved by Linux and are rejected.
   ProcessUser process_user = 24;
@@ -396,8 +399,8 @@ message SandboxStatus {
   LinuxSandboxResources resources = 14;
   // MetricLabels contains sandbox metadata intended for metric dimensions.
   map<string, string> metric_labels = 15;
-  // ProcessUser is the initial identity configured in the persisted OCI spec,
-  // not a live observation of credentials changed by the application.
+  // ProcessUser reports the user configured in the persisted OCI bundle.
+  // It does not observe live or restored snapshot credentials.
   ProcessUser process_user = 16;
 }
 

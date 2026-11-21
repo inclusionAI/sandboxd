@@ -28,6 +28,7 @@ for stage in one two; do
     echo ready > /workspace/ready-$stage
     cat /run/sandboxd/checkpoint > /workspace/outcome-$stage
     tr "\000" "\n" < /run/sandboxd/restore-environ > /workspace/environment-$stage
+    echo "$(id -u):$(id -g)" > /workspace/identity-$stage
     echo done > /workspace/done-$stage
 done
 exec sleep 600'
@@ -56,13 +57,30 @@ for stage in one two; do
         --checkpoint-dir "${TEST_DIR}/checkpoint-${stage}" --leave-running=false
     helper --action delete --sandbox-id "${source_id}"
     jq -n --arg root "${ROOTFS}" --arg dir "${TEST_DIR}" --arg workload "${workload}" --arg stage "${stage}" \
-        '{runtime:"firecracker",rootfs:{type:"LOCAL",path:$root},command:["/bin/sh","-c",$workload],cwd:"/",processUser:{uid:1000,gid:1001},resources:{CPU:1000,Memory:256},writableLayerLimitBytes:"67108864",stdout:($dir+"/stdout"),stderr:($dir+"/stderr"),mounts:[{type:"bind",target:"/workspace",hostPath:($dir+"/workspace"),options:["rbind","rw"]}],envs:{CHECKPOINT_OWNER_TEST:$stage}}' \
+        '{runtime:"firecracker",rootfs:{type:"LOCAL",path:$root},command:["/bin/sh","-c",$workload],cwd:"/",resources:{CPU:1000,Memory:256},writableLayerLimitBytes:"67108864",stdout:($dir+"/stdout"),stderr:($dir+"/stderr"),mounts:[{type:"bind",target:"/workspace",hostPath:($dir+"/workspace"),options:["rbind","rw"]}],envs:{CHECKPOINT_OWNER_TEST:$stage}}' \
         > "${TEST_DIR}/request-${stage}.json"
+    if [ "${stage}" = two ]; then
+        jq '.processUser={uid:1000,gid:1001}' "${TEST_DIR}/request-${stage}.json" > "${TEST_DIR}/request-next.json"
+        mv "${TEST_DIR}/request-next.json" "${TEST_DIR}/request-${stage}.json"
+    fi
     source_id="${PREFIX}-${stage}"
     helper --action restore --target-id "${source_id}" \
         --request-file "${TEST_DIR}/request-${stage}.json" --checkpoint-dir "${TEST_DIR}/checkpoint-${stage}"
     created_ids+=("${source_id}")
     wait_file "${TEST_DIR}/workspace/done-${stage}"
+    sbox --address "${SOCKET}" inspect "${source_id}" > "${TEST_DIR}/inspect-${stage}.json"
+    if [ "${stage}" = one ]; then
+        jq -e '.process_user == {}' "${TEST_DIR}/inspect-${stage}.json" >/dev/null
+    else
+        jq -e '.process_user == {"uid":1000,"gid":1001}' "${TEST_DIR}/inspect-${stage}.json" >/dev/null
+    fi
+    test "$(cat "${TEST_DIR}/workspace/identity-${stage}")" = 1000:1001
+    test ! -e "${TEST_DIR}/checkpoint-${stage}/sandboxd-process-user.json"
+    if [ "${stage}" = one ] && [ -n "${DAEMON_RESTART_HELPER:-}" ]; then
+        "${DAEMON_RESTART_HELPER}"
+        sbox --address "${SOCKET}" inspect "${source_id}" | tee "${TEST_DIR}/inspect-recovered.json" |
+            jq -e '(.state // 0) == 0 and .process_user == {}' >/dev/null
+    fi
     grep -qx restore "${TEST_DIR}/workspace/outcome-${stage}"
     grep -qx "CHECKPOINT_OWNER_TEST=${stage}" "${TEST_DIR}/workspace/environment-${stage}"
     test "$(stat -c %u:%g "${TEST_DIR}/workspace/environment-${stage}")" = 1000:1001

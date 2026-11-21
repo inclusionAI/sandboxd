@@ -56,6 +56,7 @@ echo started >> /workspace/starts
 echo ready > /workspace/ready
 while [ ! -f /workspace/proceed ]; do sleep .1; done
 echo "$marker" > /workspace/resumed
+echo "$(id -u):$(id -g)" > /workspace/resumed-identity
 exec sleep 600'
 sbox_cmd start --runtime "${RUNTIME}" --sandbox-id "${PREFIX}-source" \
     --rootfs "${ROOTFS}" --cwd / --user 1000:1001 --cpu-millicores 1000 \
@@ -92,30 +93,38 @@ if [ "${CHECKPOINT}" = 1 ]; then
     helper --action checkpoint --sandbox-id "${PREFIX}-source" \
         --checkpoint-dir "${TEST_DIR}/checkpoint" --leave-running=false
     helper --action delete --sandbox-id "${PREFIX}-source"
-    jq -e '.user.uid == 1000 and .user.gid == 1001' \
-        "${TEST_DIR}/checkpoint/sandboxd-process-user.json" >/dev/null
-    jq '.processUser={uid:0,gid:0}' "${TEST_DIR}/request.json" > "${TEST_DIR}/conflict.json"
-    if helper --action restore --target-id "${PREFIX}-conflict" \
-        --request-file "${TEST_DIR}/conflict.json" --checkpoint-dir "${TEST_DIR}/checkpoint" \
-        > "${TEST_DIR}/conflict.log" 2>&1; then
-        created_ids+=("${PREFIX}-conflict")
-        echo 'ERROR: restore accepted conflicting UID/GID' >&2; exit 1
+    test ! -e "${TEST_DIR}/checkpoint/sandboxd-process-user.json"
+    if [ "${RUNTIME}" = runsc ]; then
+        jq '.processUser={uid:0,gid:0}' "${TEST_DIR}/request.json" > "${TEST_DIR}/conflict.json"
+        if helper --action restore --target-id "${PREFIX}-conflict" \
+            --request-file "${TEST_DIR}/conflict.json" --checkpoint-dir "${TEST_DIR}/checkpoint" \
+            > "${TEST_DIR}/conflict.log" 2>&1; then
+            created_ids+=("${PREFIX}-conflict")
+            echo 'ERROR: runsc accepted a mismatched OCI user' >&2; exit 1
+        fi
+        grep -q 'does not match across checkpoint restore' "${TEST_DIR}/conflict.log"
+        jq '.processUser={uid:1000,gid:1001}' "${TEST_DIR}/request.json" > "${TEST_DIR}/request-next.json"
+        mv "${TEST_DIR}/request-next.json" "${TEST_DIR}/request.json"
     fi
-    grep -q 'conflicts with checkpoint identity' "${TEST_DIR}/conflict.log"
     helper --action restore --target-id "${PREFIX}-restored" \
         --request-file "${TEST_DIR}/request.json" --checkpoint-dir "${TEST_DIR}/checkpoint"
     created_ids+=("${PREFIX}-restored")
-    sbox_cmd inspect "${PREFIX}-restored" | tee "${TEST_DIR}/inspect-restored.json" |
-        jq -e '.process_user == {"uid":1000,"gid":1001}' >/dev/null
+    sbox_cmd inspect "${PREFIX}-restored" > "${TEST_DIR}/inspect-restored.json"
+    if [ "${RUNTIME}" = runsc ]; then
+        jq -e '.process_user == {"uid":1000,"gid":1001}' "${TEST_DIR}/inspect-restored.json" >/dev/null
+    else
+        jq -e '.process_user == {}' "${TEST_DIR}/inspect-restored.json" >/dev/null
+    fi
     printf 'go\n' > "${TEST_DIR}/rw/proceed"
     for _ in $(seq 1 100); do
-        [ -f "${TEST_DIR}/rw/resumed" ] && break
+        grep -qx 1000:1001 "${TEST_DIR}/rw/resumed-identity" 2>/dev/null && break
         sleep .1
     done
     test "$(cat "${TEST_DIR}/rw/resumed")" = memory-from-nonroot
     test "$(stat -c %u:%g "${TEST_DIR}/rw/resumed")" = 1000:1001
+    test "$(cat "${TEST_DIR}/rw/resumed-identity")" = 1000:1001
     test "$(wc -l < "${TEST_DIR}/rw/starts")" -eq 1
-    printf 'PASS: %s checkpoint identity, conflicting restore rejection, non-root resumed write\n' "${RUNTIME}"
+    printf 'PASS: %s runtime credential restore, configured inspection, non-root resumed write\n' "${RUNTIME}"
 fi
 helper --action delete --sandbox-id "${PREFIX}-$([ "${CHECKPOINT}" = 1 ] && echo restored || echo source)"
 test -f "${TEST_DIR}/rw/identity"

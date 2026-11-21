@@ -29,68 +29,44 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func TestResolveProcessUserFresh(t *testing.T) {
-	user, err := resolveProcessUser(nil, "")
+func TestResolveProcessUser(t *testing.T) {
+	user, err := resolveProcessUser(nil)
 	require.NoError(t, err)
 	require.Nil(t, user)
 	for _, requested := range []*runtime.ProcessUser{{}, {Uid: 1000, Gid: 1001}} {
-		user, err := resolveProcessUser(requested, "")
+		user, err := resolveProcessUser(requested)
 		require.NoError(t, err)
 		require.Equal(t, &svc.User{UID: requested.Uid, GID: requested.Gid}, user)
 	}
 	for _, requested := range []*runtime.ProcessUser{{Uid: ^uint32(0)}, {Gid: ^uint32(0)}} {
-		_, err := resolveProcessUser(requested, "")
+		_, err := resolveProcessUser(requested)
 		require.ErrorIs(t, err, errord.ErrInvalidArgument)
 	}
 }
 
-func TestCheckpointProcessUserRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	umask := uint32(0027)
-	saved := specs.User{UID: 1000, GID: 1001, AdditionalGids: []uint32{1002}, Umask: &umask}
-	require.NoError(t, writeCheckpointProcessUser(dir, &specs.Spec{Process: &specs.Process{User: saved}}))
-	for _, requested := range []*runtime.ProcessUser{nil, {Uid: 1000, Gid: 1001}} {
-		user, err := resolveProcessUser(requested, dir)
-		require.NoError(t, err)
-		require.Equal(t, &svc.User{UID: 1000, GID: 1001, AdditionalGids: []uint32{1002}, Umask: &umask}, user)
-	}
-	for _, requested := range []*runtime.ProcessUser{{}, {Uid: 1000, Gid: 1002}, {Uid: 1001, Gid: 1001}} {
-		_, err := resolveProcessUser(requested, dir)
-		require.ErrorIs(t, err, errord.ErrFailedPrecondition)
-	}
-	info, err := os.Stat(filepath.Join(dir, checkpointProcessUserFile))
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
-}
-
-func TestCheckpointProcessUserLegacyAndInvalidMetadata(t *testing.T) {
-	dir := t.TempDir()
-	user, err := resolveProcessUser(nil, dir)
-	require.NoError(t, err)
-	require.Nil(t, user)
-	_, err = resolveProcessUser(&runtime.ProcessUser{Uid: 1000, Gid: 1001}, dir)
-	require.ErrorIs(t, err, errord.ErrFailedPrecondition)
-	for _, data := range []string{`{`, `{}`, `{"version":2,"user":{}}`, `{"version":1,"user":{"uid":4294967295}}`} {
-		require.NoError(t, os.WriteFile(filepath.Join(dir, checkpointProcessUserFile), []byte(data), 0600))
-		_, err := resolveProcessUser(nil, dir)
-		require.ErrorIs(t, err, errord.ErrInvalidArgument)
-	}
-	require.ErrorIs(t, writeCheckpointProcessUser(dir, &specs.Spec{}), errord.ErrFailedPrecondition)
-}
-
-func TestStartRejectsConflictingProcessUserBeforeAllocation(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, writeCheckpointProcessUser(dir, &specs.Spec{Process: &specs.Process{User: specs.User{UID: 1000, GID: 1001}}}))
+func TestStartValidatesProcessUserBeforeAllocation(t *testing.T) {
 	service := newTestService(t, nil)
-	// No filesystem, network or runtime provider: validation must complete first.
-	_, err := service.Start(context.Background(), &runtime.StartRequest{CheckpointInfo: &runtime.CheckpointInfo{CheckpointDir: dir}, ProcessUser: &runtime.ProcessUser{}})
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
-	require.ErrorContains(t, err, "conflicts with checkpoint identity")
-	_, err = service.Start(context.Background(), &runtime.StartRequest{ProcessUser: &runtime.ProcessUser{Uid: ^uint32(0)}})
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	directory := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(directory, "checkpoint.img"), []byte("image"), 0600))
+	// Fresh and restore requests validate numeric IDs before allocating resources.
+	for _, checkpoint := range []*runtime.CheckpointInfo{nil, {CheckpointDir: directory}} {
+		_, err := service.Start(context.Background(), &runtime.StartRequest{CheckpointInfo: checkpoint, ProcessUser: &runtime.ProcessUser{Uid: ^uint32(0)}})
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+	}
 }
 
-func TestCheckpointSavesProcessUserBeforeCapture(t *testing.T) {
+func TestRestoreReceivesCallerConfiguredUser(t *testing.T) {
+	handler := newCheckpointTestHandler()
+	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
+	user, err := resolveProcessUser(&runtime.ProcessUser{Uid: 1000, Gid: 1001})
+	require.NoError(t, err)
+	directory := t.TempDir()
+	require.NoError(t, service.startSandboxRuntime(context.Background(), "runsc", svc.StartConfig{ID: "sbox-restore-user", CheckpointDir: directory, ProcessUser: user}))
+	require.Len(t, handler.restores, 1)
+	require.Equal(t, &svc.User{UID: 1000, GID: 1001}, handler.restores[0].ProcessUser)
+}
+
+func TestCheckpointUsesRuntimeCredentials(t *testing.T) {
 	handler := newCheckpointTestHandler()
 	service := newTestService(t, map[string]svc.Handler{"runsc": handler})
 	storeRunningSandbox(t, service, "sbox-user", "runsc")
@@ -98,9 +74,9 @@ func TestCheckpointSavesProcessUserBeforeCapture(t *testing.T) {
 	require.NoError(t, err)
 	sb.Spec.Process.User = specs.User{UID: 1000, GID: 1001}
 	handler.checkpointFn = func(_ context.Context, config svc.CheckpointConfig) error {
-		user, err := resolveProcessUser(nil, config.Directory)
+		entries, err := os.ReadDir(config.Directory)
 		require.NoError(t, err)
-		require.Equal(t, &svc.User{UID: 1000, GID: 1001}, user)
+		require.Empty(t, entries)
 		return nil
 	}
 	_, err = service.Checkpoint(context.Background(), &runtime.CheckpointRequest{ID: "sbox-user", CheckpointDir: filepath.Join(t.TempDir(), "checkpoint"), TimeoutSeconds: 5})

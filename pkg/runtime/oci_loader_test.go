@@ -371,7 +371,8 @@ func TestGenerateOciProcessUser(t *testing.T) {
 		{"omitted preserves base", nil, "", User{UID: 2000, GID: 2001, AdditionalGids: []uint32{2002}, Umask: &umask}},
 		{"numeric user clears old groups", &User{UID: 1000, GID: 1001}, "", User{UID: 1000, GID: 1001, Umask: &umask}},
 		{"explicit root overrides base", &User{}, "", User{Umask: &umask}},
-		{"restore preserves saved groups and umask", &User{UID: 1000, GID: 1001, AdditionalGids: []uint32{1002}}, "/checkpoint", User{UID: 1000, GID: 1001, AdditionalGids: []uint32{1002}}},
+		{"restore bundle retains configured base", nil, "/checkpoint", User{UID: 2000, GID: 2001, AdditionalGids: []uint32{2002}, Umask: &umask}},
+		{"restore bundle accepts caller user", &User{UID: 1000, GID: 1001}, "/checkpoint", User{UID: 1000, GID: 1001, Umask: &umask}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			loader, err := NewBundleLoader("", t.TempDir())

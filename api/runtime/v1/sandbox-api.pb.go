@@ -1415,7 +1415,10 @@ type StartRequest struct {
 	InjectEntrypoint string `protobuf:"bytes,22,opt,name=inject_entrypoint,json=injectEntrypoint,proto3" json:"inject_entrypoint,omitempty"`
 	// PreferImagePath lets the image's PATH override the request's fallback PATH.
 	PreferImagePath bool `protobuf:"varint,23,opt,name=prefer_image_path,json=preferImagePath,proto3" json:"prefer_image_path,omitempty"`
-	// ProcessUser overrides the OCI base user. Omitted preserves the base user;
+	// ProcessUser configures the numeric user in the target OCI bundle.
+	// Fresh starts use it to launch the process. Restore credentials belong to
+	// the runtime snapshot; callers supply a compatible target configuration.
+	// Omitted preserves the base user;
 	// an explicit message containing zero values selects root (0:0).
 	// UID/GID 4294967295 are reserved by Linux and are rejected.
 	ProcessUser   *ProcessUser `protobuf:"bytes,24,opt,name=process_user,json=processUser,proto3" json:"process_user,omitempty"`
@@ -2162,8 +2165,8 @@ type SandboxStatus struct {
 	Resources *LinuxSandboxResources `protobuf:"bytes,14,opt,name=resources,proto3" json:"resources,omitempty"`
 	// MetricLabels contains sandbox metadata intended for metric dimensions.
 	MetricLabels map[string]string `protobuf:"bytes,15,rep,name=metric_labels,json=metricLabels,proto3" json:"metric_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// ProcessUser is the initial identity configured in the persisted OCI spec,
-	// not a live observation of credentials changed by the application.
+	// ProcessUser reports the user configured in the persisted OCI bundle.
+	// It does not observe live or restored snapshot credentials.
 	ProcessUser   *ProcessUser `protobuf:"bytes,16,opt,name=process_user,json=processUser,proto3" json:"process_user,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

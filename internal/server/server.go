@@ -1272,7 +1272,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
 		}
 	}
-	processUser, err := resolveProcessUser(startReq.ProcessUser, checkpointDir)
+	processUser, err := resolveProcessUser(startReq.ProcessUser)
 	if err != nil {
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
 	}
