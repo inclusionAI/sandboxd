@@ -21,6 +21,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
@@ -35,10 +36,10 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	// Rolled for StartRequest.prefer_image_path (field 23), an opt-in flag
-	// that leaves the existing request fields and default behavior unchanged.
+	// Rolled for optional StartRequest.process_user (24), SandboxStatus.process_user
+	// (16) and ProcessUser; existing field numbers and omitted defaults are unchanged.
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "397a1f9b10afb4227fb5c23fe79ddebc96d925c03d2583c8712eee0d90c7a249"
+	const want = "e3ef0922c4da76d247aa1ab385f5e83204a55dc2e5e6d6e270ccb3d235714f8c"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}
@@ -84,5 +85,68 @@ func TestStartResponseLegacyWireCompatibility(t *testing.T) {
 	}
 	if decoded.ID != response.ID || decoded.Message != response.Message || decoded.SandboxIp != "" {
 		t.Fatalf("legacy server response did not retain its original fields: %s", &decoded)
+	}
+}
+
+func TestProcessUserWirePresenceAndLegacyRequests(t *testing.T) {
+	for _, user := range []*ProcessUser{nil, {}, {Uid: 1000, Gid: 1001}} {
+		original := &StartRequest{SandboxID: "sbox-wire-user", ProcessUser: user}
+		wire, err := proto.Marshal(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded StartRequest
+		if err := proto.Unmarshal(wire, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if !proto.Equal(original, &decoded) {
+			t.Fatalf("presence or identity changed: %v", &decoded)
+		}
+	}
+	descriptor := protodesc.ToFileDescriptorProto(File_api_runtime_v1_sandbox_api_proto)
+	var legacyMessages []*descriptorpb.DescriptorProto
+	for _, message := range descriptor.MessageType {
+		if message.GetName() == "ProcessUser" {
+			continue
+		}
+		if message.GetName() == "StartRequest" || message.GetName() == "SandboxStatus" {
+			var fields []*descriptorpb.FieldDescriptorProto
+			for _, field := range message.Field {
+				if field.GetName() != "process_user" {
+					fields = append(fields, field)
+				}
+			}
+			message.Field = fields
+		}
+		legacyMessages = append(legacyMessages, message)
+	}
+	descriptor.MessageType = legacyMessages
+	legacyFile, err := protodesc.NewFile(descriptor, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := dynamicpb.NewMessage(legacyFile.Messages().ByName("StartRequest"))
+	fields := legacy.Descriptor().Fields()
+	legacy.Set(fields.ByName("sandbox_id"), protoreflect.ValueOfString("sbox-old-client"))
+	wire, err := proto.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current StartRequest
+	if err := proto.Unmarshal(wire, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.ProcessUser != nil || current.SandboxID != "sbox-old-client" {
+		t.Fatalf("legacy request changed: %v", &current)
+	}
+	wire, err = proto.Marshal(&StartRequest{SandboxID: "sbox-new-client", ProcessUser: &ProcessUser{Uid: 1000, Gid: 1001}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(wire, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if got := legacy.Get(fields.ByName("sandbox_id")).String(); got != "sbox-new-client" {
+		t.Fatalf("legacy decoding changed: %s", got)
 	}
 }

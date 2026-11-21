@@ -113,3 +113,19 @@ func TestStartRootfs(t *testing.T) {
 	_, err = startRootfs("/rootfs", "registry.example/image:tag", false)
 	require.ErrorContains(t, err, "mutually exclusive")
 }
+
+func TestParseStartUser(t *testing.T) {
+	for _, tc := range []struct {
+		input    string
+		uid, gid uint32
+	}{
+		{"1000:1001", 1000, 1001}, {"0:0", 0, 0}, {"4294967294:42", 4294967294, 42},
+	} {
+		user, err := parseStartUser(tc.input)
+		require.NoError(t, err)
+		require.Equal(t, &runtime.ProcessUser{Uid: tc.uid, Gid: tc.gid}, user)
+	}
+	for _, input := range []string{"", "1000", ":1", "1:", "1:2:3", "alice:users", "-1:0", "+1:0", "1: 2", "4294967295:0", "0:4294967296"} {
+		t.Run(input, func(t *testing.T) { _, err := parseStartUser(input); require.Error(t, err) })
+	}
+}

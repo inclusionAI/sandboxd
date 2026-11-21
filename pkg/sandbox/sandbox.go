@@ -144,5 +144,6 @@ func (c *Sandbox) ApiStatus() *runtime.SandboxStatus {
 		Stdout:       c.Metadata.Stdout,
 		Stderr:       c.Metadata.Stderr,
 		Resources:    copyResource,
+		ProcessUser:  &runtime.ProcessUser{Uid: c.Spec.Process.User.UID, Gid: c.Spec.Process.User.GID},
 	}
 }

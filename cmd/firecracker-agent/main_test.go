@@ -426,6 +426,23 @@ func TestSharedVirtioFSDirectory(t *testing.T) {
 	}
 }
 
+func checkpointTestProcess(environment []string) firecrackerproto.ProcessSpec {
+	return firecrackerproto.ProcessSpec{
+		UID: uint32(os.Geteuid()), GID: uint32(os.Getegid()), Env: environment,
+	}
+}
+
+func checkCheckpointFileOwner(t *testing.T, path string, uid, gid uint32) {
+	t.Helper()
+	var stat unix.Stat_t
+	if err := unix.Stat(path, &stat); err != nil {
+		t.Fatal(err)
+	}
+	if stat.Uid != uid || stat.Gid != gid || stat.Mode&0777 != 0600 {
+		t.Fatalf("%s owner/mode = %d:%d/%o, want %d:%d/600", path, stat.Uid, stat.Gid, stat.Mode&0777, uid, gid)
+	}
+}
+
 func TestCheckpointHandoff(t *testing.T) {
 	root := t.TempDir()
 	environment := []string{
@@ -433,11 +450,13 @@ func TestCheckpointHandoff(t *testing.T) {
 		"YR_SEED_FILE=/untrusted",
 		"YR_ENV_FILE=/untrusted",
 	}
-	handoff, err := prepareCheckpointHandoff(root, environment)
+	handoff, err := prepareCheckpointHandoff(root, checkpointTestProcess(environment))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer handoff.close()
+	checkCheckpointFileOwner(t, handoff.fifoPath, handoff.uid, handoff.gid)
+	checkCheckpointFileOwner(t, handoff.environmentPath, handoff.uid, handoff.gid)
 	initialEnvironment, err := os.ReadFile(handoff.environmentPath)
 	if err != nil {
 		t.Fatal(err)
@@ -472,6 +491,7 @@ func TestCheckpointHandoff(t *testing.T) {
 		}
 		select {
 		case read := <-result:
+			checkCheckpointFileOwner(t, handoff.fifoPath, handoff.uid, handoff.gid)
 			want := outcome + "\n"
 			if read.err != nil || read.value != want {
 				t.Fatalf("handoff = %q, %v, want %q", read.value, read.err, want)
@@ -481,12 +501,12 @@ func TestCheckpointHandoff(t *testing.T) {
 		}
 	}
 
-	if err := writeCheckpointEnvironment(
-		handoff.environmentPath,
+	if err := handoff.writeEnvironment(
 		[]string{"RUNTIME_ID=restore"},
 	); err != nil {
 		t.Fatal(err)
 	}
+	checkCheckpointFileOwner(t, handoff.environmentPath, handoff.uid, handoff.gid)
 	data, err := os.ReadFile(handoff.environmentPath)
 	if err != nil {
 		t.Fatal(err)
@@ -498,7 +518,7 @@ func TestCheckpointHandoff(t *testing.T) {
 }
 
 func TestCheckpointHandoffDeliversRestoreAfterReaderReopens(t *testing.T) {
-	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), checkpointTestProcess(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +565,7 @@ func TestCheckpointHandoffDeliversRestoreAfterReaderReopens(t *testing.T) {
 }
 
 func TestCheckpointHandoffRecreatesRemovedFIFO(t *testing.T) {
-	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), checkpointTestProcess(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,7 +611,7 @@ func TestCheckpointHandoffRecreatesRemovedFIFO(t *testing.T) {
 }
 
 func TestCheckpointHandoffCloseWithoutReader(t *testing.T) {
-	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), checkpointTestProcess(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +646,7 @@ func waitForCheckpointReader(t *testing.T, handoff *checkpointHandoff) {
 }
 
 func TestCheckpointClockFailureKeepsNextFIFOBlocked(t *testing.T) {
-	handoff, err := prepareCheckpointHandoff(t.TempDir(), nil)
+	handoff, err := prepareCheckpointHandoff(t.TempDir(), checkpointTestProcess(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -707,7 +727,12 @@ func TestCheckpointClockBeforeHandoff(t *testing.T) {
 	for _, outcome := range []string{"resume", "restore", "error"} {
 		t.Run(outcome, func(t *testing.T) {
 			result := make(chan string, 1)
-			handoff := &checkpointHandoff{reader: result, environmentPath: filepath.Join(t.TempDir(), "environment")}
+			handoff := &checkpointHandoff{
+				reader:          result,
+				environmentPath: filepath.Join(t.TempDir(), "environment"),
+				uid:             uint32(os.Geteuid()),
+				gid:             uint32(os.Getegid()),
+			}
 			previous := state.handoff
 			state.handoff = handoff
 			defer func() { state.handoff = previous }()
@@ -728,6 +753,9 @@ func TestCheckpointClockBeforeHandoff(t *testing.T) {
 			}
 			if !called {
 				t.Fatal("guest clock not synchronized")
+			}
+			if outcome == "restore" {
+				checkCheckpointFileOwner(t, handoff.environmentPath, handoff.uid, handoff.gid)
 			}
 			select {
 			case actual := <-result:

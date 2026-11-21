@@ -101,6 +101,9 @@ type StartConfig struct {
 	ExtraConfig             string
 	EnableKVM               bool
 	CheckpointDir           string
+	// ProcessUser selects the numeric target OCI user. An override retains the
+	// base umask and clears previous groups/name. Restore credentials belong to the runtime.
+	ProcessUser *User
 	// InitialFiles are platform-owned gVisor files installed before the first process.
 	// Restore must use the saved filesystem state instead of replaying them.
 	InitialFiles []InitialFile

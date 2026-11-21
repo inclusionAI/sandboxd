@@ -98,6 +98,9 @@ func storeRunningSandbox(t *testing.T, service *sandboxService, id, runtimeName 
 		ID:             id,
 		RuntimeHandler: runtimeName,
 	}))
+	sb, err := service.sandboxManager.Get(id)
+	require.NoError(t, err)
+	sb.Spec.Process = &specs.Process{}
 }
 
 func TestCheckpointForwardsRequest(t *testing.T) {
