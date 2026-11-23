@@ -18,12 +18,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+
+	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
 )
 
 func TestPrepareRunscPrivateRootfsSeedsReadonlyDirectoryTargets(t *testing.T) {
@@ -43,7 +44,7 @@ func TestPrepareRunscPrivateRootfsSeedsReadonlyDirectoryTargets(t *testing.T) {
 		mountRunscNVProxyOverlay = originalMount
 		unmountRunscNVProxyPath = originalUnmount
 	})
-	mountRunscNVProxyOverlay = func(_, upper, _, _ string) error {
+	mountRunscNVProxyOverlay = func(_, upper, _, _ string, _ bool) error {
 		info, err := os.Lstat(filepath.Join(upper, "etc", "hosts"))
 		if err != nil || !info.Mode().IsRegular() {
 			return errors.New("runsc upper file target was not prepared")
@@ -82,7 +83,7 @@ func TestPrepareRunscNVProxyRootfs(t *testing.T) {
 	})
 
 	var mountedLower, mountedUpper, mountedWork, mountedTarget string
-	mountRunscNVProxyOverlay = func(lower, upper, work, target string) error {
+	mountRunscNVProxyOverlay = func(lower, upper, work, target string, _ bool) error {
 		mountedLower, mountedUpper, mountedWork, mountedTarget = lower, upper, work, target
 		return nil
 	}
@@ -180,7 +181,7 @@ func TestPrepareRunscNVProxyRootfsDoesNotFollowLowerSymlinks(t *testing.T) {
 				mountRunscNVProxyOverlay = originalMount
 				unmountRunscNVProxyPath = originalUnmount
 			})
-			mountRunscNVProxyOverlay = func(_, upper, _, _ string) error {
+			mountRunscNVProxyOverlay = func(_, upper, _, _ string, _ bool) error {
 				info, err := os.Stat(filepath.Join(upper, "proc", "driver", "nvidia"))
 				if err != nil {
 					return err
@@ -228,22 +229,46 @@ func TestPrepareRunscNVProxyRootfsMountsEROFSImage(t *testing.T) {
 
 	originalImageMount := mountRunscNVProxyEROFSImage
 	originalOverlayMount := mountRunscNVProxyOverlay
+	originalProbeMount := mountRunscOverlayFilesystem
 	originalUnmount := unmountRunscNVProxyPath
 	t.Cleanup(func() {
 		mountRunscNVProxyEROFSImage = originalImageMount
 		mountRunscNVProxyOverlay = originalOverlayMount
+		mountRunscOverlayFilesystem = originalProbeMount
 		unmountRunscNVProxyPath = originalUnmount
 	})
 	var imageSource, imageTarget, overlayLower string
+	imageMounted := false
 	mountRunscNVProxyEROFSImage = func(source, target string) error {
 		imageSource, imageTarget = source, target
+		imageMounted = true
 		return nil
 	}
-	mountRunscNVProxyOverlay = func(lower, _, _, _ string) error {
+	overlayMounts := 0
+	mountRunscNVProxyOverlay = func(lower, _, _, _ string, volatile bool) error {
+		overlayMounts++
+		if !imageMounted || lower != imageTarget {
+			t.Fatalf("private overlay attempt %d lost the mounted EROFS lower", overlayMounts)
+		}
 		overlayLower = lower
+		if volatile {
+			return syscall.EINVAL
+		}
 		return nil
 	}
-	unmountRunscNVProxyPath = func(string, int) error { return syscall.EINVAL }
+	mountRunscOverlayFilesystem = func(_, _, _ string, _ uintptr, options string) error {
+		if overlayOptionsVolatile(options) {
+			return syscall.EINVAL
+		}
+		return nil
+	}
+	unmountRunscNVProxyPath = func(target string, _ int) error {
+		if target == imageTarget && imageMounted {
+			imageMounted = false
+			return nil
+		}
+		return syscall.EINVAL
+	}
 
 	spec := &runtimecore.Spec{
 		Root: &runtimecore.Root{Path: "rootfs", Readonly: false},
@@ -266,6 +291,9 @@ func TestPrepareRunscNVProxyRootfsMountsEROFSImage(t *testing.T) {
 	if overlayLower != expectedLower {
 		t.Fatalf("overlay lower=%q, want %q", overlayLower, expectedLower)
 	}
+	if overlayMounts != 2 {
+		t.Fatalf("overlay attempts = %d, want primary and nonvolatile retry", overlayMounts)
+	}
 	for key := range spec.Annotations {
 		if strings.HasPrefix(key, runtimecore.GVisorRootfsAnnotationPrefix) {
 			t.Fatalf("gVisor rootfs image annotation %q was not removed", key)
@@ -276,6 +304,9 @@ func TestPrepareRunscNVProxyRootfsMountsEROFSImage(t *testing.T) {
 	}
 	if err := cleanup(); err != nil {
 		t.Fatalf("cleanup nvproxy rootfs: %v", err)
+	}
+	if imageMounted {
+		t.Fatal("cleanup did not unmount the EROFS lower")
 	}
 }
 
@@ -330,7 +361,12 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(lower, "image-file"), []byte("image"), 0644); err != nil {
 				t.Fatal(err)
 			}
-			spec := &runtimecore.Spec{Root: &runtimecore.Root{Path: lower, Readonly: true}}
+			spec := &runtimecore.Spec{
+				Root: &runtimecore.Root{Path: lower, Readonly: true},
+				Mounts: []runtimecore.Mount{{
+					Type: "bind", Source: t.TempDir(), Destination: "/logs/output", Options: []string{"rw"},
+				}},
+			}
 			cleanup, err := prepareRunscPrivateRootfs(bundle, spec, hostWritable)
 			if err != nil {
 				t.Fatal(err)
@@ -361,6 +397,12 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 			if spec.Root.Readonly == hostWritable {
 				t.Fatalf("unexpected guest root readonly=%t", spec.Root.Readonly)
 			}
+			if info, err := os.Stat(filepath.Join(merged, "logs", "output")); err != nil || !info.IsDir() {
+				t.Fatalf("writable bind target missing from the merged root: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(lower, "logs")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("writable bind target changed the shared lower: %v", err)
+			}
 			if err := os.WriteFile(filepath.Join(merged, "image-file"), []byte("private"), 0644); err != nil {
 				t.Fatal(err)
 			}
@@ -380,49 +422,174 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 	}
 }
 
-// Exercise the kernel mount boundary, including hosts predating overlay volatile.
 func TestPrivateRootfsOverlayCapabilityFallback(t *testing.T) {
+	firstErr := fmt.Errorf("initial overlay failure: %w", syscall.EINVAL)
+	type attempt struct {
+		kind string
+		err  error
+	}
 	for _, tc := range []struct {
-		name            string
-		first, fallback error
-		calls           int
+		name         string
+		attempts     []attempt
+		wantedErrors []error
 	}{
-		{name: "supported", calls: 1},
-		{name: "unsupported", first: syscall.EINVAL, calls: 2},
-		{name: "unsupported-and-invalid-base", first: syscall.EINVAL, fallback: syscall.ENOENT, calls: 2},
-		{name: "permission-denied", first: syscall.EPERM, calls: 1},
-		{name: "busy", first: syscall.EBUSY, calls: 1},
+		{
+			name:     "primary success",
+			attempts: []attempt{{"primary", nil}},
+		},
+		{
+			name:         "ordinary EINVAL with supported volatile",
+			attempts:     []attempt{{"primary", firstErr}, {"probe", nil}},
+			wantedErrors: []error{firstErr},
+		},
+		{
+			name:         "inconclusive probe",
+			attempts:     []attempt{{"primary", firstErr}, {"probe", syscall.EINVAL}, {"control", syscall.EPERM}},
+			wantedErrors: []error{firstErr, syscall.EPERM},
+		},
+		{
+			name:     "confirmed incompatibility",
+			attempts: []attempt{{"primary", firstErr}, {"probe", syscall.EINVAL}, {"control", nil}, {"retry", nil}},
+		},
+		{
+			name:         "confirmed incompatibility with failed retry",
+			attempts:     []attempt{{"primary", firstErr}, {"probe", syscall.EINVAL}, {"control", nil}, {"retry", syscall.ENOENT}},
+			wantedErrors: []error{firstErr, syscall.ENOENT},
+		},
+		{
+			name:         "permission denied",
+			attempts:     []attempt{{"primary", syscall.EPERM}},
+			wantedErrors: []error{syscall.EPERM},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			original := mountRunscOverlayFilesystem
-			t.Cleanup(func() { mountRunscOverlayFilesystem = original })
+			bundle := t.TempDir()
+			lower := t.TempDir()
+			rootfsDir := filepath.Join(bundle, runscNVProxyRootfsDir)
+			upperDir := filepath.Join(bundle, runscNVProxyUpperDir)
+			workDir := filepath.Join(bundle, runscNVProxyWorkDir)
+			stageDirs := []string{rootfsDir, upperDir, workDir}
+			probeLower := "lowerdir=" + filepath.Join(workDir, "lower1") + ":" + filepath.Join(workDir, "lower2")
+			options := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lower, upperDir, workDir)
+
+			originalMount := mountRunscOverlayFilesystem
+			originalUnmount := unmountRunscNVProxyPath
+			t.Cleanup(func() {
+				mountRunscOverlayFilesystem = originalMount
+				unmountRunscNVProxyPath = originalUnmount
+			})
+			// Simulate a kernel mount and require the stage reset to unmount
+			// any successful probe before creating or removing staging paths.
+			mounted := false
+			unmountRunscNVProxyPath = func(target string, _ int) error {
+				if target == rootfsDir && mounted {
+					mounted = false
+					return nil
+				}
+				return syscall.EINVAL
+			}
 			calls := 0
 			mountRunscOverlayFilesystem = func(source, target, fstype string, flags uintptr, data string) error {
-				calls++
-				if source != "overlay" || target != "/target" || fstype != "overlay" || flags != 0 {
+				if mounted || calls >= len(tc.attempts) {
+					t.Fatalf("unexpected mount call %d (mounted=%t): %s", calls+1, mounted, data)
+				}
+				if source != "overlay" || target != rootfsDir || fstype != "overlay" || flags != 0 {
 					t.Fatalf("changed mount boundary: %s %s %s %d", source, target, fstype, flags)
 				}
-				expected := "lowerdir=/lower,upperdir=/upper,workdir=/work"
-				if calls == 1 {
-					expected += ",volatile"
+				kind, mountErr := tc.attempts[calls].kind, tc.attempts[calls].err
+				var expected string
+				switch kind {
+				case "primary":
+					expected = options + ",volatile"
+				case "probe":
+					expected = probeLower + ",volatile"
+				case "control":
+					expected = probeLower
+				case "retry":
+					expected = options
 				}
 				if data != expected {
 					t.Fatalf("options = %q, want %q", data, expected)
 				}
-				if calls == 1 {
-					return tc.first
+				for _, dir := range stageDirs {
+					if _, err := os.Stat(filepath.Join(dir, "first-attempt")); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("%s found old staging contents in %s: %v", kind, dir, err)
+					}
 				}
-				return tc.fallback
+				if kind == "primary" || kind == "retry" {
+					if info, err := os.Stat(filepath.Join(upperDir, "logs", "output")); err != nil || !info.IsDir() {
+						t.Fatalf("%s missing the staged writable bind target: %v", kind, err)
+					}
+					if entries, err := os.ReadDir(workDir); err != nil || len(entries) != 0 {
+						t.Fatalf("%s workdir must be empty: %v, %v", kind, entries, err)
+					}
+				}
+				if kind == "primary" {
+					for _, dir := range stageDirs {
+						if err := os.WriteFile(filepath.Join(dir, "first-attempt"), nil, 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				calls++
+				mounted = mountErr == nil
+				return mountErr
 			}
-			err := mountRunscNVProxyOverlay("/lower", "/upper", "/work", "/target")
-			expectedErr := tc.first
-			if tc.calls == 2 {
-				expectedErr = tc.fallback
+			spec := &runtimecore.Spec{
+				Root: &runtimecore.Root{Path: lower, Readonly: true},
+				Mounts: []runtimecore.Mount{{
+					Type: "bind", Source: t.TempDir(), Destination: "/logs/output", Options: []string{"rw"},
+				}},
 			}
-			if !errors.Is(err, expectedErr) || calls != tc.calls {
-				t.Fatalf("mount: %v (%d calls), want %v (%d calls)", err, calls, expectedErr, tc.calls)
+			cleanup, err := prepareRunscPrivateRootfs(bundle, spec, false)
+			if calls != len(tc.attempts) || (err == nil) != (len(tc.wantedErrors) == 0) {
+				t.Fatalf("prepareRunscPrivateRootfs() after %d mounts returned %v", calls, err)
+			}
+			for _, wanted := range tc.wantedErrors {
+				if !errors.Is(err, wanted) {
+					t.Errorf("prepareRunscPrivateRootfs() error %v lost %v", err, wanted)
+				}
+			}
+			if err == nil {
+				if cleanup == nil {
+					t.Fatal("successful preparation did not return cleanup")
+				}
+				if err := cleanup(); err != nil {
+					t.Fatal(err)
+				}
+			} else if cleanup != nil || spec.Root.Path != lower {
+				t.Fatal("failed preparation published a staged root")
+			}
+			if mounted {
+				t.Error("staging or probe mount remains")
+			}
+			for _, dir := range stageDirs {
+				if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("staging directory remains: %s, %v", dir, err)
+				}
 			}
 		})
+	}
+}
+
+func TestRunscLegacyOverlayMountOptionLimit(t *testing.T) {
+	original := mountRunscOverlayFilesystem
+	t.Cleanup(func() { mountRunscOverlayFilesystem = original })
+	calls := 0
+	mountRunscOverlayFilesystem = func(_, _, _ string, _ uintptr, _ string) error {
+		calls++
+		return nil
+	}
+	page := os.Getpagesize()
+	if err := mountRunscLegacyOverlay("/target", strings.Repeat("a", page-1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mountRunscLegacyOverlay("/target", strings.Repeat("a", page)); err == nil ||
+		!strings.Contains(err.Error(), fmt.Sprintf("legacy mount limit of %d bytes", page)) {
+		t.Fatalf("mountRunscLegacyOverlay() error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("mount calls = %d, want 1", calls)
 	}
 }
 

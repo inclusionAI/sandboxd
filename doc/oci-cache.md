@@ -1,5 +1,7 @@
 # OCI cache retention
 
+Multi-layer OCI root filesystems use a read-only OverlayFS mount. Sandboxd checks the serialized options against the running kernel's legacy `mount(2)` limit of one page minus one byte. Larger lists use the kernel's `fsconfig` `lowerdir+` interface with one path per layer in priority order. The kernel and the sandboxd mountinfo reader must be able to represent the full list. If they cannot, preparation fails with the applicable limit. Sandboxd verifies the mounted layer order before publishing the mount or adopting it on restart.
+
 The sandboxd startup configuration controls the node-wide zero-reference TTL for extracted OCI layers and lowerdir chains:
 
 ```toml

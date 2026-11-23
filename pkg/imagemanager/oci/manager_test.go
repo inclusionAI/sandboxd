@@ -31,6 +31,7 @@ import (
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	"github.com/moby/sys/mountinfo"
 )
 
 type panicUncompressedLayer struct {
@@ -387,8 +388,8 @@ func TestReconcileState_FixesMountAndLayerRefs(t *testing.T) {
 		t.Fatalf("put mount: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{mountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -461,8 +462,10 @@ func TestReconcileState_FixesChainRefsForRecoveredMount(t *testing.T) {
 		t.Fatalf("put mount: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{
+			mountPath: {Root: "/", FSType: "overlay", VFSOptions: "ro,lowerdir=" + chain2Path + ":" + chain1Path},
+		}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -525,8 +528,8 @@ func TestReconcileState_DropsPersistedMountWhenMountMissing(t *testing.T) {
 		t.Fatalf("put mount: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -668,8 +671,8 @@ func TestReconcileState_RecoversMountFromTxn(t *testing.T) {
 		t.Fatalf("put mount txn: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{mountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -732,8 +735,8 @@ func TestReconcileState_RecoversMountFromTxnWithChainIDs(t *testing.T) {
 		t.Fatalf("put mount txn: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{mountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -797,8 +800,8 @@ func TestReconcileState_DropsTxnMountWhenLayersMissing(t *testing.T) {
 		}
 		return nil
 	}
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{mountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -840,8 +843,8 @@ func TestReconcileState_CleansOrphanOverlayMounts(t *testing.T) {
 		}
 		return nil
 	}
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{orphanMountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{orphanMountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -1662,6 +1665,11 @@ func TestBuildOverlayMountData(t *testing.T) {
 			want:      "lowerdir=/tmp/layers/l2/fs:/tmp/layers/l1/fs",
 		},
 		{
+			name:      "escaped lowerdir delimiters",
+			lowerDirs: []string{`/top:one`, `/bottom,two\three`},
+			want:      `lowerdir=/top\:one:/bottom\,two\\three`,
+		},
+		{
 			name:      "empty lowerdirs",
 			lowerDirs: nil,
 			wantErr:   true,
@@ -1682,6 +1690,106 @@ func TestBuildOverlayMountData(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Fatalf("buildOverlayMountData() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVerifyOverlayMount(t *testing.T) {
+	layers := []string{`/top:1`, `/base,2`} // Top first.
+	for _, tc := range []struct {
+		name    string
+		root    string
+		options string
+		wantErr bool
+	}{
+		{name: "legacy", root: "/", options: `ro,lowerdir=/top\134:1:/base\134\0542`},
+		{name: "structured", root: "/", options: `ro,lowerdir+=/top\0721,lowerdir+=/base\0542`},
+		{name: "truncated", root: "/", options: `ro,lowerdir+=/top\0721`, wantErr: true},
+		{name: "reordered", root: "/", options: `ro,lowerdir+=/base\0542,lowerdir+=/top\0721`, wantErr: true},
+		{name: "subdirectory bind", root: "/subdir", options: `ro,lowerdir+=/top\0721,lowerdir+=/base\0542`, wantErr: true},
+		{name: "writable", root: "/", options: `rw,lowerdir+=/top\0721,lowerdir+=/base\0542`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &mountinfo.Info{Root: tc.root, FSType: "overlay", VFSOptions: tc.options}
+			if err := verifyOverlayMount(info, "/merged", layers); (err != nil) != tc.wantErr {
+				t.Fatalf("verifyOverlayMount() = %v, want error %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestReconcileIncompleteOverlay(t *testing.T) {
+	for _, published := range []bool{true, false} {
+		t.Run(fmt.Sprintf("published=%t", published), func(t *testing.T) {
+			mgr := newTestManager(t)
+			defer mgr.store.close()
+			const imageURL = "docker.io/library/busybox:latest"
+			digests := []string{"sha256:top", "sha256:base"}
+			var layers []string
+			for _, digest := range digests {
+				layer := filepath.Join(mgr.layersDir, digest, "fs")
+				if err := os.MkdirAll(layer, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := mgr.store.putLayer(&LayerRecord{Digest: digest, Path: layer, RefCount: 1}); err != nil {
+					t.Fatal(err)
+				}
+				layers = append(layers, layer)
+			}
+			path := filepath.Join(mgr.mountsDir, "incomplete", "merged")
+			if err := os.MkdirAll(path, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if published {
+				if err := mgr.store.putMount(&OciMountRecord{ImageURL: imageURL, MountPath: path, LayerDigests: digests, LowerDirs: layers}); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := mgr.store.putMountTxn(&OciMountTxnRecord{ImageURL: imageURL, MountPath: path, LayerDigests: digests, LowerDirs: layers}); err != nil {
+				t.Fatal(err)
+			}
+			mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+				return map[string]*mountinfo.Info{
+					path: {Root: "/", FSType: "overlay", VFSOptions: "ro,lowerdir=" + mountInfoEscape.Replace(layers[0])},
+				}, true, nil
+			}
+			unmounts := 0
+			mgr.unmountFn = func(target string) error {
+				if target != path {
+					t.Fatalf("unexpected unmount target %s", target)
+				}
+				unmounts++
+				return nil
+			}
+			if err := mgr.reconcileState(); err != nil {
+				t.Fatal(err)
+			}
+			if mgr.getContainer(imageURL) != nil {
+				t.Fatal("incomplete overlay was adopted")
+			}
+			if published {
+				if _, _, err := mgr.MountImage(imageURL); err == nil || !strings.Contains(err.Error(), "expected 2 lowerdirs") {
+					t.Fatalf("incomplete persisted overlay was reusable: %v", err)
+				}
+				if unmounts != 0 {
+					t.Fatal("reconciliation unmounted a previously published image")
+				}
+				for _, digest := range digests {
+					layer, err := mgr.store.getLayer(digest)
+					if err != nil || layer == nil || layer.RefCount != 1 {
+						t.Fatalf("published layer %s lost its reference: %v, %v", digest, layer, err)
+					}
+				}
+				return
+			}
+			if unmounts != 1 {
+				t.Fatalf("got %d unmounts, want 1", unmounts)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("discarded mount target still present: %v", err)
+			}
+			if txn, err := mgr.store.getMountTxn(imageURL); err != nil || txn != nil {
+				t.Fatalf("discarded transaction still present: %v, %v", txn, err)
 			}
 		})
 	}
@@ -1816,7 +1924,7 @@ func newTestManager(t *testing.T) *Manager {
 		now:          func() time.Time { return time.Unix(1700000000, 0) },
 		mountFn:      func(string, []string) error { return nil },
 		unmountFn:    func(string) error { return nil },
-		readMnts:     func() (map[string]struct{}, bool, error) { return map[string]struct{}{}, false, nil },
+		readMnts:     func() (map[string]*mountinfo.Info, bool, error) { return map[string]*mountinfo.Info{}, false, nil },
 		diskUsage:    func(string) (float64, error) { return 0, nil },
 		layerWorkers: defaultGlobalLayerWorkers,
 		layerTTL:     DefaultLayerZeroRefTTL,

@@ -18,7 +18,7 @@ package oci
 
 import "fmt"
 
-func mountReadonlyOverlay(target, mountOpts string) error {
+func mountReadonlyOverlay(target string, lowerDirs []string) error {
 	return fmt.Errorf("overlay mount is only supported on linux")
 }
 

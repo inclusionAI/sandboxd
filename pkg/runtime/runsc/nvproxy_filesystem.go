@@ -18,12 +18,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
-	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
+	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
 )
 
 const (
@@ -37,25 +38,24 @@ var mountRunscNVProxyEROFSImage = runtimecommon.MountReadOnlyEROFSImage
 
 var mountRunscOverlayFilesystem = syscall.Mount
 
-var mountRunscNVProxyOverlay = func(lowerDir, upperDir, workDir, target string) error {
+var mountRunscNVProxyOverlay = func(lowerDir, upperDir, workDir, target string, volatile bool) error {
 	options := fmt.Sprintf(
-		"lowerdir=%s,upperdir=%s,workdir=%s,volatile",
+		"lowerdir=%s,upperdir=%s,workdir=%s",
 		lowerDir,
 		upperDir,
 		workDir,
 	)
-	// This overlay only stages mount targets and host hook output. It is
-	// recreated for every execution; guest writes use runsc's separate
-	// filestore. Do not let teardown sync the entire shared upper filesystem
-	// while other sandboxes are persisting checkpoints (Linux 5.10 ovl_sync_fs).
-	err := mountRunscOverlayFilesystem("overlay", target, "overlay", 0, options)
-	if !errors.Is(err, syscall.EINVAL) {
-		return err
+	if volatile {
+		options += ",volatile"
 	}
-	// Older kernels reject the unknown volatile option with EINVAL. Retry
-	// only that compatibility case with the pre-existing overlay semantics.
-	// If the base options are invalid too, preserve the fallback mount error.
-	return mountRunscOverlayFilesystem("overlay", target, "overlay", 0, strings.TrimSuffix(options, ",volatile"))
+	return mountRunscLegacyOverlay(target, options)
+}
+
+func mountRunscLegacyOverlay(target, options string) error {
+	if size, limit := len(options)+1, os.Getpagesize(); size > limit {
+		return fmt.Errorf("overlay mount options require %d bytes including NUL, exceeding the legacy mount limit of %d bytes", size, limit)
+	}
+	return mountRunscOverlayFilesystem("overlay", target, "overlay", 0, options)
 }
 
 var unmountRunscNVProxyPath = func(target string, flags int) error {
@@ -132,19 +132,74 @@ func prepareRunscPrivateRootfsWithMounter(
 			cleanupRunscNVProxyRootfs(bundlePath),
 		)
 	}
+	if err := prepareRunscPrivateOverlay(bundlePath, lowerDir, spec.Mounts); err != nil {
+		return nil, errors.Join(err, cleanupRunscNVProxyRootfs(bundlePath))
+	}
+
+	spec.Root.Path = runscNVProxyRootfsDir
+	spec.Root.Readonly = originalReadonly && !requireHostWritable
+	if err := writeRunscNVProxySpec(filepath.Join(bundlePath, "config.json"), spec); err != nil {
+		return nil, errors.Join(err, cleanupRunscNVProxyRootfs(bundlePath))
+	}
+	return func() error { return cleanupRunscNVProxyRootfs(bundlePath) }, nil
+}
+
+func prepareRunscPrivateOverlay(bundlePath, lowerDir string, mounts []runtimecore.Mount) error {
 	rootfsDir := filepath.Join(bundlePath, runscNVProxyRootfsDir)
 	upperDir := filepath.Join(bundlePath, runscNVProxyUpperDir)
 	workDir := filepath.Join(bundlePath, runscNVProxyWorkDir)
+	if err := stageRunscPrivateOverlay(rootfsDir, upperDir, workDir, mounts); err != nil {
+		return err
+	}
+	// This overlay only stages mount targets and host hook output. It is
+	// recreated for every execution; guest writes use runsc's separate
+	// filestore. Do not let teardown sync the entire shared upper filesystem
+	// while other sandboxes are persisting checkpoints (Linux 5.10 ovl_sync_fs).
+	err := mountRunscNVProxyOverlay(lowerDir, upperDir, workDir, rootfsDir, true)
+	if err == nil {
+		return nil
+	}
+	initialErr := fmt.Errorf("mount private runsc rootfs at %s: %w", rootfsDir, err)
+	if !errors.Is(err, syscall.EINVAL) {
+		return initialErr
+	}
+
+	reset := func() error {
+		if err := unmountRunscNVProxyMount(rootfsDir); err != nil {
+			return err
+		}
+		return removeRunscNVProxyPaths(rootfsDir, upperDir, workDir)
+	}
+	if err := reset(); err != nil {
+		return errors.Join(initialErr, fmt.Errorf("reset private runsc staging: %w", err))
+	}
+	unsupported, err := runscOverlayVolatileUnsupported(workDir, rootfsDir)
+	if err != nil {
+		return errors.Join(initialErr, fmt.Errorf("probe overlay volatile support: %w", err))
+	}
+	if !unsupported {
+		return initialErr
+	}
+	if err := reset(); err != nil {
+		return errors.Join(initialErr, fmt.Errorf("reset private runsc staging after compatibility probe: %w", err))
+	}
+	if err := stageRunscPrivateOverlay(rootfsDir, upperDir, workDir, mounts); err != nil {
+		return errors.Join(initialErr, err)
+	}
+	if err := mountRunscNVProxyOverlay(lowerDir, upperDir, workDir, rootfsDir, false); err != nil {
+		return errors.Join(initialErr, fmt.Errorf("retry private runsc rootfs mount without volatile: %w", err))
+	}
+	return nil
+}
+
+func stageRunscPrivateOverlay(rootfsDir, upperDir, workDir string, mounts []runtimecore.Mount) error {
 	for _, path := range []string{rootfsDir, upperDir, workDir} {
 		if err := os.MkdirAll(path, 0755); err != nil {
-			return nil, errors.Join(err, cleanupRunscNVProxyRootfs(bundlePath))
+			return err
 		}
 	}
-	if err := runtimecore.CreateRootfsMountTargets(upperDir, spec.Mounts); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("create private runsc rootfs mount targets: %w", err),
-			cleanupRunscNVProxyRootfs(bundlePath),
-		)
+	if err := runtimecore.CreateRootfsMountTargets(upperDir, mounts); err != nil {
+		return fmt.Errorf("create private runsc rootfs mount targets: %w", err)
 	}
 	// Seed the mount point in the private upper directory before mounting the
 	// overlay. The image-backed lower directory is untrusted and may contain
@@ -154,30 +209,33 @@ func prepareRunscPrivateRootfsWithMounter(
 	// also masks conflicting lower entries before runsc prepares nvproxy.
 	nvidiaProcDir := filepath.Join(upperDir, "proc", "driver", "nvidia")
 	if err := os.MkdirAll(nvidiaProcDir, 0755); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("create nvproxy upper procfs mount point: %w", err),
-			cleanupRunscNVProxyRootfs(bundlePath),
-		)
+		return fmt.Errorf("create nvproxy upper procfs mount point: %w", err)
 	}
 	if err := os.Chmod(nvidiaProcDir, 0555); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("set nvproxy upper procfs mount point permissions: %w", err),
-			cleanupRunscNVProxyRootfs(bundlePath),
-		)
+		return fmt.Errorf("set nvproxy upper procfs mount point permissions: %w", err)
 	}
-	if err := mountRunscNVProxyOverlay(lowerDir, upperDir, workDir, rootfsDir); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("mount nvproxy rootfs at %s: %w", rootfsDir, err),
-			cleanupRunscNVProxyRootfs(bundlePath),
-		)
-	}
+	return nil
+}
 
-	spec.Root.Path = runscNVProxyRootfsDir
-	spec.Root.Readonly = originalReadonly && !requireHostWritable
-	if err := writeRunscNVProxySpec(filepath.Join(bundlePath, "config.json"), spec); err != nil {
-		return nil, errors.Join(err, cleanupRunscNVProxyRootfs(bundlePath))
+func runscOverlayVolatileUnsupported(probeDir, target string) (bool, error) {
+	first := filepath.Join(probeDir, "lower1")
+	second := filepath.Join(probeDir, "lower2")
+	for _, path := range []string{first, second, target} {
+		if err := os.MkdirAll(path, 0755); err != nil {
+			return false, err
+		}
 	}
-	return func() error { return cleanupRunscNVProxyRootfs(bundlePath) }, nil
+	// Use a plain lower-only overlay so the parser sees volatile without the
+	// production lower's stacking depth or the upper/workdir constraints. On
+	// success the caller unmounts the probe before reusing the staging path.
+	options := "lowerdir=" + first + ":" + second
+	if err := mountRunscLegacyOverlay(target, options+",volatile"); !errors.Is(err, syscall.EINVAL) {
+		return false, err
+	}
+	if err := mountRunscLegacyOverlay(target, options); err != nil {
+		return false, fmt.Errorf("mount nonvolatile overlay control: %w", err)
+	}
+	return true, nil
 }
 
 func runscNVProxyEROFSImageSource(spec *runtimecore.Spec) (string, bool) {
@@ -200,14 +258,17 @@ func cleanupRunscNVProxyRootfs(bundlePath string) error {
 		return err
 	}
 
+	return removeRunscNVProxyPaths(
+		rootfsDir,
+		filepath.Join(bundlePath, runscNVProxyLowerDir),
+		filepath.Join(bundlePath, runscNVProxyUpperDir),
+		filepath.Join(bundlePath, runscNVProxyWorkDir),
+	)
+}
+
+func removeRunscNVProxyPaths(paths ...string) error {
 	var result error
-	for _, name := range []string{
-		runscNVProxyRootfsDir,
-		runscNVProxyLowerDir,
-		runscNVProxyUpperDir,
-		runscNVProxyWorkDir,
-	} {
-		path := filepath.Join(bundlePath, name)
+	for _, path := range paths {
 		if err := os.RemoveAll(path); err != nil {
 			result = errors.Join(result, fmt.Errorf("remove nvproxy rootfs path %s: %w", path, err))
 		}

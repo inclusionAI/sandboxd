@@ -111,7 +111,7 @@ type Manager struct {
 	mountFn   func(target string, lowerDirs []string) error
 	unmountFn func(target string) error
 	diskUsage func(path string) (float64, error)
-	readMnts  func() (map[string]struct{}, bool, error)
+	readMnts  func() (map[string]*mountinfo.Info, bool, error)
 
 	layerWorkers  int
 	layerJobs     chan layerExtractJob
@@ -215,7 +215,7 @@ func NewManagerWithZeroRefTTL(rootWorkDir string, cfgTempPath string, zeroRefTTL
 		mountFn:    defaultOverlayMount,
 		unmountFn:  defaultOverlayUnmount,
 		diskUsage:  defaultDiskUsage,
-		readMnts: func() (map[string]struct{}, bool, error) {
+		readMnts: func() (map[string]*mountinfo.Info, bool, error) {
 			return readManagedMounts(mountsDir)
 		},
 		layerWorkers: defaultGlobalLayerWorkers,
@@ -350,7 +350,9 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 	)
 	defer func() {
 		if rollbackResources {
-			m.rollbackMountTransaction(txn, reservedDigests, reservedChainIDs)
+			if err := m.rollbackMountTransaction(txn, reservedDigests, reservedChainIDs); err != nil {
+				retErr = errors.Join(retErr, err)
+			}
 		}
 	}()
 
@@ -362,7 +364,11 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 	}
 
 	// Reuse mounted state restored from BoltDB after restart.
-	if rec, err := m.store.getMount(imageURL); err == nil && rec != nil {
+	rec, err := m.readVerifiedMount(imageURL)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if rec != nil {
 		info := &ContainerInfo{
 			MountID:       rec.MountID,
 			ImageURL:      rec.ImageURL,
@@ -378,6 +384,11 @@ func (m *Manager) MountImageConfigWithContext(ctx context.Context, imageURL stri
 		timing.Stage("reuse_persisted_mount", time.Since(stageStart))
 		logrus.Infof("OCI mount reuse persisted: image=%s mount_path=%s cost=%s", imageURL, rec.MountPath, time.Since(opStart))
 		return rec.MountPath, rec.Env, imageconfig.Clone(info.ImageProcess), nil
+	}
+	if pending, err := m.store.getMountTxn(imageURL); err != nil {
+		return "", nil, nil, fmt.Errorf("read OCI mount transaction for %s: %w", imageURL, err)
+	} else if pending != nil {
+		return "", nil, nil, fmt.Errorf("OCI image %s still has an unfinished mount transaction at %s", imageURL, pending.MountPath)
 	}
 	timing.Stage("check_existing_mount", time.Since(stageStart))
 
@@ -502,9 +513,9 @@ func (m *Manager) ImageProcessWithContext(ctx context.Context, imageURL string) 
 
 	info := m.getContainer(imageURL)
 	if info == nil {
-		rec, err := m.store.getMount(imageURL)
+		rec, err := m.readVerifiedMount(imageURL)
 		if err != nil {
-			return nil, fmt.Errorf("read OCI mount metadata for %s: %w", imageURL, err)
+			return nil, err
 		}
 		if rec == nil {
 			return nil, fmt.Errorf("OCI image %s is not mounted", imageURL)
@@ -1550,27 +1561,85 @@ func defaultOverlayMount(target string, lowerDirs []string) error {
 		return nil
 	}
 
-	mountData, err := buildOverlayMountData(lowerDirs)
-	if err != nil {
-		return err
-	}
 	logrus.Infof(
-		"OCI overlay mount params: target=%s lowerdir_count=%d opts=%s",
+		"OCI overlay mount params: target=%s lowerdir_count=%d",
 		target,
 		len(lowerDirs),
-		mountData,
 	)
-	if err := mountReadonlyOverlay(target, mountData); err != nil {
-		return fmt.Errorf("overlay mount failed: target=%s opts=%s: %w", target, mountData, err)
+	if err := mountReadonlyOverlay(target, lowerDirs); err != nil {
+		return fmt.Errorf("overlay mount failed at %s: %w", target, err)
 	}
-	return nil
+	mounts, _, err := readManagedMounts(filepath.Dir(target))
+	if err != nil {
+		return fmt.Errorf("read mounted overlay at %s: %w", target, err)
+	}
+	return verifyOverlayMount(mounts[filepath.Clean(target)], target, lowerDirs)
 }
+
+var overlayPathEscape = strings.NewReplacer(`\`, `\\`, `:`, `\:`, `,`, `\,`)
 
 func buildOverlayMountData(lowerDirs []string) (string, error) {
 	if len(lowerDirs) == 0 {
 		return "", fmt.Errorf("lowerDirs is empty")
 	}
-	return "lowerdir=" + strings.Join(lowerDirs, ":"), nil
+	var opts strings.Builder
+	opts.WriteString("lowerdir=")
+	for i, dir := range lowerDirs {
+		if dir == "" || strings.ContainsRune(dir, 0) {
+			return "", fmt.Errorf("invalid OCI overlay lowerdir at layer %d", i+1)
+		}
+		if i > 0 {
+			opts.WriteByte(':')
+		}
+		overlayPathEscape.WriteString(&opts, dir)
+	}
+	return opts.String(), nil
+}
+
+var (
+	mountInfoEscape          = strings.NewReplacer(`\`, `\134`, ",", `\054`, " ", `\040`, "\t", `\011`, "\n", `\012`)
+	mountInfoEscapeWithColon = strings.NewReplacer(`\`, `\134`, ",", `\054`, " ", `\040`, "\t", `\011`, "\n", `\012`, ":", `\072`)
+)
+
+func verifyOverlayMount(info *mountinfo.Info, target string, lowerDirs []string) error {
+	if info == nil || info.FSType != "overlay" || info.Root != "/" {
+		return fmt.Errorf("expected one overlay filesystem root at %s", target)
+	}
+	options := strings.Split(info.VFSOptions, ",")
+	if len(options) == 0 || options[0] != "ro" {
+		return fmt.Errorf("OCI overlay at %s is not read-only", target)
+	}
+	legacyData, err := buildOverlayMountData(lowerDirs)
+	if err != nil {
+		return err
+	}
+	legacy, structured := false, 0
+	badLayers := fmt.Errorf("OCI overlay at %s does not contain the expected %d lowerdirs in order", target, len(lowerDirs))
+	for _, option := range options[1:] {
+		key, value, _ := strings.Cut(option, "=")
+		switch key {
+		case "lowerdir":
+			if legacy || structured > 0 || value != mountInfoEscape.Replace(strings.TrimPrefix(legacyData, "lowerdir=")) {
+				return badLayers
+			}
+			legacy = true
+		case "lowerdir+":
+			if legacy || structured >= len(lowerDirs) {
+				return badLayers
+			}
+			dir := lowerDirs[structured]
+			if value != mountInfoEscape.Replace(dir) && value != mountInfoEscapeWithColon.Replace(dir) {
+				return badLayers
+			}
+			structured++
+		case "datadir+", "upperdir", "workdir":
+			return badLayers
+		}
+	}
+	if !legacy && structured != len(lowerDirs) {
+		return badLayers
+	}
+	return nil
 }
 
 func defaultOverlayUnmount(target string) error {
@@ -1583,28 +1652,67 @@ func defaultOverlayUnmount(target string) error {
 	return nil
 }
 
-func readManagedMounts(mountsDir string) (map[string]struct{}, bool, error) {
+func readManagedMounts(mountsDir string) (map[string]*mountinfo.Info, bool, error) {
 	if runtime.GOOS != "linux" {
-		return map[string]struct{}{}, false, nil
+		return nil, false, nil
 	}
 
-	mountsRoot := filepath.Clean(mountsDir) + string(os.PathSeparator)
+	resolved, err := absoluteMountPath(mountsDir)
+	if err != nil {
+		return nil, true, err
+	}
+	mountsRoot := strings.TrimRight(resolved, string(os.PathSeparator)) + string(os.PathSeparator)
 	mountsInfo, err := mountinfo.GetMounts(func(info *mountinfo.Info) (skip, stop bool) {
 		cleanMP := filepath.Clean(info.Mountpoint)
 		return !strings.HasPrefix(cleanMP, mountsRoot), false
 	})
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return map[string]struct{}{}, false, nil
+			return nil, false, nil
 		}
 		return nil, true, err
 	}
 
-	mounts := make(map[string]struct{}, len(mountsInfo))
+	mounts := make(map[string]*mountinfo.Info, len(mountsInfo))
 	for _, info := range mountsInfo {
-		mounts[info.Mountpoint] = struct{}{}
+		mountPoint := filepath.Join(mountsDir, strings.TrimPrefix(filepath.Clean(info.Mountpoint), mountsRoot))
+		if _, exists := mounts[mountPoint]; exists {
+			// An exact match must identify a single mount at this target.
+			mounts[mountPoint] = nil
+			continue
+		}
+		mounts[mountPoint] = info
 	}
 	return mounts, true, nil
+}
+
+func absoluteMountPath(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(path)
+}
+
+func (m *Manager) readVerifiedMount(imageURL string) (*OciMountRecord, error) {
+	rec, err := m.store.getMount(imageURL)
+	if err != nil {
+		return nil, fmt.Errorf("read OCI mount metadata for %s: %w", imageURL, err)
+	}
+	if rec == nil || len(rec.LowerDirs) < 2 {
+		return rec, nil
+	}
+	mounts, check, err := m.readMnts()
+	if err != nil {
+		return nil, fmt.Errorf("read OCI mounts for %s: %w", imageURL, err)
+	}
+	if !check {
+		return nil, fmt.Errorf("cannot verify OCI overlay for %s without mountinfo", imageURL)
+	}
+	if err := verifyOverlayMount(mounts[rec.MountPath], rec.MountPath, rec.LowerDirs); err != nil {
+		return nil, err
+	}
+	return rec, nil
 }
 
 func defaultDiskUsage(p string) (float64, error) {
@@ -1710,6 +1818,14 @@ func (m *Manager) reconcileState() error {
 			chainRefCounts[chainID]++
 		}
 		validMountPoints[filepath.Clean(mount.MountPath)] = struct{}{}
+		if len(mount.LowerDirs) > 1 {
+			if err := verifyOverlayMount(managedMounts[mount.MountPath], mount.MountPath, mount.LowerDirs); err != nil {
+				// An existing sandbox can still reference this mount. Retain
+				// the record and references for normal teardown.
+				logrus.WithError(err).Warnf("refusing to adopt OCI overlay for %s", mount.ImageURL)
+				continue
+			}
+		}
 		m.containers[mount.ImageURL] = &ContainerInfo{
 			MountID:      mount.MountID,
 			ImageURL:     mount.ImageURL,
@@ -1762,10 +1878,17 @@ func (m *Manager) reconcileState() error {
 	return nil
 }
 
-func (m *Manager) rollbackMountTransaction(txn *OciMountTxnRecord, incrementedDigests []string, incrementedChains []string) {
+func (m *Manager) rollbackMountTransaction(txn *OciMountTxnRecord, incrementedDigests []string, incrementedChains []string) error {
 	if txn != nil {
+		mounts, _, err := m.readMnts()
+		if err != nil {
+			return fmt.Errorf("inspect OCI mount before rolling back %s: %w", txn.MountPath, err)
+		}
+		if info, found := mounts[txn.MountPath]; found && info == nil {
+			return fmt.Errorf("cannot roll back stacked OCI mounts at %s", txn.MountPath)
+		}
 		if err := m.unmountFn(txn.MountPath); err != nil && !isNotMountedError(err) {
-			logrus.Warnf("failed to rollback mount %s: %v", txn.MountPath, err)
+			return fmt.Errorf("roll back OCI mount %s: %w", txn.MountPath, err)
 		}
 	}
 
@@ -1778,6 +1901,7 @@ func (m *Manager) rollbackMountTransaction(txn *OciMountTxnRecord, incrementedDi
 		}
 		_ = os.RemoveAll(filepath.Dir(txn.MountPath))
 	}
+	return nil
 }
 
 func (m *Manager) rollbackReservedLayerRefs(digests []string) {
@@ -1802,7 +1926,7 @@ func (m *Manager) rollbackReservedChainRefs(chainIDs []string) {
 	}
 }
 
-func (m *Manager) recoverMountTransactions(managedMounts map[string]struct{}, shouldCheckMounts bool) error {
+func (m *Manager) recoverMountTransactions(managedMounts map[string]*mountinfo.Info, shouldCheckMounts bool) error {
 	txns, err := m.store.listMountTxns()
 	if err != nil {
 		return fmt.Errorf("failed to list mount transactions: %w", err)
@@ -1820,7 +1944,24 @@ func (m *Manager) recoverMountTransactions(managedMounts map[string]struct{}, sh
 		}
 
 		if shouldCheckMounts {
-			if _, ok := managedMounts[txn.MountPath]; ok {
+			if info, ok := managedMounts[txn.MountPath]; ok {
+				if info == nil {
+					return fmt.Errorf("cannot recover stacked OCI mounts at %s", txn.MountPath)
+				}
+				if len(txn.LowerDirs) > 1 {
+					if err := verifyOverlayMount(info, txn.MountPath, txn.LowerDirs); err != nil {
+						logrus.WithError(err).Warnf("discarding unpublished OCI overlay for %s", txn.ImageURL)
+						if err := m.unmountFn(txn.MountPath); err != nil && !isNotMountedError(err) {
+							return fmt.Errorf("unmount invalid OCI transaction for %s: %w", txn.ImageURL, err)
+						}
+						delete(managedMounts, txn.MountPath)
+						_ = os.RemoveAll(filepath.Dir(txn.MountPath))
+						if err := m.store.deleteMountTxn(txn.ImageURL); err != nil {
+							return fmt.Errorf("delete invalid OCI mount transaction for %s: %w", txn.ImageURL, err)
+						}
+						continue
+					}
+				}
 				validLayers, err := m.validateLayerDigests(txn.LayerDigests)
 				if err != nil {
 					return fmt.Errorf("failed to validate mount transaction layers for %s: %w", txn.ImageURL, err)
@@ -1888,14 +2029,18 @@ func (m *Manager) validateChainIDs(chainIDs []string) (bool, error) {
 	return true, nil
 }
 
-func (m *Manager) cleanupOrphanManagedMounts(managedMounts map[string]struct{}, validMountPoints map[string]struct{}) {
+func (m *Manager) cleanupOrphanManagedMounts(managedMounts map[string]*mountinfo.Info, validMountPoints map[string]struct{}) {
 	mountsRoot := filepath.Clean(m.mountsDir) + string(os.PathSeparator)
-	for mountPoint := range managedMounts {
+	for mountPoint, info := range managedMounts {
 		cleanMP := filepath.Clean(mountPoint)
 		if !strings.HasPrefix(cleanMP, mountsRoot) {
 			continue
 		}
 		if _, ok := validMountPoints[cleanMP]; ok {
+			continue
+		}
+		if info == nil {
+			logrus.Warnf("leaving stacked orphan OCI mounts at %s", cleanMP)
 			continue
 		}
 		if err := m.unmountFn(cleanMP); err != nil && !isNotMountedError(err) {
