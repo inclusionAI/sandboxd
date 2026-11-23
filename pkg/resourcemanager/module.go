@@ -38,7 +38,7 @@ import (
 // Lifecycle:
 //   - NewModule constructs the underlying NodeResourceManager.
 //   - Start launches the refresh loop and HTTP listener on sockPath.
-//   - Stop closes the listener and drains the background loops.
+//   - Stop closes the listener and stops the background loops.
 //   - Healthy reports whether at least one successful refresh has occurred
 //     within the staleness window.
 type Module struct {
@@ -103,7 +103,10 @@ type ephemeralStorageProvider interface {
 	EphemeralStorageCapacity() (capacityBytes, allocatableBytes uint64, err error)
 }
 
-const storageQuotaFeature = "storage-quota-v1"
+const (
+	storageQuotaFeature     = "storage-quota-v1"
+	resourceRefreshInterval = 5 * time.Second
+)
 
 // NewModule constructs the configured node-resource module. sockPath is the
 // Unix socket exposed to the external collector.
@@ -217,7 +220,7 @@ func (m *Module) SetParentMemoryReader(
 
 // SetSandboxMemoryUsage supplies live aggregate sandbox-cgroup memory
 // accounting (CgroupManager.StatsRoot plus out-of-root bookkeeping cgroups
-// such as the Firecracker checkpoint subtree). When set, the refresh loop
+// such as the Firecracker checkpoint subtree). The independent refresh loop
 // samples it on the same cadence and serves it as the sandbox_mem_usage
 // observation field on /resource, alongside — not subtracted from — the Mem
 // capacity contract. Consumers that already subtract instance requests from
@@ -228,9 +231,8 @@ func (m *Module) SetParentMemoryReader(
 // fields: a sample is kept through transient read failures only within the
 // staleness window, and the field is omitted when no fresh sample exists.
 //
-// Callers must install this before Start: the refresh goroutine launched by
-// Start must never publish an observation the first round cannot back with
-// a real sample.
+// Callers must install this before Start. The reader may outlive Stop if a
+// synchronous cgroup read is still blocked.
 func (m *Module) SetSandboxMemoryUsage(fn func() (uint64, error)) {
 	m.mu.Lock()
 	m.sandboxMemoryUsage = fn
@@ -247,6 +249,10 @@ func (m *Module) MarkSandboxStopped(target sandbox.MetricsTarget) {
 // Start launches the refresh loop and HTTP server. It returns once the
 // listener is bound. The socket reports zero until the first fresh sample.
 func (m *Module) Start() error {
+	return m.start(resourceRefreshInterval)
+}
+
+func (m *Module) start(refreshInterval time.Duration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.started {
@@ -298,12 +304,17 @@ func (m *Module) Start() error {
 
 	m.wg.Add(2)
 	go m.serve(mux)
-	go m.refreshLoop()
+	go m.refreshLoop(refreshInterval)
+	if read := m.sandboxMemoryUsage; read != nil {
+		m.wg.Add(1)
+		go m.sandboxMemoryLoop(read, refreshInterval, m.stalenessLimitLocked())
+	}
 
 	return nil
 }
 
-// Stop closes the unix listener and waits for the refresh loop to drain.
+// Stop closes the unix listener and waits for the refresh loops to exit.
+// A blocked optional usage read cannot delay shutdown or publish afterward.
 // Safe to call from any goroutine; idempotent. The previous select+close
 // pattern races on concurrent callers (two goroutines can both pass the
 // default branch and double-close stopCh, panicking). sync.Once gives a
@@ -350,8 +361,8 @@ func freshSample(now time.Time, timestamp int64, limit time.Duration) bool {
 	return timestamp != 0 && now.Sub(time.Unix(0, timestamp)) < limit
 }
 
-// Test freshness when serving readers, even if a provider or memory read
-// blocks the refresh loop past the grace period.
+// Test freshness when serving readers, even if the provider blocks the
+// capacity refresh loop past the grace period.
 func (m *Module) capacityLocked(now time.Time) (int64, int64) {
 	if !freshSample(now, m.lastRefresh.Load(), m.stalenessLimitLocked()) {
 		return 0, 0
@@ -436,9 +447,9 @@ func (m *Module) serve(mux *http.ServeMux) {
 	}
 }
 
-func (m *Module) refreshLoop() {
+func (m *Module) refreshLoop(interval time.Duration) {
 	defer m.wg.Done()
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	m.refreshOnce()
 	for {
@@ -452,20 +463,11 @@ func (m *Module) refreshLoop() {
 }
 
 func (m *Module) refreshOnce() {
-	m.mu.RLock()
-	sandboxMemoryUsage := m.sandboxMemoryUsage
-	m.mu.RUnlock()
-
 	cpu, mem, err := m.nodeResource.GetAvailableResource()
 	providerSampleAt := time.Now()
 	if err != nil {
-		// A provider failure must not bypass the sandbox-memory staleness
-		// policy below: keep the provider cache untouched for this round but
-		// still run the usage sampling so a stale observation drops out of
-		// the report instead of surviving forever on old provider data.
 		logrus.Errorf("resourcemanager: refresh failed: %v", err)
 		cpu = -1 // sentinel: skip publishing provider figures this round
-		mem = -1
 	}
 	// Wire format expects CPU in cores; underlying manager returns
 	// millicores (see standalone main.go for the same division).
@@ -473,54 +475,7 @@ func (m *Module) refreshOnce() {
 		cpu /= 1000
 	}
 
-	// Sandbox memory lives in a root cgroup outside every pod's cgroup, so
-	// no provider can see it. It is sampled on the same 5s cadence and
-	// exposed as the sandbox_mem_usage observation field next to the
-	// unchanged Mem capacity contract (see resourceInfo for why it is not
-	// subtracted from Mem). The figure includes page cache, which errs on
-	// the safe side for admission decisions that read it.
-	//
-	// Failure and staleness policy: after one successful sample, a failing
-	// sample keeps the last published usage — but only within the staleness
-	// window. Past that (or with no sample yet), the field is omitted from
-	// /resource rather than serving a frozen or fabricated figure.
-	// Sample outside the lock: the reader is an injected callback and must
-	// never run while m.mu is held.
-	var (
-		sampleOK   bool
-		sampleVal  uint64
-		sampleWarn error
-		sampleAt   time.Time
-	)
-	if sandboxMemoryUsage != nil {
-		sampleVal, sampleWarn = sandboxMemoryUsage()
-		sampleOK = sampleWarn == nil
-		sampleAt = time.Now()
-	}
 	m.mu.Lock()
-	limit := m.stalenessLimitLocked()
-	if sandboxMemoryUsage != nil {
-		switch {
-		case sampleOK:
-			m.sandboxMemUsage = sampleVal
-			m.sandboxMemUsageReady = true
-			m.lastMemSampleAt.Store(sampleAt.UnixNano())
-		default:
-			if freshSample(time.Now(), m.lastMemSampleAt.Load(), limit) {
-				logrus.Warnf(
-					"resourcemanager: read sandbox memory usage failed; keep last sample: %v",
-					sampleWarn,
-				)
-			} else {
-				m.sandboxMemUsageReady = false
-				m.lastMemSampleAt.Store(0)
-				logrus.Warnf(
-					"resourcemanager: sandbox memory sample missing or stale; dropping observation field: %v",
-					sampleWarn,
-				)
-			}
-		}
-	}
 	if cpu >= 0 {
 		if m.memoryCeiling > 0 && mem > m.memoryCeiling {
 			mem = m.memoryCeiling
@@ -528,7 +483,7 @@ func (m *Module) refreshOnce() {
 		m.availCpu = cpu
 		m.availMem = mem
 		m.lastRefresh.Store(providerSampleAt.UnixNano())
-	} else if !freshSample(time.Now(), m.lastRefresh.Load(), limit) {
+	} else if !freshSample(time.Now(), m.lastRefresh.Load(), m.stalenessLimitLocked()) {
 		// Provider data is past the staleness window: publish zero capacity
 		// rather than the frozen last-successful figure. The consumer's
 		// collector caches its previous successful response on connection
@@ -543,23 +498,81 @@ func (m *Module) refreshOnce() {
 	}
 	m.mu.Unlock()
 	if cpu >= 0 {
-		logrus.Debugf(
-			"resourcemanager: avail cpu=%d cores mem=%d bytes sandbox_mem=%d bytes",
-			cpu, mem, sandboxMemSnapshot(m),
-		)
+		logrus.Debugf("resourcemanager: avail cpu=%d cores mem=%d bytes", cpu, mem)
 	}
 	m.refreshEphemeralStorage()
 }
 
-// sandboxMemSnapshot returns the currently published sandbox-memory
-// observation for debug logging; 0 when the field is absent.
-func sandboxMemSnapshot(m *Module) uint64 {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if !m.sandboxMemUsageReady {
-		return 0
+func (m *Module) sandboxMemoryLoop(read func() (uint64, error), interval, timeout time.Duration) {
+	defer m.wg.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		default:
+		}
+		m.refreshSandboxMemory(read, timeout)
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+		}
 	}
-	return m.sandboxMemUsage
+}
+
+func (m *Module) refreshSandboxMemory(read func() (uint64, error), timeout time.Duration) {
+	type sample struct {
+		usage uint64
+		at    time.Time
+		err   error
+	}
+	deadline := time.Now().Add(timeout)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	result := make(chan sample, 1)
+	go func() {
+		usage, err := read()
+		result <- sample{usage: usage, at: time.Now(), err: err}
+	}()
+
+	select {
+	case <-m.stopCh:
+	case reading := <-result:
+		if reading.at.Before(deadline) {
+			m.recordSandboxMemorySample(reading.usage, reading.err, reading.at)
+		} else {
+			logrus.Warnf("resourcemanager: sandbox memory read exceeded %s", timeout)
+		}
+	case <-timer.C:
+		logrus.Warnf("resourcemanager: sandbox memory read exceeded %s", timeout)
+		// The synchronous kernel read cannot be canceled. Keep its slot
+		// occupied until it returns, and discard the late result. Stop can
+		// still exit because result is buffered and no worker publishes it.
+		select {
+		case <-m.stopCh:
+		case <-result:
+		}
+	}
+}
+
+func (m *Module) recordSandboxMemorySample(usage uint64, err error, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err == nil {
+		m.sandboxMemUsage = usage
+		m.sandboxMemUsageReady = true
+		m.lastMemSampleAt.Store(at.UnixNano())
+		return
+	}
+	if freshSample(at, m.lastMemSampleAt.Load(), m.stalenessLimitLocked()) {
+		logrus.Warnf("resourcemanager: read sandbox memory usage failed; keep last sample: %v", err)
+		return
+	}
+	m.sandboxMemUsageReady = false
+	m.lastMemSampleAt.Store(0)
+	logrus.Warnf("resourcemanager: sandbox memory sample missing or stale; dropping observation field: %v", err)
 }
 
 func (m *Module) refreshEphemeralStorage() {

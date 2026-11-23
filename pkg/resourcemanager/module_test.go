@@ -305,6 +305,124 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 	assert.True(t, resourceManager.stopped.Load())
 }
 
+func TestModuleBlockedSandboxMemoryKeepsCapacityFresh(t *testing.T) {
+	const expiry = 300 * time.Millisecond
+	blocked := make(chan time.Time, 1)
+	release := make(chan struct{}, 1)
+	defer close(release)
+	nextRead := make(chan struct{})
+	finishNextRead := make(chan struct{}, 1)
+	defer close(finishNextRead)
+	var reads atomic.Int32
+	m := &Module{
+		nodeResource:    &stubNodeResourceManager{cpu: 4000, mem: 8 << 30},
+		sockPath:        filepath.Join(t.TempDir(), "resource.sock"),
+		stopCh:          make(chan struct{}),
+		stalenessWindow: expiry,
+		sandboxMemoryUsage: func() (uint64, error) {
+			switch reads.Add(1) {
+			case 1:
+				return 2 << 30, nil
+			case 2:
+				blocked <- time.Now()
+				<-release
+				return 99 << 30, nil
+			case 3:
+				close(nextRead)
+				<-finishNextRead
+			}
+			return 3 << 30, nil
+		},
+	}
+	require.NoError(t, m.start(15*time.Millisecond))
+	t.Cleanup(m.Stop)
+
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", m.sockPath)
+	}}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport, Timeout: time.Second}
+	readResource := func() resourceInfo {
+		t.Helper()
+		resp, err := client.Get("http://sandboxd/resource")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var info resourceInfo
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&info))
+		return info
+	}
+
+	var blockedAt time.Time
+	select {
+	case blockedAt = <-blocked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second memory sample did not start")
+	}
+	initial := readResource()
+	require.NotNil(t, initial.SandboxMemUsage)
+	require.Equal(t, uint64(2<<30), *initial.SandboxMemUsage)
+	require.Eventually(t, func() bool {
+		return m.lastRefresh.Load() > blockedAt.Add(expiry).UnixNano()
+	}, 3*time.Second, 10*time.Millisecond, "capacity must refresh past the usage read deadline")
+	require.Equal(t, int32(2), reads.Load(), "only one usage read may be outstanding")
+	stale := readResource()
+	require.Nil(t, stale.SandboxMemUsage)
+	require.Equal(t, int64(4), stale.Cpu)
+	require.Equal(t, int64(8<<30), stale.Mem)
+	require.True(t, m.Healthy())
+
+	release <- struct{}{}
+	select {
+	case <-nextRead:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sampler did not resume after the timed-out read returned")
+	}
+	require.Nil(t, readResource().SandboxMemUsage, "the timed-out result must be discarded")
+	resumedAt := time.Now().UnixNano()
+	finishNextRead <- struct{}{}
+	require.Eventually(t, func() bool {
+		return m.lastMemSampleAt.Load() >= resumedAt
+	}, 3*time.Second, 10*time.Millisecond)
+	recovered := readResource()
+	require.NotNil(t, recovered.SandboxMemUsage)
+	require.Equal(t, uint64(3<<30), *recovered.SandboxMemUsage)
+}
+
+func TestModuleStopDoesNotWaitForBlockedSandboxMemory(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{}, 1)
+	defer close(release)
+	m := &Module{
+		nodeResource: &stubNodeResourceManager{cpu: 4000, mem: 8 << 30},
+		sockPath:     filepath.Join(t.TempDir(), "resource.sock"),
+		stopCh:       make(chan struct{}),
+		sandboxMemoryUsage: func() (uint64, error) {
+			close(started)
+			<-release
+			return 3 << 30, nil
+		},
+	}
+	require.NoError(t, m.Start())
+	t.Cleanup(m.Stop)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("memory sample did not start")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		m.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited for the blocked memory reader")
+	}
+	require.Zero(t, m.lastMemSampleAt.Load())
+}
+
 // settableNodeResourceManager extends the stub with mutable returns so a test
 // can simulate provider figures changing across refresh rounds.
 type settableNodeResourceManager struct {
@@ -321,7 +439,7 @@ func (s *settableNodeResourceManager) Stop() {
 	s.stopped.Store(true)
 }
 
-func TestRefreshOnceKeepsMemContractAndPublishesUsageField(t *testing.T) {
+func TestSandboxMemorySamplingKeepsMemContract(t *testing.T) {
 	// Mem keeps the historical capacity contract (consumers subtract instance
 	// requests themselves); sandbox usage appears in
 	// the separate observation field instead of being subtracted.
@@ -330,6 +448,7 @@ func TestRefreshOnceKeepsMemContractAndPublishesUsageField(t *testing.T) {
 		sandboxMemoryUsage: func() (uint64, error) { return 30 << 30, nil },
 	}
 	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	_, memBytes := m.Capacity()
 	assert.Equal(t, int64(120<<30), memBytes,
 		"Mem must keep the capacity contract, not the subtracted figure")
@@ -340,7 +459,7 @@ func TestRefreshOnceKeepsMemContractAndPublishesUsageField(t *testing.T) {
 	assert.Equal(t, uint64(30<<30), usage)
 }
 
-func TestRefreshOnceTracksSandboxMemoryGrowthAndRelease(t *testing.T) {
+func TestSandboxMemorySamplingTracksGrowthAndRelease(t *testing.T) {
 	// The observation field must follow the reader in both directions across
 	// successive refresh rounds while Mem stays untouched.
 	usage := uint64(1 << 30)
@@ -352,6 +471,7 @@ func TestRefreshOnceTracksSandboxMemoryGrowthAndRelease(t *testing.T) {
 
 	usage += 39 << 30 // sandbox grows 1 GiB → 40 GiB
 	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	_, memBytes := m.Capacity()
 	assert.Equal(t, int64(120<<30), memBytes)
 	m.mu.RLock()
@@ -360,14 +480,14 @@ func TestRefreshOnceTracksSandboxMemoryGrowthAndRelease(t *testing.T) {
 	assert.Equal(t, uint64(40<<30), got)
 
 	usage -= 40 << 30 // sandbox releases everything
-	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	got = m.sandboxMemUsage
 	m.mu.RUnlock()
 	assert.Equal(t, uint64(0), got)
 }
 
-func TestRefreshOnceKeepsUsageFieldOnSampleFailureWithinWindow(t *testing.T) {
+func TestSandboxMemorySamplingKeepsFreshUsageOnFailure(t *testing.T) {
 	// After a successful sample, a transient stat failure keeps the last
 	// published usage; Mem is unaffected either way because it is not
 	// derived from the sample. Recovery follows the fresh figure.
@@ -386,13 +506,14 @@ func TestRefreshOnceKeepsUsageFieldOnSampleFailureWithinWindow(t *testing.T) {
 	}
 
 	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	got := m.sandboxMemUsage
 	m.mu.RUnlock()
 	assert.Equal(t, uint64(90<<30), got)
 
 	fail = true
-	m.refreshOnce() // inside the window: keeps the last sample
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	got, ready := m.sandboxMemUsage, m.sandboxMemUsageReady
 	m.mu.RUnlock()
@@ -402,14 +523,14 @@ func TestRefreshOnceKeepsUsageFieldOnSampleFailureWithinWindow(t *testing.T) {
 
 	fail = false
 	usage = 100 << 30 // sampling recovers; observation follows the new truth
-	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	got = m.sandboxMemUsage
 	m.mu.RUnlock()
 	assert.Equal(t, uint64(100<<30), got)
 }
 
-func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
+func TestSandboxMemorySamplingOmitsMissingAndStaleUsage(t *testing.T) {
 	// Omit missing or stale observations while keeping a fresh provider healthy.
 	var fail bool
 	usage := uint64(40 << 30)
@@ -427,6 +548,7 @@ func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
 
 	fail = true
 	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	ready := m.sandboxMemUsageReady
 	m.mu.RUnlock()
@@ -434,13 +556,13 @@ func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
 	assert.True(t, m.Healthy(), "an unavailable observation must not fail service health")
 
 	fail = false
-	m.refreshOnce() // healthy sample
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	assert.True(t, m.Healthy())
 
 	fail = true
 	// Age the last successful sample past the window.
 	m.lastMemSampleAt.Store(time.Now().Add(-31 * time.Second).UnixNano())
-	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	ready = m.sandboxMemUsageReady
 	m.mu.RUnlock()
@@ -454,7 +576,7 @@ func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
 	// Sampling recovers and the observation is available again.
 	fail = false
 	usage = 70 << 30
-	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	ready, got := m.sandboxMemUsageReady, m.sandboxMemUsage
 	m.mu.RUnlock()
@@ -463,10 +585,7 @@ func TestRefreshOnceOmitsUsageFieldBeforeFirstSampleAndWhenStale(t *testing.T) {
 	assert.True(t, m.Healthy())
 }
 
-func TestRefreshOnceProviderFailureStillRunsStalenessDegrade(t *testing.T) {
-	// A provider failure must not bypass the memory staleness policy: the
-	// sampling branch still runs, so an aged sample drops out of the report
-	// instead of surviving on old provider data.
+func TestSandboxMemorySamplingDuringProviderFailure(t *testing.T) {
 	var failUsage bool
 	usage := uint64(40 << 30)
 	m := &Module{
@@ -482,24 +601,23 @@ func TestRefreshOnceProviderFailureStillRunsStalenessDegrade(t *testing.T) {
 		stalenessWindow: 30 * time.Second,
 	}
 
-	m.refreshOnce() // both provider and sampler healthy: observation ready
+	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	ready := m.sandboxMemUsageReady
 	m.mu.RUnlock()
 	assert.True(t, ready)
 
-	// Provider fails AND the previously successful usage sample ages past
-	// the window: the degraded (stale) observation must still drop out — the
-	// provider failure may not short-circuit the memory staleness policy.
+	// Provider failure does not extend the usage observation's lifetime.
 	m.nodeResource.(*failingNodeResourceManager).fail.Store(true)
 	failUsage = true
 	m.lastMemSampleAt.Store(time.Now().Add(-31 * time.Second).UnixNano())
 	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
 	m.mu.RLock()
 	ready = m.sandboxMemUsageReady
 	m.mu.RUnlock()
-	assert.False(t, ready,
-		"provider failure bypassed the staleness degrade of the usage sample")
+	assert.False(t, ready, "provider failure preserved an expired observation")
 	assert.True(t, m.Healthy(), "the provider sample is still within its grace period")
 }
 
