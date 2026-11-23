@@ -15,6 +15,10 @@
 package resourcemanager
 
 import (
+	"context"
+	"encoding/json"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -195,7 +199,8 @@ func TestOnlineProviderRefreshesAndHonorsCloudCeiling(t *testing.T) {
 	require.Equal(t, 3, policy.calls, "invalid or unobserved capacity cannot fall back to host limits")
 }
 
-func TestOnlineCapacityRequiresMeasuredCPU(t *testing.T) {
+func newOnlineCapacityFixture(t *testing.T, quota string) *onlineResourceManager {
+	t.Helper()
 	root := t.TempDir()
 	write := func(name, contents string) {
 		t.Helper()
@@ -205,13 +210,13 @@ func TestOnlineCapacityRequiresMeasuredCPU(t *testing.T) {
 	}
 	host := filepath.Join(root, "host")
 	faas := filepath.Join(root, "faas")
-	write("faas/cpu.cfs_quota_us", "-1")
+	write("faas/cpu.cfs_quota_us", quota)
 	write("faas/cpu.cfs_period_us", "100000")
 	write("faas/cpu.shares", "1024")
 	write("faas/cpuset.cpus", "0-7")
 	write("faas/memory.stat", "total_active_anon 0\n")
 	write("zoneinfo", "managed "+strconv.FormatInt((64<<30)/int64(os.Getpagesize()), 10)+"\n")
-	mgr := &onlineResourceManager{
+	return &onlineResourceManager{
 		cfg: CgroupConfig{
 			HostCpuacctCgroupPath: host,
 			FaasCpuaactCgroupPath: faas,
@@ -227,6 +232,23 @@ func TestOnlineCapacityRequiresMeasuredCPU(t *testing.T) {
 		},
 		startupTime: time.Now(),
 	}
+}
+
+func writeOnlineCPUCounters(t *testing.T, mgr *onlineResourceManager, host, offline, faas int64) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Join(mgr.cfg.HostCpuacctCgroupPath, "offline"), 0755))
+	for directory, usage := range map[string]int64{
+		mgr.cfg.HostCpuacctCgroupPath:                           host,
+		filepath.Join(mgr.cfg.HostCpuacctCgroupPath, "offline"): offline,
+		mgr.cfg.FaasCpuaactCgroupPath:                           faas,
+	} {
+		file := filepath.Join(directory, "cpuacct.usage")
+		require.NoError(t, os.WriteFile(file, []byte(strconv.FormatInt(usage, 10)), 0644))
+	}
+}
+
+func TestOnlineCapacityRequiresMeasuredCPU(t *testing.T) {
+	mgr := newOnlineCapacityFixture(t, "-1")
 	for _, sample := range []struct {
 		name                string
 		host, offline, faas int64
@@ -244,9 +266,7 @@ func TestOnlineCapacityRequiresMeasuredCPU(t *testing.T) {
 		{name: "valid interval after faas reset", host: 3e9, hasHeadroom: true},
 	} {
 		t.Run(sample.name, func(t *testing.T) {
-			write("host/cpuacct.usage", strconv.FormatInt(sample.host, 10))
-			write("host/offline/cpuacct.usage", strconv.FormatInt(sample.offline, 10))
-			write("faas/cpuacct.usage", strconv.FormatInt(sample.faas, 10))
+			writeOnlineCPUCounters(t, mgr, sample.host, sample.offline, sample.faas)
 			if !mgr.prevUsageTime.IsZero() {
 				mgr.prevUsageTime = time.Now().Add(-time.Second)
 			}
@@ -260,6 +280,58 @@ func TestOnlineCapacityRequiresMeasuredCPU(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOnlineCapacityWholeCoreRecoveryOverSocket(t *testing.T) {
+	policy := newOnlineCapacityFixture(t, "100000") // One core at the configured 100000 us period.
+	writeOnlineCPUCounters(t, policy, 2e9, 0, 0)
+	m := &Module{
+		nodeResource: &nodeResourceManager{
+			onlineMgr: policy,
+			nodeClt: &stubNodeResourceClient{resp: &NodeResource{
+				Status: NodeResourceStatus{NodeAllocatable: &NodeAllocatableResource{
+					AllocatableResource: map[string]ResourceMap{
+						"Prod": {ResourceList: corev1.ResourceList{
+							corev1.ResourceCPU:    apiresource.MustParse("8"),
+							corev1.ResourceMemory: apiresource.MustParse("64Gi"),
+						}},
+					},
+				}},
+			}},
+		},
+		sockPath: filepath.Join(t.TempDir(), "resource.sock"),
+		stopCh:   make(chan struct{}),
+	}
+	// Let Start publish the initial baseline, then drive later refreshes explicitly.
+	require.NoError(t, m.start(time.Hour))
+	t.Cleanup(m.Stop)
+	require.Eventually(t, m.Healthy, time.Second, time.Millisecond)
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", m.sockPath)
+	}}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport, Timeout: time.Second}
+	checkCapacity := func(wantCPU int64, phase string) {
+		t.Helper()
+		resp, err := client.Get("http://sandboxd/resource")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var info resourceInfo
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&info))
+		require.Equal(t, wantCPU, info.Cpu, phase)
+		require.Positive(t, info.Mem, phase)
+	}
+
+	checkCapacity(0, "startup baseline")
+	m.refreshOnce()
+	checkCapacity(1, "first valid interval after startup")
+
+	writeOnlineCPUCounters(t, policy, 1e9, 0, 0)
+	m.refreshOnce()
+	checkCapacity(0, "rebuilt baseline after counter reset")
+	m.refreshOnce()
+	checkCapacity(1, "first valid interval after counter reset")
 }
 
 type recordOnlineCeiling struct{ calls int }

@@ -130,13 +130,14 @@ func podCgroupDisappeared(podPath string, readErr error) bool {
 }
 
 type onlineResourceManager struct {
-	cfg           CgroupConfig
-	resCfg        OnlineResourceConfig
-	prevCPUUsage  []int64
-	prevUsageTime time.Time
-	lastReportCpu float64
-	lastReportMem float64
-	startupTime   time.Time
+	cfg            CgroupConfig
+	resCfg         OnlineResourceConfig
+	prevCPUUsage   []int64
+	prevUsageTime  time.Time
+	cpuReportReady bool
+	lastReportCpu  float64
+	lastReportMem  float64
+	startupTime    time.Time
 }
 
 func (mgr *onlineResourceManager) listPods() ([]*podInfo, error) {
@@ -300,13 +301,18 @@ func (mgr *onlineResourceManager) GetAvailableResource(maxCPUMilli, maxMem int64
 	cpuResource = math.Max(0.0, cpuResource)
 	memResource = math.Max(0.0, memResource)
 
-	if cpuResource > mgr.lastReportCpu {
-		cpuResource = mgr.smoothValue(mgr.lastReportCpu, cpuResource)
+	// Unmeasured zero withdraws capacity without entering the smoothing
+	// history. Seed the history from the first valid interval after a baseline.
+	if cpuMeasured {
+		if mgr.cpuReportReady && cpuResource > mgr.lastReportCpu {
+			cpuResource = mgr.smoothValue(mgr.lastReportCpu, cpuResource)
+		}
+		mgr.lastReportCpu = cpuResource
 	}
+	mgr.cpuReportReady = cpuMeasured
 	if memResource > mgr.lastReportMem {
 		memResource = mgr.smoothValue(mgr.lastReportMem, memResource)
 	}
-	mgr.lastReportCpu = cpuResource
 	mgr.lastReportMem = memResource
 
 	return int64(cpuResource * 1000), (int64(memResource) >> 30) << 30, nil
@@ -358,13 +364,10 @@ func newOnlineResourceManager(cgConfig *CgroupConfig, resCfgPath string) (*onlin
 	if err != nil {
 		return nil, err
 	}
-	// default report 1C,1G
-	mgr := &onlineResourceManager{
+	return &onlineResourceManager{
 		cfg:           *cgConfig,
 		resCfg:        resCfg,
-		lastReportCpu: 1.0,
 		lastReportMem: float64(1 << 30),
 		startupTime:   time.Now(),
-	}
-	return mgr, nil
+	}, nil
 }
