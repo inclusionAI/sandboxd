@@ -102,6 +102,8 @@ var sandboxNamespaces = []sandboxNamespace{
 type checkpointHandoff struct {
 	fifoPath        string
 	environmentPath string
+	uid             uint32
+	gid             uint32
 	mu              sync.Mutex
 	reader          chan string
 	pendingRestore  bool
@@ -432,7 +434,7 @@ func configure(request firecrackerproto.ConfigureRequest) error {
 	}
 	handoff, err := prepareCheckpointHandoff(
 		containerRoot,
-		request.Process.Env,
+		request.Process,
 	)
 	if err != nil {
 		return fmt.Errorf("prepare checkpoint handoff: %w", err)
@@ -667,52 +669,51 @@ func switchContainerRoot(root string, operations rootSwitchOperations) error {
 
 func prepareCheckpointHandoff(
 	root string,
-	environment []string,
+	process firecrackerproto.ProcessSpec,
 ) (*checkpointHandoff, error) {
-	fifoPath := filepath.Join(
-		root,
-		strings.TrimPrefix(firecrackerproto.CheckpointHandoffPath, "/"),
-	)
-	environmentPath := filepath.Join(
-		root,
-		strings.TrimPrefix(firecrackerproto.RestoreEnvPath, "/"),
-	)
-	if err := os.MkdirAll(filepath.Dir(fifoPath), 0755); err != nil {
-		return nil, err
-	}
-	if err := replaceCheckpointFIFO(fifoPath); err != nil {
-		return nil, err
-	}
-	if err := writeCheckpointEnvironment(environmentPath, environment); err != nil {
-		_ = os.Remove(fifoPath)
-		return nil, err
-	}
 	handoff := &checkpointHandoff{
-		fifoPath:        fifoPath,
-		environmentPath: environmentPath,
+		fifoPath:        filepath.Join(root, strings.TrimPrefix(firecrackerproto.CheckpointHandoffPath, "/")),
+		environmentPath: filepath.Join(root, strings.TrimPrefix(firecrackerproto.RestoreEnvPath, "/")),
+		uid:             process.UID,
+		gid:             process.GID,
 		stop:            make(chan struct{}),
 		done:            make(chan struct{}),
+	}
+	if err := os.MkdirAll(filepath.Dir(handoff.fifoPath), 0755); err != nil {
+		return nil, err
+	}
+	if err := handoff.replaceFIFO(); err != nil {
+		return nil, err
+	}
+	if err := handoff.writeEnvironment(process.Env); err != nil {
+		_ = os.Remove(handoff.fifoPath)
+		return nil, err
 	}
 	go handoff.serve()
 	return handoff, nil
 }
 
-func replaceCheckpointFIFO(path string) error {
-	replacement := path + ".next"
+func (handoff *checkpointHandoff) replaceFIFO() error {
+	replacement := handoff.fifoPath + ".next"
 	if err := os.Remove(replacement); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	if err := unix.Mkfifo(replacement, 0600); err != nil {
 		return err
 	}
-	if err := os.Rename(replacement, path); err != nil {
+	// Set ownership before publishing each inode, including later generations.
+	if err := os.Chown(replacement, int(handoff.uid), int(handoff.gid)); err != nil {
+		_ = os.Remove(replacement)
+		return err
+	}
+	if err := os.Rename(replacement, handoff.fifoPath); err != nil {
 		_ = os.Remove(replacement)
 		return err
 	}
 	return nil
 }
 
-func writeCheckpointEnvironment(path string, environment []string) error {
+func (handoff *checkpointHandoff) writeEnvironment(environment []string) error {
 	for _, entry := range environment {
 		if strings.IndexByte(entry, 0) >= 0 {
 			return errors.New("checkpoint environment contains a NUL byte")
@@ -722,11 +723,15 @@ func writeCheckpointEnvironment(path string, environment []string) error {
 	if len(content) != 0 {
 		content = append(content, 0)
 	}
-	temporary := path + ".tmp"
+	temporary := handoff.environmentPath + ".tmp"
 	if err := os.WriteFile(temporary, content, 0600); err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, path); err != nil {
+	if err := os.Chown(temporary, int(handoff.uid), int(handoff.gid)); err != nil {
+		_ = os.Remove(temporary)
+		return err
+	}
+	if err := os.Rename(temporary, handoff.environmentPath); err != nil {
 		_ = os.Remove(temporary)
 		return err
 	}
@@ -766,7 +771,7 @@ func (handoff *checkpointHandoff) serve() {
 			// Publish the next FIFO inode before completing this generation.
 			// New readers cannot attach to the old inode while its current
 			// reader is consuming the outcome and waiting for EOF.
-			if err := replaceCheckpointFIFO(handoff.fifoPath); err != nil {
+			if err := handoff.replaceFIFO(); err != nil {
 				log.Printf("replace checkpoint handoff: %v", err)
 				_ = file.Close()
 				return
@@ -800,7 +805,7 @@ func (handoff *checkpointHandoff) openWriter() (*os.File, chan string, error) {
 		return nil, nil, nil
 	}
 	if errors.Is(err, unix.ENOENT) {
-		if err := replaceCheckpointFIFO(handoff.fifoPath); err != nil {
+		if err := handoff.replaceFIFO(); err != nil {
 			return nil, nil, fmt.Errorf("recreate checkpoint handoff: %w", err)
 		}
 		return nil, nil, nil
@@ -884,7 +889,7 @@ func releaseCheckpointWithClock(request firecrackerproto.CheckpointRequest, setC
 		return fmt.Errorf("synchronize checkpoint guest wall clock: %w", err)
 	}
 	if request.Outcome == "restore" {
-		if err := writeCheckpointEnvironment(handoff.environmentPath, request.Environment); err != nil {
+		if err := handoff.writeEnvironment(request.Environment); err != nil {
 			return fmt.Errorf("write restored checkpoint environment: %w", err)
 		}
 	}

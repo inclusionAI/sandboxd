@@ -119,6 +119,13 @@ func (r *BundleLoader) GenerateOci(options OciLoadOptions) (string, *Spec, error
 		setNetworkNamespace(ociSpec.Linux, options.NetworkNameSpace)
 	}
 
+	if user := options.Config.ProcessUser; user != nil {
+		ociSpec.Process.User.UID = user.UID
+		ociSpec.Process.User.GID = user.GID
+		ociSpec.Process.User.AdditionalGids = nil
+		ociSpec.Process.User.Username = ""
+	}
+
 	if options.Config.Cwd != "" {
 		ociSpec.Process.Cwd = options.Config.Cwd
 	}
