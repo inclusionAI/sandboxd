@@ -792,6 +792,17 @@ sbox_cmd() {
     /usr/local/bin/sbox --address "${SOCKET}" --timeout 30s "$@"
 }
 
+assert_sandbox_stats_field() {
+    local sandbox_id="$1"
+    local field="$2"
+    local stats
+    # Read to EOF so the CLI can finish writing before checking a field.
+    stats="$(sbox_cmd stats "${sandbox_id}")" ||
+        fail "stats command failed for sandbox ${sandbox_id}"
+    [[ "${stats}" == *"${field}"* ]] ||
+        fail "stats output for sandbox ${sandbox_id} is missing ${field}: ${stats}"
+}
+
 set_network_policy() {
     local sandbox_id="$1"
     local policy="$2"
@@ -2128,8 +2139,7 @@ run_kata_checks() {
         "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt")"
     assert_eq "${got}" "sandboxd-network-ok" "Kata cached TAP network"
     run_network_acl_checks "Kata" kata
-    sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" ||
-        fail "Kata stats output missing memory usage"
+    assert_sandbox_stats_field "${SANDBOX_ID}" "Memory Usage"
 
     local tty_status=0
     printf 'exit 7\n' | sbox_cmd exec -t "${SANDBOX_ID}" /bin/sh >/dev/null ||
@@ -2263,8 +2273,7 @@ run_firecracker_checks() {
         "http://${GATEWAY_IP}:${HTTP_PORT}/health.txt"
     run_network_acl_checks "Firecracker" firecracker
 
-    sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" || \
-        fail "Firecracker stats output missing memory usage"
+    assert_sandbox_stats_field "${SANDBOX_ID}" "Memory Usage"
 
     local exec_status=0
     got="$(sbox_cmd exec "${SANDBOX_ID}" /bin/sh -c \
@@ -2649,7 +2658,7 @@ run_runsc_checks() {
     assert_eq "${got}" "nameserver ${GATEWAY_IP}" "runsc managed resolver ignores direct override without a policy"
     run_network_acl_checks "runsc" runsc
 
-    sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Usage" || fail "stats output missing memory usage"
+    assert_sandbox_stats_field "${SANDBOX_ID}" "Memory Usage"
 
     log "deleting sandbox"
     sbox_cmd delete "${SANDBOX_ID}"
@@ -2744,7 +2753,7 @@ run_runsc_checks() {
     sleep 6
     crash_and_restart_sandboxd
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_RUNNING"
-    sbox_cmd stats "${SANDBOX_ID}" | grep -q "Memory Limit" || fail "recovered stats failed"
+    assert_sandbox_stats_field "${SANDBOX_ID}" "Memory Limit"
     echo "trigger" > "${HOST_MOUNT}/oom-trigger"
     wait_for_state "${SANDBOX_ID}" "SANDBOX_STATE_EXITED" 600
     assert_wait_log "${SANDBOX_ID}" true

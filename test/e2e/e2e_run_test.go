@@ -131,6 +131,52 @@ func TestCheckpointMemoryBudget(t *testing.T) {
 	}
 }
 
+func TestAssertSandboxStatsField(t *testing.T) {
+	functions := e2eFunctions(t, "fail", "assert_sandbox_stats_field")
+	for _, tc := range []struct {
+		name, field, body, wantError string
+	}{
+		{
+			name:  "reads through trailing output",
+			field: "Memory Usage",
+			body:  "printf 'Memory Usage: 4096 bytes\\n'; sleep 0.1; printf 'Memory Limit: 65536 bytes\\n'",
+		},
+		{
+			name:  "checks recovery limit",
+			field: "Memory Limit",
+			body:  "printf 'Memory Usage: 4096 bytes\\nMemory Limit: 65536 bytes\\n'",
+		},
+		{
+			name:      "field missing",
+			field:     "Memory Usage",
+			body:      "printf 'CPU Usage: 100 ns\\n'",
+			wantError: "stats output for sandbox test-sandbox is missing Memory Usage: CPU Usage: 100 ns",
+		},
+		{
+			name:      "command fails after writing field",
+			field:     "Memory Usage",
+			body:      "printf 'Memory Usage: 4096 bytes\\n'; return 23",
+			wantError: "stats command failed for sandbox test-sandbox",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := functions + fmt.Sprintf(
+				"sbox_cmd() { [ \"$1\" = stats ] && [ \"$2\" = test-sandbox ] || return 99; %s; }\n"+
+					"assert_sandbox_stats_field test-sandbox %q\nprintf 'passed\\n'\n",
+				tc.body, tc.field,
+			)
+			output, err := runE2EHelper(t, script)
+			if tc.wantError == "" {
+				if err != nil || output != "passed\n" {
+					t.Fatalf("stats field check: err=%v, output=%s", err, output)
+				}
+			} else if err == nil || !strings.Contains(output, tc.wantError) || strings.Contains(output, "passed") {
+				t.Fatalf("want failure %q: err=%v, output=%s", tc.wantError, err, output)
+			}
+		})
+	}
+}
+
 func TestStopSandboxd(t *testing.T) {
 	functions := e2eFunctions(t, "log", "fail", "stop_sandboxd")
 	for _, tc := range []struct {
