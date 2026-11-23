@@ -40,6 +40,9 @@ const (
 	faasCpusetCgroupPath         = "/sys/fs/cgroup/cpuset/"
 	faasCpuCgroupPath            = "/sys/fs/cgroup/cpu/"
 	zoneinfoPath                 = "/proc/zoneinfo"
+
+	cpuSmoothingTolerance    = 0.001   // one millicore
+	memorySmoothingTolerance = 1 << 20 // one MiB
 )
 
 var (
@@ -303,14 +306,16 @@ func (mgr *onlineResourceManager) GetAvailableResource(maxCPUMilli, maxMem int64
 
 	// Unmeasured zero withdraws capacity without entering the smoothing
 	// history. Seed the history from the first valid interval after a baseline.
+	// Near a stable target, report the exact measured headroom so flooring
+	// to cores or GiB cannot keep an integer boundary unreachable.
 	if cpuMeasured {
-		if mgr.cpuReportReady && cpuResource > mgr.lastReportCpu {
+		if mgr.cpuReportReady && cpuResource-mgr.lastReportCpu > cpuSmoothingTolerance {
 			cpuResource = mgr.smoothValue(mgr.lastReportCpu, cpuResource)
 		}
 		mgr.lastReportCpu = cpuResource
 	}
 	mgr.cpuReportReady = cpuMeasured
-	if memResource > mgr.lastReportMem {
+	if memResource-mgr.lastReportMem > memorySmoothingTolerance {
 		memResource = mgr.smoothValue(mgr.lastReportMem, memResource)
 	}
 	mgr.lastReportMem = memResource

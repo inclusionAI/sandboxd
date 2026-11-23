@@ -245,7 +245,7 @@ func (mgr *k8sWatchResourceManager) watchResourceLoop(
 				continue
 			}
 		}
-		retryInterval = watchRetryMinInterval
+		started := time.Now()
 		_, err := watchStream(resourceVersion)
 		resourceVersion = ""
 		if mgr.stopped() {
@@ -256,8 +256,17 @@ func (mgr *k8sWatchResourceManager) watchResourceLoop(
 		} else if err != nil {
 			logrus.Warningf("%s watch loop exited: %v", name, err)
 		}
+		// A successful list can be followed by repeated watch failures.
+		// Only a sustained stream resets the retry delay.
+		stable := time.Since(started) >= watchRequestTimeout/2
+		if stable {
+			retryInterval = watchRetryMinInterval
+		}
 		if !mgr.waitForRetry(retryInterval) {
 			return
+		}
+		if !stable {
+			retryInterval = nextRetryInterval(retryInterval)
 		}
 	}
 }

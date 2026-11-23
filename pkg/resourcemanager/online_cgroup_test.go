@@ -334,6 +334,36 @@ func TestOnlineCapacityWholeCoreRecoveryOverSocket(t *testing.T) {
 	checkCapacity(1, "first valid interval after counter reset")
 }
 
+func TestOnlineCapacitySmoothingReachesWholeUnits(t *testing.T) {
+	const oneGiB = int64(1 << 30)
+	policy := newOnlineCapacityFixture(t, "100000")
+	policy.startupTime = time.Now().Add(-4 * time.Minute)
+	writeOnlineCPUCounters(t, policy, 2e9, 0, 0)
+	_, _, err := policy.GetAvailableResource(8000, oneGiB)
+	require.NoError(t, err)
+
+	writeOnlineCPUCounters(t, policy, 34e9, 0, 0)
+	policy.prevUsageTime = time.Now().Add(-time.Second)
+	cpu, _, err := policy.GetAvailableResource(8000, oneGiB)
+	require.NoError(t, err)
+	require.Zero(t, cpu, "the first measured interval was busy")
+
+	cpu, memory, err := policy.GetAvailableResource(8000, oneGiB)
+	require.NoError(t, err)
+	require.Positive(t, cpu)
+	require.Less(t, cpu, int64(1000), "a measured increase should still be smoothed")
+	require.Zero(t, memory, "memory capacity still grows gradually")
+
+	// At the steady-state 0.99 weight, these samples approach both exact
+	// boundaries closely enough to verify that flooring no longer traps them.
+	for range 800 {
+		cpu, memory, err = policy.GetAvailableResource(8000, oneGiB)
+		require.NoError(t, err)
+	}
+	require.Equal(t, int64(1000), cpu)
+	require.Equal(t, oneGiB, memory)
+}
+
 type recordOnlineCeiling struct{ calls int }
 
 func (r *recordOnlineCeiling) GetAvailableResource(cpuMilli, memory int64) (int64, int64, error) {

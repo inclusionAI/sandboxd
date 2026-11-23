@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/containerd/cgroups/v3/cgroup2"
 
@@ -153,6 +154,8 @@ func (c *CgroupManager) StatsRoot() (Stats, error) {
 // sibling of the sandbox root. A missing path reads
 // as zero: sibling bookkeeping cgroups appear and disappear with runtime
 // activity, and absence simply means nothing to charge.
+// The owned root already accounts for itself and its descendants. An
+// ancestor's aggregate cannot be added without counting the owned root twice.
 func (c *CgroupManager) SiblingMemoryUsage(path string) (uint64, error) {
 	v2, ok := c.ops.(*cgroupV2)
 	if path == "" || !ok {
@@ -160,6 +163,12 @@ func (c *CgroupManager) SiblingMemoryUsage(path string) (uint64, error) {
 	}
 	if err := cgroup2.VerifyGroupPath(path); err != nil {
 		return 0, err
+	}
+	if c.rootName != "" && (path == c.rootName || strings.HasPrefix(path, c.rootName+"/")) {
+		return 0, nil
+	}
+	if strings.HasPrefix(c.rootName, path+"/") {
+		return 0, fmt.Errorf("cgroup %s contains owned root %s", path, c.rootName)
 	}
 	group := filepath.Join(v2.mountpoint, path)
 	usage, err := readMemoryCurrent(group)

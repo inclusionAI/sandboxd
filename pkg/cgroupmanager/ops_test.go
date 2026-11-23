@@ -672,6 +672,28 @@ func TestSiblingMemoryUsageMissingPresentAndError(t *testing.T) {
 	assert.Contains(t, err.Error(), "memory.current")
 }
 
+func TestSiblingMemoryUsageDoesNotDoubleCountOwnedRoot(t *testing.T) {
+	mountpoint := t.TempDir()
+	manager := &CgroupManager{ops: &cgroupV2{mountpoint: mountpoint}, rootName: "/tenant/sandbox"}
+	for _, group := range []string{"/tenant", "/tenant/sandbox", "/tenant/sandbox/checkpoint", "/tenant/sandbox-checkpoint"} {
+		dir := filepath.Join(mountpoint, group)
+		require.NoError(t, os.MkdirAll(dir, 0755))
+		writeTestFile(t, filepath.Join(dir, "memory.current"), "1048576")
+	}
+
+	for _, accounted := range []string{"/tenant/sandbox", "/tenant/sandbox/checkpoint"} {
+		usage, err := manager.SiblingMemoryUsage(accounted)
+		require.NoError(t, err)
+		require.Zero(t, usage)
+	}
+	_, err := manager.SiblingMemoryUsage("/tenant")
+	require.ErrorContains(t, err, "contains owned root")
+
+	usage, err := manager.SiblingMemoryUsage("/tenant/sandbox-checkpoint")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1<<20), usage)
+}
+
 func TestV2OOMWatcherUsesCgroupBaseline(t *testing.T) {
 	mountpoint := t.TempDir()
 	name := "/sandbox/lease"

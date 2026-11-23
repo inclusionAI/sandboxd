@@ -566,3 +566,33 @@ func TestK8sWatchStopCancelsQuietStreams(t *testing.T) {
 	_, _, err := mgr.GetAvailableResource()
 	require.Error(t, err)
 }
+
+func TestK8sWatchBacksOffQuickClosuresAfterSuccessfulRelists(t *testing.T) {
+	mgr, client := newWatchTestManager(t)
+	attempts := make(chan time.Time, 3)
+	client.PrependWatchReactor("pods", func(ktesting.Action) (bool, watch.Interface, error) {
+		select {
+		case attempts <- time.Now():
+		case <-mgr.ctx.Done():
+		}
+		stream := watch.NewRaceFreeFake()
+		stream.Stop()
+		return true, stream, nil
+	})
+	mgr.watchWG.Add(1)
+	go mgr.watchPodLoop("20")
+	t.Cleanup(mgr.Stop)
+
+	var times [3]time.Time
+	deadline := time.NewTimer(8 * time.Second)
+	defer deadline.Stop()
+	for i := range times {
+		select {
+		case times[i] = <-attempts:
+		case <-deadline.C:
+			t.Fatal("watch did not reconnect after relisting")
+		}
+	}
+	require.GreaterOrEqual(t, times[1].Sub(times[0]), watchRetryMinInterval)
+	require.GreaterOrEqual(t, times[2].Sub(times[1]), 2*watchRetryMinInterval)
+}
