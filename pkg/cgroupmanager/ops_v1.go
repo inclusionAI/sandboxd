@@ -48,11 +48,7 @@ func (o *cgroupV1) mode() cgroups.CGMode {
 }
 
 func (*cgroupV1) prepareRoot(root string, _ int64) error {
-	memoryRoot := filepath.Join(cgroupMountpoint, "memory")
-	if _, err := os.Stat(memoryRoot); err != nil {
-		return fmt.Errorf("cgroup v1 memory controller is unavailable at %s: %w", memoryRoot, err)
-	}
-	return nil
+	return prepareV1MemoryRoot(filepath.Join(cgroupMountpoint, "memory"), root)
 }
 
 func (*cgroupV1) list(root string) ([]string, error) {
@@ -144,6 +140,21 @@ func (*cgroupV1) stat(name string) (Stats, error) {
 		result.MemoryMaxUsageBytes = metrics.Memory.Usage.Max
 	}
 	return result, nil
+}
+
+func (o *cgroupV1) statRoot(name string) (Stats, error) {
+	usage, err := readV1RootMemoryUsage(filepath.Join(cgroupMountpoint, "memory", name))
+	if err != nil {
+		return Stats{}, err
+	}
+	stats, err := o.stat(name)
+	if err != nil {
+		return Stats{}, err
+	}
+	// cg.Load can skip an unavailable controller. The aggregate must come
+	// from a strict memory read, never an absent Memory metric's zero value.
+	stats.MemoryUsageBytes = usage
+	return stats, nil
 }
 
 func (*cgroupV1) newOOMWatcher() (oomWatcher, error) {

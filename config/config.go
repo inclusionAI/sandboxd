@@ -109,11 +109,13 @@ type ImageManagerConfig struct {
 
 // NodeResourceConfig configures optional node-resource reporting. Provider
 // selects the CPU and memory capacity source; an empty value preserves the
-// historical Kubernetes behavior. SockPath exposes that capacity over a Unix
-// socket for an external scheduler or resource collector.
+// historical Kubernetes behavior. OnlineCfgPath is required only by the
+// online_cgroup provider. SockPath exposes capacity over a Unix socket for an
+// external scheduler or resource collector.
 type NodeResourceConfig struct {
-	Provider string `toml:"provider" json:"provider"`
-	SockPath string `toml:"sock_path" json:"sockPath"`
+	Provider      string `toml:"provider" json:"provider"`
+	OnlineCfgPath string `toml:"online_cfg_path" json:"onlineCfgPath"`
+	SockPath      string `toml:"sock_path" json:"sockPath"`
 }
 
 // RuntimeConfig binary path of the runtime

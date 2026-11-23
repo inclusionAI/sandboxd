@@ -174,7 +174,7 @@ tools/               pinned protobuf code-generation image
 ## Known limitations
 
 - Optional aggregate sandbox memory limits and matching scheduler capacity are configured through `[plugin.resource.memory_limit]`; see [node memory limit](doc/node-memory-limit.md).
-
+- Node memory pressure uses host `MemTotal - MemAvailable`; schedulable capacity and per-sandbox cgroup accounting remain separate. See [node memory metrics](doc/node-memory-metrics.md) for metric names, scope, and dashboard denominators.
 - Kata Containers and Firecracker require a usable `/dev/kvm`; nodes without KVM continue to support gVisor. Firecracker additionally requires a compatible guest kernel/initrd and the ext4 image tool. Its root filesystem may be an immutable EROFS image or a directory exported through virtio-fs; directory-backed OCI/Nydus roots require `virtiofs_enabled` and a compatible virtiofsd.
 - NVIDIA GPU sandboxes require runsc, a directory/lisafs-backed rootfs,
   `nvidia-container-cli`, accessible NVIDIA devices and userspace driver

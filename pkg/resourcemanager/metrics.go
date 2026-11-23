@@ -104,7 +104,8 @@ type Collector struct {
 	cgroupStats   func(string) (cgroupmanager.Stats, error)
 	parentMemory  func() (cgroupmanager.ParentMemoryStats, error)
 
-	capacity CapacityProvider
+	capacity   CapacityProvider
+	hostMemory func() (hostMemoryStats, error)
 
 	// state for CPU utilization delta calculation
 	prevCPUUsage int64
@@ -199,7 +200,7 @@ func (c *Collector) SetSandboxMetricsSource(source SandboxMetricsSource) {
 }
 
 // SetCgroupStatsReader connects the collector to the already-selected
-// CgroupManager backend. This keeps node, sandbox, and gRPC stats on the same
+// CgroupManager backend. This keeps node CPU, sandbox, and gRPC stats on the same
 // detected cgroup version.
 func (c *Collector) SetCgroupStatsReader(
 	reader func(string) (cgroupmanager.Stats, error),
@@ -248,11 +249,7 @@ func (c *Collector) registerMetrics(meter metric.Meter) error {
 		return err
 	}
 
-	if _, err := meter.Int64ObservableGauge("node.memory.usage",
-		metric.WithUnit("By"),
-		metric.WithDescription("Memory usage in bytes"),
-		metric.WithInt64Callback(c.memUsageCallback),
-	); err != nil {
+	if err := c.registerHostMemoryMetrics(meter); err != nil {
 		return err
 	}
 
@@ -563,19 +560,6 @@ func (c *Collector) cpuLimitCallback(_ context.Context, o metric.Float64Observer
 	limit := float64(cpuMilli) / 1000.0
 	o.Observe(limit)
 	logrus.Infof("metrics: node.cpu.limit=%.2f cores", limit)
-	return nil
-}
-
-// memUsageCallback reports memory usage from the current cgroup namespace root.
-func (c *Collector) memUsageCallback(_ context.Context, o metric.Int64Observer) error {
-	stats, err := c.rootCgroupStats()
-	if err != nil {
-		logrus.Debugf("metrics: failed to read memory cgroup: %v", err)
-		return nil
-	}
-	usage := uint64ToInt64(stats.MemoryUsageBytes)
-	o.Observe(usage)
-	logrus.Infof("metrics: node.memory.usage=%d bytes (%.2f MiB)", usage, float64(usage)/(1024*1024))
 	return nil
 }
 

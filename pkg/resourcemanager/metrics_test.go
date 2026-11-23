@@ -135,10 +135,6 @@ func TestCollectorUsesSharedCgroupStatsReader(t *testing.T) {
 		}
 	})
 
-	memObserver := &recordIntObserver{}
-	require.NoError(t, c.memUsageCallback(context.Background(), memObserver))
-	require.Equal(t, []int64{512 << 20}, memObserver.values)
-
 	require.NoError(t, c.cpuUsageCallback(context.Background(), &recordObserver{}))
 	assert.Equal(t, int64(2_000_000_000), c.prevCPUUsage)
 

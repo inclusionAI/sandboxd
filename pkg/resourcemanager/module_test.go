@@ -17,6 +17,7 @@ package resourcemanager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -28,12 +29,99 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/xpumanager"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	ktesting "k8s.io/client-go/testing"
 )
 
 type stubNodeResourceManager struct {
 	cpu     int64
 	mem     int64
 	stopped atomic.Bool
+}
+
+func TestModuleKubernetesWatchFailureAndRecoveryOverSocket(t *testing.T) {
+	mgr, client := newWatchTestManager(t)
+	_, err := mgr.initNodeSnapshot()
+	require.NoError(t, err)
+	_, err = mgr.initPodSnapshot()
+	require.NoError(t, err)
+	startTestResourceWatch(t, mgr, client, true, "10", watch.NewRaceFreeFake())
+	podWatch := watch.NewRaceFreeFake()
+	podResult := startTestResourceWatch(t, mgr, client, false, "20", podWatch)
+	m := &Module{
+		nodeResource: mgr,
+		sockPath:     filepath.Join(t.TempDir(), "resource.sock"),
+		stopCh:       make(chan struct{}),
+	}
+	require.NoError(t, m.Start())
+	t.Cleanup(m.Stop)
+	require.Eventually(t, m.Healthy, time.Second, time.Millisecond)
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", m.sockPath)
+	}}
+	t.Cleanup(transport.CloseIdleConnections)
+	httpClient := &http.Client{Transport: transport, Timeout: time.Second}
+	readResource := func() resourceInfo {
+		t.Helper()
+		resp, err := httpClient.Get("http://sandboxd/resource")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var info resourceInfo
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&info))
+		return info
+	}
+	info := readResource()
+	assert.Equal(t, int64(3), info.Cpu)
+	assert.Equal(t, int64(8<<30), info.Mem)
+
+	podWatch.Stop()
+	select {
+	case err := <-podResult:
+		require.Error(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("pod watch did not disconnect")
+	}
+	lastFresh := m.lastRefresh.Load()
+	m.refreshOnce()
+	assert.Equal(t, lastFresh, m.lastRefresh.Load(), "a cache read must not renew provider freshness")
+	assert.True(t, m.Healthy(), "short outages retain the existing grace period")
+	info = readResource()
+	assert.Equal(t, int64(8<<30), info.Mem)
+
+	failRelist := true
+	client.PrependReactor("list", "pods", func(ktesting.Action) (bool, kruntime.Object, error) {
+		if failRelist {
+			return true, nil, errors.New("API server unavailable")
+		}
+		return true, &corev1.PodList{
+			ListMeta: metav1.ListMeta{ResourceVersion: "21"},
+			Items:    []corev1.Pod{*newTestPod("default", "pod-b", "node-a", corev1.PodRunning, "1500m", "3Gi")},
+		}, nil
+	})
+	_, err = mgr.initPodSnapshot()
+	require.Error(t, err)
+	m.lastRefresh.Store(time.Now().Add(-31 * time.Second).UnixNano())
+	m.refreshOnce()
+	assert.False(t, m.Healthy())
+	info = readResource()
+	assert.Zero(t, info.Cpu)
+	assert.Zero(t, info.Mem, "publish an explicit zero in a successful HTTP response")
+
+	failRelist = false
+	version, err := mgr.initPodSnapshot()
+	require.NoError(t, err)
+	m.refreshOnce()
+	assert.False(t, m.Healthy(), "a snapshot alone must not hide a disconnected watch")
+	startTestResourceWatch(t, mgr, client, false, version, watch.NewRaceFreeFake())
+	m.refreshOnce()
+	assert.True(t, m.Healthy())
+	info = readResource()
+	assert.Equal(t, int64(2), info.Cpu)
+	assert.Equal(t, int64(7<<30), info.Mem, "recovery replaces the stale pod requests with the complete new list")
 }
 
 type stubXPUProvider struct {
@@ -66,6 +154,7 @@ func TestModuleCapacityReportsCachedAvailable(t *testing.T) {
 	// and serves over the socket: availCpu is stored in cores and scaled back
 	// to millicores, availMem passes through as bytes.
 	m := &Module{availCpu: 47, availMem: 318 << 30}
+	m.lastRefresh.Store(time.Now().UnixNano())
 	cpuMilli, memBytes := m.Capacity()
 	assert.Equal(t, int64(47000), cpuMilli)
 	assert.Equal(t, int64(318<<30), memBytes)
@@ -82,6 +171,7 @@ func TestModuleCapacityZeroBeforeFirstRefresh(t *testing.T) {
 
 func TestTransientMemoryReservationAffectsAdvertisedCapacity(t *testing.T) {
 	m := &Module{availCpu: 4, availMem: 8 << 30}
+	m.lastRefresh.Store(time.Now().UnixNano())
 	releaseFirst, ok := m.ReserveTransientMemory("checkpoint-a", 3<<30)
 	assert.True(t, ok)
 	_, ok = m.ReserveTransientMemory("checkpoint-b", 6<<30)
@@ -113,10 +203,17 @@ func TestTransientMemoryReservationAffectsAdvertisedCapacity(t *testing.T) {
 func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 	resourceManager := &stubNodeResourceManager{cpu: 2500, mem: 5 << 30}
 	sockPath := filepath.Join(t.TempDir(), "resource.sock")
+	// The usage reader mirrors a live /akernel root rollup: Mem must keep the
+	// provider capacity contract while the HTTP response exposes the usage in
+	// the sandbox_mem_usage observation field, exercising the full
+	// refresh→socket path rather than only in-process accessors.
 	m := &Module{
-		nodeResource: resourceManager,
-		sockPath:     sockPath,
-		stopCh:       make(chan struct{}),
+		nodeResource:       resourceManager,
+		sandboxMemoryUsage: func() (uint64, error) { return 2 << 30, nil },
+		sockPath:           sockPath,
+		stopCh:             make(chan struct{}),
+		transientMemory:    make(map[string]int64),
+		stalenessWindow:    30 * time.Second,
 		xpu: stubXPUProvider{resources: []xpumanager.Resource{{
 			Type:         "gpu",
 			ProductModel: "l20",
@@ -158,7 +255,11 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 		if _, ok := fields["ephemeral_storage"]; ok {
 			return false
 		}
+		if _, ok := fields["sandbox_mem_usage"]; !ok {
+			return false
+		}
 		return info.Cpu == 2 && info.Mem == 5<<30 &&
+			assert.Equal(t, uint64(2<<30), *info.SandboxMemUsage) &&
 			assert.Equal(t, uint64(150<<30), *info.Storage) &&
 			assert.Equal(t, []string{storageQuotaFeature}, info.Features) &&
 			assert.Equal(t, []xpumanager.Resource{{
@@ -168,10 +269,412 @@ func TestModuleServesAvailableResourceOverUnixSocket(t *testing.T) {
 			}}, info.Xpu)
 	}, time.Second, 10*time.Millisecond)
 
+	readResource := func() resourceInfo {
+		t.Helper()
+		resp, err := client.Get("http://sandboxd/resource")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var info resourceInfo
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&info))
+		return info
+	}
+
+	expired := time.Now().Add(-31 * time.Second).UnixNano()
+	m.lastMemSampleAt.Store(expired)
+	observationExpired := readResource()
+	require.Nil(t, observationExpired.SandboxMemUsage)
+	require.Equal(t, int64(2), observationExpired.Cpu)
+	require.Equal(t, int64(5<<30), observationExpired.Mem)
+	require.True(t, m.Healthy())
+
+	// A blocked provider cannot keep stale capacity visible to socket or
+	// reservation consumers, even without an intervening refresh.
+	m.lastRefresh.Store(expired)
+	stale := readResource()
+	require.Zero(t, stale.Cpu)
+	require.Zero(t, stale.Mem)
+	require.Nil(t, stale.SandboxMemUsage)
+	cpu, memory := m.Capacity()
+	require.Zero(t, cpu)
+	require.Zero(t, memory)
+	_, reserved := m.ReserveTransientMemory("stale", 1)
+	require.False(t, reserved)
+
 	m.Stop()
 	assert.True(t, resourceManager.stopped.Load())
 }
 
-// Module must satisfy the metrics CapacityProvider so the collector can read
-// the socket-aligned availability figure.
-var _ CapacityProvider = (*Module)(nil)
+func TestModuleBlockedSandboxMemoryKeepsCapacityFresh(t *testing.T) {
+	const expiry = 300 * time.Millisecond
+	blocked := make(chan time.Time, 1)
+	release := make(chan struct{}, 1)
+	defer close(release)
+	nextRead := make(chan struct{})
+	finishNextRead := make(chan struct{}, 1)
+	defer close(finishNextRead)
+	var reads atomic.Int32
+	m := &Module{
+		nodeResource:    &stubNodeResourceManager{cpu: 4000, mem: 8 << 30},
+		sockPath:        filepath.Join(t.TempDir(), "resource.sock"),
+		stopCh:          make(chan struct{}),
+		stalenessWindow: expiry,
+		sandboxMemoryUsage: func() (uint64, error) {
+			switch reads.Add(1) {
+			case 1:
+				return 2 << 30, nil
+			case 2:
+				blocked <- time.Now()
+				<-release
+				return 99 << 30, nil
+			case 3:
+				close(nextRead)
+				<-finishNextRead
+			}
+			return 3 << 30, nil
+		},
+	}
+	require.NoError(t, m.start(15*time.Millisecond))
+	t.Cleanup(m.Stop)
+
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", m.sockPath)
+	}}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport, Timeout: time.Second}
+	readResource := func() resourceInfo {
+		t.Helper()
+		resp, err := client.Get("http://sandboxd/resource")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var info resourceInfo
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&info))
+		return info
+	}
+
+	var blockedAt time.Time
+	select {
+	case blockedAt = <-blocked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second memory sample did not start")
+	}
+	initial := readResource()
+	require.NotNil(t, initial.SandboxMemUsage)
+	require.Equal(t, uint64(2<<30), *initial.SandboxMemUsage)
+	require.Eventually(t, func() bool {
+		return m.lastRefresh.Load() > blockedAt.Add(expiry).UnixNano()
+	}, 3*time.Second, 10*time.Millisecond, "capacity must refresh past the usage read deadline")
+	require.Equal(t, int32(2), reads.Load(), "only one usage read may be outstanding")
+	stale := readResource()
+	require.Nil(t, stale.SandboxMemUsage)
+	require.Equal(t, int64(4), stale.Cpu)
+	require.Equal(t, int64(8<<30), stale.Mem)
+	require.True(t, m.Healthy())
+
+	release <- struct{}{}
+	select {
+	case <-nextRead:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sampler did not resume after the timed-out read returned")
+	}
+	require.Nil(t, readResource().SandboxMemUsage, "the timed-out result must be discarded")
+	resumedAt := time.Now().UnixNano()
+	finishNextRead <- struct{}{}
+	require.Eventually(t, func() bool {
+		return m.lastMemSampleAt.Load() >= resumedAt
+	}, 3*time.Second, 10*time.Millisecond)
+	recovered := readResource()
+	require.NotNil(t, recovered.SandboxMemUsage)
+	require.Equal(t, uint64(3<<30), *recovered.SandboxMemUsage)
+}
+
+func TestModuleStopDoesNotWaitForBlockedSandboxMemory(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{}, 1)
+	defer close(release)
+	m := &Module{
+		nodeResource: &stubNodeResourceManager{cpu: 4000, mem: 8 << 30},
+		sockPath:     filepath.Join(t.TempDir(), "resource.sock"),
+		stopCh:       make(chan struct{}),
+		sandboxMemoryUsage: func() (uint64, error) {
+			close(started)
+			<-release
+			return 3 << 30, nil
+		},
+	}
+	require.NoError(t, m.Start())
+	t.Cleanup(m.Stop)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("memory sample did not start")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		m.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown waited for the blocked memory reader")
+	}
+	require.Zero(t, m.lastMemSampleAt.Load())
+}
+
+// settableNodeResourceManager extends the stub with mutable returns so a test
+// can simulate provider figures changing across refresh rounds.
+type settableNodeResourceManager struct {
+	cpu     int64
+	mem     int64
+	stopped atomic.Bool
+}
+
+func (s *settableNodeResourceManager) GetAvailableResource() (int64, int64, error) {
+	return s.cpu, s.mem, nil
+}
+
+func (s *settableNodeResourceManager) Stop() {
+	s.stopped.Store(true)
+}
+
+func TestSandboxMemorySamplingKeepsMemContract(t *testing.T) {
+	// Mem keeps the historical capacity contract (consumers subtract instance
+	// requests themselves); sandbox usage appears in
+	// the separate observation field instead of being subtracted.
+	m := &Module{
+		nodeResource:       &settableNodeResourceManager{cpu: 32000, mem: 120 << 30},
+		sandboxMemoryUsage: func() (uint64, error) { return 30 << 30, nil },
+	}
+	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	_, memBytes := m.Capacity()
+	assert.Equal(t, int64(120<<30), memBytes,
+		"Mem must keep the capacity contract, not the subtracted figure")
+	m.mu.RLock()
+	usage, ready := m.sandboxMemUsage, m.sandboxMemUsageReady
+	m.mu.RUnlock()
+	assert.True(t, ready)
+	assert.Equal(t, uint64(30<<30), usage)
+}
+
+func TestSandboxMemorySamplingTracksGrowthAndRelease(t *testing.T) {
+	// The observation field must follow the reader in both directions across
+	// successive refresh rounds while Mem stays untouched.
+	usage := uint64(1 << 30)
+	provider := &settableNodeResourceManager{cpu: 32000, mem: 120 << 30}
+	m := &Module{
+		nodeResource:       provider,
+		sandboxMemoryUsage: func() (uint64, error) { return usage, nil },
+	}
+
+	usage += 39 << 30 // sandbox grows 1 GiB → 40 GiB
+	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	_, memBytes := m.Capacity()
+	assert.Equal(t, int64(120<<30), memBytes)
+	m.mu.RLock()
+	got := m.sandboxMemUsage
+	m.mu.RUnlock()
+	assert.Equal(t, uint64(40<<30), got)
+
+	usage -= 40 << 30 // sandbox releases everything
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	got = m.sandboxMemUsage
+	m.mu.RUnlock()
+	assert.Equal(t, uint64(0), got)
+}
+
+func TestSandboxMemorySamplingKeepsFreshUsageOnFailure(t *testing.T) {
+	// After a successful sample, a transient stat failure keeps the last
+	// published usage; Mem is unaffected either way because it is not
+	// derived from the sample. Recovery follows the fresh figure.
+	var fail bool
+	usage := uint64(90 << 30)
+	provider := &settableNodeResourceManager{cpu: 32000, mem: 120 << 30}
+	m := &Module{
+		nodeResource: provider,
+		sandboxMemoryUsage: func() (uint64, error) {
+			if fail {
+				return 0, errors.New("cgroup stat unreadable")
+			}
+			return usage, nil
+		},
+		stalenessWindow: 30 * time.Second,
+	}
+
+	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	got := m.sandboxMemUsage
+	m.mu.RUnlock()
+	assert.Equal(t, uint64(90<<30), got)
+
+	fail = true
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	got, ready := m.sandboxMemUsage, m.sandboxMemUsageReady
+	m.mu.RUnlock()
+	assert.True(t, ready)
+	assert.Equal(t, uint64(90<<30), got, "transient failure dropped a fresh sample")
+	assert.True(t, m.Healthy())
+
+	fail = false
+	usage = 100 << 30 // sampling recovers; observation follows the new truth
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	got = m.sandboxMemUsage
+	m.mu.RUnlock()
+	assert.Equal(t, uint64(100<<30), got)
+}
+
+func TestSandboxMemorySamplingOmitsMissingAndStaleUsage(t *testing.T) {
+	// Omit missing or stale observations while keeping a fresh provider healthy.
+	var fail bool
+	usage := uint64(40 << 30)
+	provider := &settableNodeResourceManager{cpu: 32000, mem: 120 << 30}
+	m := &Module{
+		nodeResource: provider,
+		sandboxMemoryUsage: func() (uint64, error) {
+			if fail {
+				return 0, errors.New("cgroup stat unreadable")
+			}
+			return usage, nil
+		},
+		stalenessWindow: 30 * time.Second,
+	}
+
+	fail = true
+	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	ready := m.sandboxMemUsageReady
+	m.mu.RUnlock()
+	assert.False(t, ready, "first-sample failure published a usage figure")
+	assert.True(t, m.Healthy(), "an unavailable observation must not fail service health")
+
+	fail = false
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	assert.True(t, m.Healthy())
+
+	fail = true
+	// Age the last successful sample past the window.
+	m.lastMemSampleAt.Store(time.Now().Add(-31 * time.Second).UnixNano())
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	ready = m.sandboxMemUsageReady
+	m.mu.RUnlock()
+	assert.False(t, ready,
+		"stale memory sample kept serving a frozen usage figure")
+	assert.True(t, m.Healthy(), "a stale observation must not fail service health")
+	cpu, memory := m.Capacity()
+	assert.Equal(t, int64(32000), cpu)
+	assert.Equal(t, int64(120<<30), memory)
+
+	// Sampling recovers and the observation is available again.
+	fail = false
+	usage = 70 << 30
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	ready, got := m.sandboxMemUsageReady, m.sandboxMemUsage
+	m.mu.RUnlock()
+	assert.True(t, ready, "recovered sample did not restore the observation")
+	assert.Equal(t, uint64(70<<30), got)
+	assert.True(t, m.Healthy())
+}
+
+func TestSandboxMemorySamplingDuringProviderFailure(t *testing.T) {
+	var failUsage bool
+	usage := uint64(40 << 30)
+	m := &Module{
+		nodeResource: &failingNodeResourceManager{
+			wrapped: &settableNodeResourceManager{cpu: 32000, mem: 120 << 30},
+		},
+		sandboxMemoryUsage: func() (uint64, error) {
+			if failUsage {
+				return 0, errors.New("cgroup stat unreadable")
+			}
+			return usage, nil
+		},
+		stalenessWindow: 30 * time.Second,
+	}
+
+	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	ready := m.sandboxMemUsageReady
+	m.mu.RUnlock()
+	assert.True(t, ready)
+
+	// Provider failure does not extend the usage observation's lifetime.
+	m.nodeResource.(*failingNodeResourceManager).fail.Store(true)
+	failUsage = true
+	m.lastMemSampleAt.Store(time.Now().Add(-31 * time.Second).UnixNano())
+	m.refreshOnce()
+	m.refreshSandboxMemory(m.sandboxMemoryUsage, time.Second)
+	m.mu.RLock()
+	ready = m.sandboxMemUsageReady
+	m.mu.RUnlock()
+	assert.False(t, ready, "provider failure preserved an expired observation")
+	assert.True(t, m.Healthy(), "the provider sample is still within its grace period")
+}
+
+// failingNodeResourceManager wraps another manager and can start failing.
+type failingNodeResourceManager struct {
+	wrapped *settableNodeResourceManager
+	fail    atomic.Bool
+}
+
+func (f *failingNodeResourceManager) GetAvailableResource() (int64, int64, error) {
+	if f.fail.Load() {
+		return 0, 0, errors.New("provider unavailable")
+	}
+	return f.wrapped.GetAvailableResource()
+}
+
+func (f *failingNodeResourceManager) Stop() {}
+
+func TestRefreshOnceProviderStalePublishesZeroCapacity(t *testing.T) {
+	// When the provider has failed long enough that its data is past the
+	// staleness window, /resource must publish zero capacity instead of the
+	// frozen last-successful figure. The consumer's collector caches its own
+	// previous response on errors and non-200 replies, so only an explicit
+	// zero takes effect on the scheduler.
+	provider := &failingNodeResourceManager{
+		wrapped: &settableNodeResourceManager{cpu: 32000, mem: 120 << 30},
+	}
+	m := &Module{
+		nodeResource:    provider,
+		stalenessWindow: 30 * time.Second,
+	}
+
+	m.refreshOnce() // healthy: 120 GiB published
+	cpuMilli, memBytes := m.Capacity()
+	assert.Equal(t, int64(32000), cpuMilli)
+	assert.Equal(t, int64(120<<30), memBytes)
+
+	// Provider fails but the failure is still inside the window: the frozen
+	// figure keeps serving (transient failures must not flap capacity).
+	provider.fail.Store(true)
+	m.refreshOnce()
+	_, memBytes = m.Capacity()
+	assert.Equal(t, int64(120<<30), memBytes)
+
+	// Age the last provider success past the window: zero published.
+	m.lastRefresh.Store(time.Now().Add(-31 * time.Second).UnixNano())
+	m.refreshOnce()
+	cpuMilli, memBytes = m.Capacity()
+	assert.Zero(t, cpuMilli, "stale provider data kept serving old cpu capacity")
+	assert.Zero(t, memBytes, "stale provider data kept serving old mem capacity")
+	assert.False(t, m.Healthy())
+
+	// Recovery republishes the real capacity — degradation is not a latch.
+	provider.fail.Store(false)
+	m.refreshOnce()
+	_, memBytes = m.Capacity()
+	assert.Equal(t, int64(120<<30), memBytes,
+		"provider recovery did not republish real capacity")
+	assert.True(t, m.Healthy())
+}
