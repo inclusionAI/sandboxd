@@ -38,12 +38,14 @@ var mountRunscNVProxyEROFSImage = runtimecommon.MountReadOnlyEROFSImage
 
 var mountRunscOverlayFilesystem = syscall.Mount
 
+var runscOverlayPathEscape = strings.NewReplacer(`\`, `\\`, `:`, `\:`, `,`, `\,`)
+
 var mountRunscNVProxyOverlay = func(lowerDir, upperDir, workDir, target string, volatile bool) error {
 	options := fmt.Sprintf(
 		"lowerdir=%s,upperdir=%s,workdir=%s",
-		lowerDir,
-		upperDir,
-		workDir,
+		runscOverlayPathEscape.Replace(lowerDir),
+		runscOverlayPathEscape.Replace(upperDir),
+		runscOverlayPathEscape.Replace(workDir),
 	)
 	if volatile {
 		options += ",volatile"
@@ -228,7 +230,7 @@ func runscOverlayVolatileUnsupported(probeDir, target string) (bool, error) {
 	// Use a plain lower-only overlay so the parser sees volatile without the
 	// production lower's stacking depth or the upper/workdir constraints. On
 	// success the caller unmounts the probe before reusing the staging path.
-	options := "lowerdir=" + first + ":" + second
+	options := "lowerdir=" + runscOverlayPathEscape.Replace(first) + ":" + runscOverlayPathEscape.Replace(second)
 	if err := mountRunscLegacyOverlay(target, options+",volatile"); !errors.Is(err, syscall.EINVAL) {
 		return false, err
 	}

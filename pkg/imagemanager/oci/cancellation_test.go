@@ -18,12 +18,60 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/inclusionAI/sandboxd/internal/testregistry"
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageregistry"
 )
+
+func TestMountImageRetriesUnpublishedMountCleanup(t *testing.T) {
+	registry := testregistry.New(t, "layer")
+	registry.Unblock()
+	m := newTestManager(t)
+	defer m.store.close()
+	m.registry, _ = imageregistry.NewClient("")
+
+	primaryErr := errors.New("verify mounted image")
+	mounts := 0
+	m.mountFn = func(string, []string) error {
+		mounts++
+		if mounts == 1 {
+			return primaryErr
+		}
+		return nil
+	}
+	unmounts := 0
+	m.unmountFn = func(string) error {
+		unmounts++
+		if unmounts == 1 {
+			return syscall.EBUSY
+		}
+		return nil
+	}
+	if _, _, err := m.MountImage(registry.ImageURL); !errors.Is(err, primaryErr) || !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("failed mount: %v", err)
+	}
+	if txn, err := m.store.getMountTxn(registry.ImageURL); err != nil || txn == nil {
+		t.Fatalf("failed cleanup lost pending transaction: %v, %v", txn, err)
+	}
+	if _, _, err := m.MountImage(registry.ImageURL); err != nil {
+		t.Fatalf("retry after recoverable cleanup failure: %v", err)
+	}
+	if mounts != 2 || unmounts != 2 {
+		t.Fatalf("mounts=%d and unmounts=%d, want 2 each", mounts, unmounts)
+	}
+	if txn, err := m.store.getMountTxn(registry.ImageURL); err != nil || txn != nil {
+		t.Fatalf("successful retry kept pending transaction: %v, %v", txn, err)
+	}
+	if layers, err := m.store.listLayers(); err != nil || len(layers) != 1 || layers[0].RefCount != 1 {
+		t.Fatalf("successful retry leaked layer references: %v, %v", layers, err)
+	}
+	if chains, err := m.store.listChains(); err != nil || len(chains) != 1 || chains[0].RefCount != 1 {
+		t.Fatalf("successful retry leaked chain references: %v, %v", chains, err)
+	}
+}
 
 func TestCanceledImageWaiterDoesNotCancelOwner(t *testing.T) {
 	registry := testregistry.New(t, "layer")

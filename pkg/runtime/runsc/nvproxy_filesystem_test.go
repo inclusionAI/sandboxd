@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
+	"github.com/moby/sys/mountinfo"
 )
 
 func TestPrepareRunscPrivateRootfsSeedsReadonlyDirectoryTargets(t *testing.T) {
@@ -358,6 +359,15 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 			}
 			bundle := t.TempDir()
 			lower := t.TempDir()
+			if !hostWritable {
+				bundle = filepath.Join(bundle, `bundle,dir:\path`)
+				lower = filepath.Join(lower, `lower,dir:\path`)
+				for _, dir := range []string{bundle, lower} {
+					if err := os.Mkdir(dir, 0755); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
 			if err := os.WriteFile(filepath.Join(lower, "image-file"), []byte("image"), 0644); err != nil {
 				t.Fatal(err)
 			}
@@ -377,22 +387,15 @@ func TestPrivateRootfsUsesEphemeralOverlay(t *testing.T) {
 				}
 			})
 			merged := filepath.Join(bundle, spec.Root.Path)
-			mounts, err := os.ReadFile("/proc/self/mountinfo")
+			mounts, err := mountinfo.GetMounts(mountinfo.SingleEntryFilter(merged))
 			if err != nil {
 				t.Fatal(err)
 			}
-			found := false
-			for _, line := range strings.Split(string(mounts), "\n") {
-				fields := strings.Fields(line)
-				if len(fields) > 6 && fields[4] == merged {
-					found = true
-					if overlayOptionsVolatile(fields[len(fields)-1]) != mountedVolatile {
-						t.Fatalf("staging overlay options differ from successful mount: %s", line)
-					}
-				}
-			}
-			if !found {
+			if len(mounts) != 1 || mounts[0].FSType != "overlay" {
 				t.Fatal("private rootfs is not a distinct overlay mount")
+			}
+			if overlayOptionsVolatile(mounts[0].VFSOptions) != mountedVolatile {
+				t.Fatalf("staging overlay options differ from successful mount: %s", mounts[0].VFSOptions)
 			}
 			if spec.Root.Readonly == hostWritable {
 				t.Fatalf("unexpected guest root readonly=%t", spec.Root.Readonly)
@@ -590,6 +593,31 @@ func TestRunscLegacyOverlayMountOptionLimit(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("mount calls = %d, want 1", calls)
+	}
+}
+
+func TestRunscOverlayEscapesPathsForMountAndCompatibilityProbe(t *testing.T) {
+	original := mountRunscOverlayFilesystem
+	t.Cleanup(func() { mountRunscOverlayFilesystem = original })
+	var options []string
+	mountRunscOverlayFilesystem = func(_, _, _ string, _ uintptr, data string) error {
+		options = append(options, data)
+		return nil
+	}
+	if err := mountRunscNVProxyOverlay(`/image:root`, `/bundle,one/upper`, `/bundle\two/work`, "/target", true); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := options[0], `lowerdir=/image\:root,upperdir=/bundle\,one/upper,workdir=/bundle\\two/work,volatile`; got != want {
+		t.Errorf("staging options = %q, want %q", got, want)
+	}
+	probeRoot := t.TempDir()
+	probeDir := filepath.Join(probeRoot, "bundle,probe")
+	if unsupported, err := runscOverlayVolatileUnsupported(probeDir, filepath.Join(probeRoot, "target")); err != nil || unsupported {
+		t.Fatalf("compatibility probe = %v, %v", unsupported, err)
+	}
+	want := "lowerdir=" + probeRoot + `/bundle\,probe/lower1:` + probeRoot + `/bundle\,probe/lower2,volatile`
+	if got := options[1]; got != want {
+		t.Errorf("probe options = %q, want %q", got, want)
 	}
 }
 

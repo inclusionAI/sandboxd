@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,6 +33,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/moby/sys/mountinfo"
+	bolt "go.etcd.io/bbolt"
 )
 
 type panicUncompressedLayer struct {
@@ -736,7 +738,7 @@ func TestReconcileState_RecoversMountFromTxnWithChainIDs(t *testing.T) {
 	}
 
 	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
-		return map[string]*mountinfo.Info{mountPath: {}}, true, nil
+		return map[string]*mountinfo.Info{mountPath: {Options: "ro", VFSOptions: "rw"}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -1792,6 +1794,216 @@ func TestReconcileIncompleteOverlay(t *testing.T) {
 				t.Fatalf("discarded transaction still present: %v, %v", txn, err)
 			}
 		})
+	}
+}
+
+func TestReconcileBindChecksPerMountReadOnly(t *testing.T) {
+	for _, published := range []bool{false, true} {
+		for _, readOnly := range []bool{false, true} {
+			t.Run(fmt.Sprintf("published=%t/read-only=%t", published, readOnly), func(t *testing.T) {
+				mgr := newTestManager(t)
+				defer mgr.store.close()
+				const imageURL = "docker.io/library/busybox:bind"
+				const digest = "sha256:bind"
+				layer := filepath.Join(mgr.layersDir, "bind", "fs")
+				target := filepath.Join(mgr.mountsDir, "bind", "merged")
+				for _, path := range []string{layer, target} {
+					if err := os.MkdirAll(path, 0755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := mgr.store.putLayer(&LayerRecord{Digest: digest, Path: layer, RefCount: 1}); err != nil {
+					t.Fatal(err)
+				}
+				lowerDirs := []string{layer}
+				digests := []string{digest}
+				if published {
+					if err := mgr.store.putMount(&OciMountRecord{ImageURL: imageURL, MountPath: target, LayerDigests: digests, LowerDirs: lowerDirs}); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := mgr.store.putMountTxn(&OciMountTxnRecord{ImageURL: imageURL, MountPath: target, LayerDigests: digests, LowerDirs: lowerDirs}); err != nil {
+					t.Fatal(err)
+				}
+				options := "rw,relatime"
+				if readOnly {
+					options = "ro,relatime"
+				}
+				mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+					// The underlying filesystem is writable even for a read-only bind.
+					return map[string]*mountinfo.Info{target: {Options: options, VFSOptions: "rw"}}, true, nil
+				}
+				unmounts := 0
+				mgr.unmountFn = func(path string) error {
+					if path != target {
+						t.Fatalf("unexpected unmount target %s", path)
+					}
+					unmounts++
+					return nil
+				}
+				if err := mgr.reconcileState(); err != nil {
+					t.Fatal(err)
+				}
+				if adopted := mgr.getContainer(imageURL) != nil; adopted != readOnly {
+					t.Errorf("bind adoption = %t, want %t", adopted, readOnly)
+				}
+				if readOnly || published {
+					if _, err := mgr.readVerifiedMount(imageURL); (err == nil) != readOnly {
+						t.Errorf("persisted bind verification: read-only=%t, error=%v", readOnly, err)
+					}
+				}
+				wantUnmounts, wantRefs := 0, 1
+				if !published && !readOnly {
+					wantUnmounts, wantRefs = 1, 0
+				}
+				if unmounts != wantUnmounts {
+					t.Errorf("unmounts = %d, want %d", unmounts, wantUnmounts)
+				}
+				if layer, err := mgr.store.getLayer(digest); err != nil || layer == nil || layer.RefCount != wantRefs {
+					t.Errorf("layer after reconciliation: %v, %v, want %d references", layer, err, wantRefs)
+				}
+				if record, err := mgr.store.getMount(imageURL); err != nil || (record != nil) != (readOnly || published) {
+					t.Errorf("unexpected mount record: %v, %v", record, err)
+				}
+				if txn, err := mgr.store.getMountTxn(imageURL); err != nil || txn != nil {
+					t.Errorf("reconciliation kept the pending bind journal: %v, %v", txn, err)
+				}
+			})
+		}
+	}
+}
+
+func TestUnmountImagePreservesStackedMount(t *testing.T) {
+	mgr := newTestManager(t)
+	defer mgr.store.close()
+	const imageURL = "docker.io/library/busybox:latest"
+	const digest = "sha256:base"
+	path := filepath.Join(mgr.mountsDir, "stacked", "merged")
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(filepath.Dir(path), "keep")
+	if err := os.WriteFile(sibling, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putLayer(&LayerRecord{Digest: digest, RefCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putMount(&OciMountRecord{ImageURL: imageURL, MountPath: path, LayerDigests: []string{digest}}); err != nil {
+		t.Fatal(err)
+	}
+	stacked := true
+	var mountInfoErr error
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		if mountInfoErr != nil {
+			return nil, true, mountInfoErr
+		}
+		if stacked {
+			return map[string]*mountinfo.Info{path: nil}, true, nil
+		}
+		return map[string]*mountinfo.Info{path: {}}, true, nil
+	}
+	var unmounts int
+	var unmountErr error
+	mgr.unmountFn = func(string) error {
+		unmounts++
+		return unmountErr
+	}
+	if err := mgr.UnmountImage(imageURL); err == nil || !strings.Contains(err.Error(), "stacked") {
+		t.Fatalf("unmount stacked image: %v", err)
+	}
+	if rec, err := mgr.store.getMount(imageURL); err != nil || rec == nil || unmounts != 0 {
+		t.Fatalf("stacked image lost mount record: %v, %v, %d unmounts", rec, err, unmounts)
+	}
+	if layer, err := mgr.store.getLayer(digest); err != nil || layer == nil || layer.RefCount != 1 {
+		t.Fatalf("stacked image lost layer reference: %v, %v", layer, err)
+	}
+
+	stacked = false
+	mountInfoErr = errors.New("mountinfo unavailable")
+	if err := mgr.UnmountImage(imageURL); !errors.Is(err, mountInfoErr) || unmounts != 0 {
+		t.Fatalf("unmount while mountinfo is unavailable: %v, %d unmounts", err, unmounts)
+	}
+	mountInfoErr = nil
+	unmountErr = syscall.EINVAL
+	if err := mgr.UnmountImage(imageURL); !errors.Is(err, syscall.EINVAL) || unmounts != 1 {
+		t.Fatalf("EINVAL from an observed mount: %v, %d unmounts", err, unmounts)
+	}
+	unmountErr = nil
+	if err := mgr.UnmountImage(imageURL); err != nil || unmounts != 2 {
+		t.Fatalf("unmount after stack cleared: %v, %d unmounts", err, unmounts)
+	}
+	if data, err := os.ReadFile(sibling); err != nil || string(data) != "keep" {
+		t.Fatalf("mount cleanup removed unrelated sibling contents: %q, %v", data, err)
+	}
+}
+
+func TestUnmountImageRetriesMetadataReleaseWithoutReusingDetachedMount(t *testing.T) {
+	mgr := newTestManager(t)
+	defer mgr.store.close()
+	const imageURL = "docker.io/library/busybox:latest"
+	const digest = "sha256:shared"
+	const chainID = "sha256:chain"
+	path := filepath.Join(mgr.mountsDir, "retry", "merged")
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putLayer(&LayerRecord{Digest: digest, RefCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(chainRecordsBucket).Put([]byte(chainID), []byte("invalid chain record"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record := OciMountRecord{ImageURL: imageURL, MountPath: path, LayerDigests: []string{digest}, ChainIDs: []string{chainID}}
+	if err := mgr.store.putMount(&record); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putMountTxn(&OciMountTxnRecord{ImageURL: imageURL, MountPath: path, LayerDigests: []string{digest}}); err != nil {
+		t.Fatal(err)
+	}
+	mgr.setContainer(imageURL, &ContainerInfo{MountPath: path, LayerDigests: record.LayerDigests, ChainIDs: record.ChainIDs})
+	mounted := true
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		if mounted {
+			return map[string]*mountinfo.Info{path: {}}, true, nil
+		}
+		return nil, true, nil
+	}
+	mgr.unmountFn = func(string) error {
+		if !mounted {
+			return syscall.EINVAL
+		}
+		mounted = false
+		return nil
+	}
+	if err := mgr.UnmountImage(imageURL); err == nil || mounted {
+		t.Fatalf("first unmount should detach then report metadata failure: %v (mounted=%t)", err, mounted)
+	}
+	if rec, err := mgr.store.getMount(imageURL); err != nil || rec == nil {
+		t.Fatalf("failed metadata update lost the mount record: %v, %v", rec, err)
+	}
+	if layer, err := mgr.store.getLayer(digest); err != nil || layer == nil || layer.RefCount != 2 {
+		t.Fatalf("failed metadata update partially released the shared layer: %v, %v", layer, err)
+	}
+	if _, _, err := mgr.MountImage(imageURL); err == nil || !strings.Contains(err.Error(), "is not mounted at") {
+		t.Fatalf("reused a detached mount while release was pending: %v", err)
+	}
+
+	if err := mgr.store.putChain(&ChainRecord{ChainID: chainID, RefCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UnmountImage(imageURL); err != nil {
+		t.Fatalf("retry release: %v", err)
+	}
+	if rec, err := mgr.store.getMount(imageURL); err != nil || rec != nil {
+		t.Fatalf("successful release kept the mount record: %v, %v", rec, err)
+	}
+	if pending, err := mgr.store.getMountTxn(imageURL); err != nil || pending != nil {
+		t.Fatalf("successful release kept an old journal: %v, %v", pending, err)
+	}
+	if layer, err := mgr.store.getLayer(digest); err != nil || layer == nil || layer.RefCount != 1 {
+		t.Fatalf("retry did not release the mount's shared layer reference: %v, %v", layer, err)
 	}
 }
 

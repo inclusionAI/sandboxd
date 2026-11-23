@@ -220,38 +220,43 @@ func (s *metadataStore) incrementLayerRef(digest string, lastUsedUnix int64) (*L
 func (s *metadataStore) decrementLayerRef(digest string, lastUsedUnix int64) (*LayerRecord, error) {
 	var updated *LayerRecord
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(layerRecordsBucket)
-		v := b.Get([]byte(digest))
-		if v == nil {
-			return ErrLayerNotFound
-		}
-		rec := &LayerRecord{}
-		if err := json.Unmarshal(v, rec); err != nil {
-			return err
-		}
-		if rec.RefCount > 0 {
-			rec.RefCount--
-			if rec.RefCount == 0 {
-				rec.RefZeroAtUnix = lastUsedUnix
-			}
-		} else if rec.RefZeroAtUnix == 0 {
-			rec.RefZeroAtUnix = lastUsedUnix
-		}
-		rec.LastUsedUnix = lastUsedUnix
-		data, err := json.Marshal(rec)
-		if err != nil {
-			return err
-		}
-		if err := b.Put([]byte(digest), data); err != nil {
-			return err
-		}
-		updated = rec
-		return nil
+		var err error
+		updated, err = decrementLayerRef(tx, digest, lastUsedUnix)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	return updated, nil
+}
+
+func decrementLayerRef(tx *bolt.Tx, digest string, lastUsedUnix int64) (*LayerRecord, error) {
+	b := tx.Bucket(layerRecordsBucket)
+	v := b.Get([]byte(digest))
+	if v == nil {
+		return nil, ErrLayerNotFound
+	}
+	rec := &LayerRecord{}
+	if err := json.Unmarshal(v, rec); err != nil {
+		return nil, err
+	}
+	if rec.RefCount > 0 {
+		rec.RefCount--
+		if rec.RefCount == 0 {
+			rec.RefZeroAtUnix = lastUsedUnix
+		}
+	} else if rec.RefZeroAtUnix == 0 {
+		rec.RefZeroAtUnix = lastUsedUnix
+	}
+	rec.LastUsedUnix = lastUsedUnix
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.Put([]byte(digest), data); err != nil {
+		return nil, err
+	}
+	return rec, nil
 }
 
 func (s *metadataStore) deleteLayer(digest string) error {
@@ -354,38 +359,43 @@ func (s *metadataStore) incrementChainRef(chainID string, lastUsedUnix int64) (*
 func (s *metadataStore) decrementChainRef(chainID string, lastUsedUnix int64) (*ChainRecord, error) {
 	var updated *ChainRecord
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(chainRecordsBucket)
-		v := b.Get([]byte(chainID))
-		if v == nil {
-			return ErrChainNotFound
-		}
-		rec := &ChainRecord{}
-		if err := json.Unmarshal(v, rec); err != nil {
-			return err
-		}
-		if rec.RefCount > 0 {
-			rec.RefCount--
-			if rec.RefCount == 0 {
-				rec.RefZeroAtUnix = lastUsedUnix
-			}
-		} else if rec.RefZeroAtUnix == 0 {
-			rec.RefZeroAtUnix = lastUsedUnix
-		}
-		rec.LastUsedUnix = lastUsedUnix
-		data, err := json.Marshal(rec)
-		if err != nil {
-			return err
-		}
-		if err := b.Put([]byte(chainID), data); err != nil {
-			return err
-		}
-		updated = rec
-		return nil
+		var err error
+		updated, err = decrementChainRef(tx, chainID, lastUsedUnix)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	return updated, nil
+}
+
+func decrementChainRef(tx *bolt.Tx, chainID string, lastUsedUnix int64) (*ChainRecord, error) {
+	b := tx.Bucket(chainRecordsBucket)
+	v := b.Get([]byte(chainID))
+	if v == nil {
+		return nil, ErrChainNotFound
+	}
+	rec := &ChainRecord{}
+	if err := json.Unmarshal(v, rec); err != nil {
+		return nil, err
+	}
+	if rec.RefCount > 0 {
+		rec.RefCount--
+		if rec.RefCount == 0 {
+			rec.RefZeroAtUnix = lastUsedUnix
+		}
+	} else if rec.RefZeroAtUnix == 0 {
+		rec.RefZeroAtUnix = lastUsedUnix
+	}
+	rec.LastUsedUnix = lastUsedUnix
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.Put([]byte(chainID), data); err != nil {
+		return nil, err
+	}
+	return rec, nil
 }
 
 func (s *metadataStore) deleteChain(chainID string) error {
@@ -410,12 +420,28 @@ func (s *metadataStore) listChains() ([]*ChainRecord, error) {
 }
 
 func (s *metadataStore) putMount(record *OciMountRecord) error {
+	return s.saveMount(record, false)
+}
+
+// publishMount commits the mounted image and consumes its journal together.
+func (s *metadataStore) publishMount(record *OciMountRecord) error {
+	return s.saveMount(record, true)
+}
+
+func (s *metadataStore) saveMount(record *OciMountRecord, clearPending bool) error {
 	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("failed to marshal mount record: %w", err)
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(mountRecordsBucket).Put([]byte(record.ImageURL), data)
+		key := []byte(record.ImageURL)
+		if err := tx.Bucket(mountRecordsBucket).Put(key, data); err != nil {
+			return err
+		}
+		if clearPending {
+			return tx.Bucket(mountTxnBucket).Delete(key)
+		}
+		return nil
 	})
 }
 
@@ -434,8 +460,36 @@ func (s *metadataStore) getMount(imageURL string) (*OciMountRecord, error) {
 
 func (s *metadataStore) deleteMount(imageURL string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(mountRecordsBucket).Delete([]byte(imageURL))
+		return deletePublishedMount(tx, []byte(imageURL))
 	})
+}
+
+// releaseMount removes a published image and all its references together.
+func (s *metadataStore) releaseMount(imageURL string, now int64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		key := []byte(imageURL)
+		data := tx.Bucket(mountRecordsBucket).Get(key)
+		if data == nil {
+			return nil
+		}
+		var record OciMountRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			return err
+		}
+		if err := releaseMountReferences(tx, record.LayerDigests, record.ChainIDs, now); err != nil {
+			return err
+		}
+		return deletePublishedMount(tx, key)
+	})
+}
+
+func deletePublishedMount(tx *bolt.Tx, key []byte) error {
+	if err := tx.Bucket(mountRecordsBucket).Delete(key); err != nil {
+		return err
+	}
+	// Older versions could leave a journal after a successful publication.
+	// Removing the mount also retires that journal without a second release.
+	return tx.Bucket(mountTxnBucket).Delete(key)
 }
 
 func (s *metadataStore) listMounts() ([]*OciMountRecord, error) {
@@ -480,6 +534,43 @@ func (s *metadataStore) deleteMountTxn(imageURL string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(mountTxnBucket).Delete([]byte(imageURL))
 	})
+}
+
+// discardMountTxn releases an unpublished image's reservations exactly once.
+func (s *metadataStore) discardMountTxn(imageURL string, now int64) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(mountTxnBucket)
+		key := []byte(imageURL)
+		data := bucket.Get(key)
+		if data == nil {
+			return nil
+		}
+		if tx.Bucket(mountRecordsBucket).Get(key) != nil {
+			return fmt.Errorf("cannot discard mount journal for published image %s", imageURL)
+		}
+		var record OciMountTxnRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			return err
+		}
+		if err := releaseMountReferences(tx, record.LayerDigests, record.ChainIDs, now); err != nil {
+			return err
+		}
+		return bucket.Delete(key)
+	})
+}
+
+func releaseMountReferences(tx *bolt.Tx, digests, chainIDs []string, now int64) error {
+	for _, digest := range digests {
+		if _, err := decrementLayerRef(tx, digest, now); err != nil && !errors.Is(err, ErrLayerNotFound) {
+			return fmt.Errorf("release OCI layer %s: %w", digest, err)
+		}
+	}
+	for _, chainID := range chainIDs {
+		if _, err := decrementChainRef(tx, chainID, now); err != nil && !errors.Is(err, ErrChainNotFound) {
+			return fmt.Errorf("release OCI lowerdir chain %s: %w", chainID, err)
+		}
+	}
+	return nil
 }
 
 func (s *metadataStore) listMountTxns() ([]*OciMountTxnRecord, error) {

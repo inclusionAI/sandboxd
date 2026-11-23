@@ -81,9 +81,11 @@ func TestReadonlyOCIOverlayKernelMount(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name       string
+		layerCount int
 		structured bool
 	}{
-		{name: "legacy"},
+		{name: "bind", layerCount: 1},
+		{name: "legacy", layerCount: 2},
 		{name: "structured", structured: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -95,7 +97,7 @@ func TestReadonlyOCIOverlayKernelMount(t *testing.T) {
 			if err := os.Mkdir(merged, 0755); err != nil {
 				t.Fatal(err)
 			}
-			layerCount := 2
+			layerCount := tc.layerCount
 			if tc.structured {
 				layerCount = os.Getpagesize()/128 + 1
 			}
