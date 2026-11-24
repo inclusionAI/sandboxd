@@ -1,5 +1,11 @@
 # OCI cache retention
 
+Multi-layer OCI root filesystems use a read-only OverlayFS mount. Sandboxd checks the serialized options against the running kernel's legacy `mount(2)` limit of one page minus one byte. Larger lists use the kernel's `fsconfig` `lowerdir+` interface with one path per layer in priority order. The kernel and the sandboxd mountinfo reader must be able to represent the full list. If they cannot, preparation fails with the applicable limit. Sandboxd verifies the mounted layer order before publishing the mount or adopting it on restart.
+
+Single-layer images use read-only bind mounts. Sandboxd verifies the mount's read-only flag before publishing or reusing it, including when recovering a mount interrupted during its initial setup.
+
+If cleanup of an unpublished mount fails, sandboxd retains its transaction and holds its layer references. A later request for that image retries cleanup before allocating another mount. Teardown leaves stacked mount targets and their records in place until the stack is resolved, and removes only empty mount directories. Sandboxd releases the mount record and its layer references together after detaching the mount. If the metadata update fails, teardown can retry while the detached path remains unavailable for reuse.
+
 The sandboxd startup configuration controls the node-wide zero-reference TTL for extracted OCI layers and lowerdir chains:
 
 ```toml

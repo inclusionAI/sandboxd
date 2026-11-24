@@ -23,7 +23,52 @@ import (
 	"testing"
 
 	"github.com/inclusionAI/sandboxd/pkg/imagemanager/imageconfig"
+	bolt "go.etcd.io/bbolt"
 )
+
+func TestDiscardMountTxnReleasesReferencesExactlyOnce(t *testing.T) {
+	store, err := openMetadataStore(filepath.Join(t.TempDir(), "metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	const imageURL = "registry.example/image:v1"
+	const digest = "sha256:shared"
+	const chainID = "sha256:chain"
+	if err := store.putLayer(&LayerRecord{Digest: digest, RefCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.putMountTxn(&OciMountTxnRecord{
+		ImageURL: imageURL, LayerDigests: []string{digest}, ChainIDs: []string{chainID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(chainRecordsBucket).Put([]byte(chainID), []byte("invalid record"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.discardMountTxn(imageURL, 1); err == nil {
+		t.Fatal("expected a failed reference update")
+	}
+	if layer, err := store.getLayer(digest); err != nil || layer == nil || layer.RefCount != 2 {
+		t.Fatalf("failed transaction partially released the shared layer: %v, %v", layer, err)
+	}
+	if err := store.putChain(&ChainRecord{ChainID: chainID, RefCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for _, now := range []int64{2, 3} {
+		if err := store.discardMountTxn(imageURL, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if layer, err := store.getLayer(digest); err != nil || layer == nil || layer.RefCount != 1 {
+		t.Fatalf("shared layer reference was released more than once: %v, %v", layer, err)
+	}
+	if chain, err := store.getChain(chainID); err != nil || chain == nil || chain.RefCount != 0 || chain.RefZeroAtUnix != 2 {
+		t.Fatalf("unexpected chain after retried rollback: %v, %v", chain, err)
+	}
+}
 
 func TestMetadataStorePersistsImageProcess(t *testing.T) {
 	store, err := openMetadataStore(filepath.Join(t.TempDir(), "metadata.db"))

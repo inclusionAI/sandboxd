@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,6 +32,8 @@ import (
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	"github.com/moby/sys/mountinfo"
+	bolt "go.etcd.io/bbolt"
 )
 
 type panicUncompressedLayer struct {
@@ -387,8 +390,8 @@ func TestReconcileState_FixesMountAndLayerRefs(t *testing.T) {
 		t.Fatalf("put mount: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{mountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -461,8 +464,10 @@ func TestReconcileState_FixesChainRefsForRecoveredMount(t *testing.T) {
 		t.Fatalf("put mount: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{
+			mountPath: {Root: "/", FSType: "overlay", VFSOptions: "ro,lowerdir=" + chain2Path + ":" + chain1Path},
+		}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -525,8 +530,8 @@ func TestReconcileState_DropsPersistedMountWhenMountMissing(t *testing.T) {
 		t.Fatalf("put mount: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -668,8 +673,8 @@ func TestReconcileState_RecoversMountFromTxn(t *testing.T) {
 		t.Fatalf("put mount txn: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{mountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -732,8 +737,8 @@ func TestReconcileState_RecoversMountFromTxnWithChainIDs(t *testing.T) {
 		t.Fatalf("put mount txn: %v", err)
 	}
 
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{mountPath: {Options: "ro", VFSOptions: "rw"}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -797,8 +802,8 @@ func TestReconcileState_DropsTxnMountWhenLayersMissing(t *testing.T) {
 		}
 		return nil
 	}
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{mountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{mountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -840,8 +845,8 @@ func TestReconcileState_CleansOrphanOverlayMounts(t *testing.T) {
 		}
 		return nil
 	}
-	mgr.readMnts = func() (map[string]struct{}, bool, error) {
-		return map[string]struct{}{orphanMountPath: {}}, true, nil
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		return map[string]*mountinfo.Info{orphanMountPath: {}}, true, nil
 	}
 
 	if err := mgr.reconcileState(); err != nil {
@@ -1662,6 +1667,11 @@ func TestBuildOverlayMountData(t *testing.T) {
 			want:      "lowerdir=/tmp/layers/l2/fs:/tmp/layers/l1/fs",
 		},
 		{
+			name:      "escaped lowerdir delimiters",
+			lowerDirs: []string{`/top:one`, `/bottom,two\three`},
+			want:      `lowerdir=/top\:one:/bottom\,two\\three`,
+		},
+		{
 			name:      "empty lowerdirs",
 			lowerDirs: nil,
 			wantErr:   true,
@@ -1684,6 +1694,316 @@ func TestBuildOverlayMountData(t *testing.T) {
 				t.Fatalf("buildOverlayMountData() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestVerifyOverlayMount(t *testing.T) {
+	layers := []string{`/top:1`, `/base,2`} // Top first.
+	for _, tc := range []struct {
+		name    string
+		root    string
+		options string
+		wantErr bool
+	}{
+		{name: "legacy", root: "/", options: `ro,lowerdir=/top\134:1:/base\134\0542`},
+		{name: "structured", root: "/", options: `ro,lowerdir+=/top\0721,lowerdir+=/base\0542`},
+		{name: "truncated", root: "/", options: `ro,lowerdir+=/top\0721`, wantErr: true},
+		{name: "reordered", root: "/", options: `ro,lowerdir+=/base\0542,lowerdir+=/top\0721`, wantErr: true},
+		{name: "subdirectory bind", root: "/subdir", options: `ro,lowerdir+=/top\0721,lowerdir+=/base\0542`, wantErr: true},
+		{name: "writable", root: "/", options: `rw,lowerdir+=/top\0721,lowerdir+=/base\0542`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &mountinfo.Info{Root: tc.root, FSType: "overlay", VFSOptions: tc.options}
+			if err := verifyOverlayMount(info, "/merged", layers); (err != nil) != tc.wantErr {
+				t.Fatalf("verifyOverlayMount() = %v, want error %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestReconcileIncompleteOverlay(t *testing.T) {
+	for _, published := range []bool{true, false} {
+		t.Run(fmt.Sprintf("published=%t", published), func(t *testing.T) {
+			mgr := newTestManager(t)
+			defer mgr.store.close()
+			const imageURL = "docker.io/library/busybox:latest"
+			digests := []string{"sha256:top", "sha256:base"}
+			var layers []string
+			for _, digest := range digests {
+				layer := filepath.Join(mgr.layersDir, digest, "fs")
+				if err := os.MkdirAll(layer, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := mgr.store.putLayer(&LayerRecord{Digest: digest, Path: layer, RefCount: 1}); err != nil {
+					t.Fatal(err)
+				}
+				layers = append(layers, layer)
+			}
+			path := filepath.Join(mgr.mountsDir, "incomplete", "merged")
+			if err := os.MkdirAll(path, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if published {
+				if err := mgr.store.putMount(&OciMountRecord{ImageURL: imageURL, MountPath: path, LayerDigests: digests, LowerDirs: layers}); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := mgr.store.putMountTxn(&OciMountTxnRecord{ImageURL: imageURL, MountPath: path, LayerDigests: digests, LowerDirs: layers}); err != nil {
+				t.Fatal(err)
+			}
+			mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+				return map[string]*mountinfo.Info{
+					path: {Root: "/", FSType: "overlay", VFSOptions: "ro,lowerdir=" + mountInfoEscape.Replace(layers[0])},
+				}, true, nil
+			}
+			unmounts := 0
+			mgr.unmountFn = func(target string) error {
+				if target != path {
+					t.Fatalf("unexpected unmount target %s", target)
+				}
+				unmounts++
+				return nil
+			}
+			if err := mgr.reconcileState(); err != nil {
+				t.Fatal(err)
+			}
+			if mgr.getContainer(imageURL) != nil {
+				t.Fatal("incomplete overlay was adopted")
+			}
+			if published {
+				if _, _, err := mgr.MountImage(imageURL); err == nil || !strings.Contains(err.Error(), "expected 2 lowerdirs") {
+					t.Fatalf("incomplete persisted overlay was reusable: %v", err)
+				}
+				if unmounts != 0 {
+					t.Fatal("reconciliation unmounted a previously published image")
+				}
+				for _, digest := range digests {
+					layer, err := mgr.store.getLayer(digest)
+					if err != nil || layer == nil || layer.RefCount != 1 {
+						t.Fatalf("published layer %s lost its reference: %v, %v", digest, layer, err)
+					}
+				}
+				return
+			}
+			if unmounts != 1 {
+				t.Fatalf("got %d unmounts, want 1", unmounts)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("discarded mount target still present: %v", err)
+			}
+			if txn, err := mgr.store.getMountTxn(imageURL); err != nil || txn != nil {
+				t.Fatalf("discarded transaction still present: %v, %v", txn, err)
+			}
+		})
+	}
+}
+
+func TestReconcileBindChecksPerMountReadOnly(t *testing.T) {
+	for _, published := range []bool{false, true} {
+		for _, readOnly := range []bool{false, true} {
+			t.Run(fmt.Sprintf("published=%t/read-only=%t", published, readOnly), func(t *testing.T) {
+				mgr := newTestManager(t)
+				defer mgr.store.close()
+				const imageURL = "docker.io/library/busybox:bind"
+				const digest = "sha256:bind"
+				layer := filepath.Join(mgr.layersDir, "bind", "fs")
+				target := filepath.Join(mgr.mountsDir, "bind", "merged")
+				for _, path := range []string{layer, target} {
+					if err := os.MkdirAll(path, 0755); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := mgr.store.putLayer(&LayerRecord{Digest: digest, Path: layer, RefCount: 1}); err != nil {
+					t.Fatal(err)
+				}
+				lowerDirs := []string{layer}
+				digests := []string{digest}
+				if published {
+					if err := mgr.store.putMount(&OciMountRecord{ImageURL: imageURL, MountPath: target, LayerDigests: digests, LowerDirs: lowerDirs}); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := mgr.store.putMountTxn(&OciMountTxnRecord{ImageURL: imageURL, MountPath: target, LayerDigests: digests, LowerDirs: lowerDirs}); err != nil {
+					t.Fatal(err)
+				}
+				options := "rw,relatime"
+				if readOnly {
+					options = "ro,relatime"
+				}
+				mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+					// The underlying filesystem is writable even for a read-only bind.
+					return map[string]*mountinfo.Info{target: {Options: options, VFSOptions: "rw"}}, true, nil
+				}
+				unmounts := 0
+				mgr.unmountFn = func(path string) error {
+					if path != target {
+						t.Fatalf("unexpected unmount target %s", path)
+					}
+					unmounts++
+					return nil
+				}
+				if err := mgr.reconcileState(); err != nil {
+					t.Fatal(err)
+				}
+				if adopted := mgr.getContainer(imageURL) != nil; adopted != readOnly {
+					t.Errorf("bind adoption = %t, want %t", adopted, readOnly)
+				}
+				if readOnly || published {
+					if _, err := mgr.readVerifiedMount(imageURL); (err == nil) != readOnly {
+						t.Errorf("persisted bind verification: read-only=%t, error=%v", readOnly, err)
+					}
+				}
+				wantUnmounts, wantRefs := 0, 1
+				if !published && !readOnly {
+					wantUnmounts, wantRefs = 1, 0
+				}
+				if unmounts != wantUnmounts {
+					t.Errorf("unmounts = %d, want %d", unmounts, wantUnmounts)
+				}
+				if layer, err := mgr.store.getLayer(digest); err != nil || layer == nil || layer.RefCount != wantRefs {
+					t.Errorf("layer after reconciliation: %v, %v, want %d references", layer, err, wantRefs)
+				}
+				if record, err := mgr.store.getMount(imageURL); err != nil || (record != nil) != (readOnly || published) {
+					t.Errorf("unexpected mount record: %v, %v", record, err)
+				}
+				if txn, err := mgr.store.getMountTxn(imageURL); err != nil || txn != nil {
+					t.Errorf("reconciliation kept the pending bind journal: %v, %v", txn, err)
+				}
+			})
+		}
+	}
+}
+
+func TestUnmountImagePreservesStackedMount(t *testing.T) {
+	mgr := newTestManager(t)
+	defer mgr.store.close()
+	const imageURL = "docker.io/library/busybox:latest"
+	const digest = "sha256:base"
+	path := filepath.Join(mgr.mountsDir, "stacked", "merged")
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(filepath.Dir(path), "keep")
+	if err := os.WriteFile(sibling, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putLayer(&LayerRecord{Digest: digest, RefCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putMount(&OciMountRecord{ImageURL: imageURL, MountPath: path, LayerDigests: []string{digest}}); err != nil {
+		t.Fatal(err)
+	}
+	stacked := true
+	var mountInfoErr error
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		if mountInfoErr != nil {
+			return nil, true, mountInfoErr
+		}
+		if stacked {
+			return map[string]*mountinfo.Info{path: nil}, true, nil
+		}
+		return map[string]*mountinfo.Info{path: {}}, true, nil
+	}
+	var unmounts int
+	var unmountErr error
+	mgr.unmountFn = func(string) error {
+		unmounts++
+		return unmountErr
+	}
+	if err := mgr.UnmountImage(imageURL); err == nil || !strings.Contains(err.Error(), "stacked") {
+		t.Fatalf("unmount stacked image: %v", err)
+	}
+	if rec, err := mgr.store.getMount(imageURL); err != nil || rec == nil || unmounts != 0 {
+		t.Fatalf("stacked image lost mount record: %v, %v, %d unmounts", rec, err, unmounts)
+	}
+	if layer, err := mgr.store.getLayer(digest); err != nil || layer == nil || layer.RefCount != 1 {
+		t.Fatalf("stacked image lost layer reference: %v, %v", layer, err)
+	}
+
+	stacked = false
+	mountInfoErr = errors.New("mountinfo unavailable")
+	if err := mgr.UnmountImage(imageURL); !errors.Is(err, mountInfoErr) || unmounts != 0 {
+		t.Fatalf("unmount while mountinfo is unavailable: %v, %d unmounts", err, unmounts)
+	}
+	mountInfoErr = nil
+	unmountErr = syscall.EINVAL
+	if err := mgr.UnmountImage(imageURL); !errors.Is(err, syscall.EINVAL) || unmounts != 1 {
+		t.Fatalf("EINVAL from an observed mount: %v, %d unmounts", err, unmounts)
+	}
+	unmountErr = nil
+	if err := mgr.UnmountImage(imageURL); err != nil || unmounts != 2 {
+		t.Fatalf("unmount after stack cleared: %v, %d unmounts", err, unmounts)
+	}
+	if data, err := os.ReadFile(sibling); err != nil || string(data) != "keep" {
+		t.Fatalf("mount cleanup removed unrelated sibling contents: %q, %v", data, err)
+	}
+}
+
+func TestUnmountImageRetriesMetadataReleaseWithoutReusingDetachedMount(t *testing.T) {
+	mgr := newTestManager(t)
+	defer mgr.store.close()
+	const imageURL = "docker.io/library/busybox:latest"
+	const digest = "sha256:shared"
+	const chainID = "sha256:chain"
+	path := filepath.Join(mgr.mountsDir, "retry", "merged")
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putLayer(&LayerRecord{Digest: digest, RefCount: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(chainRecordsBucket).Put([]byte(chainID), []byte("invalid chain record"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record := OciMountRecord{ImageURL: imageURL, MountPath: path, LayerDigests: []string{digest}, ChainIDs: []string{chainID}}
+	if err := mgr.store.putMount(&record); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.store.putMountTxn(&OciMountTxnRecord{ImageURL: imageURL, MountPath: path, LayerDigests: []string{digest}}); err != nil {
+		t.Fatal(err)
+	}
+	mgr.setContainer(imageURL, &ContainerInfo{MountPath: path, LayerDigests: record.LayerDigests, ChainIDs: record.ChainIDs})
+	mounted := true
+	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
+		if mounted {
+			return map[string]*mountinfo.Info{path: {}}, true, nil
+		}
+		return nil, true, nil
+	}
+	mgr.unmountFn = func(string) error {
+		if !mounted {
+			return syscall.EINVAL
+		}
+		mounted = false
+		return nil
+	}
+	if err := mgr.UnmountImage(imageURL); err == nil || mounted {
+		t.Fatalf("first unmount should detach then report metadata failure: %v (mounted=%t)", err, mounted)
+	}
+	if rec, err := mgr.store.getMount(imageURL); err != nil || rec == nil {
+		t.Fatalf("failed metadata update lost the mount record: %v, %v", rec, err)
+	}
+	if layer, err := mgr.store.getLayer(digest); err != nil || layer == nil || layer.RefCount != 2 {
+		t.Fatalf("failed metadata update partially released the shared layer: %v, %v", layer, err)
+	}
+	if _, _, err := mgr.MountImage(imageURL); err == nil || !strings.Contains(err.Error(), "is not mounted at") {
+		t.Fatalf("reused a detached mount while release was pending: %v", err)
+	}
+
+	if err := mgr.store.putChain(&ChainRecord{ChainID: chainID, RefCount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.UnmountImage(imageURL); err != nil {
+		t.Fatalf("retry release: %v", err)
+	}
+	if rec, err := mgr.store.getMount(imageURL); err != nil || rec != nil {
+		t.Fatalf("successful release kept the mount record: %v, %v", rec, err)
+	}
+	if pending, err := mgr.store.getMountTxn(imageURL); err != nil || pending != nil {
+		t.Fatalf("successful release kept an old journal: %v, %v", pending, err)
+	}
+	if layer, err := mgr.store.getLayer(digest); err != nil || layer == nil || layer.RefCount != 1 {
+		t.Fatalf("retry did not release the mount's shared layer reference: %v, %v", layer, err)
 	}
 }
 
@@ -1816,7 +2136,7 @@ func newTestManager(t *testing.T) *Manager {
 		now:          func() time.Time { return time.Unix(1700000000, 0) },
 		mountFn:      func(string, []string) error { return nil },
 		unmountFn:    func(string) error { return nil },
-		readMnts:     func() (map[string]struct{}, bool, error) { return map[string]struct{}{}, false, nil },
+		readMnts:     func() (map[string]*mountinfo.Info, bool, error) { return map[string]*mountinfo.Info{}, false, nil },
 		diskUsage:    func(string) (float64, error) { return 0, nil },
 		layerWorkers: defaultGlobalLayerWorkers,
 		layerTTL:     DefaultLayerZeroRefTTL,

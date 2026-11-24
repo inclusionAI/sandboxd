@@ -115,7 +115,7 @@ func TestRunscHandlerDoesNotPrepareNVProxyRootfsForGenericSpecUpdates(t *testing
 
 	originalMount := mountRunscNVProxyOverlay
 	t.Cleanup(func() { mountRunscNVProxyOverlay = originalMount })
-	mountRunscNVProxyOverlay = func(_, _, _, _ string) error {
+	mountRunscNVProxyOverlay = func(_, _, _, _ string, _ bool) error {
 		return errors.New("unexpected nvproxy overlay")
 	}
 
@@ -152,7 +152,7 @@ func TestRunscHandlerMountsRootfsImageForNVProxy(t *testing.T) {
 		unmountRunscNVProxyPath = originalUnmount
 	})
 	var lowerDir string
-	mountRunscNVProxyOverlay = func(lower, _, _, _ string) error {
+	mountRunscNVProxyOverlay = func(lower, _, _, _ string, _ bool) error {
 		lowerDir = lower
 		return nil
 	}
