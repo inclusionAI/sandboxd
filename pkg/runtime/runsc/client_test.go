@@ -286,6 +286,8 @@ func TestCheckpointArguments(t *testing.T) {
 		compression  string
 	}{
 		{name: "raw-stop", compression: "none"},
+		{name: "raw-leave-running", leaveRunning: true, compression: "none"},
+		{name: "compressed-stop", compress: true, compression: "flate-best-speed"},
 		{
 			name: "compressed-leave-running", compress: true,
 			leaveRunning: true, compression: "flate-best-speed",
@@ -314,19 +316,16 @@ func TestCheckpointArguments(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			arguments := string(data)
-			if strings.Contains(arguments, "--skip-filestore-pages") || strings.Contains(arguments, "--filestore-snapshot-dir") {
-				t.Fatalf("default checkpoint must retain full serialization: %q", arguments)
+			want := append(client.globalArgs(), "checkpoint", "--compression="+test.compression)
+			if !test.compress {
+				want = append(want, "--direct")
 			}
-			if !strings.Contains(
-				arguments,
-				"--compression="+test.compression+"\n",
-			) {
-				t.Fatalf("checkpoint arguments = %q", arguments)
+			if test.leaveRunning {
+				want = append(want, "--leave-running")
 			}
-			hasLeaveRunning := strings.Contains(arguments, "--leave-running\n")
-			if hasLeaveRunning != test.leaveRunning {
-				t.Fatalf("leave-running argument = %v, want %v", hasLeaveRunning, test.leaveRunning)
+			want = append(want, "--image-path", filepath.Join(tempDir, "checkpoint"), "sbox-checkpoint")
+			if got := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n"); !slices.Equal(got, want) {
+				t.Fatalf("checkpoint arguments = %q, want %q", got, want)
 			}
 		})
 	}

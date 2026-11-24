@@ -448,11 +448,12 @@ func (c *Client) Checkpoint(
 	}
 
 	args := append(c.globalArgs(), "checkpoint")
-	compression := "none"
 	if compress {
-		compression = "flate-best-speed"
+		args = append(args, "--compression=flate-best-speed")
+	} else {
+		// Keep the memory pages file out of the page cache while sandbox memory is still resident.
+		args = append(args, "--compression=none", "--direct")
 	}
-	args = append(args, "--compression="+compression)
 	if leaveRunning {
 		args = append(args, "--leave-running")
 	}

@@ -71,6 +71,8 @@ never overwrites a non-empty directory.
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
 
+For runsc, uncompressed checkpoints (`compress=false`) use `runsc checkpoint --direct` to write the memory pages file with `O_DIRECT`. This bypasses the host page cache for those writes and limits dirty-page buildup while sandbox memory is still resident. The checkpoint filesystem must support direct I/O for that file. Compressed checkpoints use the regular compressed writer.
+
 ## Runsc filestore checkpoints
 
 Runsc normally serializes application memory and writable-layer pages into its checkpoint files. Set the node-owned `[plugin.runtime.runsc] checkpoint_mode = "reflink"` to capture writable filestores with the matching gVisor bundle's `FICLONE` support instead. An unset mode or `"full"` preserves page serialization; unknown modes fail runtime initialization. This setting does not change the meaning of `snapshot_type`, which runsc ignores, or enable dirty-page incremental application-memory checkpoints.
