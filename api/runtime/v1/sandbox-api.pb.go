@@ -2863,8 +2863,7 @@ func (*ListAvailableRuntimesRequest) Descriptor() ([]byte, []int) {
 	return file_api_runtime_v1_sandbox_api_proto_rawDescGZIP(), []int{32}
 }
 
-// RuntimeInfo describes one initialized runtime handler and its optional
-// checkpoint/restore application handoff interface.
+// RuntimeInfo describes one initialized runtime handler and its capabilities.
 type RuntimeInfo struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// RuntimeClass is the handler name accepted by sandbox start requests.
@@ -2875,8 +2874,11 @@ type RuntimeInfo struct {
 	CheckpointHandoffPath string `protobuf:"bytes,3,opt,name=checkpoint_handoff_path,json=checkpointHandoffPath,proto3" json:"checkpoint_handoff_path,omitempty"`
 	// RestoreEnvPath exposes the target OCI process environment after restore.
 	RestoreEnvPath string `protobuf:"bytes,4,opt,name=restore_env_path,json=restoreEnvPath,proto3" json:"restore_env_path,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// SupportsReadOnlyOCIImageMounts reports that sandboxd verified its local
+	// OCI mount path and this handler supports read-only OCI image volumes.
+	SupportsReadOnlyOciImageMounts bool `protobuf:"varint,5,opt,name=supports_read_only_oci_image_mounts,json=supportsReadOnlyOciImageMounts,proto3" json:"supports_read_only_oci_image_mounts,omitempty"`
+	unknownFields                  protoimpl.UnknownFields
+	sizeCache                      protoimpl.SizeCache
 }
 
 func (x *RuntimeInfo) Reset() {
@@ -2935,6 +2937,13 @@ func (x *RuntimeInfo) GetRestoreEnvPath() string {
 		return x.RestoreEnvPath
 	}
 	return ""
+}
+
+func (x *RuntimeInfo) GetSupportsReadOnlyOciImageMounts() bool {
+	if x != nil {
+		return x.SupportsReadOnlyOciImageMounts
+	}
+	return false
 }
 
 // ListAvailableRuntimesResponse contains the available runtime class snapshot.
@@ -3274,12 +3283,13 @@ const file_api_runtime_v1_sandbox_api_proto_rawDesc = "" +
 	"\x16memory_max_usage_bytes\x18\x04 \x01(\x04R\x13memoryMaxUsageBytes\x12\"\n" +
 	"\rcpu_kernel_ns\x18\x05 \x01(\x04R\vcpuKernelNs\x12\x1e\n" +
 	"\vcpu_user_ns\x18\x06 \x01(\x04R\tcpuUserNs\"\x1e\n" +
-	"\x1cListAvailableRuntimesRequest\"\xd4\x01\n" +
+	"\x1cListAvailableRuntimesRequest\"\xa1\x02\n" +
 	"\vRuntimeInfo\x12#\n" +
 	"\rruntime_class\x18\x01 \x01(\tR\fruntimeClass\x12>\n" +
 	"\x1bsupports_checkpoint_restore\x18\x02 \x01(\bR\x19supportsCheckpointRestore\x126\n" +
 	"\x17checkpoint_handoff_path\x18\x03 \x01(\tR\x15checkpointHandoffPath\x12(\n" +
-	"\x10restore_env_path\x18\x04 \x01(\tR\x0erestoreEnvPath\"}\n" +
+	"\x10restore_env_path\x18\x04 \x01(\tR\x0erestoreEnvPath\x12K\n" +
+	"#supports_read_only_oci_image_mounts\x18\x05 \x01(\bR\x1esupportsReadOnlyOciImageMounts\"}\n" +
 	"\x1dListAvailableRuntimesResponse\x12'\n" +
 	"\x0fruntime_classes\x18\x01 \x03(\tR\x0eruntimeClasses\x123\n" +
 	"\bruntimes\x18\x02 \x03(\v2\x17.runtime.v1.RuntimeInfoR\bruntimes\"1\n" +

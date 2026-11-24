@@ -1538,6 +1538,37 @@ func reverseCopy(items []string) []string {
 	return out
 }
 
+// ProbeReadOnlyMounts verifies the bind and overlay paths in the actual image cache.
+func (m *Manager) ProbeReadOnlyMounts() error {
+	probe, err := os.MkdirTemp(m.mountsDir, ".oci-mount-probe-")
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(probe, "target")
+	lowers := []string{filepath.Join(probe, "upper"), filepath.Join(probe, "lower")}
+	// These empty directories can be removed without ever traversing a mount.
+	defer func() {
+		for _, path := range []string{target, lowers[0], lowers[1], probe} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				logrus.WithError(err).Warnf("clean OCI mount probe %s", path)
+			}
+		}
+	}()
+	for _, path := range []string{lowers[0], lowers[1], target} {
+		if err := os.Mkdir(path, 0700); err != nil {
+			return err
+		}
+	}
+	for _, layers := range [][]string{lowers[:1], lowers} {
+		err := m.mountFn(target, layers)
+		// Verification can fail after the mount was attached.
+		if err = errors.Join(err, m.unmountManagedTarget(target)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func defaultOverlayMount(target string, lowerDirs []string) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("overlay mount is only supported on linux")
