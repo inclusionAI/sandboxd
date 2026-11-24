@@ -37,6 +37,9 @@ var _ runtimecore.Handler = &Handler{}
 var _ runtimecore.CheckpointHandler = &Handler{}
 var _ runtimecore.CheckpointRestoreCapabilitiesProvider = &Handler{}
 var _ runtimecore.SandboxDefaultsProvider = &Handler{}
+var _ runtimecore.OCIImageMountsProvider = &Handler{}
+
+func (*Handler) SupportsReadOnlyOCIImageMounts() bool { return true }
 
 const (
 	ImageName                  = "rootfs.img"

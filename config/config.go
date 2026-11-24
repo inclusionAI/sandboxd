@@ -92,6 +92,8 @@ func (p ManagedRuntimeProfile) MinimumStorageMB() (uint64, error) {
 
 // ImageManagerConfig configures image and mount lifecycle management.
 type ImageManagerConfig struct {
+	// DisableOCIImageMounts disallows OCI image volumes on this worker.
+	DisableOCIImageMounts bool `toml:"disable_oci_image_mounts" json:"disableOCIImageMounts"`
 	// OCIZeroRefTTL controls time-based GC of unreferenced OCI layers and lowerdirs.
 	// Empty uses 30m; zero disables TTL GC without disabling disk-pressure GC.
 	OCIZeroRefTTL     string `toml:"oci_zero_ref_ttl" json:"ociZeroRefTTL"`

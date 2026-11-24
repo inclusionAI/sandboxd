@@ -36,10 +36,10 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	// Rolled for optional StartRequest.process_user (24), SandboxStatus.process_user
-	// (16) and ProcessUser; existing field numbers and omitted defaults are unchanged.
+	// Rolled for optional RuntimeInfo.supports_read_only_oci_image_mounts (5).
+	// Older workers omit the field and therefore do not advertise support.
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "e3ef0922c4da76d247aa1ab385f5e83204a55dc2e5e6d6e270ccb3d235714f8c"
+	const want = "c1ae824a8441f63d017a53cbfa2dd79e1ed998fce2934a28970f05b1f2d28848"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}
