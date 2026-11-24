@@ -282,14 +282,17 @@ func TestCheckpointArguments(t *testing.T) {
 	for _, test := range []struct {
 		name         string
 		compress     bool
+		directIO     bool
+		wantDirect   bool
 		leaveRunning bool
 		compression  string
 	}{
 		{name: "raw-stop", compression: "none"},
-		{name: "raw-leave-running", leaveRunning: true, compression: "none"},
+		{name: "raw-direct-stop", directIO: true, wantDirect: true, compression: "none"},
+		{name: "raw-direct-leave-running", directIO: true, wantDirect: true, leaveRunning: true, compression: "none"},
 		{name: "compressed-stop", compress: true, compression: "flate-best-speed"},
 		{
-			name: "compressed-leave-running", compress: true,
+			name: "compressed-leave-running", compress: true, directIO: true,
 			leaveRunning: true, compression: "flate-best-speed",
 		},
 	} {
@@ -302,7 +305,7 @@ func TestCheckpointArguments(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("RUNSC_TEST_ARGS", argsFile)
-			client := NewClient(binary, filepath.Join(tempDir, "root"))
+			client := NewClientWithOptions(binary, filepath.Join(tempDir, "root"), Options{CheckpointDirectIO: test.directIO})
 			if err := client.Checkpoint(
 				context.Background(),
 				"sbox-checkpoint",
@@ -317,7 +320,7 @@ func TestCheckpointArguments(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := append(client.globalArgs(), "checkpoint", "--compression="+test.compression)
-			if !test.compress {
+			if test.wantDirect {
 				want = append(want, "--direct")
 			}
 			if test.leaveRunning {

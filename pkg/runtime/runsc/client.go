@@ -66,6 +66,7 @@ type Options struct {
 	DebugLogPath       string
 	IgnoreCgroups      bool
 	PlatformDevicePath string
+	CheckpointDirectIO bool
 	BackgroundRestore  bool
 	ReflinkFilestores  bool
 }
@@ -451,8 +452,10 @@ func (c *Client) Checkpoint(
 	if compress {
 		args = append(args, "--compression=flate-best-speed")
 	} else {
-		// Keep the memory pages file out of the page cache while sandbox memory is still resident.
-		args = append(args, "--compression=none", "--direct")
+		args = append(args, "--compression=none")
+		if c.Options.CheckpointDirectIO {
+			args = append(args, "--direct")
+		}
 	}
 	if leaveRunning {
 		args = append(args, "--leave-running")

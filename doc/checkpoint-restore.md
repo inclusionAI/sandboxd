@@ -71,7 +71,7 @@ never overwrites a non-empty directory.
 The directory is the artifact boundary. Its contents are opaque and specific
 to the runtime that created them.
 
-For runsc, uncompressed checkpoints (`compress=false`) use `runsc checkpoint --direct` to write the memory pages file with `O_DIRECT`. This bypasses the host page cache for those writes and limits dirty-page buildup while sandbox memory is still resident. The checkpoint filesystem must support direct I/O for that file. Compressed checkpoints use the regular compressed writer.
+Runsc uses buffered checkpoint writes by default. On nodes whose checkpoint filesystem supports direct I/O, set `checkpoint_direct_io = true` under `[plugin.runtime.runsc]`. For uncompressed checkpoints (`compress=false`), sandboxd then passes `--direct` to `runsc checkpoint` so the memory pages file bypasses the host page cache. This limits dirty-page buildup while sandbox memory is still resident. Compressed checkpoints always use the regular compressed writer.
 
 ## Runsc filestore checkpoints
 

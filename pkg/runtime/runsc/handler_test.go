@@ -54,12 +54,14 @@ func TestNewRunscHandlerPropagatesCheckpointOptions(t *testing.T) {
 				cfg := config.Config{RootDir: filepath.Join(base, "sandboxd", "root")}
 				cfg.RuntimeConfig.FilestoreDir = filepath.Join(base, "filestore")
 				cfg.RuntimeConfig.Runsc.CheckpointMode = mode
+				cfg.RuntimeConfig.Runsc.CheckpointDirectIO = true
 				cfg.RuntimeConfig.Runsc.BackgroundRestore = background
 				handler, err := NewHandler(cfg, "/usr/local/bin/runsc", nil)
 				if !assert.NoError(t, err) {
 					return
 				}
 				client := handler.runsc.(*Client)
+				assert.True(t, client.Options.CheckpointDirectIO)
 				assert.Equal(t, background, client.Options.BackgroundRestore)
 				assert.Equal(t, mode == "reflink", client.Options.ReflinkFilestores)
 			})
