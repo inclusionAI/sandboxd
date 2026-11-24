@@ -99,8 +99,7 @@ type sandboxService struct {
 
 	runtime.UnimplementedSandboxServiceServer
 
-	fsMgr               *fsManager
-	ociImageMountsReady bool
+	fsMgr *fsManager
 
 	ready                             atomic.Bool
 	recoveryReady                     atomic.Bool
@@ -529,10 +528,6 @@ func (h *sandboxService) ListAvailableRuntimes(
 			info.CheckpointHandoffPath = capabilities.CheckpointHandoffPath
 			info.RestoreEnvPath = capabilities.RestoreEnvPath
 		}
-		if provider, ok := handler.(svc.OCIImageMountsProvider); ok {
-			info.SupportsReadOnlyOciImageMounts = h.ociImageMountsReady &&
-				!h.config.DisableOCIImageMounts && provider.SupportsReadOnlyOCIImageMounts()
-		}
 		runtimes = append(runtimes, info)
 	}
 
@@ -914,13 +909,6 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		resourceMod:                       nodeResMod,
 		xpuMgr:                            xpuMgr,
 		rebootGate:                        gate,
-	}
-	if !cfg.DisableOCIImageMounts {
-		if err := imgMod.ProbeOCIImageMounts(); err != nil {
-			logrus.WithError(err).Warn("read-only OCI image mount capability unavailable")
-		} else {
-			s.ociImageMountsReady = true
-		}
 	}
 
 	// VolumeManager comes up before runtime handlers. An ordinary directory is
@@ -1321,14 +1309,6 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	if err := svc.ValidateMountDestinations(mountDestinations); err != nil {
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(fmt.Errorf("%v: %w", err, errord.ErrInvalidArgument))
-	}
-	if h.config.DisableOCIImageMounts {
-		for _, mount := range startReq.Mounts {
-			if _, ok := mount.GetSource().(*runtime.Mount_ImageUrl); ok {
-				err := errord.ToGRPCf(errord.ErrFailedPrecondition, "OCI image volumes are disabled on this worker")
-				return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
-			}
-		}
 	}
 	managedRollback, err := h.prepareManagedRuntime(ctx, startReq, checkpointDir)
 	if err != nil {

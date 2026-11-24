@@ -246,33 +246,6 @@ func TestListAvailableRuntimes(t *testing.T) {
 	}, resp.Runtimes)
 }
 
-type ociMountTestHandler struct{ *svc.FakeRuntimeHandler }
-
-func (*ociMountTestHandler) SupportsReadOnlyOCIImageMounts() bool { return true }
-
-func TestListAvailableRuntimesAdvertisesReadOnlyOCIImageMountsOnlyWhereEnabled(t *testing.T) {
-	s := newTestService(t, map[string]svc.Handler{
-		"runsc":       &ociMountTestHandler{svc.NewFakeRuntimeHandler()},
-		"firecracker": &firecracker.Handler{},
-	})
-	resp, err := s.ListAvailableRuntimes(context.Background(), &runtime.ListAvailableRuntimesRequest{})
-	require.NoError(t, err)
-	require.Len(t, resp.Runtimes, 2)
-	assert.False(t, resp.Runtimes[0].GetSupportsReadOnlyOciImageMounts())
-	assert.False(t, resp.Runtimes[1].GetSupportsReadOnlyOciImageMounts())
-
-	s.ociImageMountsReady = true
-	resp, err = s.ListAvailableRuntimes(context.Background(), &runtime.ListAvailableRuntimesRequest{})
-	require.NoError(t, err)
-	assert.False(t, resp.Runtimes[0].GetSupportsReadOnlyOciImageMounts())
-	assert.True(t, resp.Runtimes[1].GetSupportsReadOnlyOciImageMounts())
-
-	s.config.DisableOCIImageMounts = true
-	resp, err = s.ListAvailableRuntimes(context.Background(), &runtime.ListAvailableRuntimesRequest{})
-	require.NoError(t, err)
-	assert.False(t, resp.Runtimes[1].GetSupportsReadOnlyOciImageMounts())
-}
-
 func TestListAvailableRuntimesWithUnavailableSandboxMemoryObservation(t *testing.T) {
 	s := newTestService(t, map[string]svc.Handler{
 		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
