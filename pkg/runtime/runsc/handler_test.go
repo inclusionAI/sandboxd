@@ -79,6 +79,26 @@ func TestNewRunscHandlerPropagatesIgnoreCgroups(t *testing.T) {
 	assert.True(t, client.Options.IgnoreCgroups)
 }
 
+func TestNewRunscHandlerCLIGOMAXPROCS(t *testing.T) {
+	for _, limit := range []int{-1, 0, 1, 4, 1024, 1025} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			cfg := config.Config{RootDir: filepath.Join(t.TempDir(), "root")}
+			cfg.RuntimeConfig.FilestoreDir = filepath.Join(t.TempDir(), "filestore")
+			cfg.RuntimeConfig.Runsc.CLIGOMAXPROCS = limit
+			handler, err := NewHandler(cfg, "/usr/local/bin/runsc", nil)
+			if limit < 0 || limit > 1024 {
+				if assert.Error(t, err) {
+					assert.Contains(t, err.Error(), "cli_gomaxprocs")
+				}
+				return
+			}
+			if assert.NoError(t, err) {
+				assert.Equal(t, limit, handler.runsc.(*Client).Options.CLIGOMAXPROCS)
+			}
+		})
+	}
+}
+
 func TestNewRunscHandlerPropagatesKVMPlatform(t *testing.T) {
 	rootDir := filepath.Join(t.TempDir(), "sandboxd", "root")
 	cfg := config.Config{RootDir: rootDir}

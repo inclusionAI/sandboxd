@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -116,6 +117,58 @@ func TestDeleteDeadlineWithInheritedOutputPipe(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("Delete blocked on inherited pipe for %s", elapsed)
+	}
+}
+
+func TestCLIGOMAXPROCSIsLocalToEachCommand(t *testing.T) {
+	for _, limit := range []int{0, 4} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			dir := t.TempDir()
+			binary := filepath.Join(dir, "runsc")
+			record := filepath.Join(dir, "environment")
+			script := `#!/bin/sh
+printf '%s|%s\n' "$GOMAXPROCS" "$RUNSC_TEST_KEEP" >> "$RUNSC_TEST_ENV"
+case " $* " in *" list "*) printf '[]';; esac
+`
+			if err := os.WriteFile(binary, []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("GOMAXPROCS", "7")
+			t.Setenv("RUNSC_TEST_KEEP", "preserved")
+			t.Setenv("RUNSC_TEST_ENV", record)
+			client := NewClientWithOptions(binary, filepath.Join(dir, "root"), Options{
+				CLIGOMAXPROCS: limit,
+				FilestoreDir:  filepath.Join(dir, "filestore"),
+			})
+			ctx := context.Background()
+			if err := client.Create(ctx, StartArgs{ID: "sandbox-id", BundleDir: filepath.Join(dir, "bundle"),
+				UserStdout: filepath.Join(dir, "stdout"), UserStderr: filepath.Join(dir, "stderr")}); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Checkpoint(ctx, "sandbox-id", filepath.Join(dir, "checkpoint"), false, true); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Delete(ctx, "sandbox-id", true); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.ListJSON(ctx); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "7|preserved\n"
+			if limit > 0 {
+				want = "4|preserved\n"
+			}
+			if string(data) != strings.Repeat(want, 4) {
+				t.Fatalf("command environments = %q, want %q", data, strings.Repeat(want, 4))
+			}
+			if got := os.Getenv("GOMAXPROCS"); got != "7" {
+				t.Fatalf("changed daemon environment to %q", got)
+			}
+		})
 	}
 }
 
