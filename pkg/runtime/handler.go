@@ -52,11 +52,6 @@ type CheckpointRestoreCapabilitiesProvider interface {
 	CheckpointRestoreCapabilities() CheckpointRestoreCapabilities
 }
 
-// OCIImageMountsProvider opts a handler into scheduling for read-only OCI image volumes.
-type OCIImageMountsProvider interface {
-	SupportsReadOnlyOCIImageMounts() bool
-}
-
 type CheckpointConfig struct {
 	ID        string
 	Directory string

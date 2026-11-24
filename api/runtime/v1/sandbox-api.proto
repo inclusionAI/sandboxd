@@ -492,8 +492,12 @@ message StatsResponse {
 // for new sandbox creation.
 message ListAvailableRuntimesRequest {}
 
-// RuntimeInfo describes one initialized runtime handler and its capabilities.
+// RuntimeInfo describes one initialized runtime handler and its optional
+// checkpoint/restore application handoff interface.
 message RuntimeInfo {
+  reserved 5;
+  reserved "supports_read_only_oci_image_mounts";
+
   // RuntimeClass is the handler name accepted by sandbox start requests.
   string runtime_class = 1;
   // SupportsCheckpointRestore reports whether the handler implements both operations.
@@ -502,9 +506,6 @@ message RuntimeInfo {
   string checkpoint_handoff_path = 3;
   // RestoreEnvPath exposes the target OCI process environment after restore.
   string restore_env_path = 4;
-  // SupportsReadOnlyOCIImageMounts reports that sandboxd verified its local
-  // OCI mount path and this handler supports read-only OCI image volumes.
-  bool supports_read_only_oci_image_mounts = 5;
 }
 
 // ListAvailableRuntimesResponse contains the available runtime class snapshot.

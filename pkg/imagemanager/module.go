@@ -227,9 +227,6 @@ func (m *Module) Stop() {
 // transition right now.
 func (m *Module) Healthy() bool { return m.healthy.Load() }
 
-// ProbeOCIImageMounts checks the local OCI image volume prerequisites.
-func (m *Module) ProbeOCIImageMounts() error { return m.ociMgr.ProbeReadOnlyMounts() }
-
 // ParseCgroupMemoryLimit parses the independent distill-fs cgroup limit.
 func ParseCgroupMemoryLimit(value string) (int64, error) {
 	return parseMemorySize(value)

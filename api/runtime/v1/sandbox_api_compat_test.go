@@ -36,10 +36,11 @@ func TestV010WireContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(wire)
-	// Rolled for optional RuntimeInfo.supports_read_only_oci_image_mounts (5).
-	// Older workers omit the field and therefore do not advertise support.
+	// Rolled for optional StartRequest.process_user (24), SandboxStatus.process_user
+	// (16) and ProcessUser; existing field numbers and omitted defaults are unchanged.
+	// RuntimeInfo field 5 remains reserved after reverting OCI mount reporting.
 	// Recompute after any proto change: run this test, copy the got hash.
-	const want = "c1ae824a8441f63d017a53cbfa2dd79e1ed998fce2934a28970f05b1f2d28848"
+	const want = "0f3b77b47cf482e7c5c2c219cee1df8d974a27ac11cd99ccd833d97ca002ef29"
 	if got := hex.EncodeToString(sum[:]); got != want {
 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
 	}
