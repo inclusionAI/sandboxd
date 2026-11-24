@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -79,5 +80,65 @@ func TestManagedStartRejectsInvalidMountsBeforeProfilePreparation(t *testing.T) 
 				t.Fatalf("invalid mounts changed managed state: entries=%v err=%v", entries, readErr)
 			}
 		})
+	}
+}
+
+func TestManagedStartRejectsDisabledOCIImageVolumeBeforeProfilePreparation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		target  string
+		code    codes.Code
+		message string
+	}{
+		{"disabled_volume", "/data", codes.FailedPrecondition, "OCI image volumes are disabled on this worker"},
+		{"invalid_destination", "relative", codes.InvalidArgument, "mount destination"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service := managedTestService(t)
+			service.recoveryReady.Store(true)
+			service.config.DisableOCIImageMounts = true
+			root := service.config.ManagedRuntimeRoot
+			// Block profile preparation before it can attempt a kernel mount.
+			if err := os.WriteFile(filepath.Join(root, "collections"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			request := fsTestStartRequest("sbox-disabled-image-volume")
+			request.ExtraConfig = `{"managedRuntimeProfile":"compose-v1"}`
+			request.Labels = map[string]string{"adx.tenant_id": "allowed"}
+			request.WritableLayerLimitBytes = 8192 << 20
+			request.Mounts[0].Target = tc.target
+
+			response, err := service.Start(context.Background(), request)
+			if status.Code(err) != tc.code || !strings.Contains(status.Convert(err).Message(), tc.message) {
+				t.Errorf("error = %v, want %s with %q", err, tc.code, tc.message)
+			}
+			if response == nil || response.Code != -1 {
+				t.Errorf("response = %v, want rejection", response)
+			}
+			entries, err := os.ReadDir(root)
+			if err != nil || len(entries) != 1 || entries[0].Name() != "collections" || entries[0].IsDir() {
+				t.Fatalf("request changed managed state: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestStartPreparesOCIRootfsWhenOCIImageVolumesAreDisabled(t *testing.T) {
+	service := newTestService(t, map[string]svc.Handler{"runsc": svc.NewFakeRuntimeHandler()})
+	service.config.DisableOCIImageMounts = true
+	images := newFSTestImageService()
+	service.fsMgr = newFSManager(images)
+	request := fsTestStartRequest("sbox-image-rootfs")
+	request.Mounts = nil
+
+	// The fixture has no resource managers. It mounts the rootfs, then rolls
+	// it back when the separate resource preparation fails.
+	_, err := service.Start(context.Background(), request)
+	if err == nil || !strings.Contains(err.Error(), "allocate resource") {
+		t.Fatalf("error = %v, want resource allocation failure", err)
+	}
+	image := request.Rootfs.GetImageUrl()
+	if mounted, unmounted := images.mountCalls(image), images.umountCalls(image); mounted != 1 || unmounted != 1 {
+		t.Fatalf("OCI rootfs calls = %d mounts, %d unmounts, want one each", mounted, unmounted)
 	}
 }

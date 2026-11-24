@@ -231,7 +231,7 @@ It is cleaned by normal or idempotent sandbox deletion.
 
 ### Runtime inventory failures and readiness
 
-`ListAvailableRuntimes` advertises `supports_read_only_oci_image_mounts` for the ready runsc handler after sandboxd verifies read-only bind and overlay mounts in the local OCI cache at startup. The check uses local scratch directories. The requested image and registry access are resolved during sandbox creation. Setting `[plugin.image].disable_oci_image_mounts = true` withdraws the capability and rejects OCI image volume requests on this worker before allocation. OCI image root filesystems follow their normal configuration.
+`ListAvailableRuntimes` advertises `supports_read_only_oci_image_mounts` for the ready runsc handler after sandboxd verifies read-only bind and overlay mounts in the local OCI cache at startup. The check uses local scratch directories. The requested image and registry access are resolved during sandbox creation. Setting `[plugin.image].disable_oci_image_mounts = true` withdraws the capability and rejects OCI image volume requests on this worker before managed profile preparation and resource allocation. OCI image root filesystems follow their normal configuration.
 
 Periodic runtime inventories run concurrently with independent ten-second budgets. A failed or timed-out inventory closes admission and removes only that runtime class from `ListAvailableRuntimes`; existing sandbox metadata and status remain intact. A later successful inventory reopens the class. Delete and cleanup operations remain available during degradation. A handler that ignores cancellation cannot accumulate overlapping inventory calls across passes.
 
