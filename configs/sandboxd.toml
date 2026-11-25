@@ -93,6 +93,8 @@ background_restore = false
 # Use "reflink" only when live filestores and checkpoints share a filesystem
 # supporting FICLONE for the runtime's mount namespaces. See checkpoint-restore.md.
 checkpoint_mode = "full"
+# Bypass the page cache for uncompressed checkpoint pages on storage supporting O_DIRECT.
+checkpoint_direct_io = false
 # Operator-owned create flags; omit to keep ["--net-raw=true"], or use [] for none.
 # Use --name=value for every flag, including booleans; sandboxd-managed flags cannot be overridden.
 # Docker 28+ bridge networking also needs --allow-packet-socket-write,

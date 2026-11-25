@@ -13,6 +13,7 @@ import (
 
 func TestCheckpointOptionsDefaultOff(t *testing.T) {
 	cfg := DefaultConfig()
+	require.False(t, cfg.RuntimeConfig.Runsc.CheckpointDirectIO)
 	require.False(t, cfg.RuntimeConfig.Runsc.BackgroundRestore)
 	require.False(t, cfg.RuntimeConfig.CheckpointSync.SyncOutput)
 	mode, err := NormalizeRunscCheckpointMode(cfg.RuntimeConfig.Runsc.CheckpointMode)
@@ -35,4 +36,10 @@ func TestCheckpointOptionsTOML(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestRunscCheckpointDirectIOTOML(t *testing.T) {
+	cfg := DefaultConfig()
+	require.NoError(t, toml.Unmarshal([]byte("[plugin.runtime.runsc]\ncheckpoint_direct_io=true\n"), &cfg))
+	require.True(t, cfg.RuntimeConfig.Runsc.CheckpointDirectIO)
 }

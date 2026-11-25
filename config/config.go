@@ -205,6 +205,8 @@ type RunscConfig struct {
 	// snapshots of writable filestores. Reflink requires a matching runsc bundle
 	// and a shared reflink-capable filesystem for live and saved filestores.
 	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
+	// CheckpointDirectIO uses direct I/O for uncompressed checkpoint pages.
+	CheckpointDirectIO bool `toml:"checkpoint_direct_io" json:"checkpointDirectIO"`
 	// BackgroundRestore lets runsc load remaining memory pages after restore
 	// returns. False preserves synchronous loading.
 	BackgroundRestore bool `toml:"background_restore" json:"backgroundRestore"`

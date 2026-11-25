@@ -100,14 +100,15 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 
 	return &Handler{
 		runsc: NewClientWithOptions(bin, runscRoot, Options{
-			ExtraArgs:         cfg.RuntimeConfig.Runsc.ExtraArgs,
-			Platform:          platform,
-			FilestoreDir:      cfg.RuntimeConfig.FilestoreDir,
-			OverlayTmpfsSize:  cfg.RuntimeConfig.OverlayTmpfsSize,
-			DebugLogPath:      runscLogPath,
-			IgnoreCgroups:     cfg.DisableCgroup,
-			BackgroundRestore: cfg.RuntimeConfig.Runsc.BackgroundRestore,
-			ReflinkFilestores: checkpointMode == "reflink",
+			ExtraArgs:          cfg.RuntimeConfig.Runsc.ExtraArgs,
+			Platform:           platform,
+			FilestoreDir:       cfg.RuntimeConfig.FilestoreDir,
+			OverlayTmpfsSize:   cfg.RuntimeConfig.OverlayTmpfsSize,
+			DebugLogPath:       runscLogPath,
+			IgnoreCgroups:      cfg.DisableCgroup,
+			CheckpointDirectIO: cfg.RuntimeConfig.Runsc.CheckpointDirectIO,
+			BackgroundRestore:  cfg.RuntimeConfig.Runsc.BackgroundRestore,
+			ReflinkFilestores:  checkpointMode == "reflink",
 		}),
 		ociLoader:              loader,
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,

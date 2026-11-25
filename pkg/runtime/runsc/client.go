@@ -66,6 +66,7 @@ type Options struct {
 	DebugLogPath       string
 	IgnoreCgroups      bool
 	PlatformDevicePath string
+	CheckpointDirectIO bool
 	BackgroundRestore  bool
 	ReflinkFilestores  bool
 }
@@ -448,11 +449,14 @@ func (c *Client) Checkpoint(
 	}
 
 	args := append(c.globalArgs(), "checkpoint")
-	compression := "none"
 	if compress {
-		compression = "flate-best-speed"
+		args = append(args, "--compression=flate-best-speed")
+	} else {
+		args = append(args, "--compression=none")
+		if c.Options.CheckpointDirectIO {
+			args = append(args, "--direct")
+		}
 	}
-	args = append(args, "--compression="+compression)
 	if leaveRunning {
 		args = append(args, "--leave-running")
 	}
