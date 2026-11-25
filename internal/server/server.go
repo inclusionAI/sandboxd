@@ -767,6 +767,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	if err := validateRuntimeFilestore(cfg.RuntimeConfig); err != nil {
 		return nil, err
 	}
+	if err := firecracker.ValidateCheckpointMemoryLimit(cfg.FirecrackerCheckpointMemoryMaxBytes, cfg.DisableCgroup || cfg.CgroupCacheSize <= 0); err != nil {
+		return nil, err
+	}
 	if _, err := runscRestoreConcurrency(cfg.RuntimeConfig.Runsc.RestoreConcurrency); err != nil {
 		return nil, err
 	}

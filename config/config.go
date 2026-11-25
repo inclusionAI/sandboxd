@@ -274,6 +274,10 @@ type FirecrackerConfig struct {
 
 type ResourceConfig struct {
 	MaxInstanceNum int `toml:"max_instance_num" json:"maxInstanceNum"`
+	// FirecrackerCheckpointMemoryMaxBytes optionally caps native snapshot
+	// cgroup charges on cgroup v2. Zero retains an existing scoped limit or
+	// preserves the historical shared group when no scoped group exists.
+	FirecrackerCheckpointMemoryMaxBytes int64 `toml:"firecracker_checkpoint_memory_max_bytes" json:"firecrackerCheckpointMemoryMaxBytes"`
 
 	// MemoryLimit optionally budgets and caps the sandbox parent on cgroup v2.
 	MemoryLimit MemoryLimitConfig `toml:"memory_limit" json:"memoryLimit"`

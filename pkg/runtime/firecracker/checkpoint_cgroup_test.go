@@ -44,6 +44,7 @@ func TestFirecrackerCheckpointCgroupMigration(t *testing.T) {
 			}
 			err := withFirecrackerProcessInCheckpointCgroup(
 				"/akernel/sbox-test",
+				firecrackerCheckpointCgroup,
 				42,
 				func() error {
 					events = append(events, "snapshot")
@@ -83,6 +84,7 @@ func TestFirecrackerCheckpointCgroupInitialMoveFailure(t *testing.T) {
 	terminateCalled := false
 	err := withFirecrackerProcessInCheckpointCgroup(
 		"/akernel/sbox-test",
+		firecrackerCheckpointCgroup,
 		42,
 		func() error {
 			snapshotCalled = true
@@ -112,6 +114,7 @@ func TestFirecrackerCheckpointCgroupRollbackFailureStopsVMM(t *testing.T) {
 	terminated := false
 	err := withFirecrackerProcessInCheckpointCgroup(
 		"/akernel/sbox-test",
+		firecrackerCheckpointCgroup,
 		42,
 		func() error { return nil },
 		func(string, int) error {
@@ -138,6 +141,7 @@ func TestFirecrackerCheckpointRejectsRootSourceCgroup(t *testing.T) {
 	moveCalled := false
 	err := withFirecrackerProcessInCheckpointCgroup(
 		"/",
+		firecrackerCheckpointCgroup,
 		42,
 		func() error { return nil },
 		func(string, int) error {

@@ -213,6 +213,9 @@ func (instance *firecrackerInstance) shouldPersist() bool {
 
 // Handler manages the Firecracker microVM lifecycle.
 type Handler struct {
+	checkpointCgroup    string
+	checkpointMemoryMax int64
+
 	writableIOEngine  string
 	writableCacheType string
 	binary            string
@@ -535,6 +538,12 @@ func NewHandlerForRuntime(
 			)
 		}
 	}
+	checkpointGroup, checkpointMax, err := configureCheckpointMemory(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("configure Firecracker checkpoint memory: %w", err)
+	}
+	handler.checkpointCgroup = checkpointGroup
+	handler.checkpointMemoryMax = checkpointMax
 	handler.recoverInstances()
 	return handler, nil
 }
