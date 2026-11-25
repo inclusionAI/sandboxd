@@ -22,6 +22,7 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFirecrackerCheckpointHeadroom(t *testing.T) {
@@ -63,6 +64,96 @@ func TestFirecrackerCheckpointMemorySlotHonorsCancellation(t *testing.T) {
 	)
 	assert.NoError(t, err)
 	release()
+}
+
+func TestFirecrackerCheckpointConcurrencyValidation(t *testing.T) {
+	for _, value := range []int{-1, 1025} {
+		_, err := firecrackerCheckpointConcurrency(value)
+		require.Error(t, err)
+	}
+	for _, value := range []int{0, 1, 4, 32, 1024} {
+		limit, err := firecrackerCheckpointConcurrency(value)
+		require.NoError(t, err)
+		require.Equal(t, max(1, value), limit)
+	}
+}
+
+func TestFirecrackerRestoreMemorySlotsDefaultToSharedPool(t *testing.T) {
+	service := &sandboxService{}
+	release, err := service.acquireFirecrackerCheckpointMemorySlot(context.Background())
+	require.NoError(t, err)
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err = service.acquireFirecrackerRestoreMemorySlot(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestFirecrackerRestoreMemorySlotsCanBeBoundedIndependently(t *testing.T) {
+	service := &sandboxService{}
+	service.config.ResourceConfig.FirecrackerRestoreConcurrency = 4
+	releaseCheckpoint, err := service.acquireFirecrackerCheckpointMemorySlot(context.Background())
+	require.NoError(t, err)
+	defer releaseCheckpoint()
+	var releases []func()
+	for range 4 {
+		release, err := service.acquireFirecrackerRestoreMemorySlot(context.Background())
+		require.NoError(t, err)
+		releases = append(releases, release)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err = service.acquireFirecrackerRestoreMemorySlot(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	_, err = service.acquireFirecrackerCheckpointMemorySlot(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	releases[0]()
+	release, err := service.acquireFirecrackerRestoreMemorySlot(context.Background())
+	require.NoError(t, err)
+	release()
+	for _, release := range releases[1:] {
+		release()
+	}
+	ctx, cancel = context.WithCancel(context.Background())
+	cancel()
+	_, err = service.acquireFirecrackerRestoreMemorySlot(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestFirecrackerCheckpointMemorySlotsBoundAndReuseCapacity(t *testing.T) {
+	service := &sandboxService{}
+	service.config.ResourceConfig.FirecrackerCheckpointConcurrency = 4
+	var releases []func()
+	for range 4 {
+		release, err := service.acquireFirecrackerCheckpointMemorySlot(context.Background())
+		require.NoError(t, err)
+		releases = append(releases, release)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := service.acquireFirecrackerCheckpointMemorySlot(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = service.acquireFirecrackerCheckpointMemorySlot(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	releases[0]()
+	release, err := service.acquireFirecrackerCheckpointMemorySlot(context.Background())
+	require.NoError(t, err)
+	release()
+	for _, release := range releases[1:] {
+		release()
+	}
+	// A cancelled request must not consume even an immediately available slot.
+	ctx, cancel = context.WithCancel(context.Background())
+	cancel()
+	_, err = service.acquireFirecrackerCheckpointMemorySlot(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	for range 4 {
+		release, err := service.acquireFirecrackerCheckpointMemorySlot(context.Background())
+		require.NoError(t, err)
+		t.Cleanup(release)
+	}
 }
 
 func TestShouldRaiseFirecrackerCheckpointMemoryLimit(t *testing.T) {

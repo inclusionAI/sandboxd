@@ -1073,9 +1073,11 @@ func (handler *Handler) Restore(
 	command.Stdout = stdout
 	command.Stderr = stderr
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	tSpawnBegin := time.Now()
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start Firecracker restore VMM: %w", err)
 	}
+	tSpawned := time.Now()
 	restoredVcpus := uint32(0)
 	if artifact.Manifest != nil && artifact.Manifest.Compat != nil {
 		compat := artifact.Manifest.Compat
@@ -1121,9 +1123,11 @@ func (handler *Handler) Restore(
 	if err := attachFirecrackerProcess(startConfig.CgroupPath, command.Process.Pid); err != nil {
 		return fmt.Errorf("attach restored Firecracker to cgroup: %w", err)
 	}
+	tAttached := time.Now()
 	if err := handler.persistInstance(instance); err != nil {
 		return err
 	}
+	tPersistedBeforeAPI := time.Now()
 
 	startupCtx, stopWatching := firecrackerStartupContext(ctx, instance.vmmExit)
 	defer stopWatching()
@@ -1153,6 +1157,7 @@ func (handler *Handler) Restore(
 	if err := waitForFirecrackerAgent(agentCtx, vsockPath); err != nil {
 		return err
 	}
+	tAgentReady := time.Now()
 	if err := requestFirecrackerAgent(
 		agentCtx,
 		vsockPath,
@@ -1161,6 +1166,7 @@ func (handler *Handler) Restore(
 	); err != nil {
 		return fmt.Errorf("configure restored Firecracker network: %w", err)
 	}
+	tNetworkReady := time.Now()
 	if err := requestFirecrackerAgent(
 		agentCtx,
 		vsockPath,
@@ -1173,6 +1179,7 @@ func (handler *Handler) Restore(
 	); err != nil {
 		return fmt.Errorf("release restored Firecracker sandbox: %w", err)
 	}
+	tReleased := time.Now()
 	instance.markConfigured()
 	// A restored Firecracker diffs against the memory file it loaded, so the
 	// sandbox-owned base adopts that image and the next checkpoint runs as a
@@ -1190,7 +1197,18 @@ func (handler *Handler) Restore(
 	keepRuntimeArtifacts = true
 	phaseMS := func(from, to time.Time) int64 { return to.Sub(from).Milliseconds() }
 	tEnd := time.Now()
-	logrus.Infof(
+	logrus.WithFields(logrus.Fields{
+		"restore_started_unix_ns": tStarted.UnixNano(),
+		"spawn_us":                tSpawned.Sub(tSpawnBegin).Microseconds(),
+		"register_attach_us":      tAttached.Sub(tSpawned).Microseconds(),
+		"persist_before_api_us":   tPersistedBeforeAPI.Sub(tAttached).Microseconds(),
+		"api_wait_us":             tReady.Sub(tPersistedBeforeAPI).Microseconds(),
+		"snapshot_load_us":        tLoaded.Sub(tReady).Microseconds(),
+		"agent_wait_us":           tAgentReady.Sub(tLoaded).Microseconds(),
+		"guest_network_us":        tNetworkReady.Sub(tAgentReady).Microseconds(),
+		"guest_release_us":        tReleased.Sub(tNetworkReady).Microseconds(),
+		"finalize_us":             tEnd.Sub(tReleased).Microseconds(),
+	}).Infof(
 		"firecracker: restored sandbox %s pid=%d "+
 			"phases: open=%dms prepare=%dms instantiate=%dms vmm_ready=%dms "+
 			"load=%dms agent=%dms total=%dms",

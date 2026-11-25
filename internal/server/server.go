@@ -116,6 +116,7 @@ type sandboxService struct {
 	restoreAdmissionSlots             chan struct{}
 	firecrackerCheckpointMemorySlotMu sync.Mutex
 	firecrackerCheckpointMemorySlot   chan struct{}
+	firecrackerRestoreMemorySlot      chan struct{}
 }
 
 // loadRuntimeHandlers loads runtime handlers with exponential backoff.
@@ -213,6 +214,7 @@ func (h *sandboxService) startSandboxRuntime(
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("check runtime failed: %v", err)
 		return fmt.Errorf("runtime %q is not available: %w", runtimeName, err)
 	}
+	tAdmitted := time.Now()
 
 	handler, ok := h.serviceHandler.Get(runtimeName)
 	if !ok {
@@ -232,6 +234,8 @@ func (h *sandboxService) startSandboxRuntime(
 		}
 	}
 
+	tCgroupPrepared := time.Now()
+	tHandlerStarted := tCgroupPrepared
 	if startConfig.CheckpointDir != "" {
 		checkpointHandler, ok := handler.(svc.CheckpointHandler)
 		if !ok {
@@ -249,7 +253,10 @@ func (h *sandboxService) startSandboxRuntime(
 			startConfig.Resources,
 			handler,
 			false,
-			func() error { return checkpointHandler.Restore(ctx, startConfig) },
+			func() error {
+				tHandlerStarted = time.Now()
+				return checkpointHandler.Restore(ctx, startConfig)
+			},
 		)
 	} else {
 		err = handler.Start(ctx, startConfig)
@@ -261,6 +268,15 @@ func (h *sandboxService) startSandboxRuntime(
 	}
 
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("StartSandbox %s success, traceID: %v, spanId: %v, cost: %v", startConfig.ID, traceID, spanID, time.Since(start).String())
+	if runtimeName == config.RuntimeNameFirecracker && startConfig.CheckpointDir != "" {
+		logrus.WithFields(logrus.Fields{
+			"sandbox_id":         startConfig.ID,
+			"admission_us":       tAdmitted.Sub(start).Microseconds(),
+			"cgroup_prepare_us":  tCgroupPrepared.Sub(tAdmitted).Microseconds(),
+			"restore_queue_us":   tHandlerStarted.Sub(tCgroupPrepared).Microseconds(),
+			"runtime_handler_us": time.Since(tHandlerStarted).Microseconds(),
+		}).Info("firecracker restore control phases")
+	}
 	return nil
 }
 
@@ -769,6 +785,12 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}
 	if _, err := runscRestoreConcurrency(cfg.RuntimeConfig.Runsc.RestoreConcurrency); err != nil {
 		return nil, err
+	}
+	if _, err := firecrackerCheckpointConcurrency(cfg.ResourceConfig.FirecrackerCheckpointConcurrency); err != nil {
+		return nil, fmt.Errorf("firecracker_checkpoint_concurrency: %w", err)
+	}
+	if _, err := firecrackerCheckpointConcurrency(cfg.ResourceConfig.FirecrackerRestoreConcurrency); err != nil {
+		return nil, fmt.Errorf("firecracker_restore_concurrency: %w", err)
 	}
 	runscPlatform, err := config.NormalizeRunscPlatform(cfg.RuntimeConfig.Runsc.Platform)
 	if err != nil {

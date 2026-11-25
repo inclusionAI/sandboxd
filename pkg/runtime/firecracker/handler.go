@@ -213,22 +213,23 @@ func (instance *firecrackerInstance) shouldPersist() bool {
 
 // Handler manages the Firecracker microVM lifecycle.
 type Handler struct {
-	writableIOEngine  string
-	writableCacheType string
-	binary            string
-	sandboxRoot       string
-	storageRoot       string
-	runtimeRoot       string
-	kernelPath        string
-	initrdPath        string
-	kernelArgs        string
-	kvmDevice         string
-	defaultVCPUs      uint32
-	defaultMem        uint32
-	defaultDisk       uint64
-	ociLoader         runtimecore.OciLoader
-	virtiofsdPath     string
-	virtioFSEnabled   bool
+	shutdownGracePeriod time.Duration
+	writableIOEngine    string
+	writableCacheType   string
+	binary              string
+	sandboxRoot         string
+	storageRoot         string
+	runtimeRoot         string
+	kernelPath          string
+	initrdPath          string
+	kernelArgs          string
+	kvmDevice           string
+	defaultVCPUs        uint32
+	defaultMem          uint32
+	defaultDisk         uint64
+	ociLoader           runtimecore.OciLoader
+	virtiofsdPath       string
+	virtioFSEnabled     bool
 
 	mu        sync.RWMutex
 	instances map[string]*firecrackerInstance
@@ -377,6 +378,10 @@ func NewHandlerForRuntime(
 		)
 	}
 	applyFirecrackerDefaults(&firecrackerConfig)
+	shutdownGrace, err := firecrackerShutdownGracePeriod(firecrackerConfig.ShutdownGracePeriodMillis)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateFirecrackerWritablePolicy(firecrackerConfig); err != nil {
 		return nil, err
 	}
@@ -430,6 +435,7 @@ func NewHandlerForRuntime(
 		}
 	}
 	handler := &Handler{
+		shutdownGracePeriod:    shutdownGrace,
 		binary:                 binary,
 		sandboxRoot:            sandboxRoot,
 		storageRoot:            storageRoot,
@@ -1131,7 +1137,9 @@ func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
 			logrus.Debugf("firecracker: guest shutdown %s: %v", sandboxID, err)
 		}
 	}
-	handler.stopInstance(instance, false)
+	if err := handler.stopInstance(instance, false); err != nil {
+		return err
+	}
 	handler.mu.Lock()
 	delete(handler.instances, sandboxID)
 	handler.mu.Unlock()
@@ -1340,32 +1348,55 @@ func (handler *Handler) waitGuest(
 func (handler *Handler) stopInstance(
 	instance *firecrackerInstance,
 	force bool,
-) {
+) (retErr error) {
 	state := instance.snapshot()
+	stopped := false
 	defer func() {
-		if err := cleanupFirecrackerVirtioFS(state.VirtioFS, handler.virtiofsdPath); err != nil {
-			logrus.Warnf("firecracker: clean virtio-fs for %s: %v", state.ID, err)
+		if stopped {
+			retErr = errors.Join(retErr, cleanupFirecrackerVirtioFS(state.VirtioFS, handler.virtiofsdPath))
+		}
+		if retErr != nil {
+			logrus.Warnf("firecracker: stop %s: %v", state.ID, retErr)
 		}
 	}()
 	if !firecrackerProcessMatches(state.PID, handler.binary, state.APIPath, state.ID) {
 		instance.finish(runtimecore.Exit{ExitedAt: time.Now(), ExitCode: state.ExitCode})
-		return
+		stopped = true
+		return nil
+	}
+	grace := handler.shutdownGracePeriod
+	if grace <= 0 {
+		grace = firecrackerShutdownTimeout
 	}
 	if !force && waitFirecrackerProcess(
 		state,
 		handler.binary,
-		firecrackerShutdownTimeout,
+		grace,
 	) {
-		return
+		stopped = true
+		return nil
 	}
 	_ = signalFirecrackerProcess(state, handler.binary, syscall.SIGTERM)
 	if waitFirecrackerProcess(state, handler.binary, 500*time.Millisecond) {
-		return
+		stopped = true
+		return nil
 	}
 	_ = signalFirecrackerProcess(state, handler.binary, syscall.SIGKILL)
 	if !waitFirecrackerProcess(state, handler.binary, time.Second) {
-		logrus.Warnf("firecracker: VMM pid %d did not exit after SIGKILL", state.PID)
+		return fmt.Errorf("firecracker: VMM pid %d did not exit after SIGKILL; preserve sandbox resources for retry", state.PID)
 	}
+	stopped = true
+	return nil
+}
+
+func firecrackerShutdownGracePeriod(milliseconds int) (time.Duration, error) {
+	if milliseconds < 0 || milliseconds > 10000 {
+		return 0, fmt.Errorf("firecracker shutdown_grace_period_ms must be zero or between 1 and 10000: %d", milliseconds)
+	}
+	if milliseconds == 0 {
+		return firecrackerShutdownTimeout, nil
+	}
+	return time.Duration(milliseconds) * time.Millisecond, nil
 }
 
 func waitFirecrackerProcess(

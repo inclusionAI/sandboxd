@@ -80,7 +80,11 @@ func (h *sandboxService) withTransientFirecrackerCheckpointMemory(
 	if !config.IsFirecrackerFamily(runtimeName) {
 		return operation()
 	}
-	releaseSlot, err := h.acquireFirecrackerCheckpointMemorySlot(ctx)
+	acquireSlot := h.acquireFirecrackerCheckpointMemorySlot
+	if !isCheckpoint {
+		acquireSlot = h.acquireFirecrackerRestoreMemorySlot
+	}
+	releaseSlot, err := acquireSlot(ctx)
 	if err != nil {
 		return err
 	}
@@ -188,18 +192,58 @@ func shouldRaiseFirecrackerCheckpointMemoryLimit(
 	}
 }
 
+func firecrackerCheckpointConcurrency(value int) (int, error) {
+	if value < 0 || value > 1024 {
+		return 0, errors.New("Firecracker operation concurrency must be zero or between 1 and 1024")
+	}
+	if value == 0 {
+		return 1, nil
+	}
+	return value, nil
+}
+
 func (h *sandboxService) acquireFirecrackerCheckpointMemorySlot(
 	ctx context.Context,
 ) (func(), error) {
-	h.firecrackerCheckpointMemorySlotMu.Lock()
-	if h.firecrackerCheckpointMemorySlot == nil {
-		h.firecrackerCheckpointMemorySlot = make(chan struct{}, 1)
+	return h.acquireFirecrackerOperationMemorySlot(ctx, false)
+}
+
+func (h *sandboxService) acquireFirecrackerRestoreMemorySlot(ctx context.Context) (func(), error) {
+	if h.config.ResourceConfig.FirecrackerRestoreConcurrency == 0 {
+		return h.acquireFirecrackerCheckpointMemorySlot(ctx)
 	}
-	slot := h.firecrackerCheckpointMemorySlot
+	return h.acquireFirecrackerOperationMemorySlot(ctx, true)
+}
+
+func (h *sandboxService) acquireFirecrackerOperationMemorySlot(ctx context.Context, independentRestore bool) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	configured := h.config.ResourceConfig.FirecrackerCheckpointConcurrency
+	if independentRestore {
+		configured = h.config.ResourceConfig.FirecrackerRestoreConcurrency
+	}
+	limit, err := firecrackerCheckpointConcurrency(configured)
+	if err != nil {
+		return nil, err
+	}
+	h.firecrackerCheckpointMemorySlotMu.Lock()
+	slotPtr := &h.firecrackerCheckpointMemorySlot
+	if independentRestore {
+		slotPtr = &h.firecrackerRestoreMemorySlot
+	}
+	if *slotPtr == nil {
+		*slotPtr = make(chan struct{}, limit)
+	}
+	slot := *slotPtr
 	h.firecrackerCheckpointMemorySlotMu.Unlock()
 
 	select {
 	case slot <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-slot
+			return nil, err
+		}
 		return func() { <-slot }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
