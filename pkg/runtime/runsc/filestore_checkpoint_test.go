@@ -17,10 +17,14 @@ package runsc
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
@@ -271,4 +275,84 @@ func TestIncrementalGenerationState(t *testing.T) {
 	if exists, err := restarted.hasGenerationState("worker"); err != nil || exists {
 		t.Fatalf("retained deleted generation state: %v", err)
 	}
+}
+
+func TestGenerationCrashRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name, head string
+		want       []string
+	}{
+		{"first capture", "", nil},
+		{"before rename", `{"generation":"g1","remote":"/out/g1","frozen":"frozen-1"}`, []string{"frozen-1"}},
+		{"after rename", `{"generation":"g2","remote":"/out/g2","frozen":"frozen-2"}`, []string{"frozen-2"}},
+		{"torn head", "{", []string{"frozen-1", "frozen-2", "images-2", "latest.tmp"}},
+		{"invalid head", `{"frozen":"../other"}`, []string{"frozen-1", "frozen-2", "images-2", "latest.tmp"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			c := NewClientWithOptions("runsc", root, Options{FilestoreDir: root})
+			require.NoError(t, c.createGenerationState("worker", ""))
+			dir := c.generationState("worker")
+			for _, name := range []string{"frozen-1", "frozen-2", "images-2", "unrelated"} {
+				require.NoError(t, os.Mkdir(filepath.Join(dir, name), 0700))
+			}
+			for _, name := range []string{"origin", "latest.tmp"} {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("untouched"), 0600))
+			}
+			if tc.head != "" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "latest.json"), []byte(tc.head), 0600))
+			}
+			for i := 0; i < 2; i++ {
+				require.NoError(t, recoverGenerationCaches(root))
+			}
+			for _, name := range []string{"frozen-1", "frozen-2", "images-2", "latest.tmp"} {
+				_, err := os.Stat(filepath.Join(dir, name))
+				if slices.Contains(tc.want, name) {
+					require.NoError(t, err, name)
+				} else {
+					require.ErrorIs(t, err, os.ErrNotExist, name)
+				}
+			}
+			require.DirExists(t, filepath.Join(dir, "unrelated"))
+			require.FileExists(t, filepath.Join(dir, "origin"))
+			if tc.head != "" {
+				data, err := os.ReadFile(filepath.Join(dir, "latest.json"))
+				require.NoError(t, err)
+				require.Equal(t, tc.head, string(data))
+			}
+		})
+	}
+}
+
+func TestGenerationRecoveryHonorsInheritedPublisherLock(t *testing.T) {
+	root := t.TempDir()
+	c := NewClientWithOptions("runsc", root, Options{FilestoreDir: root})
+	require.NoError(t, c.createGenerationState("worker", ""))
+	dir := c.generationState("worker")
+	stage := filepath.Join(dir, "images-1")
+	require.NoError(t, os.Mkdir(stage, 0700))
+	lock, err := lockGeneration(dir)
+	require.NoError(t, err)
+	defer lock.Close()
+	// A child holding the inherited directory FD outlives the parent's FD.
+	cmd := exec.Command("cat")
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	defer stdin.Close()
+	cmd.ExtraFiles = []*os.File{lock}
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	})
+	require.NoError(t, lock.Close())
+	require.NoError(t, recoverGenerationCaches(root))
+	require.ErrorIs(t, c.removeGenerationState("worker"), unix.EWOULDBLOCK)
+	require.DirExists(t, stage)
+	require.NoError(t, stdin.Close())
+	require.NoError(t, cmd.Wait())
+	require.NoError(t, recoverGenerationCaches(root))
+	require.NoDirExists(t, stage)
 }

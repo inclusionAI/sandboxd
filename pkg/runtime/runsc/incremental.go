@@ -18,11 +18,18 @@ import (
 	"context"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
+
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 //go:embed filestore_publish.py
@@ -69,11 +76,113 @@ func (c *Client) createGenerationState(id, origin string) error {
 	return nil
 }
 
+// Use the cache directory inode as the lock. The publisher inherits the same
+// open file description, so even a daemon crash cannot expose a live publisher
+// to recovery. Closing (without LOCK_UN) releases the last holder's lock.
+func lockGeneration(dir string) (*os.File, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
+		var opened, current os.FileInfo
+		opened, err = f.Stat()
+		if err == nil {
+			current, err = os.Lstat(dir)
+		}
+		if err == nil && (!opened.IsDir() || !os.SameFile(opened, current)) {
+			err = fmt.Errorf("generation directory replaced: %s", dir)
+		}
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// The local head is the commit record. Never consult or delete shared output
+// here: its lifetime and external visibility are controlled by the caller.
+func sweepGeneration(dir string) error {
+	var head struct{ Frozen, Generation, Remote string }
+	p := filepath.Join(dir, "latest.json")
+	data, err := os.ReadFile(p)
+	if err == nil {
+		if err := json.Unmarshal(data, &head); err != nil {
+			return err
+		}
+		if filepath.Base(head.Frozen) != head.Frozen || !strings.HasPrefix(head.Frozen, "frozen-") || len(head.Frozen) == len("frozen-") || head.Generation == "" || !filepath.IsAbs(head.Remote) {
+			return fmt.Errorf("invalid generation head in %s", dir)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	} else if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("unreadable generation head in %s", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == head.Frozen {
+			continue
+		}
+		if (e.IsDir() && (strings.HasPrefix(name, "frozen-") || strings.HasPrefix(name, "images-"))) || (name == "latest.tmp" && e.Type().IsRegular()) {
+			if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func recoverGenerationCaches(filestore string) error {
+	if !filepath.IsAbs(filestore) {
+		return nil
+	}
+	root := filepath.Join(filestore, ".generations")
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || len(e.Name()) != sha256.Size*2 {
+			continue
+		}
+		if _, err := hex.DecodeString(e.Name()); err != nil {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		f, err := lockGeneration(dir)
+		if err == nil {
+			err = sweepGeneration(dir)
+			f.Close()
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			logrus.WithError(err).Warnf("defer incremental cache recovery for %s", dir)
+		}
+	}
+	return nil
+}
+
 func (c *Client) removeGenerationState(id string) error {
 	if !filepath.IsAbs(c.Options.FilestoreDir) {
 		return nil
 	}
-	return os.RemoveAll(c.generationState(id))
+	dir := c.generationState(id)
+	f, err := lockGeneration(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return os.RemoveAll(dir)
 }
 
 func (c *Client) hasGenerationState(id string) (bool, error) {
@@ -92,39 +201,45 @@ func (c *Client) captureGeneration(ctx context.Context, id, destination string, 
 		return fmt.Errorf("incremental checkpoint destination must be absolute")
 	}
 	state := c.generationState(id)
+	lock, err := lockGeneration(state)
+	if err != nil {
+		return fmt.Errorf("lock generation: %w", err)
+	}
+	defer lock.Close()
+	// Retry startup cleanup that raced another holder or was interrupted.
+	if err := sweepGeneration(state); err != nil {
+		return fmt.Errorf("recover generation: %w", err)
+	}
 	frozen, err := os.MkdirTemp(state, "frozen-")
 	if err != nil {
 		return err
 	}
-	committed := false
 	defer func() {
-		if !committed {
-			// Publication can commit just before cancellation or an fsync error.
-			data, err := os.ReadFile(filepath.Join(state, "latest.json"))
-			var head struct{ Frozen string }
-			if os.IsNotExist(err) || (err == nil && json.Unmarshal(data, &head) == nil && head.Frozen != filepath.Base(frozen)) {
-				os.RemoveAll(frozen)
-			}
+		if err := sweepGeneration(state); err != nil {
+			logrus.WithError(err).Warnf("clean incremental capture in %s", state)
 		}
 	}()
 	image, err := os.MkdirTemp(state, "images-")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(image)
+
 	if _, err := os.Stat(filepath.Join(state, "origin")); err == nil {
 		args = append(args, "--filestore-extent-snapshot")
 	} else if !os.IsNotExist(err) {
 		return err
 	}
 	args = append(args, "--skip-filestore-pages", "--filestore-snapshot-dir="+frozen, "--image-path", image, id)
-	if out, err := exec.CommandContext(ctx, c.Binary, args...).CombinedOutput(); err != nil {
+	freeze := exec.CommandContext(ctx, c.Binary, args...)
+	freeze.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	if out, err := freeze.CombinedOutput(); err != nil {
 		return fmt.Errorf("freeze incremental capture: %w: %s", err, out)
 	}
 	cmd := exec.CommandContext(ctx, "/usr/bin/python3", "-I", "-c", filestorePublisher, state, frozen, image, destination)
+	cmd.ExtraFiles = []*os.File{lock}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("publish incremental capture: %w: %s", err, out)
 	}
-	committed = true
 	return nil
 }
