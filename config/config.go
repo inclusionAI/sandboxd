@@ -236,6 +236,11 @@ type RuncConfig struct {
 
 // FirecrackerConfig contains immutable guest boot artifacts and VM defaults.
 type FirecrackerConfig struct {
+	// SealedCheckpointHelper and SealedCheckpointScratch enable sealed disk generations
+	// on restore with the matching runtime helper and a private shared directory.
+	SealedCheckpointHelper  string `toml:"sealed_checkpoint_helper" json:"sealedCheckpointHelper"`
+	SealedCheckpointScratch string `toml:"sealed_checkpoint_scratch" json:"sealedCheckpointScratch"`
+
 	// WritableIOEngine selects Sync, Async, SyncDirect, or AsyncDirect for
 	// the private ext4 disk. Direct engines require a compatible VMM.
 	// The host must provide STATX_DIOALIGN for direct engines and io_uring

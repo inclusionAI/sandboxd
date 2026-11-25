@@ -591,3 +591,26 @@ Managed profile Registry transport is operator-owned and keyed by the complete R
 ## Initial process identity
 
 Runtime snapshots preserve process credentials during checkpoint and restore. `StartRequest.process_user` configures the target OCI bundle user: fresh starts use it to launch a process, while restore resumes credentials from the runtime snapshot. Callers supply compatible target OCI configuration; runsc validates its User against the checkpoint spec. Omitting the field retains the configured base user. `SandboxStatus.process_user` reports that bundle configuration rather than observing credentials inside the resumed snapshot. Callers own business-identity and shared-storage configuration. See [initial process UID/GID](process-user.md) for fresh-start defaults and filesystem preparation.
+
+### Firecracker sealed writable disks (experimental)
+
+The matching [Firecracker sealed virtio-blk runtime](https://github.com/akernel-dev/firecracker/pull/11) can restore a conventional v2 snapshot lazily, direct disk writes into local XFS, and publish complete generations to JuiceFS after resume. A starts normally and creates a v2 G0 with its overlay drive configured as Async. A restored B or C enables the new backend. Legacy archives and virtio-fs restores keep their existing paths.
+
+```toml
+[plugin.runtime.firecracker]
+checkpoint_mode = "incremental"
+writable_io_engine = "Async"
+writable_cache_type = "Writeback"
+sealed_checkpoint_helper = "/opt/firecracker/tools/sealed-block/checkpoint.py"
+sealed_checkpoint_scratch = "/juicefs/private/sandboxd-publisher"
+```
+
+Install the matched VMM, its trusted coordinator, Python 3.10+ and libatomic on the host. The scratch directory must already exist, be mode 0700, and be reserved for sandboxd. Use the same writable JuiceFS mount for scratch, source and output directories; keep public checkpoint directories outside scratch. Keep live filestore storage on reflink-enabled local XFS. For an existing deployment, stage and qualify the matching release bundle first. The runtime checks the control-file mapping while the restored VM is paused so an older VMM cannot silently boot with an empty local disk.
+
+Use the ordinary Restore and Checkpoint RPCs. Leave the snapshot type empty to select KVM Diff on a sealed drive. With leave-running set, the handler drains the device and saves RAM diff and vmstate locally while paused, cuts to a prepared upper, resumes and releases the guest checkpoint handoff, then runs the reference worker to merge local ranges and publish in parallel. The RPC waits until the complete disk, RAM and vmstate are exported and the v2 manifest has been written. A stopping capture keeps the guest paused until commit and then stops it. Each exported directory can be restored independently with a sandboxd reader that accepts the Diff manifest type.
+
+Sandboxd pins the baseline in a per-attempt private shared directory, keeps the previous generation available for replay, and creates separate exported inodes with same-mount copy_file_range. Removing a public output does not detach B's publishing parent. The VMM has read-only access to the lower file. Local XFS holds the active uppers, cumulative merge slots and captured RAM diff. Deleting the sandbox reclaims the private workspace and shared scratch; public checkpoint directories are caller-owned. Keep the configured scratch root stable while sandboxes exist.
+
+Checkpoint operations are serialized per sandbox. If publication fails after the disk cut, a subsequent RPC first finishes the previous pending merge/publication against the private parent, then captures current state to its own destination. A failure with uncertain RAM capture before the cut fences subsequent captures on that VM; restore a committed generation in a fresh sandbox. Host-loss recovery of uncommitted local generations and garbage collection of abandoned node-owned scratch after host loss require orchestration. Managed image collection leases retain their separate same-filesystem requirements.
+
+For a sandboxd RPC smoke test, run `test/e2e/firecracker-sealed.sh` with `SOCKET`, `EROFS_ROOTFS`, and `CHECKPOINT_ROOT` pointing to the isolated daemon, its EROFS fixture and a writable test directory on the publisher mount. It deletes public G0 while B is live, publishes four generations across upper-slot reuse, and restores three of them in reverse order. For failure injection, select `test/e2e/firecracker-sealed-fault.py` as the test daemon's helper, set `SEALED_REAL_HELPER` to the matching runtime helper, and pass the same `SEALED_FAIL_MERGE_MARKER` path to the daemon and the test. The marker injects one post-resume merge ENOSPC.
