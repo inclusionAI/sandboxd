@@ -98,17 +98,22 @@ func NewHandler(cfg config.Config, bin string, loader runtimecore.OciLoader) (*H
 		return nil, fmt.Errorf("initialize EROFS loop manager: %w", err)
 	}
 
+	if err := recoverGenerationCaches(cfg.RuntimeConfig.FilestoreDir); err != nil {
+		logrus.WithError(err).Warn("could not scan runsc incremental caches at startup")
+	}
+
 	return &Handler{
 		runsc: NewClientWithOptions(bin, runscRoot, Options{
-			ExtraArgs:          cfg.RuntimeConfig.Runsc.ExtraArgs,
-			Platform:           platform,
-			FilestoreDir:       cfg.RuntimeConfig.FilestoreDir,
-			OverlayTmpfsSize:   cfg.RuntimeConfig.OverlayTmpfsSize,
-			DebugLogPath:       runscLogPath,
-			IgnoreCgroups:      cfg.DisableCgroup,
-			CheckpointDirectIO: cfg.RuntimeConfig.Runsc.CheckpointDirectIO,
-			BackgroundRestore:  cfg.RuntimeConfig.Runsc.BackgroundRestore,
-			ReflinkFilestores:  checkpointMode == "reflink",
+			ExtraArgs:             cfg.RuntimeConfig.Runsc.ExtraArgs,
+			Platform:              platform,
+			FilestoreDir:          cfg.RuntimeConfig.FilestoreDir,
+			OverlayTmpfsSize:      cfg.RuntimeConfig.OverlayTmpfsSize,
+			DebugLogPath:          runscLogPath,
+			IgnoreCgroups:         cfg.DisableCgroup,
+			CheckpointDirectIO:    cfg.RuntimeConfig.Runsc.CheckpointDirectIO,
+			BackgroundRestore:     cfg.RuntimeConfig.Runsc.BackgroundRestore,
+			ReflinkFilestores:     checkpointMode == "reflink",
+			IncrementalFilestores: checkpointMode == "incremental",
 		}),
 		ociLoader:              loader,
 		rootfsOverlayTmpfsSize: cfg.RuntimeConfig.OverlayTmpfsSize,

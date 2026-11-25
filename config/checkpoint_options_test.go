@@ -22,7 +22,7 @@ func TestCheckpointOptionsDefaultOff(t *testing.T) {
 }
 
 func TestCheckpointOptionsTOML(t *testing.T) {
-	for _, mode := range []string{"full", "reflink"} {
+	for _, mode := range []string{"full", "reflink", "incremental"} {
 		for _, background := range []bool{false, true} {
 			for _, syncOutput := range []bool{false, true} {
 				t.Run(fmt.Sprintf("mode=%s/background=%t/sync=%t", mode, background, syncOutput), func(t *testing.T) {

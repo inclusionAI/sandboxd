@@ -66,7 +66,7 @@ func TestRunscCheckpointMode(t *testing.T) {
 			t.Fatalf("mode %q: got %q, %v; want %q", tc.input, got, err, tc.want)
 		}
 	}
-	for _, input := range []string{"incremental", "softdirty", "unknown"} {
+	for _, input := range []string{"softdirty", "unknown"} {
 		if _, err := NormalizeRunscCheckpointMode(input); err == nil {
 			t.Fatalf("accepted invalid runsc mode %q", input)
 		}
