@@ -84,6 +84,7 @@ type cgroupOps interface {
 	stat(name string) (Stats, error)
 	statRoot(name string) (Stats, error)
 	newOOMWatcher() (oomWatcher, error)
+	populated(name string) (bool, error)
 	kill(name string) error
 	delete(name string) error
 }

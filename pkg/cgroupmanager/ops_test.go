@@ -256,9 +256,12 @@ type fakeCgroupOps struct {
 	createdResources *specs.LinuxResources
 	oom              *fakeOOMWatcher
 	killErr          error
+	populatedState   bool
+	populatedErr     error
 }
 
-func (f *fakeCgroupOps) mode() cgroups.CGMode { return cgroups.Unified }
+func (f *fakeCgroupOps) mode() cgroups.CGMode           { return cgroups.Unified }
+func (f *fakeCgroupOps) populated(string) (bool, error) { return f.populatedState, f.populatedErr }
 func (f *fakeCgroupOps) prepareRoot(string, int64) error {
 	f.calls = append(f.calls, "prepare-root")
 	return nil

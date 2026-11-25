@@ -65,9 +65,12 @@ type CgroupManager struct {
 
 	createReqs chan *createRequest
 
-	db         store.DbStore
-	storeDirty atomic.Bool
-	storeMu    sync.Mutex
+	db            store.DbStore
+	storeDirty    atomic.Bool
+	storeMu       sync.Mutex
+	storeRequest  atomic.Uint64
+	storedRequest uint64 // guarded by storeMu
+	lifecycleMu   sync.RWMutex
 
 	gcQueue *util.Queue[string]
 	gcWake  chan struct{}
@@ -173,6 +176,8 @@ func gcBackoff(attempt int) time.Duration {
 
 func (c *CgroupManager) ShutDown() error {
 	c.shutdownOnce.Do(func() {
+		c.lifecycleMu.Lock()
+		defer c.lifecycleMu.Unlock()
 		c.stopped.Store(true)
 		close(c.stopCh)
 		c.wg.Wait()
@@ -192,6 +197,8 @@ func (c *CgroupManager) ShutDown() error {
 // SaveState preserves active leases without stopping the manager or releasing
 // resources that may still be in use by an unfinished sandbox deletion.
 func (c *CgroupManager) SaveState() error {
+	c.lifecycleMu.RLock()
+	defer c.lifecycleMu.RUnlock()
 	if err := c.store(); err != nil {
 		c.storeDirty.Store(true)
 		return err
@@ -210,6 +217,11 @@ func (c *CgroupManager) Status() ([]string, []string) {
 // Runtime teardown has already run, so draining and restoring the small set of
 // controls managed by sandboxd belongs on this release path, not Start.
 func (c *CgroupManager) Recycle(id string) error {
+	c.lifecycleMu.RLock()
+	defer c.lifecycleMu.RUnlock()
+	if c.stopped.Load() {
+		return errCgroupManagerStopped
+	}
 	if _, active := c.usingID.Pop(id); !active {
 		return nil
 	}
@@ -259,13 +271,13 @@ func (c *CgroupManager) cleanForReuse(name string) error {
 // Allocate hands out an idle cgroup name (e.g. "/sandbox/<id>"). On a cache
 // miss, creation remains serialized by the maintenance goroutine.
 func (c *CgroupManager) Allocate() (string, error) {
+	c.lifecycleMu.RLock()
+	defer c.lifecycleMu.RUnlock()
 	if c.stopped.Load() {
 		return "", errCgroupManagerStopped
 	}
 	if id := c.idleID.Pop(); id != "" {
-		c.usingID.Set(id, struct{}{})
-		c.storeDirty.Store(true)
-		return id, nil
+		return c.markUsingDurable(id)
 	}
 
 	c.mu.Lock()
@@ -291,12 +303,29 @@ func (c *CgroupManager) Allocate() (string, error) {
 		if res.err != nil {
 			return "", res.err
 		}
-		c.usingID.Set(res.id, struct{}{})
-		c.storeDirty.Store(true)
-		return res.id, nil
+		return c.markUsingDurable(res.id)
 	case <-c.stopCh:
 		return "", errCgroupManagerStopped
 	}
+}
+
+// markUsingDurable persists a lease before a runtime can attach a process.
+// Failed writes have an uncertain on-disk outcome. Return the group to the
+// idle queue only after a successful rollback snapshot excludes it.
+func (c *CgroupManager) markUsingDurable(id string) (string, error) {
+	c.usingID.Set(id, struct{}{})
+	c.storeDirty.Store(true)
+	if err := c.store(); err != nil {
+		c.usingID.Pop(id)
+		if rollbackErr := c.store(); rollbackErr != nil {
+			c.usingID.Set(id, struct{}{})
+			c.storeDirty.Store(true)
+			return "", errors.Join(err, fmt.Errorf("rollback cgroup %s: %w; lease quarantined", id, rollbackErr))
+		}
+		c.idleID.Push(id)
+		return "", err
+	}
+	return id, nil
 }
 
 func (c *CgroupManager) run() {
@@ -521,6 +550,10 @@ func NewCgroupManager(
 		if usingIDs.Has(id) {
 			continue
 		}
+		if c.quarantineUnrecordedGroup(id) {
+			recoveryDirty = true
+			continue
+		}
 		if c.idleID.Length() < c.cacheSize {
 			if err := c.cleanForReuse(id); err == nil {
 				c.idleID.Push(id)
@@ -546,6 +579,18 @@ func NewCgroupManager(
 	return c, nil
 }
 
+// Older daemons could hand out a group before the periodic save. An absent
+// lease is therefore not proof that the kernel group is safe to drain.
+func (c *CgroupManager) quarantineUnrecordedGroup(id string) bool {
+	populated, err := c.ops.populated(id)
+	if err == nil && !populated {
+		return false
+	}
+	c.usingID.Set(id, struct{}{})
+	logrus.WithError(err).Warnf("retain unrecorded cgroup %s: populated or workload state unavailable; do not recycle", id)
+	return true
+}
+
 func (c *CgroupManager) keepStoring() {
 	defer c.wg.Done()
 	ticker := time.NewTicker(storeInterval)
@@ -567,6 +612,10 @@ func (c *CgroupManager) keepStoring() {
 }
 
 func (c *CgroupManager) store() error {
+	if c.db == nil {
+		return nil
+	}
+	requested := c.storeRequest.Add(1)
 	start := time.Now()
 	defer func() {
 		logrus.Debugf(
@@ -579,6 +628,12 @@ func (c *CgroupManager) store() error {
 	// cannot overwrite a newer explicit save.
 	c.storeMu.Lock()
 	defer c.storeMu.Unlock()
+	if requested <= c.storedRequest {
+		return nil
+	}
+	// Only requests published before the snapshot may borrow its successful
+	// commit. Later mutations and failed commits never advance coverage.
+	covered := c.storeRequest.Load()
 	data, err := json.Marshal(storedCgroupIDs{Items: c.usingID.Keys()})
 	if err != nil {
 		return fmt.Errorf("encode cgroup using IDs: %w", err)
@@ -586,6 +641,7 @@ func (c *CgroupManager) store() error {
 	if err := c.db.StoreRaw(config.CgroupBucket, data); err != nil {
 		return fmt.Errorf("store cgroup using IDs: %w", err)
 	}
+	c.storedRequest = covered
 	return nil
 }
 
