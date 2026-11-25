@@ -2052,8 +2052,14 @@ func (m *Manager) recoverMountTransactions(managedMounts map[string]*mountinfo.I
 			delete(managedMounts, txn.MountPath)
 		}
 
-		if err := m.discardMountTransaction(txn, false); err != nil {
+		if err := m.removeLowerDirAlias(txn.LowerDirAlias); err != nil {
 			return err
+		}
+		m.removeUnmountedTarget(txn.MountPath)
+		// Startup rebuilds references from the surviving mounts. Leave the
+		// counters intact until that pass can account for every live mount.
+		if err := m.store.deleteMountTxn(txn.ImageURL); err != nil {
+			return fmt.Errorf("delete interrupted OCI mount transaction for %s: %w", txn.ImageURL, err)
 		}
 	}
 

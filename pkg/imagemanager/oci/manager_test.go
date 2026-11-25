@@ -436,13 +436,13 @@ func TestReconcileState_FixesChainRefsForRecoveredMount(t *testing.T) {
 		}
 	}
 
-	if err := mgr.store.putLayer(&LayerRecord{Digest: "sha256:a", Path: layer1Path, RefCount: 0}); err != nil {
+	if err := mgr.store.putLayer(&LayerRecord{Digest: "sha256:a", Path: layer1Path, RefCount: 1}); err != nil {
 		t.Fatalf("put layer1: %v", err)
 	}
 	if err := mgr.store.putLayer(&LayerRecord{Digest: "sha256:b", Path: layer2Path, RefCount: 99}); err != nil {
 		t.Fatalf("put layer2: %v", err)
 	}
-	if err := mgr.store.putChain(&ChainRecord{ChainID: "sha256:c1", Path: chain1Path, RefCount: 0}); err != nil {
+	if err := mgr.store.putChain(&ChainRecord{ChainID: "sha256:c1", Path: chain1Path, RefCount: 1}); err != nil {
 		t.Fatalf("put chain1: %v", err)
 	}
 	if err := mgr.store.putChain(&ChainRecord{ChainID: "sha256:c2", Path: chain2Path, RefCount: 99}); err != nil {
@@ -462,6 +462,18 @@ func TestReconcileState_FixesChainRefsForRecoveredMount(t *testing.T) {
 		LowerDirs:    []string{chain2Path, chain1Path},
 	}); err != nil {
 		t.Fatalf("put mount: %v", err)
+	}
+
+	// Reconciliation rebuilds counts even when an interrupted mount shares
+	// backing with a live mount and the stored counts are already too low.
+	const interrupted = "docker.io/library/alpine:interrupted"
+	if err := mgr.store.putMountTxn(&OciMountTxnRecord{
+		ImageURL:     interrupted,
+		MountPath:    filepath.Join(mgr.mountsDir, "interrupted", "merged"),
+		LayerDigests: []string{"sha256:a"},
+		ChainIDs:     []string{"sha256:c1"},
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	mgr.readMnts = func() (map[string]*mountinfo.Info, bool, error) {
@@ -502,6 +514,12 @@ func TestReconcileState_FixesChainRefsForRecoveredMount(t *testing.T) {
 	}
 	if chain1.RefCount != 1 || chain2.RefCount != 1 {
 		t.Fatalf("chain refcounts not fixed, got %d and %d", chain1.RefCount, chain2.RefCount)
+	}
+	if layer, err := mgr.store.getLayer("sha256:a"); err != nil || layer == nil || layer.RefCount != 1 {
+		t.Fatalf("live layer reference lost after rollback: %v, %v", layer, err)
+	}
+	if txn, err := mgr.store.getMountTxn(interrupted); err != nil || txn != nil {
+		t.Fatalf("interrupted mount transaction remains: %v, %v", txn, err)
 	}
 }
 

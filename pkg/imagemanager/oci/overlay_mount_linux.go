@@ -26,7 +26,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var errStructuredOverlayUnavailable = errors.New("structured OverlayFS options unavailable")
+var (
+	errStructuredOverlayUnavailable = errors.New("structured OverlayFS options unavailable")
+	errOverlayMountInfoLimit        = errors.New("ordered lowerdirs exceed the supported mountinfo line limit")
+)
 
 func mountReadonlyOverlay(target string, lowerDirs []string, compactData func(int) (string, error)) error {
 	return mountReadonlyOverlayWith(target, lowerDirs, os.Getpagesize(), func(target, data string) error {
@@ -59,7 +62,8 @@ func mountReadonlyOverlayWith(
 	if err := mountLayers(target, lowerDirs); err != nil {
 		structuredErr := fmt.Errorf("overlay options use %d bytes, exceeding the legacy mount limit of %d bytes for %d layers: %w",
 			len(data), pageSize-1, len(lowerDirs), err)
-		if compactData == nil || !errors.Is(err, errStructuredOverlayUnavailable) {
+		canCompact := errors.Is(err, errStructuredOverlayUnavailable) || errors.Is(err, errOverlayMountInfoLimit)
+		if compactData == nil || !canCompact {
 			return structuredErr
 		}
 		data, err := compactData(pageSize - 1)
@@ -151,7 +155,7 @@ func checkOverlayMountInfoSize(target string, optionsBytes int) error {
 	}
 	const mountInfoOverhead = 1024 // Fixed fields, mount IDs and optional flags.
 	if len(mountInfoEscape.Replace(resolvedTarget))+mountInfoOverhead+optionsBytes >= bufio.MaxScanTokenSize {
-		return fmt.Errorf("ordered lowerdirs exceed the supported mountinfo line limit of %d bytes", bufio.MaxScanTokenSize-1)
+		return fmt.Errorf("%w of %d bytes", errOverlayMountInfoLimit, bufio.MaxScanTokenSize-1)
 	}
 	return nil
 }

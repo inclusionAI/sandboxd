@@ -89,6 +89,7 @@ func TestReadonlyOverlayCompactFallback(t *testing.T) {
 		{name: "permission error", nativeErr: unix.EPERM},
 		{name: "attach error", nativeErr: unix.EINVAL},
 		{name: "compact legacy mount", nativeErr: unsupported, wantCompact: true},
+		{name: "native mountinfo limit", nativeErr: errOverlayMountInfoLimit, wantCompact: true},
 		{name: "cannot fit", nativeErr: unsupported, compactErr: tooLarge, wantCompact: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
