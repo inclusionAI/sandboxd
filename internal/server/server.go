@@ -1746,6 +1746,14 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}, startFailure(ctx, "runtime start ("+startReq.Runtime+")", err)
 	}
 	runtimeStarted = true
+	tailStart := time.Now()
+	tailStage := tailStart
+	tailPhases := logrus.Fields{"sandbox": sandboxID}
+	defer func() {
+		tailPhases["total_ms"] = time.Since(tailStart).Seconds() * 1000
+		tailPhases["success"] = startSucceeded
+		logrus.WithFields(tailPhases).Debug("sandbox start tail phases")
+	}()
 
 	// If Ports are specified, set up DNAT rules using sandbox IP from startSandboxRuntime.
 	if len(startReq.Ports) > 0 {
@@ -1764,6 +1772,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		dnatConfigured = true
 	}
 
+	tailPhases["dnat_ms"] = time.Since(tailStage).Seconds() * 1000
+	tailStage = time.Now()
 	if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
@@ -1771,6 +1781,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}, err
 	}
 	filesystemCommitted = true
+	tailPhases["filesystem_ms"] = time.Since(tailStage).Seconds() * 1000
+	tailStage = time.Now()
 	metadata := &runtime.SandboxMetadata{
 		ID:             sandboxID,
 		RuntimeHandler: startReq.Runtime,
@@ -1785,11 +1797,14 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			Message: fmt.Sprintf("Failed to persist sandbox metadata: %v", err),
 		}, err
 	}
+	tailPhases["metadata_ms"] = time.Since(tailStage).Seconds() * 1000
+	tailStage = time.Now()
 	h.sandboxManager.ReceiveEvent(sandbox.Event{
 		Type:      sandbox.EventTypeCreate,
 		MetaData:  metadata,
 		SandboxID: sandboxID,
 	})
+	tailPhases["create_event_ms"] = time.Since(tailStage).Seconds() * 1000
 	startSucceeded = true
 	managedCommitted = true
 	return &runtime.StartResponse{
