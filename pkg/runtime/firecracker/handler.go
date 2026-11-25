@@ -72,6 +72,7 @@ var (
 )
 
 type firecrackerPersistedState struct {
+	Sealed      bool                      `json:"sealed,omitempty"`
 	ID          string                    `json:"id"`
 	PID         int                       `json:"pid"`
 	BundlePath  string                    `json:"bundle_path"`
@@ -213,6 +214,8 @@ func (instance *firecrackerInstance) shouldPersist() bool {
 
 // Handler manages the Firecracker microVM lifecycle.
 type Handler struct {
+	sealedHelper      string
+	sealedScratch     string
 	writableIOEngine  string
 	writableCacheType string
 	binary            string
@@ -377,6 +380,9 @@ func NewHandlerForRuntime(
 		)
 	}
 	applyFirecrackerDefaults(&firecrackerConfig)
+	if err := validateSealedConfig(firecrackerConfig, runtimeName); err != nil {
+		return nil, err
+	}
 	if err := validateFirecrackerWritablePolicy(firecrackerConfig); err != nil {
 		return nil, err
 	}
@@ -434,6 +440,8 @@ func NewHandlerForRuntime(
 		sandboxRoot:            sandboxRoot,
 		storageRoot:            storageRoot,
 		runtimeRoot:            firecrackerproto.HostRuntimeRoot,
+		sealedHelper:           firecrackerConfig.SealedCheckpointHelper,
+		sealedScratch:          firecrackerConfig.SealedCheckpointScratch,
 		writableIOEngine:       firecrackerConfig.WritableIOEngine,
 		writableCacheType:      firecrackerConfig.WritableCacheType,
 		kernelPath:             firecrackerConfig.KernelImagePath,
@@ -816,6 +824,7 @@ func (handler *Handler) Start(
 		"--api-sock", apiPath,
 		"--id", startConfig.ID,
 	)
+	command.Env = sealedVMMEnv(false)
 	command.Dir = stateDir
 	command.Stdout = stdout
 	command.Stderr = stderr
@@ -1132,6 +1141,11 @@ func (handler *Handler) Delete(ctx context.Context, sandboxID string) error {
 		}
 	}
 	handler.stopInstance(instance, false)
+	if state.Sealed {
+		if err := handler.cleanSealedScratch(filepath.Dir(state.OverlayPath)); err != nil {
+			return err
+		}
+	}
 	handler.mu.Lock()
 	delete(handler.instances, sandboxID)
 	handler.mu.Unlock()

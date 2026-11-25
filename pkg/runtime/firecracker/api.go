@@ -152,6 +152,9 @@ func (api *firecrackerAPI) loadSnapshot(
 	virtioFSSocketPath,
 	virtioFSStatePath string,
 ) error {
+	return api.loadSnapshotRunning(ctx, statePath, memoryPath, liveMemoryPath, tapName, vsockPath, virtioFSSocketPath, virtioFSStatePath, true)
+}
+func (api *firecrackerAPI) loadSnapshotRunning(ctx context.Context, statePath, memoryPath, liveMemoryPath, tapName, vsockPath, virtioFSSocketPath, virtioFSStatePath string, resume bool) error {
 	backend := map[string]string{
 		"backend_type": "File",
 		"backend_path": memoryPath,
@@ -167,7 +170,7 @@ func (api *firecrackerAPI) loadSnapshot(
 		"snapshot_path":     statePath,
 		"mem_backend":       backend,
 		"track_dirty_pages": true,
-		"resume_vm":         true,
+		"resume_vm":         resume,
 		"network_overrides": []map[string]string{{
 			"iface_id":      "eth0",
 			"host_dev_name": tapName,

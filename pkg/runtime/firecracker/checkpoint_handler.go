@@ -74,6 +74,9 @@ func (handler *Handler) Checkpoint(
 	hasVirtioFS := state.VirtioFS != nil
 
 	api := newFirecrackerAPI(state.APIPath)
+	if state.Sealed {
+		return handler.checkpointSealed(ctx, config, instance, state, api)
+	}
 	requestedType, err := resolveRequestedSnapshotType(
 		handler.checkpointMode, config.SnapshotType,
 	)
@@ -136,51 +139,8 @@ func (handler *Handler) Checkpoint(
 	}
 	tPrepared := time.Now()
 
-	// Best-effort guest flush (U4): sync the writable layer while the guest is
-	// still running, so the overlay cloned below captures quiesced data. A
-	// miss (old guest agent, slow sync, dead vsock) never fails the checkpoint
-	// — the overlay clone is crash-consistent either way.
+	handler.prepareGuestCheckpoint(ctx, state)
 	tFlushed := time.Now()
-	flushCtx, flushCancel := context.WithTimeout(ctx, firecrackerFlushTimeout)
-	flushErr := requestFirecrackerAgentWaiting(
-		flushCtx,
-		state.VsockPath,
-		firecrackerproto.MessageFlush,
-		nil,
-		firecrackerFlushTimeout,
-	)
-	flushCancel()
-	tFlushed = time.Now()
-	if flushErr != nil {
-		logrus.Debugf(
-			"firecracker: guest flush before checkpointing %s skipped: %v",
-			sandboxID, flushErr,
-		)
-	}
-
-	// Best-effort guest shrink (E2B absorption), config-gated because it is
-	// net-negative for read-hot workloads: dropping the caches makes the next
-	// re-read re-materialize pages through block DMA, which re-dirties the
-	// next window (measured: snapshot phase 23-72ms without vs 130-143ms with
-	// on a continuous 512MiB re-read loop). It helps long parks of
-	// cold-cache sandboxes, which is why it stays available.
-	if handler.shrinkBeforeCheckpoint {
-		shrinkCtx, shrinkCancel := context.WithTimeout(ctx, firecrackerFlushTimeout)
-		shrinkErr := requestFirecrackerAgentWaiting(
-			shrinkCtx,
-			state.VsockPath,
-			firecrackerproto.MessageShrink,
-			nil,
-			firecrackerFlushTimeout,
-		)
-		shrinkCancel()
-		if shrinkErr != nil {
-			logrus.Debugf(
-				"firecracker: guest shrink before checkpointing %s skipped: %v",
-				sandboxID, shrinkErr,
-			)
-		}
-	}
 
 	if err := api.pause(ctx); err != nil {
 		discardUnsealedFirecrackerCheckpoint(files)
@@ -375,6 +335,52 @@ func (handler *Handler) Checkpoint(
 		sandboxID, snapshotType, memoryInfo.Size()>>20, config.Directory,
 	)
 	return nil
+}
+
+func (handler *Handler) prepareGuestCheckpoint(ctx context.Context, state firecrackerPersistedState) {
+	// Best-effort guest flush (U4): sync the writable layer while the guest is
+	// still running, so the overlay cloned below captures quiesced data. A
+	// miss (old guest agent, slow sync, dead vsock) never fails the checkpoint
+	// — the overlay clone is crash-consistent either way.
+	flushCtx, flushCancel := context.WithTimeout(ctx, firecrackerFlushTimeout)
+	flushErr := requestFirecrackerAgentWaiting(
+		flushCtx,
+		state.VsockPath,
+		firecrackerproto.MessageFlush,
+		nil,
+		firecrackerFlushTimeout,
+	)
+	flushCancel()
+	if flushErr != nil {
+		logrus.Debugf(
+			"firecracker: guest flush before checkpointing %s skipped: %v",
+			state.ID, flushErr,
+		)
+	}
+
+	// Best-effort guest shrink (E2B absorption), config-gated because it is
+	// net-negative for read-hot workloads: dropping the caches makes the next
+	// re-read re-materialize pages through block DMA, which re-dirties the
+	// next window (measured: snapshot phase 23-72ms without vs 130-143ms with
+	// on a continuous 512MiB re-read loop). It helps long parks of
+	// cold-cache sandboxes, which is why it stays available.
+	if handler.shrinkBeforeCheckpoint {
+		shrinkCtx, shrinkCancel := context.WithTimeout(ctx, firecrackerFlushTimeout)
+		shrinkErr := requestFirecrackerAgentWaiting(
+			shrinkCtx,
+			state.VsockPath,
+			firecrackerproto.MessageShrink,
+			nil,
+			firecrackerFlushTimeout,
+		)
+		shrinkCancel()
+		if shrinkErr != nil {
+			logrus.Debugf(
+				"firecracker: guest shrink before checkpointing %s skipped: %v",
+				state.ID, shrinkErr,
+			)
+		}
+	}
 }
 
 func (handler *Handler) finishCheckpointedSandbox(
@@ -1016,14 +1022,34 @@ func (handler *Handler) Restore(
 	// memory into sandbox-owned shared live storage, while other restores map
 	// it privately. The writable layer is always sandbox-owned.
 	tPrepared := time.Now()
-	checkpointFiles, memorySize, err := instantiateFirecrackerCheckpoint(
-		ctx,
-		artifact,
-		&handler.digestCache,
-		startConfig.CheckpointDir,
-		stateDir,
-		filepath.Join(storageDir, "overlay.ext4"),
-	)
+	sealed := handler.sealedHelper != "" && artifact.Layout == firecrackerCheckpointLayoutV2Directory && !checkpointHasVirtioFS
+	var checkpointFiles firecrackerCheckpointFiles
+	var memorySize int64
+	if sealed {
+		defer func() {
+			if !keepStorage {
+				if err := handler.cleanSealedScratch(storageDir); err != nil {
+					// Retain the ownership receipt so cleanup can be retried.
+					keepStorage = true
+					retErr = errors.Join(retErr, err)
+				}
+			}
+		}()
+		diskLimit := startConfig.WritableLayerLimitBytes
+		if diskLimit == 0 {
+			diskLimit = handler.defaultDisk
+		}
+		checkpointFiles, memorySize, err = handler.instantiateSealed(ctx, artifact, storageDir, stateDir, diskLimit)
+	} else {
+		checkpointFiles, memorySize, err = instantiateFirecrackerCheckpoint(
+			ctx,
+			artifact,
+			&handler.digestCache,
+			startConfig.CheckpointDir,
+			stateDir,
+			filepath.Join(storageDir, "overlay.ext4"),
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -1069,6 +1095,7 @@ func (handler *Handler) Restore(
 		"--api-sock", apiPath,
 		"--id", startConfig.ID,
 	)
+	command.Env = sealedVMMEnv(sealed)
 	command.Dir = stateDir
 	command.Stdout = stdout
 	command.Stderr = stderr
@@ -1090,6 +1117,7 @@ func (handler *Handler) Restore(
 			APIPath:     apiPath,
 			VsockPath:   vsockPath,
 			OverlayPath: checkpointFiles.Overlay,
+			Sealed:      sealed,
 			VirtioFS:    virtioFSState,
 			MemoryMiB:   uint32(memorySize >> 20),
 			Vcpus:       restoredVcpus,
@@ -1135,7 +1163,7 @@ func (handler *Handler) Restore(
 	}
 	readyCancel()
 	tReady := time.Now()
-	if err := api.loadSnapshot(
+	if err := api.loadSnapshotRunning(
 		startupCtx,
 		checkpointFiles.State,
 		checkpointFiles.Memory,
@@ -1144,8 +1172,17 @@ func (handler *Handler) Restore(
 		vsockPath,
 		virtioFSSocketPathIfConfigured(virtioFSState),
 		checkpointFiles.VirtioFSState,
+		!sealed,
 	); err != nil {
 		return fmt.Errorf("load Firecracker checkpoint for %s: %w", startConfig.ID, err)
+	}
+	if sealed {
+		if err := verifySealedMapping(command.Process.Pid, filepath.Join(storageDir, "sealed", "epochs")); err != nil {
+			return err
+		}
+		if err := api.resume(startupCtx); err != nil {
+			return err
+		}
 	}
 	tLoaded := time.Now()
 	agentCtx, agentCancel := context.WithTimeout(startupCtx, firecrackerAgentTimeout)

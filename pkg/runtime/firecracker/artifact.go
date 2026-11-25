@@ -40,6 +40,7 @@ const (
 	firecrackerSnapshotTypeFull        = "Full"
 	firecrackerSnapshotTypeIncremental = "Incremental"
 	firecrackerSnapshotTypeSoftDirty   = "SoftDirty"
+	firecrackerSnapshotTypeDiff        = "Diff"
 )
 
 // firecrackerCheckpointCompat pins the software stack a checkpoint was
@@ -346,7 +347,7 @@ func readFirecrackerCheckpointManifest(dir string) (*firecrackerCheckpointManife
 		)
 	}
 	switch manifest.SnapshotType {
-	case firecrackerSnapshotTypeFull,
+	case firecrackerSnapshotTypeDiff, firecrackerSnapshotTypeFull,
 		firecrackerSnapshotTypeIncremental,
 		firecrackerSnapshotTypeSoftDirty:
 	default:
