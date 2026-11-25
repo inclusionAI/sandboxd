@@ -92,6 +92,7 @@ platform = "systrap"
 background_restore = false
 # Use "reflink" only when live filestores and checkpoints share a filesystem
 # supporting FICLONE for the runtime's mount namespaces. See checkpoint-restore.md.
+# Experimental "incremental" uses local XFS and a shared JuiceFS generation directory.
 checkpoint_mode = "full"
 # Bypass the page cache for uncompressed checkpoint pages on storage supporting O_DIRECT.
 checkpoint_direct_io = false

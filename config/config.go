@@ -201,9 +201,7 @@ type RunscConfig struct {
 	// ExtraArgs supplies operator-owned runsc flags. Nil preserves --net-raw;
 	// an explicitly empty list disables that default.
 	ExtraArgs []string `toml:"extra_args" json:"extraArgs"`
-	// CheckpointMode selects full page serialization (the default) or reflink
-	// snapshots of writable filestores. Reflink requires a matching runsc bundle
-	// and a shared reflink-capable filesystem for live and saved filestores.
+	// CheckpointMode selects full (default), reflink, or incremental root filestore publication.
 	CheckpointMode string `toml:"checkpoint_mode" json:"checkpointMode"`
 	// CheckpointDirectIO uses direct I/O for uncompressed checkpoint pages.
 	CheckpointDirectIO bool `toml:"checkpoint_direct_io" json:"checkpointDirectIO"`
@@ -362,13 +360,13 @@ func NormalizeRunscPlatform(value string) (string, error) {
 
 // NormalizeRunscCheckpointMode validates the node-owned checkpoint policy.
 func NormalizeRunscCheckpointMode(value string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
+	switch mode := strings.ToLower(strings.TrimSpace(value)); mode {
 	case "", "full":
 		return "full", nil
-	case "reflink":
-		return "reflink", nil
+	case "reflink", "incremental":
+		return mode, nil
 	default:
-		return "", fmt.Errorf("runsc checkpoint_mode must be full or reflink, got %q", value)
+		return "", fmt.Errorf("runsc checkpoint_mode must be full, reflink, or incremental, got %q", value)
 	}
 }
 

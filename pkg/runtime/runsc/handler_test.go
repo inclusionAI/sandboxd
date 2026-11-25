@@ -47,7 +47,7 @@ func TestNewRunscHandlerUsesSharedLogFile(t *testing.T) {
 }
 
 func TestNewRunscHandlerPropagatesCheckpointOptions(t *testing.T) {
-	for _, mode := range []string{"full", "reflink"} {
+	for _, mode := range []string{"full", "reflink", "incremental"} {
 		for _, background := range []bool{false, true} {
 			t.Run(fmt.Sprintf("mode=%s/background=%t", mode, background), func(t *testing.T) {
 				base := t.TempDir()
@@ -64,6 +64,7 @@ func TestNewRunscHandlerPropagatesCheckpointOptions(t *testing.T) {
 				assert.True(t, client.Options.CheckpointDirectIO)
 				assert.Equal(t, background, client.Options.BackgroundRestore)
 				assert.Equal(t, mode == "reflink", client.Options.ReflinkFilestores)
+				assert.Equal(t, mode == "incremental", client.Options.IncrementalFilestores)
 			})
 		}
 	}

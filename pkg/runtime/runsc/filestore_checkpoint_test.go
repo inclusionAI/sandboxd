@@ -238,7 +238,37 @@ func TestHandlerValidatesReflinkMode(t *testing.T) {
 		t.Fatal("reflink mode was not propagated")
 	}
 	cfg.RuntimeConfig.Runsc.CheckpointMode = "incremental"
-	if _, err := NewHandler(cfg, "runsc", nil); err == nil {
-		t.Fatal("accepted unsupported runsc mode")
+	if h, err := NewHandler(cfg, "runsc", nil); err != nil || !h.runsc.(*Client).Options.IncrementalFilestores {
+		t.Fatalf("incremental mode was not propagated: %v", err)
+	}
+}
+
+func TestIncrementalGenerationState(t *testing.T) {
+	root := t.TempDir()
+	c := NewClientWithOptions("runsc", root, Options{FilestoreDir: root, IncrementalFilestores: true})
+	origin := t.TempDir()
+	manifest := filepath.Join(origin, filestoreManifestName)
+	if err := os.WriteFile(manifest, []byte(`{"filestores":[{"file":"filestore-0"},{"file":"filestore-1"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.createGenerationState("worker", origin); err == nil {
+		t.Fatal("accepted multiple filestores")
+	}
+	if err := os.WriteFile(manifest, []byte(`{"filestores":[{"file":"filestore-0"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.createGenerationState("worker", origin); err != nil {
+		t.Fatal(err)
+	}
+	// A running sandbox keeps its capture lineage across a daemon restart.
+	restarted := NewClientWithOptions("runsc", root, Options{FilestoreDir: root})
+	if exists, err := restarted.hasGenerationState("worker"); err != nil || !exists {
+		t.Fatalf("lost capture state: %v", err)
+	}
+	if err := restarted.removeGenerationState("worker"); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := restarted.hasGenerationState("worker"); err != nil || exists {
+		t.Fatalf("retained deleted generation state: %v", err)
 	}
 }

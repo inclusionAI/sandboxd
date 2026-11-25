@@ -133,7 +133,7 @@ func TestExtraArgs(t *testing.T) {
 			t.Fatalf("extra args = %v, want %v", client.Options.ExtraArgs, want)
 		}
 	}
-	for _, arg := range []string{"", "--", "--log", "--log-format", "--net-raw", "--allow-packet-socket-write", "create", "true", "--root=/other", "--network=host", "--platform=kvm", "--overlay2=none", "--ignore-cgroups=true", "--debug-log=/other", "--bundle=/other"} {
+	for _, arg := range []string{"", "--", "--log", "--log-format", "--net-raw", "--allow-packet-socket-write", "create", "true", "--root=/other", "--network=host", "--platform=kvm", "--overlay2=none", "--ignore-cgroups=true", "--debug-log=/other", "--bundle=/other", "--filestore-lazy-restore=lazy"} {
 		if err := validateExtraArgs([]string{arg}); err == nil {
 			t.Errorf("accepted invalid extra arg %q", arg)
 		}

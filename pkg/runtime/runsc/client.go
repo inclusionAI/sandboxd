@@ -59,16 +59,17 @@ type Client struct {
 }
 
 type Options struct {
-	ExtraArgs          []string
-	Platform           string
-	FilestoreDir       string
-	OverlayTmpfsSize   string
-	DebugLogPath       string
-	IgnoreCgroups      bool
-	PlatformDevicePath string
-	CheckpointDirectIO bool
-	BackgroundRestore  bool
-	ReflinkFilestores  bool
+	ExtraArgs             []string
+	Platform              string
+	FilestoreDir          string
+	OverlayTmpfsSize      string
+	DebugLogPath          string
+	IgnoreCgroups         bool
+	PlatformDevicePath    string
+	CheckpointDirectIO    bool
+	BackgroundRestore     bool
+	ReflinkFilestores     bool
+	IncrementalFilestores bool
 }
 
 type StartArgs struct {
@@ -106,7 +107,7 @@ func NewClientWithOptions(binary, rootDir string, options Options) *Client {
 // Create performs the single required runsc binary exec. It intentionally uses
 // regular files for stdio so the boot/gofer processes do not inherit pipes held
 // by exec.Cmd, which can otherwise make create appear to hang.
-func (c *Client) Create(ctx context.Context, args StartArgs) error {
+func (c *Client) Create(ctx context.Context, args StartArgs) (retErr error) {
 	if args.ID == "" {
 		return fmt.Errorf("container id is empty")
 	}
@@ -166,16 +167,31 @@ func (c *Client) Create(ctx context.Context, args StartArgs) error {
 		rootOverlay = RootFileOverlay(c.Options.FilestoreDir, c.Options.OverlayTmpfsSize)
 	}
 	cmdArgs = append(cmdArgs, "--overlay2="+rootOverlay)
-	if c.Options.ReflinkFilestores || args.ManagedFilestores || args.FilestoreAdoptDir != "" {
+	if c.Options.IncrementalFilestores || c.Options.ReflinkFilestores || args.ManagedFilestores || args.FilestoreAdoptDir != "" {
 		// Older kernels require identical mount objects for FICLONE. Fresh
 		// backing files must use the launcher's mount, like checkpoint files.
 		cmdArgs = append(cmdArgs, "--filestore-parent-mountns=true")
 	}
 	if args.FilestoreAdoptDir != "" {
-		cmdArgs = append(cmdArgs,
-			"--filestore-adopt-dir="+args.FilestoreAdoptDir,
-			"--filestore-clone-on-adopt=true",
-		)
+		cmdArgs = append(cmdArgs, "--filestore-adopt-dir="+args.FilestoreAdoptDir)
+		if c.Options.IncrementalFilestores {
+			cmdArgs = append(cmdArgs, "--filestore-lazy-restore=lazy")
+		} else {
+			cmdArgs = append(cmdArgs, "--filestore-clone-on-adopt=true")
+		}
+	}
+	if c.Options.IncrementalFilestores {
+		if args.ManagedFilestores {
+			return fmt.Errorf("incremental checkpoint supports a single root filestore")
+		}
+		if err := c.createGenerationState(args.ID, args.FilestoreAdoptDir); err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil {
+				_ = c.removeGenerationState(args.ID)
+			}
+		}()
 	}
 	cmdArgs = append(cmdArgs, "create")
 	cmdArgs = append(cmdArgs,
@@ -231,7 +247,7 @@ func validateExtraArgs(args []string) error {
 			return fmt.Errorf("invalid extra_args entry %q: use --name=value (including booleans)", arg)
 		}
 		switch name {
-		case "--root", "--platform", "--network", "--overlay2", "--ignore-cgroups", "--debug-log", "--bundle", "--filestore-adopt-dir", "--filestore-clone-on-adopt", "--filestore-parent-mountns", "--allow-rootfs-tar-annotation", "--restore-spec-validation":
+		case "--root", "--platform", "--network", "--overlay2", "--ignore-cgroups", "--debug-log", "--bundle", "--filestore-adopt-dir", "--filestore-clone-on-adopt", "--filestore-lazy-restore", "--filestore-parent-mountns", "--allow-rootfs-tar-annotation", "--restore-spec-validation":
 			return fmt.Errorf("extra_args cannot override sandboxd-managed flag %s", name)
 		}
 	}
@@ -459,6 +475,11 @@ func (c *Client) Checkpoint(
 	}
 	if leaveRunning {
 		args = append(args, "--leave-running")
+	}
+	if state, err := c.hasGenerationState(id); err != nil {
+		return err
+	} else if state {
+		return c.captureGeneration(ctx, id, imageDir, args)
 	}
 	reflink, err := c.useReflinkCheckpoint(id)
 	if err != nil {
@@ -741,11 +762,11 @@ func (c *Client) Delete(ctx context.Context, id string, force bool) error {
 			return ctxErr
 		}
 		if force && isRunscNotFound(output) {
-			return nil
+			return c.removeGenerationState(id)
 		}
 		return fmt.Errorf("runsc delete %s failed: %w: %s", id, err, string(output))
 	}
-	return nil
+	return c.removeGenerationState(id)
 }
 
 func isRunscNotFound(output []byte) bool {
