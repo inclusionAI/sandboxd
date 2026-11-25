@@ -59,7 +59,7 @@ func TestReadonlyOverlayLegacyByteLimit(t *testing.T) {
 				}
 				return unix.ENOSYS
 			}
-			err := mountReadonlyOverlayWith("/merged", lowerDirs, pageSize, legacy, structured)
+			err := mountReadonlyOverlayWith("/merged", lowerDirs, pageSize, legacy, structured, nil)
 			if tc.structured {
 				if !errors.Is(err, unix.ENOSYS) || !strings.Contains(err.Error(), "4096 bytes, exceeding the legacy mount limit of 4095 bytes") {
 					t.Fatalf("expected byte limit and original error, got %v", err)
@@ -69,6 +69,68 @@ func TestReadonlyOverlayLegacyByteLimit(t *testing.T) {
 			}
 			if calls != 1 {
 				t.Fatalf("got %d mount attempts, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestReadonlyOverlayCompactFallback(t *testing.T) {
+	const pageSize = 4096
+	lowerDirs := []string{"/top", "/" + strings.Repeat("x", pageSize)}
+	unsupported := fmt.Errorf("%w: VFS: Legacy: Cumulative options too large: %w", errStructuredOverlayUnavailable, unix.EINVAL)
+	tooLarge := errors.New("compact lowerdirs exceed the budget")
+	for _, tc := range []struct {
+		name        string
+		nativeErr   error
+		compactErr  error
+		wantCompact bool
+	}{
+		{name: "native succeeds"},
+		{name: "permission error", nativeErr: unix.EPERM},
+		{name: "attach error", nativeErr: unix.EINVAL},
+		{name: "compact legacy mount", nativeErr: unsupported, wantCompact: true},
+		{name: "cannot fit", nativeErr: unsupported, compactErr: tooLarge, wantCompact: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const compact = "lowerdir=/a/c2/fs:/a/c1/fs"
+			var calls []string
+			err := mountReadonlyOverlayWith("/merged", lowerDirs, pageSize,
+				func(target, data string) error {
+					calls = append(calls, "legacy")
+					if target != "/merged" || data != compact {
+						t.Fatalf("unexpected compact mount %s with %q", target, data)
+					}
+					return nil
+				},
+				func(target string, dirs []string) error {
+					calls = append(calls, "native")
+					if target != "/merged" || !slices.Equal(dirs, lowerDirs) {
+						t.Fatal("structured mount must receive the canonical paths")
+					}
+					return tc.nativeErr
+				},
+				func(budget int) (string, error) {
+					calls = append(calls, "compact")
+					if budget != pageSize-1 {
+						t.Fatalf("budget = %d, want %d", budget, pageSize-1)
+					}
+					return compact, tc.compactErr
+				})
+			wantCalls := []string{"native"}
+			wantErr := tc.nativeErr
+			if tc.wantCompact {
+				wantCalls = append(wantCalls, "compact")
+				if tc.compactErr == nil {
+					wantCalls = append(wantCalls, "legacy")
+					wantErr = nil
+				}
+			}
+			if !slices.Equal(calls, wantCalls) || !errors.Is(err, wantErr) {
+				t.Fatalf("calls = %v, err = %v, want %v and %v", calls, err, wantCalls, wantErr)
+			}
+			if tc.compactErr != nil &&
+				(!errors.Is(err, tc.compactErr) || !strings.Contains(err.Error(), "Cumulative options too large")) {
+				t.Fatalf("expected both failures, got %v", err)
 			}
 		})
 	}
@@ -130,7 +192,8 @@ func TestReadonlyOCIOverlayKernelMount(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			if err := defaultOverlayMount(merged, layers); err != nil {
+			mgr := &Manager{}
+			if err := mgr.mountOverlay(&OciMountTxnRecord{MountPath: merged, LowerDirs: layers}); err != nil {
 				t.Fatal(err)
 			}
 			assertFile := func(name, want string) {

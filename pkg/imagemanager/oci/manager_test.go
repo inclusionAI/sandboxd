@@ -2134,7 +2134,7 @@ func newTestManager(t *testing.T) *Manager {
 		chainLocks:   make(map[string]*imageLockEntry),
 		stopCh:       make(chan struct{}),
 		now:          func() time.Time { return time.Unix(1700000000, 0) },
-		mountFn:      func(string, []string) error { return nil },
+		mountFn:      func(*OciMountTxnRecord) error { return nil },
 		unmountFn:    func(string) error { return nil },
 		readMnts:     func() (map[string]*mountinfo.Info, bool, error) { return map[string]*mountinfo.Info{}, false, nil },
 		diskUsage:    func(string) (float64, error) { return 0, nil },

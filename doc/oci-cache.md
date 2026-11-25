@@ -1,6 +1,8 @@
 # OCI cache retention
 
-Multi-layer OCI root filesystems use a read-only OverlayFS mount. Sandboxd checks the serialized options against the running kernel's legacy `mount(2)` limit of one page minus one byte. Larger lists use the kernel's `fsconfig` `lowerdir+` interface with one path per layer in priority order. The kernel and the sandboxd mountinfo reader must be able to represent the full list. If they cannot, preparation fails with the applicable limit. Sandboxd verifies the mounted layer order before publishing the mount or adopting it on restart.
+Multi-layer OCI root filesystems use a read-only OverlayFS mount. Sandboxd checks the serialized options against the running kernel's legacy `mount(2)` limit of one page minus one byte. Larger lists first use `fsconfig` with one `lowerdir+` option per layer in priority order. When the kernel rejects that representation during setup, sandboxd can retry with a single legacy `lowerdir=` list using a short symlink to the existing chain cache. The same layers and cache references are used with either representation.
+
+The compatibility path creates a symlink per mount under the private `/run/sandboxd-oci` directory. Keep this directory writable by sandboxd and available for as long as the mounts survive, including across daemon restarts. Sandboxd verifies the symlink's destination and the read-only ordered layer list before publishing or adopting a compact mount. The mount journal covers symlink cleanup after a failed attempt or restart, and normal teardown removes the symlink after detaching the mount. If the compact options still exceed the byte limit, preparation fails with the required size, the budget, and any available kernel diagnostic.
 
 Single-layer images use read-only bind mounts. Sandboxd verifies the mount's read-only flag before publishing or reusing it, including when recovering a mount interrupted during its initial setup.
 

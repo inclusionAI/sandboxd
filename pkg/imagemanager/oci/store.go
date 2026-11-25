@@ -63,6 +63,7 @@ type OciMountRecord struct {
 	LayerDigests  []string             `json:"layer_digests"`
 	ChainIDs      []string             `json:"chain_ids,omitempty"`
 	LowerDirs     []string             `json:"lower_dirs"`
+	LowerDirAlias string               `json:"lowerdir_alias,omitempty"`
 	Env           []string             `json:"env,omitempty"`
 	ImageProcess  *imageconfig.Process `json:"image_process,omitempty"`
 	CreatedAtUnix int64                `json:"created_at_unix"`
@@ -76,6 +77,7 @@ type OciMountTxnRecord struct {
 	LayerDigests  []string `json:"layer_digests"`
 	ChainIDs      []string `json:"chain_ids,omitempty"`
 	LowerDirs     []string `json:"lower_dirs"`
+	LowerDirAlias string   `json:"lowerdir_alias,omitempty"`
 	CreatedAtUnix int64    `json:"created_at_unix"`
 }
 

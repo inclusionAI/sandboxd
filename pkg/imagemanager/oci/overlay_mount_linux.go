@@ -18,13 +18,17 @@ package oci
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
-func mountReadonlyOverlay(target string, lowerDirs []string) error {
+var errStructuredOverlayUnavailable = errors.New("structured OverlayFS options unavailable")
+
+func mountReadonlyOverlay(target string, lowerDirs []string, compactData func(int) (string, error)) error {
 	return mountReadonlyOverlayWith(target, lowerDirs, os.Getpagesize(), func(target, data string) error {
 		if err := checkOverlayMountInfoSize(target, len(mountInfoEscape.Replace(data))); err != nil {
 			return err
@@ -32,7 +36,7 @@ func mountReadonlyOverlay(target string, lowerDirs []string) error {
 		// A lower-only overlay is read-only. Some kernels reject MS_RDONLY
 		// on the legacy path.
 		return unix.Mount("overlay", target, "overlay", 0, data)
-	}, mountReadonlyOverlayLayers)
+	}, mountReadonlyOverlayLayers, compactData)
 }
 
 func mountReadonlyOverlayWith(
@@ -41,6 +45,7 @@ func mountReadonlyOverlayWith(
 	pageSize int,
 	mountLegacy func(string, string) error,
 	mountLayers func(string, []string) error,
+	compactData func(int) (string, error),
 ) error {
 	data, err := buildOverlayMountData(lowerDirs)
 	if err != nil {
@@ -52,8 +57,19 @@ func mountReadonlyOverlayWith(
 		return mountLegacy(target, data)
 	}
 	if err := mountLayers(target, lowerDirs); err != nil {
-		return fmt.Errorf("overlay options use %d bytes, exceeding the legacy mount limit of %d bytes for %d layers: %w",
+		structuredErr := fmt.Errorf("overlay options use %d bytes, exceeding the legacy mount limit of %d bytes for %d layers: %w",
 			len(data), pageSize-1, len(lowerDirs), err)
+		if compactData == nil || !errors.Is(err, errStructuredOverlayUnavailable) {
+			return structuredErr
+		}
+		data, err := compactData(pageSize - 1)
+		if err == nil {
+			if err := mountLegacy(target, data); err != nil {
+				return fmt.Errorf("%w (mount compact lowerdirs using %d of %d bytes: %w)", structuredErr, len(data), pageSize-1, err)
+			}
+			return nil
+		}
+		return fmt.Errorf("%w (prepare compact lowerdirs: %w)", structuredErr, err)
 	}
 	return nil
 }
@@ -69,19 +85,25 @@ func mountReadonlyOverlayLayers(target string, lowerDirs []string) error {
 
 	fsFD, err := unix.Fsopen("overlay", unix.FSOPEN_CLOEXEC)
 	if err != nil {
-		return fmt.Errorf("open overlay filesystem context: %w", err)
+		err = fmt.Errorf("open overlay filesystem context: %w", err)
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EOPNOTSUPP) {
+			return fmt.Errorf("%w: %w", errStructuredOverlayUnavailable, err)
+		}
+		return err
 	}
 	defer unix.Close(fsFD)
 	if err := unix.FsconfigSetFlag(fsFD, "ro"); err != nil {
-		return fmt.Errorf("configure overlay read-only: %w", err)
+		return overlayContextError(fsFD, "configure overlay read-only", err)
 	}
 	for i, dir := range lowerDirs {
 		if err := unix.FsconfigSetString(fsFD, "lowerdir+", dir); err != nil {
-			return fmt.Errorf("configure overlay lowerdir+ layer %d of %d (path is %d bytes): %w", i+1, len(lowerDirs), len(dir), err)
+			step := fmt.Sprintf("configure overlay lowerdir+ layer %d of %d (path is %d bytes)", i+1, len(lowerDirs), len(dir))
+			return overlayContextError(fsFD, step, err)
 		}
 	}
 	if err := unix.FsconfigCreate(fsFD); err != nil {
-		return fmt.Errorf("create overlay from all %d lowerdir+ layers: %w", len(lowerDirs), err)
+		step := fmt.Sprintf("create overlay from all %d lowerdir+ layers", len(lowerDirs))
+		return overlayContextError(fsFD, step, err)
 	}
 	mountFD, err := unix.Fsmount(fsFD, unix.FSMOUNT_CLOEXEC, unix.MOUNT_ATTR_RDONLY)
 	if err != nil {
@@ -92,6 +114,32 @@ func mountReadonlyOverlayLayers(target string, lowerDirs []string) error {
 		return fmt.Errorf("attach ordered overlay mount: %w", err)
 	}
 	return nil
+}
+
+func overlayContextError(fd int, step string, cause error) error {
+	var buf [4096]byte
+	var messages []string
+	for range 16 {
+		n, err := unix.Read(fd, buf[:])
+		if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EMSGSIZE) {
+			continue
+		}
+		if err != nil || n == 0 {
+			break
+		}
+		messages = append(messages, strings.TrimSpace(string(buf[:n])))
+	}
+	// Older implementations reject lowerdir+ while setting parameters or
+	// when creating the filesystem. Some report only EINVAL. Retry the same
+	// layers through the legacy representation before attaching any mount.
+	if errors.Is(cause, unix.EINVAL) || errors.Is(cause, unix.ENAMETOOLONG) ||
+		errors.Is(cause, unix.ENOSYS) || errors.Is(cause, unix.EOPNOTSUPP) {
+		cause = fmt.Errorf("%w: %w", errStructuredOverlayUnavailable, cause)
+	}
+	if len(messages) > 0 {
+		return fmt.Errorf("%s: %w (%s)", step, cause, strings.Join(messages, "; "))
+	}
+	return fmt.Errorf("%s: %w", step, cause)
 }
 
 func checkOverlayMountInfoSize(target string, optionsBytes int) error {

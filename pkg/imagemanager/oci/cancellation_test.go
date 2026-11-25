@@ -35,7 +35,7 @@ func TestMountImageRetriesUnpublishedMountCleanup(t *testing.T) {
 
 	primaryErr := errors.New("verify mounted image")
 	mounts := 0
-	m.mountFn = func(string, []string) error {
+	m.mountFn = func(*OciMountTxnRecord) error {
 		mounts++
 		if mounts == 1 {
 			return primaryErr
