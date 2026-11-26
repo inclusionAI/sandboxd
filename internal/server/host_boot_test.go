@@ -17,6 +17,7 @@ import (
 func seedBootResourceStore(t *testing.T, dir string) *store.BboltStoreImp {
 	t.Helper()
 	db := store.NewStoreImp(filepath.Join(dir, "metadata.db"))
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	require.NoError(t, db.StoreRaw(config.CgroupBucket, []byte(`{"items":["/akernel/leased"]}`)))
 	require.NoError(t, db.StoreRaw(config.BridgeIpBucket, []byte(`{"items":["active-tap"]}`)))
 	require.NoError(t, db.StoreRaw("registration", []byte("retain-authoritative-metadata")))
@@ -64,7 +65,11 @@ func TestHostBootChangeRetiresOnlyKernelLeases(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(bundle), 0755))
 	require.NoError(t, os.WriteFile(bundle, []byte("retain-for-normal-reconciliation"), 0600))
 
+	// Startup reconciles the previous process's store before opening its handle.
+	require.NoError(t, db.Close())
 	require.NoError(t, reconcileHostBootID(dir, "boot-b"))
+	db = store.NewStoreImp(filepath.Join(dir, "metadata.db"))
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	for _, key := range []string{config.CgroupBucket, config.BridgeIpBucket} {
 		_, err := db.LoadRaw(key)
 		require.Error(t, err)

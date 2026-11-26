@@ -73,8 +73,8 @@ func (h *sandboxService) restoreACLState(restore aclRestoreFunc, owners []string
 		if !h.runscACLRecoveryPending.Load() {
 			return nil
 		}
-		h.aclMu.Lock()
-		defer h.aclMu.Unlock()
+		h.aclRecoveryMu.Lock()
+		defer h.aclRecoveryMu.Unlock()
 		if err := ctx.Err(); err != nil {
 			return err
 		}
