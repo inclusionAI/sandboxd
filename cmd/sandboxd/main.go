@@ -46,18 +46,22 @@ import (
 )
 
 var (
-	root          = config.DefaultRootDir
-	configFile    = ""
-	socketAddress = config.DefaultSocketAddress
-	httpAddress   = config.DefaultHttpAddress
-	pprofAddress  = ""
-	versionFlag   bool
-	logLevel      = "info"
-	logFile       = "./sandboxd.log"
+	root                       = config.DefaultRootDir
+	configFile                 = ""
+	socketAddress              = config.DefaultSocketAddress
+	httpAddress                = config.DefaultHttpAddress
+	pprofAddress               = ""
+	versionFlag                bool
+	checkpointImageArchiveFlag bool
+	logLevel                   = "info"
+	logFile                    = "./sandboxd.log"
 )
 
 func main() {
 	initFlag()
+	if checkpointImageArchiveFlag {
+		return
+	}
 	if versionFlag {
 		fmt.Printf("%s:\n", os.Args[0])
 		fmt.Println("  Version: ", version.Version)
@@ -142,6 +146,7 @@ func main() {
 
 func initFlag() {
 	flag.BoolVar(&versionFlag, "version", false, "print version information and exit")
+	flag.BoolVar(&checkpointImageArchiveFlag, "supports-checkpoint-image-archive", false, "report support for the checkpoint image archive and exit")
 	flag.StringVar(&root, "root", root, "configuration directory; config defaults to <root>/config.toml")
 	flag.StringVar(&configFile, "config", configFile, "path to config.toml; defaults to <root>/config.toml")
 	flag.StringVar(&socketAddress, "socket", socketAddress, "sandbox socket address")

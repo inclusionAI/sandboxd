@@ -37,19 +37,20 @@ import (
 
 // Config corresponds to the [plugin.image] sandboxd configuration section.
 type Config struct {
-	RegistrySchemes   map[string]string // Trusted exact-authority policy derived from managed profiles.
-	ManagementSocket  string            // Optional private Unix API for trusted runtime image preparation.
-	OCIZeroRefTTL     string            // Empty uses 30m; zero disables OCI TTL GC only.
-	ChunkDBSize       string            // ChunkDB map capacity; empty uses the distill-fs default.
-	Root              string
-	DistillFsBin      string
-	OSSTemplate       string
-	NydusTemplate     string
-	NydusSuffix       string
-	OSSAuthsPath      string
-	RegistryAuthsPath string
-	CgroupMemoryLimit string // human-readable: "512MiB" / "2GiB" / raw bytes; "0" / "" = no limit
-	DisableCgroup     bool
+	RegistrySchemes           map[string]string // Trusted exact-authority policy derived from managed profiles.
+	CheckpointArchiveRegistry string            // Trusted, worker-only Nydus archive served directly over its configured transport.
+	ManagementSocket          string            // Optional private Unix API for trusted runtime image preparation.
+	OCIZeroRefTTL             string            // Empty uses 30m; zero disables OCI TTL GC only.
+	ChunkDBSize               string            // ChunkDB map capacity; empty uses the distill-fs default.
+	Root                      string
+	DistillFsBin              string
+	OSSTemplate               string
+	NydusTemplate             string
+	NydusSuffix               string
+	OSSAuthsPath              string
+	RegistryAuthsPath         string
+	CgroupMemoryLimit         string // human-readable: "512MiB" / "2GiB" / raw bytes; "0" / "" = no limit
+	DisableCgroup             bool
 }
 
 // Module owns the in-process distillfs Manager, OCI manager and HttpWorker.
@@ -109,17 +110,18 @@ func NewModule(cfg Config) (*Module, error) {
 	}
 
 	mgr, err := distillfs.NewManager(&distillfs.ManagerConfig{
-		ChunkDBSize:       cfg.ChunkDBSize,
-		Context:           context.Background(),
-		Root:              cfg.Root,
-		OSSCfgPath:        cfg.OSSTemplate,
-		NydusCfgPath:      cfg.NydusTemplate,
-		BinPath:           cfg.DistillFsBin,
-		NydusClient:       nydusClient,
-		OSSAuthsPath:      cfg.OSSAuthsPath,
-		RegistryAuthsPath: cfg.RegistryAuthsPath,
-		CgroupMemoryLimit: cgroupMemoryLimit,
-		DisableCgroup:     cfg.DisableCgroup,
+		ChunkDBSize:               cfg.ChunkDBSize,
+		Context:                   context.Background(),
+		Root:                      cfg.Root,
+		OSSCfgPath:                cfg.OSSTemplate,
+		NydusCfgPath:              cfg.NydusTemplate,
+		BinPath:                   cfg.DistillFsBin,
+		NydusClient:               nydusClient,
+		OSSAuthsPath:              cfg.OSSAuthsPath,
+		RegistryAuthsPath:         cfg.RegistryAuthsPath,
+		CheckpointArchiveRegistry: cfg.CheckpointArchiveRegistry,
+		CgroupMemoryLimit:         cgroupMemoryLimit,
+		DisableCgroup:             cfg.DisableCgroup,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("imagemanager: distillfs manager: %w", err)
@@ -134,11 +136,12 @@ func NewModule(cfg Config) (*Module, error) {
 	// lifecycle metadata.
 	dbPath := filepath.Join(cfg.Root, "mount_records.db")
 	worker, err := api.NewHttpWorker(&api.HttpWorkerConfig{
-		Manager:     mgr,
-		OCIManager:  ociMgr,
-		NydusClient: nydusClient,
-		NydusSuffix: cfg.NydusSuffix,
-		DBPath:      dbPath,
+		Manager:                   mgr,
+		CheckpointArchiveRegistry: cfg.CheckpointArchiveRegistry,
+		OCIManager:                ociMgr,
+		NydusClient:               nydusClient,
+		NydusSuffix:               cfg.NydusSuffix,
+		DBPath:                    dbPath,
 	})
 	if err != nil {
 		ociMgr.Close()

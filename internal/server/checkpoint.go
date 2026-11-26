@@ -138,6 +138,11 @@ func (h *sandboxService) Checkpoint(
 		cleanupErr := directory.cleanup()
 		return nil, errord.ToGRPC(errors.Join(fmt.Errorf("prepare managed runtime checkpoint: %w", err), cleanupErr))
 	}
+	// The archive verifies and durably links the OCI graph before a runtime
+	// capture can stop the source or publish a restorable checkpoint.
+	if err := h.captureCheckpointImage(checkpointCtx, request.ID, directory.path); err != nil {
+		return nil, errord.ToGRPC(errors.Join(err, directory.cleanup()))
+	}
 	captureStarted := time.Now()
 	err = h.withTransientFirecrackerCheckpointMemory(
 		checkpointCtx,

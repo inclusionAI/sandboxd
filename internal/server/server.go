@@ -99,7 +99,8 @@ type sandboxService struct {
 
 	runtime.UnimplementedSandboxServiceServer
 
-	fsMgr *fsManager
+	fsMgr                  *fsManager
+	checkpointImageArchive *checkpointImageArchive
 
 	ready                             atomic.Bool
 	recoveryReady                     atomic.Bool
@@ -292,6 +293,14 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return errord.ToGRPC(errord.ErrNotImplemented)
 	}
 
+	if archive := h.checkpointImageArchive; archive != nil {
+		unlock, err := archive.locks.Acquire(ctx, sandboxID)
+		if err != nil {
+			return errord.ToGRPC(err)
+		}
+		defer unlock()
+	}
+
 	resource, err := h.sandboxManager.CollectResourceByID(sandboxID)
 	if err != nil {
 		return err
@@ -338,6 +347,11 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 
 	if err := h.releaseManagedSandbox(sandboxID, c.Metadata.Labels[managedOwnerLabel]); err != nil {
 		return fmt.Errorf("release managed sandbox ownership: %w", err)
+	}
+	if archive := h.checkpointImageArchive; archive != nil {
+		if err := archive.queueRelease(sandboxID); err != nil {
+			return fmt.Errorf("queue checkpoint image lease release: %w", err)
+		}
 	}
 	h.sandboxManager.Delete(sandboxID)
 	return nil
@@ -549,6 +563,16 @@ func (h *sandboxService) Run() error {
 			continue
 		}
 		break
+	}
+	archiveCtx, cancelArchiveRecovery := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := h.recoverCheckpointImageLeases(archiveCtx); err != nil {
+		logrus.WithError(err).Warn("checkpoint image lease recovery deferred")
+	}
+	cancelArchiveRecovery()
+	if archive := h.checkpointImageArchive; archive != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go archive.runPendingReleases(ctx)
 	}
 	h.recoveryReady.Store(true)
 	// Manager.Start is the blocking event loop; launch collection housekeeping
@@ -866,20 +890,36 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	if err != nil {
 		return nil, err
 	}
+	checkpointImageArchive, err := newCheckpointImageArchive(cfg.CheckpointImageArchive, cfg.StoreDir)
+	if err != nil {
+		return nil, fmt.Errorf("configure checkpoint image archive: %w", err)
+	}
+	archiveRegistry := ""
+	if checkpointImageArchive != nil {
+		archiveRegistry = checkpointImageArchive.authority
+		if _, exists := registrySchemes[archiveRegistry]; exists {
+			return nil, errors.New("checkpoint image archive needs a separate Registry authority")
+		}
+		if registrySchemes == nil {
+			registrySchemes = make(map[string]string)
+		}
+		registrySchemes[archiveRegistry] = checkpointImageArchive.scheme
+	}
 	imgMod, err := imagemanager.NewModule(imagemanager.Config{
-		RegistrySchemes:   registrySchemes,
-		ManagementSocket:  cfg.ManagementSocket,
-		OCIZeroRefTTL:     cfg.OCIZeroRefTTL,
-		Root:              cfg.ImageManagerRoot,
-		DistillFsBin:      cfg.DistillFsBin,
-		OSSTemplate:       cfg.OSSTemplate,
-		NydusTemplate:     cfg.NydusTemplate,
-		NydusSuffix:       cfg.NydusSuffix,
-		OSSAuthsPath:      cfg.OSSAuthsPath,
-		RegistryAuthsPath: cfg.RegistryAuthsPath,
-		CgroupMemoryLimit: cfg.CgroupMemoryLimit,
-		ChunkDBSize:       cfg.ChunkDBSize,
-		DisableCgroup:     cfg.DisableCgroup,
+		RegistrySchemes:           registrySchemes,
+		CheckpointArchiveRegistry: archiveRegistry,
+		ManagementSocket:          cfg.ManagementSocket,
+		OCIZeroRefTTL:             cfg.OCIZeroRefTTL,
+		Root:                      cfg.ImageManagerRoot,
+		DistillFsBin:              cfg.DistillFsBin,
+		OSSTemplate:               cfg.OSSTemplate,
+		NydusTemplate:             cfg.NydusTemplate,
+		NydusSuffix:               cfg.NydusSuffix,
+		OSSAuthsPath:              cfg.OSSAuthsPath,
+		RegistryAuthsPath:         cfg.RegistryAuthsPath,
+		CgroupMemoryLimit:         cfg.CgroupMemoryLimit,
+		ChunkDBSize:               cfg.ChunkDBSize,
+		DisableCgroup:             cfg.DisableCgroup,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("imagemanager: %w", err)
@@ -899,6 +939,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 
 	stateStore := store.NewStoreImp(storePath)
 	s := &sandboxService{
+		checkpointImageArchive:            checkpointImageArchive,
 		config:                            cfg,
 		store:                             stateStore,
 		UnimplementedSandboxServiceServer: runtime.UnimplementedSandboxServiceServer{},
@@ -1285,6 +1326,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
 	}
 	startReq := proto.Clone(request).(*runtime.StartRequest)
+	if err := h.checkpointImageArchive.validateUserImages(startReq); err != nil {
+		return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+	}
 	checkpointDir := ""
 	var err error
 	if startReq.CheckpointInfo != nil {
@@ -1518,7 +1562,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	var preparedResources *preparedStartResources
 	var sandboxFiles *preparedSandboxFiles
 	var filesystemCommitted bool
+	var runtimeAttempted bool
 	var runtimeStarted bool
+	var archiveLease bool
 	var dnatConfigured bool
 	var aclAttempted bool
 	var aclRegistered bool
@@ -1527,16 +1573,23 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		if startSucceeded {
 			return
 		}
-		if runtimeStarted {
+		archiveReleasable := !runtimeAttempted
+		if runtimeStarted || (archiveLease && runtimeAttempted) {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
-				if err := handler.Delete(cleanupCtx, sandboxID); err != nil {
+				if err := handler.Delete(cleanupCtx, sandboxID); err != nil && !errors.Is(err, errord.ErrNotFound) {
 					logrus.Warnf("rollback runtime for sandbox %s: %v", sandboxID, err)
 				} else {
+					archiveReleasable = true
 					h.sandboxManager.CleanSandboxRoot(sandboxID)
 				}
 			}
 			cancel()
+		}
+		if archiveLease && archiveReleasable {
+			if err := h.checkpointImageArchive.queueRelease(sandboxID); err != nil {
+				logrus.Warnf("rollback checkpoint image lease for sandbox %s: %v", sandboxID, err)
+			}
 		}
 		if dnatConfigured {
 			h.networkMgr.cleanupDnatRules(sandboxID)
@@ -1591,6 +1644,12 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
 
+	if checkpointDir != "" {
+		archiveLease, err = h.restoreCheckpointImage(ctx, sandboxID, checkpointDir, startReq.Rootfs)
+		if err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()}, errord.ToGRPC(err)
+		}
+	}
 	fsCh := make(chan fsPrepareResult, 1)
 	resourceCh := make(chan resourcePrepareResult, 1)
 	go func() {
@@ -1738,6 +1797,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		InitialFiles:            sandboxFiles.InitialFiles(),
 		ManagedHosts:            sandboxFiles.ManagedHosts(),
 	}
+	runtimeAttempted = true
 	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,

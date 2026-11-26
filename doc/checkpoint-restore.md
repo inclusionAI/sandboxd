@@ -1,5 +1,15 @@
 # Checkpoint and restore
 
+## Temporary AKernel Nydus images
+
+A sandbox started from a temporary AKernel image requires an image archive for checkpoint and restore. Configure the worker's private archive service through `[plugin.checkpoint_image_archive]` with its HTTPS `origin`, `worker_token_file`, and the absolute `checkpoint_artifacts` directory of the distributed filesystem checkpoint store. AKernel uses JuiceFS for this store and runsc full checkpoint mode. The `sandboxd -supports-checkpoint-image-archive` flag reports support without starting the service.
+
+Before native capture, sandboxd requests the verified OCI image archive and its receipt in the staged checkpoint directory. Capture aborts if the service cannot complete this operation. The immutable source reference in the ADX snapshot stays the same. On restore, sandboxd checks for the receipt and asks the private service for a scoped image reference at the same digest.
+
+The regular Nydus image path reads manifests and blob byte ranges from the archive's exact authority. Put a separate pull credential for user `akernel-checkpoint` in the worker's Registry auth file and trust the service CA. Archive pulls use direct Registry transport and TLS verification. Sandbox requests cannot supply archive URLs for rootfs or image volume mounts. The runtime lease remains durable until confirmed deletion. Its release is queued on disk so a service outage delays reference cleanup without delaying the worker's local cleanup. Pod replacement preserves the lease files beside `storeDir` for reconciliation with recovered runtime inventory.
+
+Ordinary checkpoints and node-local managed Compose collections retain their existing formats. To roll back temporary publication, revert Harbor runner routing and leave this integration available while archive-backed checkpoints and restored instances still exist.
+
 ## Experimental runtime image collections
 
 The optional `[plugin.image].management_socket` exposes immutable OCI image preparation to a trusted node runtime adapter over a private Unix socket (0700 parent, 0600 socket). It is never mounted into a sandbox. The adapter exports ROFS through an operator-owned read-only collection and registers its checked metadata with inner containerd; Docker lower content remains outside the writable checkpoint. Arbitrary sandbox host-path access is not authorized by this API.

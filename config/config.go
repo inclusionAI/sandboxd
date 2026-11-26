@@ -53,8 +53,16 @@ type PluginConfig struct {
 
 	NodeResourceConfig `toml:"node_resource" json:"nodeResource"`
 
-	ImageManagerConfig   `toml:"image" json:"image"`
-	ManagedRuntimeConfig `toml:"managed_runtime" json:"managedRuntime"`
+	ImageManagerConfig     `toml:"image" json:"image"`
+	ManagedRuntimeConfig   `toml:"managed_runtime" json:"managedRuntime"`
+	CheckpointImageArchive CheckpointImageArchiveConfig `toml:"checkpoint_image_archive" json:"checkpointImageArchive"`
+}
+
+// CheckpointImageArchiveConfig references the private AKernel image archive.
+type CheckpointImageArchiveConfig struct {
+	Origin              string `toml:"origin" json:"origin"`
+	WorkerTokenFile     string `toml:"worker_token_file" json:"workerTokenFile"`
+	CheckpointArtifacts string `toml:"checkpoint_artifacts" json:"checkpointArtifacts"`
 }
 
 // ManagedRuntimeConfig is deployment-owned. Guests select a profile name only.

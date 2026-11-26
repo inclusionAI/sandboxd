@@ -17,6 +17,7 @@ package distillfs
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,15 +72,16 @@ type manager struct {
 	mu          sync.RWMutex
 	ctx         context.Context
 
-	binPath          string
-	root             string
-	ossCfgTemplate   BackendConfig // OSS backend config template
-	nydusCfgTemplate BackendConfig // Nydus backend config template
-	daemons          map[string]*Daemon
-	nydusClient      NydusClient           // Client for fetching Nydus images
-	ossAuths         OSSAuthsConfig        // OSS authentication credentials
-	registryAuths    RegistryAuthsConfig   // Registry authentication credentials
-	cgroupCtrl       *imgcgroup.Controller // Memory cgroup for daemon processes (nil = disabled)
+	binPath                   string
+	root                      string
+	ossCfgTemplate            BackendConfig // OSS backend config template
+	nydusCfgTemplate          BackendConfig // Nydus backend config template
+	daemons                   map[string]*Daemon
+	nydusClient               NydusClient    // Client for fetching Nydus images
+	ossAuths                  OSSAuthsConfig // OSS authentication credentials
+	checkpointArchiveRegistry string
+	registryAuths             RegistryAuthsConfig   // Registry authentication credentials
+	cgroupCtrl                *imgcgroup.Controller // Memory cgroup for daemon processes (nil = disabled)
 
 	// recovered tracks daemons loaded from disk and whether restored sandbox
 	// filesystem state still references them. A nil map means reconciliation
@@ -116,17 +119,18 @@ type ChunkDBStats struct {
 
 // ManagerConfig holds configuration for creating a new Manager
 type ManagerConfig struct {
-	ChunkDBSize       string          // Whole bytes or integer B/KiB/MiB/GiB/TiB; empty preserves defaults.
-	Context           context.Context // Context for tracing and cancellation (optional, defaults to Background)
-	Root              string          // Root working directory
-	OSSCfgPath        string          // Path to OSS config template file
-	NydusCfgPath      string          // Path to Nydus config template file
-	BinPath           string          // Path to distill_fs binary
-	NydusClient       NydusClient     // Client for fetching Nydus images
-	OSSAuthsPath      string          // Path to OSS auths file (oss_auths.json)
-	RegistryAuthsPath string          // Path to registry auths file (registry_auths.json)
-	CgroupMemoryLimit int64           // Memory limit in bytes for distill_fs cgroup (0 = no limit)
-	DisableCgroup     bool            // Never create or modify a distill_fs cgroup
+	ChunkDBSize               string          // Whole bytes or integer B/KiB/MiB/GiB/TiB; empty preserves defaults.
+	Context                   context.Context // Context for tracing and cancellation (optional, defaults to Background)
+	Root                      string          // Root working directory
+	OSSCfgPath                string          // Path to OSS config template file
+	NydusCfgPath              string          // Path to Nydus config template file
+	BinPath                   string          // Path to distill_fs binary
+	NydusClient               NydusClient     // Client for fetching Nydus images
+	OSSAuthsPath              string          // Path to OSS auths file (oss_auths.json)
+	RegistryAuthsPath         string          // Path to registry auths file (registry_auths.json)
+	CheckpointArchiveRegistry string          // Exact authority of the worker-only archive.
+	CgroupMemoryLimit         int64           // Memory limit in bytes for distill_fs cgroup (0 = no limit)
+	DisableCgroup             bool            // Never create or modify a distill_fs cgroup
 }
 
 func NewManager(config *ManagerConfig) (Manager, error) {
@@ -150,19 +154,28 @@ func NewManager(config *ManagerConfig) (Manager, error) {
 		cgroupCtrl = imgcgroup.NewController(config.CgroupMemoryLimit)
 	}
 	mgr := &manager{
-		chunkDBSize:      size,
-		ctx:              ctx,
-		binPath:          config.BinPath,
-		root:             config.Root,
-		ossCfgTemplate:   BackendConfig{},
-		nydusCfgTemplate: BackendConfig{},
-		daemons:          map[string]*Daemon{},
-		recovered:        map[string]bool{},
-		nydusClient:      config.NydusClient,
-		cgroupCtrl:       cgroupCtrl,
+		chunkDBSize:               size,
+		ctx:                       ctx,
+		binPath:                   config.BinPath,
+		root:                      config.Root,
+		ossCfgTemplate:            BackendConfig{},
+		nydusCfgTemplate:          BackendConfig{},
+		daemons:                   map[string]*Daemon{},
+		recovered:                 map[string]bool{},
+		nydusClient:               config.NydusClient,
+		checkpointArchiveRegistry: config.CheckpointArchiveRegistry,
+		cgroupCtrl:                cgroupCtrl,
 	}
 	if err := mgr.prepare(config.OSSCfgPath, config.NydusCfgPath, config.OSSAuthsPath, config.RegistryAuthsPath); err != nil {
 		return nil, fmt.Errorf("failed to prepare distillfs manager: %w", err)
+	}
+	if host := mgr.checkpointArchiveRegistry; host != "" {
+		if mgr.nydusCfgTemplate.Registry == nil {
+			return nil, fmt.Errorf("checkpoint archive requires a Nydus Registry backend")
+		}
+		if err := validateCheckpointRegistryAuth(mgr.registryAuths[host].Auth); err != nil {
+			return nil, err
+		}
 	}
 	if err := mgr.loadExistedDaemons(); err != nil {
 		return nil, fmt.Errorf("failed to load existed daemons: %w", err)
@@ -430,6 +443,15 @@ func (mgr *manager) setupOSSDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	return d, nil
 }
 
+func validateCheckpointRegistryAuth(auth string) error {
+	decoded, err := base64.StdEncoding.DecodeString(auth)
+	user, password, _ := strings.Cut(string(decoded), ":")
+	if err != nil || user != "akernel-checkpoint" || password == "" {
+		return fmt.Errorf("checkpoint archive requires an akernel-checkpoint credential for its exact Registry authority")
+	}
+	return nil
+}
+
 // setupNydusDaemon creates a daemon for Nydus source type
 func (mgr *manager) setupNydusDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 	d := &Daemon{
@@ -479,8 +501,17 @@ func (mgr *manager) setupNydusDaemon(opts *DaemonCreateOpt) (*Daemon, error) {
 			}
 			logrus.Infof("populated registry host/repo from image URL: %s/%s", host, repo)
 
-			// Try to populate registry auth from registry auths file if not already set.
-			if mgr.registryAuths != nil && d.config.Registry.Auth == "" {
+			if host == mgr.checkpointArchiveRegistry {
+				// The template may point at a cluster-wide proxy, disable TLS
+				// checks, or override blob routing for ordinary Registries.
+				d.proxyURL = ""
+				d.config.Registry.Proxy = nil
+				d.config.Registry.SkipVerify = false
+				d.config.Registry.BlobUrlScheme = d.config.Registry.Scheme
+				d.config.Registry.BlobRedirectedHost = ""
+				d.config.Registry.RegistryToken = ""
+				d.config.Registry.Auth = mgr.registryAuths[host].Auth
+			} else if mgr.registryAuths != nil && d.config.Registry.Auth == "" {
 				// Try host/repo first, then fallback to host only.
 				hostRepo := host + "/" + repo
 				if authEntry, ok := mgr.registryAuths[hostRepo]; ok {

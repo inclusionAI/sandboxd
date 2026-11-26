@@ -59,11 +59,12 @@ func generateNydusID(imageURL string) string {
 
 // HttpWorkerConfig holds the configuration for creating an HttpWorker.
 type HttpWorkerConfig struct {
-	Manager     distillfs.Manager
-	OCIManager  *oci.Manager
-	NydusClient *nydus.RegistryClient
-	NydusSuffix string
-	DBPath      string // path to BoltDB mount store; empty to disable
+	Manager                   distillfs.Manager
+	CheckpointArchiveRegistry string
+	OCIManager                *oci.Manager
+	NydusClient               *nydus.RegistryClient
+	NydusSuffix               string
+	DBPath                    string // path to BoltDB mount store; empty to disable
 }
 
 func NewHttpWorker(cfg *HttpWorkerConfig) (*HttpWorker, error) {
@@ -76,24 +77,26 @@ func NewHttpWorker(cfg *HttpWorkerConfig) (*HttpWorker, error) {
 		}
 	}
 	return &HttpWorker{
-		ctx:         context.Background(),
-		mgr:         cfg.Manager,
-		ociMgr:      cfg.OCIManager,
-		nydusClient: cfg.NydusClient,
-		nydusSuffix: cfg.NydusSuffix,
-		nydusCache:  NewNydusImageCache(),
-		mountStore:  mountStore,
+		ctx:                       context.Background(),
+		mgr:                       cfg.Manager,
+		checkpointArchiveRegistry: cfg.CheckpointArchiveRegistry,
+		ociMgr:                    cfg.OCIManager,
+		nydusClient:               cfg.NydusClient,
+		nydusSuffix:               cfg.NydusSuffix,
+		nydusCache:                NewNydusImageCache(),
+		mountStore:                mountStore,
 	}, nil
 }
 
 type HttpWorker struct {
-	ctx         context.Context
-	mgr         distillfs.Manager
-	ociMgr      *oci.Manager
-	nydusClient *nydus.RegistryClient
-	nydusSuffix string
-	nydusCache  *NydusImageCache
-	mountStore  *MountStore
+	ctx                       context.Context
+	mgr                       distillfs.Manager
+	checkpointArchiveRegistry string
+	ociMgr                    *oci.Manager
+	nydusClient               *nydus.RegistryClient
+	nydusSuffix               string
+	nydusCache                *NydusImageCache
+	mountStore                *MountStore
 
 	nydusOperations keyedlock.Locks
 }
@@ -512,6 +515,8 @@ func (w *HttpWorker) MountOCI(ctx context.Context, req *OCIMountRequest) (*OCIMo
 		return nil, fmt.Errorf("image_url is required")
 	}
 
+	checkpointImage := w.checkpointArchiveRegistry != "" &&
+		strings.HasPrefix(req.ImageURL, w.checkpointArchiveRegistry+"/")
 	// Try to detect Nydus image if nydusClient is available
 	if w.nydusClient != nil {
 		// Try original URL
@@ -520,6 +525,8 @@ func (w *HttpWorker) MountOCI(ctx context.Context, req *OCIMountRequest) (*OCIMo
 			return &OCIMountResponse{MountPath: attempt.mountPoint, Env: attempt.env, ImageProcess: attempt.imageProcess}, nil
 		} else if ctx.Err() != nil {
 			return nil, ctx.Err()
+		} else if checkpointImage {
+			return nil, fmt.Errorf("mount checkpoint archive as Nydus: %w", err)
 		} else if attempt.detected {
 			logrus.WithError(err).Warnf("detected Nydus image for %s but Nydus mount failed, skip OCI fallback", req.ImageURL)
 			return nil, err
