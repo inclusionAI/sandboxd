@@ -148,6 +148,12 @@ func TestCompactLowerDirRecovery(t *testing.T) {
 				t.Fatalf("pending transaction after recovery: %v, %v", pending, err)
 			}
 			if tc.wantAdopt {
+				// The verifier used before alias support sees the same mount
+				// but only has the canonical lowerdirs from the record.
+				if err := verifyOCIMountLayers(mounts[txn.MountPath], txn.MountPath, txn.LowerDirs); err == nil ||
+					!strings.Contains(err.Error(), "does not contain the expected 2 lowerdirs in order") {
+					t.Fatalf("canonical-only verifier on compact mount: %v", err)
+				}
 				if path, _, err := mgr.MountImage(txn.ImageURL); err != nil || path != txn.MountPath {
 					t.Fatalf("reuse = %q, %v", path, err)
 				}
@@ -176,6 +182,9 @@ func TestCompactLowerDirRecovery(t *testing.T) {
 			}
 			if len(mounts) != 0 {
 				t.Fatalf("live mount after cleanup: %v", mounts)
+			}
+			if record, err := mgr.store.getMount(txn.ImageURL); err != nil || record != nil {
+				t.Fatalf("published mount after cleanup: %v, %v", record, err)
 			}
 			if target, err := os.Readlink(alias.path); tc.replace {
 				if err != nil || target != replacement {

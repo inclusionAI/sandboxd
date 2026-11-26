@@ -22,3 +22,12 @@ The TTL starts when the last reference is released. A new reference clears that 
 Background GC checks run every two minutes. With a positive TTL, zero-reference entries become eligible after that interval and are removed by a later check. With `"0s"`, disk-pressure GC remains enabled: at 85% filesystem usage it removes unreferenced entries in least-recently-used order, aiming for 75% usage or until no eligible entries remain. Disk pressure can evict an entry before a positive TTL has elapsed.
 
 This setting does not change checkpoint retention, Nydus or distill-fs cache policies, or persistence when the image-manager root is replaced or deleted. It does not prefetch images or synchronize cache between nodes.
+
+## Downgrading after compact mounts
+
+A sandboxd version that verifies only canonical lowerdirs retains the record and references for a surviving compact mount, then rejects reuse because mountinfo contains alias paths. An existing sandbox can continue using its mounted root filesystem, so the failure may first appear when a new sandbox starts.
+
+1. Block new starts, restores, and managed image preparation for the affected image manager. Wait for in-flight operations and drain its OCI mount consumers through their normal deletion and release paths.
+2. Identify the compact overlays under `oci/mounts` within the configured `[plugin.image].root` in the image manager's mountinfo. Their `lowerdir=` lists start with `/run/sandboxd-oci/`. Record their targets and aliases, then stop the version that created the compact mounts with `SIGTERM` and let shutdown finish. A successful OCI unmount removes the alias and the mount record and releases the layer and chain references.
+3. Check for `OCI unmount success` for the recorded mounts and confirm their mount entries and aliases are gone from any namespace that will be reused. If cleanup is incomplete, restart a sandboxd version that supports compact mounts with the same image root and alias directory. Resolve the cleanup error while admission is blocked, then repeat shutdown and verification.
+4. Start the older version and reopen admission once it is ready. The extracted cache can be retained. Images that require compaction are still subject to the older daemon's mount option limits.
