@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/inclusionAI/sandboxd/internal/managedlease"
+	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/moby/sys/mountinfo"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -437,10 +438,7 @@ func (h *sandboxService) recoverManagedBinding(id, guestRoot, source string, liv
 	return nil
 }
 
-func (h *sandboxService) startManagedCollectionGC() {
-	if h.config.ManagedRuntimeRoot == "" {
-		return
-	}
+func (h *sandboxService) startDeferredCleanup() {
 	h.managedGCCancel = make(chan struct{})
 	h.managedGCWait.Add(1)
 	go func() {
@@ -452,6 +450,10 @@ func (h *sandboxService) startManagedCollectionGC() {
 			case <-h.managedGCCancel:
 				return
 			case <-ticker.C:
+				h.reapFailedXPUStarts()
+				if h.config.ManagedRuntimeRoot == "" {
+					continue
+				}
 				entries, err := os.ReadDir(filepath.Join(h.config.ManagedRuntimeRoot, "records"))
 				if err != nil {
 					continue
@@ -476,4 +478,18 @@ func (h *sandboxService) startManagedCollectionGC() {
 			}
 		}
 	}()
+}
+
+func (h *sandboxService) reapFailedXPUStarts() {
+	pending := sandbox.ListFilterByLabels(map[string]string{xpuStartPendingLabel: "true"})
+	for _, attempt := range h.sandboxManager.List(pending) {
+		select {
+		case <-h.managedGCCancel:
+			return
+		default:
+		}
+		if err := h.deleteSandboxAttempt(context.Background(), attempt.Metadata.ID, attempt); err != nil {
+			logrus.WithError(err).WithField("sandbox_id", attempt.Metadata.ID).Warn("XPU start cleanup deferred")
+		}
+	}
 }

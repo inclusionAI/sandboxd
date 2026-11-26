@@ -53,6 +53,8 @@ type PluginConfig struct {
 
 	NodeResourceConfig `toml:"node_resource" json:"nodeResource"`
 
+	XPUConfig `toml:"xpu" json:"xpu"`
+
 	ImageManagerConfig   `toml:"image" json:"image"`
 	ManagedRuntimeConfig `toml:"managed_runtime" json:"managedRuntime"`
 }
@@ -88,6 +90,18 @@ func (p ManagedRuntimeProfile) MinimumStorageMB() (uint64, error) {
 		return 0, fmt.Errorf("invalid managed runtime storage geometry")
 	}
 	return uint64(p.WritableMB) + uint64(root), nil
+}
+
+// XPUConfig contains optional vendor accelerator providers.
+type XPUConfig struct {
+	Ascend AscendConfig `toml:"ascend" json:"ascend"`
+}
+
+// AscendConfig enables the external Ascend OCI adapter for runc sandboxes.
+type AscendConfig struct {
+	Enabled      bool   `toml:"enabled" json:"enabled"`
+	Adapter      string `toml:"adapter" json:"adapter"`
+	MountProfile string `toml:"mount_profile" json:"mountProfile"`
 }
 
 // ImageManagerConfig configures image and mount lifecycle management.

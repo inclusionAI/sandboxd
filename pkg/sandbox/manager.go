@@ -242,8 +242,16 @@ func (m *Manager) syncEvent(event Event) {
 	}
 }
 
-// StoreMetadata store all sandbox metadata to disk.
+// StoreMetadata persists and publishes a sandbox.
 func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error {
+	if err := m.PersistMetadata(id, data); err != nil {
+		return err
+	}
+	return m.TrackPersistedSandbox(id)
+}
+
+// PersistMetadata writes recovery metadata without publishing an in-flight Start.
+func (m *Manager) PersistMetadata(id string, data *runtime.SandboxMetadata) error {
 	if data == nil || data.ID != id {
 		return fmt.Errorf("sandbox metadata ID does not match %q", id)
 	}
@@ -251,7 +259,6 @@ func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error 
 	if err != nil {
 		return fmt.Errorf("resolve sandbox %q root: %w", id, err)
 	}
-	start := time.Now()
 
 	if _, err := os.Stat(sandboxRoot); os.IsNotExist(err) {
 		if err := os.MkdirAll(sandboxRoot, 0755); err != nil {
@@ -267,12 +274,20 @@ func (m *Manager) StoreMetadata(id string, data *runtime.SandboxMetadata) error 
 	if err := util.AtomicWriteFile(dataFile, bytes, 0600); err != nil {
 		return fmt.Errorf("save sandbox metadata %s: %w", data.ID, err)
 	}
+	return nil
+}
+
+// TrackPersistedSandbox makes persisted recovery state available to Delete.
+func (m *Manager) TrackPersistedSandbox(id string) error {
+	sandboxRoot, err := util.JoinWithinRoot(m.root, id)
+	if err != nil {
+		return err
+	}
 	stored, err := m.loadSandbox(sandboxRoot)
 	if err != nil {
-		return fmt.Errorf("load stored sandbox metadata %s: %w", data.ID, err)
+		return fmt.Errorf("load stored sandbox metadata %s: %w", id, err)
 	}
-	m.sandboxes.Set(data.ID, stored)
-	logrus.Debugf("store sandbox %s metadata success, cost %v", data.ID, time.Since(start).String())
+	m.sandboxes.Set(id, stored)
 	return nil
 }
 

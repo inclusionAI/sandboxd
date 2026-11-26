@@ -42,6 +42,7 @@ import (
 	"github.com/inclusionAI/sandboxd/pkg/sandbox"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/inclusionAI/sandboxd/pkg/volumemanager"
+	"github.com/inclusionAI/sandboxd/pkg/xpumanager"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -129,7 +130,7 @@ func TestMergeStartEnvsImagePath(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			imageEnvs := append(tc.imageEnvs, "MODE=image", "IMAGE_ONLY=a=b", "NVIDIA_VISIBLE_DEVICES=all")
-			envs := mergeStartEnvs(imageEnvs, requestEnvs, tc.preferImagePath)
+			envs := mergeStartEnvs(imageEnvs, requestEnvs, tc.preferImagePath, nil)
 			var paths, modes []string
 			var imageOnly string
 			for _, env := range envs {
@@ -147,6 +148,38 @@ func TestMergeStartEnvsImagePath(t *testing.T) {
 			require.Equal(t, tc.wantPaths, paths)
 			require.Equal(t, []string{"image", "request"}, modes)
 			require.Equal(t, "a=b", imageOnly)
+		})
+	}
+}
+
+func TestAscendEnvironmentReservationIsAllocationScoped(t *testing.T) {
+	for _, allocated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allocated=%v", allocated), func(t *testing.T) {
+			var allocations []*runtime.XpuAllocation
+			if allocated {
+				allocations = []*runtime.XpuAllocation{{Type: "npu"}}
+			}
+			envs := mergeStartEnvs([]string{"ASCEND_RT_VISIBLE_DEVICES=image"}, nil, false, allocations)
+			if allocated {
+				require.Empty(t, envs)
+			} else {
+				require.Equal(t, []*runtime.KeyValue{{Key: "ASCEND_RT_VISIBLE_DEVICES", Value: "image"}}, envs)
+			}
+
+			s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler()})
+			response, err := s.Start(context.Background(), &runtime.StartRequest{
+				Runtime: config.RuntimeNameRunsc, Rootfs: &runtime.RootfsConfig{},
+				Envs:           map[string]string{"ASCEND_RT_VISIBLE_DEVICES": "request"},
+				XpuAllocations: allocations,
+				// Stop at label validation after checking request environment values.
+				Labels: map[string]string{xpumanager.AllocationAnnotation: "reserved"},
+			})
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			if allocated {
+				require.Contains(t, response.Message, "environment variable")
+			} else {
+				require.Contains(t, response.Message, "label")
+			}
 		})
 	}
 }
@@ -390,7 +423,6 @@ func TestStartRejectsFirecrackerOCIImageBeforeFilesystemPrepare(t *testing.T) {
 
 func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {
 	for _, runtimeName := range []string{
-		config.RuntimeNameRunc,
 		config.RuntimeNameKata,
 		config.RuntimeNameFirecracker,
 	} {
@@ -405,6 +437,64 @@ func TestStartRejectsXPUForUnsupportedRuntimes(t *testing.T) {
 			})
 			assert.Equal(t, codes.InvalidArgument, status.Code(err))
 			assert.Contains(t, response.Message, "XPU allocations require runtime")
+		})
+	}
+}
+
+func TestStartRejectsXPUWhenManagerIsUnavailable(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunc: svc.NewFakeRuntimeHandler(),
+	})
+	response, err := s.Start(context.Background(), &runtime.StartRequest{
+		Runtime:        config.RuntimeNameRunc,
+		Rootfs:         &runtime.RootfsConfig{},
+		XpuAllocations: []*runtime.XpuAllocation{{Type: "npu"}},
+	})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, response.Message, "XPU manager is not configured")
+}
+
+func TestStartPreservesXPUStatusDuringRuntimeRecovery(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{
+		config.RuntimeNameRunc:  svc.NewFakeRuntimeHandler(),
+		config.RuntimeNameRunsc: svc.NewFakeRuntimeHandler(),
+	})
+	defer s.sandboxManager.Stop()
+	directory := t.TempDir()
+	adapter := filepath.Join(directory, "adapter")
+	profile := filepath.Join(directory, "mounts.json")
+	require.NoError(t, os.WriteFile(profile, []byte(`{"default":[]}`), 0600))
+	require.NoError(t, os.WriteFile(adapter, []byte(`#!/bin/sh
+case "$1" in
+  version) printf '%s' '{"schema_version":1,"provider_version":"fake-v1"}' ;;
+  discover) printf '%s' '{"schema_version":1,"provider_version":"fake-v1","devices":[{"scheduler_id":0,"logic_id":0,"device_node_id":0,"stable_id":"die-0","product_model":"ascend310p3","runtime_family":"Ascend310P","healthy":true}]}' ;;
+  *) exit 3 ;;
+esac
+`), 0700))
+	s.xpuMgr = xpumanager.New("", true, directory, config.XPUConfig{
+		Ascend: config.AscendConfig{Enabled: true, Adapter: adapter, MountProfile: profile},
+	})
+	s.xpuMgr.SetRuntimeAvailable(func(name string) bool { return s.checkRuntimeAdmission(name) == nil })
+	require.Len(t, s.xpuMgr.Resources(), 1)
+	s.sandboxManager.SetRuntimeReconciler(config.RuntimeNameRunc, func(context.Context, []*svc.State) error {
+		return errors.New("recovery pending")
+	})
+	require.Empty(t, s.xpuMgr.Resources())
+	for _, test := range []struct {
+		name        string
+		runtime     string
+		allocations []*runtime.XpuAllocation
+		code        codes.Code
+	}{
+		{"plain runc", config.RuntimeNameRunc, nil, codes.Unavailable},
+		{"NPU runc", config.RuntimeNameRunc, []*runtime.XpuAllocation{{Type: "npu", DeviceIds: []uint32{0}}}, codes.Unavailable},
+		{"NPU runsc", config.RuntimeNameRunsc, []*runtime.XpuAllocation{{Type: "npu", DeviceIds: []uint32{0}}}, codes.InvalidArgument},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := s.Start(context.Background(), &runtime.StartRequest{
+				Runtime: test.runtime, Rootfs: &runtime.RootfsConfig{}, XpuAllocations: test.allocations,
+			})
+			require.Equal(t, test.code, status.Code(err), "%v", err)
 		})
 	}
 }
@@ -963,6 +1053,44 @@ func TestRuntimeDeleteTimeoutDrainsOnlyOwnedCgroupAndRetries(t *testing.T) {
 	assert.Equal(t, 2, h.calls)
 }
 
+func TestFailedXPUStartRetainsBundleForDeleteRetry(t *testing.T) {
+	handler := &retryXPUStartDelete{fail: true}
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunc: handler})
+	id, err := s.sandboxManager.ReserveID("sbox-xpu-rollback")
+	require.NoError(t, err)
+	metadata := &runtime.SandboxMetadata{ID: id, RuntimeHandler: config.RuntimeNameRunc, Labels: map[string]string{xpuStartPendingLabel: "true"}}
+	require.NoError(t, s.sandboxManager.PersistMetadata(id, metadata))
+	_, err = s.sandboxManager.Get(id)
+	require.Error(t, err, "an in-flight start must not be published")
+	spec := filepath.Join(s.config.RootDir, "containers", id, config.SandboxSpecFile)
+	require.NoError(t, os.WriteFile(spec, []byte(`{"linux":{},"annotations":{"sandbox.akernel.dev/xpu-allocation":"retained"}}`), 0600))
+
+	require.ErrorContains(t, s.rollbackXPUStart(id, metadata, sandbox.OccupiedResource{}), "runtime still live")
+	require.FileExists(t, spec, "the persisted lease must survive an incomplete rollback")
+	_, err = s.sandboxManager.Get(id)
+	require.NoError(t, err, "normal deletion must be able to find the failed start")
+	_, err = s.sandboxManager.ReserveID(id)
+	require.ErrorIs(t, err, errord.ErrAlreadyExists)
+
+	handler.fail = false
+	s.reapFailedXPUStarts()
+	require.NoFileExists(t, spec)
+	_, err = s.sandboxManager.ReserveID(id)
+	require.NoError(t, err)
+}
+
+type retryXPUStartDelete struct {
+	svc.FakeRuntimeHandler
+	fail bool
+}
+
+func (h *retryXPUStartDelete) Delete(context.Context, string) error {
+	if h.fail {
+		return errors.New("runtime still live")
+	}
+	return nil
+}
+
 func TestStart_And_Delete(t *testing.T) {
 	s := newTestService(t, map[string]svc.Handler{
 		"runsc": svc.NewFakeRuntimeHandler(),
@@ -1301,4 +1429,42 @@ func TestSetupDnatRules_MultipleContainers(t *testing.T) {
 	s.networkMgr.cleanupDnatRules("ctr-1")
 	assert.Empty(t, s.networkMgr.rulesFor("ctr-1"))
 	assert.NotEmpty(t, s.networkMgr.rulesFor("ctr-2"))
+}
+
+func TestFailedXPUStartCleanupPreservesReplacement(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replacement pending %t", pending), func(t *testing.T) {
+			handler := &retryXPUStartDelete{}
+			s := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunc: handler})
+			id := "sbox-xpu-reused"
+			publish := func(pending bool) *sandbox.Sandbox {
+				t.Helper()
+				_, err := s.sandboxManager.ReserveID(id)
+				require.NoError(t, err)
+				metadata := &runtime.SandboxMetadata{ID: id, RuntimeHandler: config.RuntimeNameRunc, Labels: map[string]string{}}
+				if pending {
+					metadata.Labels[xpuStartPendingLabel] = "true"
+				}
+				require.NoError(t, s.sandboxManager.PersistMetadata(id, metadata))
+				spec := filepath.Join(s.config.RootDir, "containers", id, config.SandboxSpecFile)
+				require.NoError(t, os.WriteFile(spec, []byte(`{"linux":{}}`), 0600))
+				require.NoError(t, s.sandboxManager.TrackPersistedSandbox(id))
+				current, err := s.sandboxManager.Get(id)
+				require.NoError(t, err)
+				return current
+			}
+			oldAttempt := publish(true)
+			require.NoError(t, s.deleteSandbox(context.Background(), id))
+			replacement := publish(pending)
+
+			// The old pass resumes after another cleanup and successful ID reuse.
+			require.NoError(t, s.deleteSandboxAttempt(context.Background(), id, oldAttempt))
+			current, err := s.sandboxManager.Get(id)
+			require.NoError(t, err)
+			require.Same(t, replacement, current)
+			_, err = s.sandboxManager.ReserveID(id)
+			require.ErrorIs(t, err, errord.ErrAlreadyExists)
+			require.NoError(t, s.deleteSandbox(context.Background(), id))
+		})
+	}
 }
