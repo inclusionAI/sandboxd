@@ -72,6 +72,10 @@ type SandboxService interface {
 	RebootHandler() http.Handler
 }
 
+// A persisted XPU attempt with this label still needs teardown. Only Start
+// owns the label, and clears it durably before reporting success.
+const xpuStartPendingLabel = "sandbox.akernel.dev/xpu-start-pending"
+
 var _ SandboxService = &sandboxService{}
 
 // sandboxService implements SandboxService.
@@ -256,11 +260,40 @@ func (h *sandboxService) startSandboxRuntime(
 	}
 	if err != nil {
 		logrus.WithField(trace.ContextKeyTraceId, traceID).Errorf("runtime handler create sandbox failed: %v", err)
-		h.sandboxManager.CleanSandboxRoot(startConfig.ID)
+		if startConfig.SpecUpdates == nil {
+			h.sandboxManager.CleanSandboxRoot(startConfig.ID)
+		}
 		return errord.ToGRPC(err)
 	}
 
 	logrus.WithField(trace.ContextKeyTraceId, traceID).Infof("StartSandbox %s success, traceID: %v, spanId: %v, cost: %v", startConfig.ID, traceID, spanID, time.Since(start).String())
+	return nil
+}
+
+// rollbackXPUStart confirms runtime deletion before its caller releases
+// the device and other owners. Failed deletion keeps the persisted sandbox
+// available to normal deletion and restart recovery.
+func (h *sandboxService) rollbackXPUStart(id string, meta *runtime.SandboxMetadata, resource sandbox.OccupiedResource) error {
+	handler, ok := h.serviceHandler.Get(meta.RuntimeHandler)
+	var err error
+	if !ok {
+		err = fmt.Errorf("runtime %q unavailable for cleanup", meta.RuntimeHandler)
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*h.deleteAttemptTimeout())
+		defer cancel()
+		var killCgroup func(string) error
+		if h.cgroupMgr != nil {
+			killCgroup = h.cgroupMgr.Kill
+		}
+		err = h.deleteRuntimeBounded(ctx, id, handler, resource, killCgroup)
+	}
+	if (err == nil || errors.Is(err, errord.ErrNotFound)) && h.xpuMgr != nil {
+		err = h.xpuMgr.Retire(id)
+	}
+	if err != nil && !errors.Is(err, errord.ErrNotFound) {
+		return errors.Join(err, h.sandboxManager.TrackPersistedSandbox(id))
+	}
+	h.sandboxManager.CleanSandboxRoot(id)
 	return nil
 }
 
@@ -294,7 +327,16 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 
 	resource, err := h.sandboxManager.CollectResourceByID(sandboxID)
 	if err != nil {
-		return err
+		if c.Metadata.Labels[xpuStartPendingLabel] != "true" || !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		// A crash before the OCI spec was written still owns its preallocated resources.
+		resource = sandbox.OccupiedResource{ID: sandboxID, Resources: make(map[string]string)}
+		for _, name := range []string{config.ResourceNameCgroup, config.ResourceNameInterface} {
+			if value := c.Metadata.Labels[config.ResourceAnnotationKeyPrefix+name]; value != "" {
+				resource.Resources[name] = value
+			}
+		}
 	}
 
 	var killCgroup func(string) error
@@ -314,7 +356,9 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		)
 	}
 	if h.xpuMgr != nil {
-		h.xpuMgr.Release(sandboxID)
+		if err := h.xpuMgr.Retire(sandboxID); err != nil {
+			return fmt.Errorf("retire XPU lease for %s: %w", sandboxID, err)
+		}
 	}
 
 	if err := h.deactivateStartNetwork(resource); err != nil {
@@ -378,6 +422,13 @@ func (h *sandboxService) deleteAttemptTimeout() time.Duration {
 // timed-out RPC cannot leave a partially deleted sandbox for another caller to
 // release again.
 func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) error {
+	return h.deleteSandboxAttempt(ctx, sandboxID, nil)
+}
+
+// deleteSandboxAttempt binds deferred cleanup to the object seen by the reaper.
+// Teardown singleflight owns the identity check and all cleanup side effects;
+// the manager keeps the ID reserved until teardown has fully retired it.
+func (h *sandboxService) deleteSandboxAttempt(ctx context.Context, sandboxID string, expected *sandbox.Sandbox) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -387,24 +438,46 @@ func (h *sandboxService) deleteSandbox(ctx context.Context, sandboxID string) er
 	budget := 2 * h.deleteAttemptTimeout()
 	waitCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	resultCh := h.deleteGroup.DoChan(sandboxID, func() (interface{}, error) {
-		cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), budget)
-		defer cancelCleanup()
-
-		if h.networkMgr != nil {
-			h.networkMgr.cleanupDnatRules(sandboxID)
+	for {
+		if err := waitCtx.Err(); err != nil {
+			return err
 		}
-		return nil, h.deleteSandboxRuntime(cleanupCtx, sandboxID)
-	})
+		resultCh := h.deleteGroup.DoChan(sandboxID, func() (interface{}, error) {
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), budget)
+			defer cancelCleanup()
 
-	select {
-	case result := <-resultCh:
-		return result.Err
-	case <-waitCtx.Done():
-		if ctx.Err() == nil {
-			metrics.RecordRuntimeCallResult("delete", "stuck", "")
+			if expected != nil {
+				current, err := h.sandboxManager.Get(sandboxID)
+				if errors.Is(err, errord.ErrNotFound) {
+					return true, nil
+				}
+				if err != nil {
+					return false, err
+				}
+				if current != expected || current.Metadata.Labels[xpuStartPendingLabel] != "true" {
+					return true, nil
+				}
+			}
+			if h.networkMgr != nil {
+				h.networkMgr.cleanupDnatRules(sandboxID)
+			}
+			return false, h.deleteSandboxRuntime(cleanupCtx, sandboxID)
+		})
+
+		select {
+		case result := <-resultCh:
+			// An ordinary Delete may have joined a stale reaper pass. Retry
+			// instead of reporting that the replacement was deleted.
+			if expected == nil && result.Val == true && result.Err == nil {
+				continue
+			}
+			return result.Err
+		case <-waitCtx.Done():
+			if ctx.Err() == nil {
+				metrics.RecordRuntimeCallResult("delete", "stuck", "")
+			}
+			return waitCtx.Err()
 		}
-		return waitCtx.Err()
 	}
 }
 
@@ -551,9 +624,8 @@ func (h *sandboxService) Run() error {
 		break
 	}
 	h.recoveryReady.Store(true)
-	// Manager.Start is the blocking event loop; launch collection housekeeping
-	// before entering it so cleanup also runs while the service is online.
-	h.startManagedCollectionGC()
+	// Manager.Start is the blocking event loop. Launch deferred cleanup first.
+	h.startDeferredCleanup()
 	h.sandboxManager.Start()
 	return nil
 }
@@ -824,7 +896,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}
 	xpuMgr := xpumanager.New(
 		cfg.RuntimeConfig.RuntimeBinary[config.RuntimeNameRunsc],
+		cfg.RuntimeConfig.RuntimeBinary[config.RuntimeNameRunc] != "",
 		sandboxRoot,
+		cfg.XPUConfig,
 	)
 
 	// Construct the optional node-resource module first, but start reporting
@@ -931,6 +1005,9 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		}
 	}()
 	s.loadRuntimeHandlers()
+	s.xpuMgr.SetRuntimeAvailable(func(name string) bool {
+		return s.checkRuntimeAdmission(name) == nil
+	})
 	if nodeResMod != nil && cfg.RuntimeConfig.FilestoreDir != "" {
 		nodeResMod.SetEphemeralStorageProvider(s.volumeMgr)
 	}
@@ -1210,12 +1287,12 @@ func resourcesToLinux(
 
 // mergeStartEnvs lists image variables first so request values override them,
 // except for PATH when the request marks it as a fallback.
-func mergeStartEnvs(imageEnvs []string, requestEnvs map[string]string, preferImagePath bool) []*runtime.KeyValue {
+func mergeStartEnvs(imageEnvs []string, requestEnvs map[string]string, preferImagePath bool, allocations []*runtime.XpuAllocation) []*runtime.KeyValue {
 	envs := make([]*runtime.KeyValue, 0, len(imageEnvs)+len(requestEnvs))
 	hasImagePath := false
 	for _, entry := range imageEnvs {
 		key, value, ok := strings.Cut(entry, "=")
-		if !ok || xpumanager.ReservedEnv(key) {
+		if !ok || xpumanager.ReservedEnv(key, allocations) {
 			continue
 		}
 		if key == "PATH" {
@@ -1392,14 +1469,14 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		startReq.Network = "sandbox"
 	}
 	for key := range startReq.Envs {
-		if xpumanager.ReservedEnv(key) {
+		if xpumanager.ReservedEnv(key, startReq.XpuAllocations) {
 			err := fmt.Errorf("environment variable %q is managed by sandboxd", key)
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
 				errord.ToGRPC(errord.ErrInvalidArgument)
 		}
 	}
 	for key := range startReq.Labels {
-		if xpumanager.ReservedAnnotation(key) {
+		if xpumanager.ReservedAnnotation(key) || key == xpuStartPendingLabel {
 			err := fmt.Errorf("label %q is managed by sandboxd", key)
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
 				errord.ToGRPC(errord.ErrInvalidArgument)
@@ -1430,10 +1507,21 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		return &runtime.StartResponse{Code: -1, Message: err.Error()},
 			errord.ToGRPC(errord.ErrInvalidArgument)
 	}
-	if len(startReq.XpuAllocations) > 0 && startReq.Runtime != config.RuntimeNameRunsc {
-		err := fmt.Errorf("XPU allocations require runtime %q", config.RuntimeNameRunsc)
-		return &runtime.StartResponse{Code: -1, Message: err.Error()},
-			errord.ToGRPC(errord.ErrInvalidArgument)
+	if len(startReq.XpuAllocations) > 0 {
+		if startReq.Runtime != config.RuntimeNameRunsc && startReq.Runtime != config.RuntimeNameRunc {
+			err := fmt.Errorf("XPU allocations require runtime %q or %q", config.RuntimeNameRunsc, config.RuntimeNameRunc)
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errord.ToGRPC(errord.ErrInvalidArgument)
+		}
+		if h.xpuMgr == nil {
+			err := errors.New("XPU manager is not configured")
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errord.ToGRPC(errord.ErrFailedPrecondition)
+		}
+		if err := h.xpuMgr.ValidateRuntime(startReq.Runtime, startReq.XpuAllocations); err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()},
+				errord.ToGRPC(err)
+		}
 	}
 	if startReq.WritableLayerLimitBytes > 0 {
 		if startReq.Runtime != config.RuntimeNameRunsc &&
@@ -1519,6 +1607,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	var sandboxFiles *preparedSandboxFiles
 	var filesystemCommitted bool
 	var runtimeStarted bool
+	var xpuRuntimeAttempted bool
+	var sandboxMetadata *runtime.SandboxMetadata
 	var dnatConfigured bool
 	var aclAttempted bool
 	var aclRegistered bool
@@ -1527,7 +1617,13 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		if startSucceeded {
 			return
 		}
-		if runtimeStarted {
+		if xpuRuntimeAttempted {
+			if err := h.rollbackXPUStart(sandboxID, sandboxMetadata, preparedResources.OccupiedResource); err != nil {
+				managedCommitted = true
+				logrus.WithError(err).WithField("sandbox_id", sandboxID).Warn("XPU start rollback incomplete; retaining the sandbox for deletion")
+				return
+			}
+		} else if runtimeStarted {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			if handler, ok := h.serviceHandler.Get(startReq.Runtime); ok {
 				if err := handler.Delete(cleanupCtx, sandboxID); err != nil {
@@ -1588,6 +1684,10 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		if sandboxFiles != nil {
 			sandboxFiles.Rollback()
 		}
+		if xpuAcquired {
+			// Also remove preliminary metadata if Start failed before launch.
+			h.sandboxManager.CleanSandboxRoot(sandboxID)
+		}
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
 
@@ -1622,17 +1722,17 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 			return &runtime.StartResponse{Code: -1, Message: err.Error()},
 				errord.ToGRPC(errord.ErrFailedPrecondition)
 		}
-		specUpdates, err = h.xpuMgr.Acquire(sandboxID, startReq.XpuAllocations)
+		specUpdates, err = h.xpuMgr.Acquire(ctx, sandboxID, startReq.Runtime, startReq.XpuAllocations)
 		if err != nil {
 			return &runtime.StartResponse{
 				Code:    -1,
 				Message: fmt.Sprintf("failed to allocate XPU devices: %v", err),
-			}, errord.ToGRPC(errord.ErrInvalidArgument)
+			}, startFailure(ctx, "XPU allocation", err)
 		}
 		xpuAcquired = specUpdates != nil
 	}
 
-	env := mergeStartEnvs(preparedFilesystem.rootfs.RootFS.Env(), startReq.Envs, startReq.PreferImagePath)
+	env := mergeStartEnvs(preparedFilesystem.rootfs.RootFS.Env(), startReq.Envs, startReq.PreferImagePath, startReq.XpuAllocations)
 	var imageProcess *imageProcessSpec
 	if startReq.InjectEntrypoint != "" {
 		resolvedImageProcess, resolveErr := preparedFilesystem.rootfs.RootFS.ResolveImageProcess(ctx)
@@ -1738,6 +1838,33 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		InitialFiles:            sandboxFiles.InitialFiles(),
 		ManagedHosts:            sandboxFiles.ManagedHosts(),
 	}
+	sandboxMetadata = &runtime.SandboxMetadata{
+		ID:             sandboxID,
+		RuntimeHandler: startReq.Runtime,
+		Labels:         copyStringMap(startReq.Labels),
+		MetricLabels:   copyStringMap(startReq.MetricLabels),
+		Stdout:         startReq.Stdout,
+		Stderr:         startReq.Stderr,
+	}
+	if xpuAcquired {
+		// Make recovery state durable before the runtime can touch the device.
+		// The bundle contains the provider-owned lease before launch.
+		if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+		}
+		filesystemCommitted = true
+		if sandboxMetadata.Labels == nil {
+			sandboxMetadata.Labels = make(map[string]string)
+		}
+		sandboxMetadata.Labels[xpuStartPendingLabel] = "true"
+		for key, value := range preparedResources.ToLabels() {
+			sandboxMetadata.Labels[key] = value
+		}
+		if err := h.sandboxManager.PersistMetadata(sandboxID, sandboxMetadata); err != nil {
+			return &runtime.StartResponse{Code: -1, Message: err.Error()}, err
+		}
+		xpuRuntimeAttempted = true
+	}
 	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
@@ -1764,30 +1891,29 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		dnatConfigured = true
 	}
 
-	if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
-		return &runtime.StartResponse{
-			Code:    -1,
-			Message: fmt.Sprintf("Failed to commit filesystem state: %v", err),
-		}, err
+	if !filesystemCommitted {
+		if err := h.fsMgr.Commit(sandboxID, preparedFilesystem); err != nil {
+			return &runtime.StartResponse{
+				Code:    -1,
+				Message: fmt.Sprintf("Failed to commit filesystem state: %v", err),
+			}, err
+		}
+		filesystemCommitted = true
 	}
-	filesystemCommitted = true
-	metadata := &runtime.SandboxMetadata{
-		ID:             sandboxID,
-		RuntimeHandler: startReq.Runtime,
-		Labels:         copyStringMap(startReq.Labels),
-		MetricLabels:   copyStringMap(startReq.MetricLabels),
-		Stdout:         startReq.Stdout,
-		Stderr:         startReq.Stderr,
+	if xpuRuntimeAttempted {
+		sandboxMetadata.Labels = copyStringMap(startReq.Labels)
 	}
-	if err := h.sandboxManager.StoreMetadata(sandboxID, metadata); err != nil {
+	err = h.sandboxManager.StoreMetadata(sandboxID, sandboxMetadata)
+	if err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
 			Message: fmt.Sprintf("Failed to persist sandbox metadata: %v", err),
 		}, err
 	}
+
 	h.sandboxManager.ReceiveEvent(sandbox.Event{
 		Type:      sandbox.EventTypeCreate,
-		MetaData:  metadata,
+		MetaData:  sandboxMetadata,
 		SandboxID: sandboxID,
 	})
 	startSucceeded = true

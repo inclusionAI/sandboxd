@@ -240,10 +240,18 @@ func (r *Handler) Start(ctx context.Context, startConfig runtimecore.StartConfig
 		return err
 	}
 
-	if err := r.launchShim(bundlePath, startConfig); err != nil {
+	abortShim, err := r.launchShim(bundlePath, startConfig)
+	if err != nil {
 		return err
 	}
 	if err := r.waitStarted(ctx, bundlePath); err != nil {
+		if startConfig.SpecUpdates != nil {
+			// Stop the launcher and its runc CLI before the server's Delete.
+			// Otherwise a late create can race with a successful absent check.
+			abortShim()
+			keepMounts, keepRootfs = true, true
+			return err
+		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), config.StopTimeout)
 		defer cancel()
 		_ = r.client.Delete(cleanupCtx, startConfig.ID, true)
@@ -251,6 +259,11 @@ func (r *Handler) Start(ctx context.Context, startConfig runtimecore.StartConfig
 		return err
 	}
 	if err := runtimecommon.WriteSandboxRuntimeMarker(bundlePath, config.RuntimeNameRunc); err != nil {
+		if startConfig.SpecUpdates != nil {
+			abortShim()
+			keepMounts, keepRootfs = true, true
+			return fmt.Errorf("persist runc runtime marker: %w", err)
+		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), config.StopTimeout)
 		defer cancel()
 		_ = r.client.Delete(cleanupCtx, startConfig.ID, true)
@@ -263,8 +276,12 @@ func (r *Handler) Start(ctx context.Context, startConfig runtimecore.StartConfig
 	return nil
 }
 
-func (r *Handler) launchShim(bundlePath string, startConfig runtimecore.StartConfig) error {
-	cmd := exec.Command(
+func (r *Handler) launchShim(bundlePath string, startConfig runtimecore.StartConfig) (func(), error) {
+	// Successful shims outlive the Start RPC. Only an explicit abort cancels
+	// the command while it is running.
+	shimCtx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(
+		shimCtx,
 		r.shimBinary,
 		"--binary", r.binary,
 		"--root", r.stateRoot,
@@ -274,16 +291,35 @@ func (r *Handler) launchShim(bundlePath string, startConfig runtimecore.StartCon
 		"--stderr", startConfig.Stderr,
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// runc run (the shim child) inherits the launcher's process group.
+		// Kill it together with the shim so it cannot create after cleanup.
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start runc shim: %w", err)
+		cancel()
+		return nil, fmt.Errorf("start runc shim: %w", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer cancel()
+		_ = cmd.Wait()
+	}()
+	abort := func() {
+		cancel()
+		<-done
 	}
 	pidPath := filepath.Join(bundlePath, runcshim.ShimPIDFile)
 	if err := util.AtomicWriteFile(pidPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("persist runc shim pid: %w", err)
+		abort()
+		return nil, fmt.Errorf("persist runc shim pid: %w", err)
 	}
-	go func() { _ = cmd.Wait() }()
-	return nil
+	return abort, nil
 }
 
 func (r *Handler) waitStarted(ctx context.Context, bundlePath string) error {
