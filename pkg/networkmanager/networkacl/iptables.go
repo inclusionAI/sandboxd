@@ -77,6 +77,7 @@ var newACLIP6TablesClient = func() (iptablesClient, error) {
 }
 
 type iptablesBackend struct {
+	batch                *filterBatch
 	client               iptablesClient
 	ipv6Client           iptablesClient
 	bridgeIP             net.IP
@@ -136,6 +137,7 @@ func newIPTablesBackend(bridgeIP net.IP) (*iptablesBackend, error) {
 	if err := backend.ensureDropBarrier(); err != nil {
 		return nil, err
 	}
+	backend.batch = findFilterBatch()
 	return backend, nil
 }
 
@@ -391,6 +393,15 @@ func (b *iptablesBackend) apply(old, next persistedEntry) error {
 		return fmt.Errorf("iptables ACL sandbox IP %q is not IPv4", next.IP)
 	}
 	stableEgress, stableIngress, nextEgress, nextIngress := iptablesChainNames(ip, next.Generation)
+	if old.Policy.Empty() && b.batch != nil {
+		fresh, err := b.batch.fresh(ip, next.HostVeth)
+		if err != nil {
+			return err
+		}
+		if fresh {
+			return b.createBatch(ip, next)
+		}
+	}
 	stableEgressExists := false
 	stableIngressExists := false
 	if old.Policy.Empty() {
@@ -1405,6 +1416,15 @@ func (b *iptablesBackend) cleanup(entry persistedEntry) error {
 	ip := net.ParseIP(entry.IP).To4()
 	if ip == nil {
 		return fmt.Errorf("iptables ACL sandbox IP %q is not IPv4", entry.IP)
+	}
+	if b.batch != nil {
+		complete, err := b.batch.hasGeneration(ip, entry.Generation)
+		if err != nil {
+			return err
+		}
+		if complete {
+			return b.cleanupBatch(ip, entry)
+		}
 	}
 	stableEgress, stableIngress, _, _ := iptablesChainNames(ip, entry.Generation)
 	egressExists, egressErr := b.forceStableBarrierIfExists(stableEgress)
