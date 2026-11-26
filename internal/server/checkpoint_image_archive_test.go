@@ -27,6 +27,8 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/pkg/errord"
+	svc "github.com/inclusionAI/sandboxd/pkg/runtime"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -42,7 +44,8 @@ func TestCheckpointImageArchiveLifecycle(t *testing.T) {
 	require.NoError(t, os.Mkdir(dir, 0700))
 
 	digest := "sha256:" + strings.Repeat("a", 64)
-	image := "registry.example/akernel-ephemeral/" + strings.Repeat("b", 32) + "/service-0@" + digest
+	const registry = "registry.example:5443"
+	image := registry + "/akernel-ephemeral/" + strings.Repeat("b", 32) + "/service-0@" + digest
 	type action struct {
 		path   string
 		fields map[string]string
@@ -91,6 +94,9 @@ func TestCheckpointImageArchiveLifecycle(t *testing.T) {
 			"source": {Rootfs: raw},
 		}},
 	}
+	h.config.ManagedRuntimeProfiles = map[string]config.ManagedRuntimeProfile{
+		"harbor-ephemeral-a": {Registry: registry, RepositoryPrefix: "akernel-ephemeral"},
+	}
 	ctx := context.Background()
 	require.NoError(t, h.captureCheckpointImage(ctx, "source", dir))
 	got := <-actions
@@ -134,4 +140,136 @@ func TestCheckpointImageArchiveLifecycle(t *testing.T) {
 	mount := &runtime.Mount{Source: &runtime.Mount_ImageUrl{ImageUrl: restored.GetImageUrl()}}
 	require.ErrorContains(t, a.validateUserImages(&runtime.StartRequest{Mounts: []*runtime.Mount{mount}}), "cannot be mounted by callers")
 	require.ErrorContains(t, a.validateUserImages(&runtime.StartRequest{Rootfs: restored}), "internal to restore")
+}
+
+func TestCheckpointImageArchiveSourcePolicy(t *testing.T) {
+	const temporaryRegistry = "temporary.example:5443"
+	const durableRegistry = "durable.example:5443"
+	profiles := map[string]config.ManagedRuntimeProfile{
+		"harbor-ephemeral-a": {Registry: temporaryRegistry, RepositoryPrefix: "akernel-ephemeral"},
+		"durable":            {Registry: durableRegistry, RepositoryPrefix: "managed"},
+	}
+	build := "/" + strings.Repeat("b", 32) + "/service-0@sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name      string
+		image     string
+		profiles  map[string]config.ManagedRuntimeProfile
+		temporary bool
+	}{
+		{"configured temporary source", "https://" + temporaryRegistry + "/akernel-ephemeral" + build, profiles, true},
+		{"unconfigured Registry", "other.example:5443/akernel-ephemeral" + build, profiles, false},
+		{"different port", "temporary.example:5000/akernel-ephemeral" + build, profiles, false},
+		{"configured durable Registry", durableRegistry + "/akernel-ephemeral" + build, profiles, false},
+		{"different repository prefix", temporaryRegistry + "/akernel-ephemeral-copy" + build, profiles, false},
+		{"no managed profiles", temporaryRegistry + "/akernel-ephemeral" + build, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootfs := &runtime.RootfsConfig{
+				Type:   runtime.RootfsSrcType_IMAGE,
+				Source: &runtime.RootfsConfig_ImageUrl{ImageUrl: tc.image},
+			}
+			raw, err := proto.Marshal(rootfs)
+			require.NoError(t, err)
+			worker := &sandboxService{
+				fsMgr: &fsManager{sandboxState: map[string]sandboxFSState{
+					"source": {Rootfs: raw},
+				}},
+			}
+			worker.config.ManagedRuntimeProfiles = tc.profiles
+			dir := t.TempDir()
+
+			captureErr := worker.captureCheckpointImage(t.Context(), "source", dir)
+			leased, restoreErr := worker.restoreCheckpointImage(t.Context(), "restored", dir, rootfs)
+			require.False(t, leased)
+			require.Equal(t, tc.image, rootfs.GetImageUrl())
+			if tc.temporary {
+				require.ErrorIs(t, captureErr, errord.ErrFailedPrecondition)
+				require.ErrorIs(t, restoreErr, errord.ErrFailedPrecondition)
+			} else {
+				require.NoError(t, captureErr)
+				require.NoError(t, restoreErr)
+			}
+		})
+	}
+}
+
+type checkpointImageInventory struct {
+	svc.FakeRuntimeHandler
+	states []*svc.State
+}
+
+func (i *checkpointImageInventory) List(context.Context) ([]*svc.State, error) {
+	return i.states, nil
+}
+
+func TestRecoverCheckpointImageLeasesQueuesOrphans(t *testing.T) {
+	var available atomic.Bool
+	releases := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var fields map[string]string
+		if r.URL.Path != "/v1/archive/release" || json.NewDecoder(r.Body).Decode(&fields) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		releases <- fields["lease"]
+		if !available.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(server.Close)
+
+	root := t.TempDir()
+	cfg := config.CheckpointImageArchiveConfig{
+		Origin:              server.URL,
+		WorkerTokenFile:     filepath.Join(root, "worker-token"),
+		CheckpointArtifacts: filepath.Join(root, "artifacts"),
+	}
+	require.NoError(t, os.WriteFile(cfg.WorkerTokenFile, []byte("test-credential"), 0600))
+	store := filepath.Join(root, "store")
+	archive, err := newCheckpointImageArchive(cfg, store)
+	require.NoError(t, err)
+	const orphan = "sbox-orphan"
+	const live = "sbox-active"
+	const tracked = "sbox-tracked"
+	orphanLease, err := archive.reserve(orphan)
+	require.NoError(t, err)
+	_, err = archive.reserve(live)
+	require.NoError(t, err)
+	_, err = archive.reserve(tracked)
+	require.NoError(t, err)
+
+	inventory := &checkpointImageInventory{states: []*svc.State{
+		{ID: live, Status: svc.SandboxStatusRunning},
+	}}
+	worker := newTestService(t, map[string]svc.Handler{config.RuntimeNameRunsc: inventory})
+	t.Cleanup(worker.sandboxManager.Stop)
+	require.NoError(t, worker.sandboxManager.StoreMetadata(tracked, &runtime.SandboxMetadata{
+		ID: tracked, RuntimeHandler: config.RuntimeNameRunsc,
+	}))
+	worker.checkpointImageArchive = archive
+
+	ctx := t.Context()
+	require.NoError(t, worker.recoverCheckpointImageLeases(ctx))
+	require.Empty(t, releases, "startup recovery must not contact the archive")
+	pending := filepath.Join(archive.state, checkpointReleasePrefix+orphanLease)
+	require.FileExists(t, pending)
+	require.NoFileExists(t, archive.leaseFile(orphan))
+	require.FileExists(t, archive.leaseFile(live))
+	require.FileExists(t, archive.leaseFile(tracked))
+
+	require.ErrorContains(t, archive.drainPendingReleases(ctx), "HTTP 503")
+	require.Len(t, releases, 1)
+	require.Equal(t, orphanLease, <-releases)
+	require.FileExists(t, pending)
+
+	restarted, err := newCheckpointImageArchive(cfg, store)
+	require.NoError(t, err)
+	available.Store(true)
+	require.NoError(t, restarted.drainPendingReleases(ctx))
+	require.Len(t, releases, 1)
+	require.Equal(t, orphanLease, <-releases)
+	require.NoFileExists(t, pending)
+	require.FileExists(t, restarted.leaseFile(live))
+	require.FileExists(t, restarted.leaseFile(tracked))
 }

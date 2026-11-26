@@ -41,10 +41,11 @@ import (
 const (
 	checkpointImageArchiveReceipt = "akernel-image-archive.json"
 	checkpointReleasePrefix       = "release-"
+	temporaryCheckpointRepository = "akernel-ephemeral"
 )
 
 var (
-	temporaryCheckpointImage = regexp.MustCompile(`^[^/\s]+/akernel-ephemeral/[0-9a-f]{32}/service-0([:@].*)?$`)
+	temporaryCheckpointBuild = regexp.MustCompile(`^[0-9a-f]{32}/service-0([:@].*)?$`)
 	checkpointArtifactID     = regexp.MustCompile(`^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$`)
 	checkpointRuntimeLease   = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
@@ -151,6 +152,22 @@ func normalizeCheckpointImage(image string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(image, "https://"), "http://")
 }
 
+// A temporary image belongs to the reserved build namespace of a configured
+// managed Registry. The worker's profiles supply the trusted source.
+func (h *sandboxService) isTemporaryCheckpointImage(image string) bool {
+	authority, repository, _ := strings.Cut(image, "/")
+	prefix, build, _ := strings.Cut(repository, "/")
+	if authority == "" || prefix != temporaryCheckpointRepository || !temporaryCheckpointBuild.MatchString(build) {
+		return false
+	}
+	for _, profile := range h.config.ManagedRuntimeProfiles {
+		if profile.Registry == authority && profile.RepositoryPrefix == prefix {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *checkpointImageArchive) validateUserImages(request *runtime.StartRequest) error {
 	if a == nil {
 		return nil
@@ -221,7 +238,10 @@ func (a *checkpointImageArchive) reserve(id string) (string, error) {
 // queueRelease persists the worker's proof that the runtime is gone. An archive
 // outage can delay reference cleanup while local sandbox deletion completes.
 func (a *checkpointImageArchive) queueRelease(id string) error {
-	path := a.leaseFile(id)
+	return a.queueReleaseFile(a.leaseFile(id))
+}
+
+func (a *checkpointImageArchive) queueReleaseFile(path string) error {
 	lease, err := readArchiveLease(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -301,8 +321,8 @@ func (a *checkpointImageArchive) releaseFile(ctx context.Context, path string) e
 	return syncArchiveDirectory(a.state)
 }
 
-// During startup, verify runtime inventory before releasing leases whose
-// sandbox metadata was lost on a process failure or pod replacement.
+// During startup, verify runtime inventory before queuing release for leases
+// whose sandbox metadata was lost on a process failure or pod replacement.
 func (h *sandboxService) recoverCheckpointImageLeases(ctx context.Context) error {
 	archive := h.checkpointImageArchive
 	if archive == nil {
@@ -327,22 +347,19 @@ func (h *sandboxService) recoverCheckpointImageLeases(ctx context.Context) error
 			known[archive.leaseFile(state.ID)] = true
 		}
 	}
-	var releaseErrors []error
+	var queueErrors []error
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
-			return errors.Join(append(releaseErrors, err)...)
+			return errors.Join(append(queueErrors, err)...)
 		}
 		path := filepath.Join(archive.state, entry.Name())
 		if _, err := uuid.Parse(entry.Name()); entry.Type().IsRegular() && err == nil && !known[path] {
-			request, cancel := context.WithTimeout(ctx, 5*time.Second)
-			err := archive.releaseFile(request, path)
-			cancel()
-			if err != nil {
-				releaseErrors = append(releaseErrors, err)
+			if err := archive.queueReleaseFile(path); err != nil {
+				queueErrors = append(queueErrors, err)
 			}
 		}
 	}
-	return errors.Join(releaseErrors...)
+	return errors.Join(queueErrors...)
 }
 
 func syncArchiveDirectory(path string) error {
@@ -376,7 +393,7 @@ func (h *sandboxService) captureCheckpointImage(ctx context.Context, id, dir str
 	if err != nil {
 		return err
 	}
-	if !temporaryCheckpointImage.MatchString(image) &&
+	if !h.isTemporaryCheckpointImage(image) &&
 		(archive == nil || !strings.HasPrefix(image, archive.authority+"/akernel-checkpoint/")) {
 		return nil
 	}
@@ -412,7 +429,7 @@ func (h *sandboxService) captureCheckpointImage(ctx context.Context, id, dir str
 
 func (h *sandboxService) restoreCheckpointImage(ctx context.Context, id, dir string, rootfs *runtime.RootfsConfig) (bool, error) {
 	image := normalizeCheckpointImage(rootfs.GetImageUrl())
-	temporary := temporaryCheckpointImage.MatchString(image)
+	temporary := h.isTemporaryCheckpointImage(image)
 	receipt, err := os.Lstat(filepath.Join(dir, checkpointImageArchiveReceipt))
 	if errors.Is(err, os.ErrNotExist) && !temporary {
 		return false, nil
