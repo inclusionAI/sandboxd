@@ -154,7 +154,7 @@ func TestACLStartupQuarantinesUnknownRunscAndRetriesBeforeReopening(t *testing.T
 	var failACL atomic.Bool
 	var mu sync.Mutex
 	var activeCalls, retainedCalls []map[string]bool
-	restore := func(active map[string]networkacl.Binding, retained map[string]bool) error {
+	restore := func(_ context.Context, active map[string]networkacl.Binding, retained map[string]bool) error {
 		mu.Lock()
 		defer mu.Unlock()
 		ids := make(map[string]bool)
@@ -225,7 +225,7 @@ func TestACLStartupRetainsUnknownOwnersWithMissingEndpointMetadata(t *testing.T)
 	const id = "sbox-unknown-missing-endpoint"
 	storeACLRecoverySandbox(t, s, id, false)
 	var restores atomic.Int32
-	require.NoError(t, s.restoreACLState(func(active map[string]networkacl.Binding, retained map[string]bool) error {
+	require.NoError(t, s.restoreACLState(func(_ context.Context, active map[string]networkacl.Binding, retained map[string]bool) error {
 		first := restores.Add(1) == 1
 		if len(active) != 0 || retained[id] != first {
 			return errors.New("unexpected quarantine ownership during authoritative recovery")
@@ -252,7 +252,7 @@ func TestACLStartupRetainsUntrackedOwnersUntilRuntimeInventoryRecovers(t *testin
 	defer s.sandboxManager.Stop()
 	const id = "sbox-untracked-acl-owner"
 	var calls atomic.Int32
-	restore := func(active map[string]networkacl.Binding, retained map[string]bool) error {
+	restore := func(_ context.Context, active map[string]networkacl.Binding, retained map[string]bool) error {
 		first := calls.Add(1) == 1
 		if len(active) != 0 || retained[id] != first {
 			return errors.New("untracked ACL owner was not quarantined until confirmed recovery")

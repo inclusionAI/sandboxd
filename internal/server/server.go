@@ -32,6 +32,8 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/contextlock"
+	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 	"github.com/inclusionAI/sandboxd/internal/metrics"
 	"github.com/inclusionAI/sandboxd/internal/trace"
 	"github.com/inclusionAI/sandboxd/internal/util"
@@ -106,7 +108,9 @@ type sandboxService struct {
 	rebootGate                        *rebootGate
 	deleteGroup                       singleflight.Group
 	runtimeDeleteTimeout              time.Duration
-	aclMu                             sync.Mutex
+	aclRecoveryMu                     contextlock.RWMutex
+	aclStartingOwners                 sync.Map // string -> struct{}; mutations share aclRecoveryMu
+	aclSandboxLocks                   keyedlock.Locks
 	runscACLRecoveryPending           atomic.Bool
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]string
@@ -265,6 +269,13 @@ func (h *sandboxService) startSandboxRuntime(
 }
 
 func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string) (err error) {
+	if h.aclMgr != nil {
+		release, lockErr := h.aclSandboxLocks.Acquire(ctx, sandboxID)
+		if lockErr != nil {
+			return errord.ToGRPC(lockErr)
+		}
+		defer release()
+	}
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
 	defer func() {
@@ -325,9 +336,11 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return err
 	}
 	if h.aclMgr != nil {
-		h.aclMu.Lock()
+		// Runtime deletion and filesystem teardown do not mutate the ACL owner.
+		// Protect only ACL retirement, lease release and metadata removal.
+		h.aclRecoveryMu.RLock()
+		defer h.aclRecoveryMu.RUnlock()
 		aclErr := h.aclMgr.Remove(sandboxID)
-		h.aclMu.Unlock()
 		if aclErr != nil {
 			return fmt.Errorf("remove network ACL for sandbox %s: %w", sandboxID, aclErr)
 		}
@@ -636,6 +649,11 @@ func (h *sandboxService) Shutdown() {
 			logrus.Warnf("shutdown: failed to unmount filestore: %v", err)
 		}
 	}
+	if closer, ok := h.store.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			logrus.Warnf("shutdown: close metadata store: %v", err)
+		}
+	}
 	logrus.Info("sandbox service shutdown complete")
 }
 
@@ -718,6 +736,7 @@ func resetMetadataIfResourceStateIncompatible(storePath string) error {
 	}
 
 	db := store.NewStoreImp(storePath)
+	defer db.Close()
 	for _, key := range []string{config.CgroupBucket, config.BridgeIpBucket} {
 		data, err := db.LoadRaw(key)
 		if err != nil {
@@ -732,6 +751,9 @@ func resetMetadataIfResourceStateIncompatible(storePath string) error {
 		}
 		if err := json.Unmarshal(data, &state); err != nil {
 			logrus.Warnf("metadata db %s has incompatible %s bucket (%v); removing stale db", storePath, key, err)
+			if err := db.Close(); err != nil {
+				return err
+			}
 			if err := os.Remove(storePath); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("remove incompatible metadata db %s: %w", storePath, err)
 			}
@@ -897,7 +919,15 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 	}()
 	imgSvc := imgMod.Service()
 
-	stateStore := store.NewStoreImp(storePath)
+	stateStore, err := store.Open(storePath)
+	if err != nil {
+		return nil, fmt.Errorf("open metadata store: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			_ = stateStore.Close()
+		}
+	}()
 	s := &sandboxService{
 		config:                            cfg,
 		store:                             stateStore,
@@ -1074,7 +1104,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("restore sandbox filesystem state: %w", err)
 	}
 	if s.aclMgr != nil {
-		if err := s.restoreACLState(s.aclMgr.RestoreRetaining, s.aclMgr.OwnerIDs()); err != nil {
+		if err := s.restoreACLState(s.aclMgr.RestoreRetainingContext, s.aclMgr.OwnerIDs()); err != nil {
 			return nil, fmt.Errorf("restore network ACL state: %w", err)
 		}
 	}
@@ -1122,7 +1152,7 @@ func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequ
 }
 
 func (h *sandboxService) SetNetworkPolicy(
-	_ context.Context,
+	ctx context.Context,
 	request *runtime.SetNetworkPolicyRequest,
 ) (*runtime.SetNetworkPolicyResponse, error) {
 	if request == nil || strings.TrimSpace(request.SandboxID) == "" {
@@ -1136,8 +1166,15 @@ func (h *sandboxService) SetNetworkPolicy(
 		return nil, errord.ToGRPC(fmt.Errorf("network ACL is disabled: %w", errord.ErrFailedPrecondition))
 	}
 
-	h.aclMu.Lock()
-	defer h.aclMu.Unlock()
+	// Deletion keeps this ID reserved until metadata removal. Share its lock
+	// across the status check and policy write so the checked instance survives.
+	release, err := h.aclSandboxLocks.Acquire(ctx, request.SandboxID)
+	if err != nil {
+		return nil, errord.ToGRPC(err)
+	}
+	defer release()
+	h.aclRecoveryMu.RLock()
+	defer h.aclRecoveryMu.RUnlock()
 	current, err := h.sandboxManager.Get(request.SandboxID)
 	if err != nil {
 		return nil, errord.ToGRPC(err)
@@ -1548,12 +1585,10 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		aclCleanupFailed := aclAttempted && !aclRegistered
 		if aclAttempted && h.aclMgr != nil {
-			h.aclMu.Lock()
 			if err := h.aclMgr.Remove(sandboxID); err != nil {
 				logrus.Warnf("rollback network ACL for sandbox %s: %v", sandboxID, err)
 				aclCleanupFailed = true
 			}
-			h.aclMu.Unlock()
 		}
 		if aclCleanupFailed && preparedResources != nil {
 			resource := preparedResources.Resources[config.ResourceNameInterface]
@@ -1587,6 +1622,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		if sandboxFiles != nil {
 			sandboxFiles.Rollback()
+		}
+		if aclAttempted {
+			h.finishACLStart(sandboxID)
 		}
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
@@ -1678,14 +1716,15 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 				Code: -1, Message: err.Error(),
 			}, err
 		}
-		h.aclMu.Lock()
+		// Retain this owner before registration becomes visible to recovery.
+		// Runtime startup and rollback need not hold the recovery barrier.
+		h.beginACLStart(sandboxID)
 		aclAttempted = true
 		err = h.aclMgr.Register(networkacl.Binding{
 			SandboxID: sandboxID,
 			IP:        preparedResources.network.Ip,
 			HostVeth:  preparedResources.network.Interface.Name,
 		}, networkPolicy)
-		h.aclMu.Unlock()
 		if err != nil {
 			return &runtime.StartResponse{
 				Code: -1, Message: fmt.Sprintf("failed to install network ACL: %v", err),
@@ -1779,7 +1818,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		Stdout:         startReq.Stdout,
 		Stderr:         startReq.Stderr,
 	}
-	if err := h.sandboxManager.StoreMetadata(sandboxID, metadata); err != nil {
+	if err := h.storeStartMetadata(ctx, metadata, aclEnabled); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
 			Message: fmt.Sprintf("Failed to persist sandbox metadata: %v", err),

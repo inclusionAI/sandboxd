@@ -30,8 +30,14 @@ const (
 	DefaultDNSProxyPerSandboxConcurrencyLimit = 16
 )
 
-type dnsAuthorizer func(net.IP, []string) bool
-type dnsObserver func(net.IP, []string, []string, []byte) ([]byte, error)
+// Capture ownership before contacting upstream, not when its response arrives.
+type dnsAuthorization struct {
+	SandboxID   string
+	Incarnation string
+	Generation  uint64
+}
+type dnsAuthorizer func(net.IP, []string) (dnsAuthorization, bool)
+type dnsObserver func(dnsAuthorization, net.IP, []string, []string, []byte) ([]byte, error)
 
 type dnsProxy struct {
 	udp       *net.UDPConn
@@ -263,7 +269,11 @@ func (p *dnsProxy) handle(source net.IP, request []byte, network string) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	if p.authorize == nil || !p.authorize(source, names) {
+	if p.authorize == nil {
+		return dnsResponse(header, questions, dnsmessage.RCodeRefused)
+	}
+	authorization, allowed := p.authorize(source, names)
+	if !allowed {
 		return dnsResponse(header, questions, dnsmessage.RCodeRefused)
 	}
 	var lastErr error
@@ -279,7 +289,7 @@ func (p *dnsProxy) handle(source net.IP, request []byte, network string) ([]byte
 				if len(grantNames) == 0 {
 					return response, nil
 				}
-				observed, observeErr := p.observe(source, names, grantNames, response)
+				observed, observeErr := p.observe(authorization, source, names, grantNames, response)
 				if observeErr != nil {
 					return dnsResponse(header, questions, dnsmessage.RCodeServerFailure)
 				}

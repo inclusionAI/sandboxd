@@ -252,6 +252,7 @@ networkacl-test: bpfnat-test-image ## run privileged network ACL dataplane tests
 
 networkacl-test-local:
 	$(GO) test -count=1 -v -tags networkacl_integration ./pkg/networkmanager/networkacl
+	$(GO) test -count=1 -v -tags networkacl_integration -run '^TestIntegrationACLRecovery' ./internal/server
 
 tidy: ## ensure go.mod/go.sum are up-to-date
 	@GOFLAGS= $(GO) mod tidy

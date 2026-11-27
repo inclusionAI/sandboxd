@@ -320,6 +320,7 @@ jobs:
 
       - name: Prepare network ACL kernel prerequisites
         run: |
+          sudo modprobe tun
           sudo modprobe br_netfilter
           sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
 
