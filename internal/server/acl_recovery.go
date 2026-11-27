@@ -17,6 +17,26 @@ import (
 
 type aclRestoreFunc func(map[string]networkacl.Binding, map[string]bool) error
 
+func (h *sandboxService) lockACLRecovery(ctx context.Context) error {
+	// A queued RWMutex writer blocks new readers. Retry without queuing so a
+	// recovery poll waiting for publication does not stall healthy backends.
+	retry := time.NewTicker(5 * time.Millisecond)
+	defer retry.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if h.aclRecoveryMu.TryLock() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-retry.C:
+		}
+	}
+}
+
 // A failed inventory is not evidence that retained instances stopped. Keep the
 // unverified bindings/leases out of destructive ACL reconciliation and keep only
 // runsc admission closed. Healthy backends still complete their strict restore.
@@ -73,7 +93,9 @@ func (h *sandboxService) restoreACLState(restore aclRestoreFunc, owners []string
 		if !h.runscACLRecoveryPending.Load() {
 			return nil
 		}
-		h.aclRecoveryMu.Lock()
+		if err := h.lockACLRecovery(ctx); err != nil {
+			return err
+		}
 		defer h.aclRecoveryMu.Unlock()
 		if err := ctx.Err(); err != nil {
 			return err

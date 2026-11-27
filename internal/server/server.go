@@ -32,6 +32,7 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 	"github.com/inclusionAI/sandboxd/internal/metrics"
 	"github.com/inclusionAI/sandboxd/internal/trace"
 	"github.com/inclusionAI/sandboxd/internal/util"
@@ -107,6 +108,7 @@ type sandboxService struct {
 	deleteGroup                       singleflight.Group
 	runtimeDeleteTimeout              time.Duration
 	aclRecoveryMu                     sync.RWMutex
+	aclSandboxLocks                   keyedlock.Locks
 	runscACLRecoveryPending           atomic.Bool
 	checkpointMu                      sync.Mutex
 	checkpointing                     map[string]string
@@ -266,8 +268,11 @@ func (h *sandboxService) startSandboxRuntime(
 
 func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID string) (err error) {
 	if h.aclMgr != nil {
-		h.aclRecoveryMu.RLock()
-		defer h.aclRecoveryMu.RUnlock()
+		release, lockErr := h.aclSandboxLocks.Acquire(ctx, sandboxID)
+		if lockErr != nil {
+			return errord.ToGRPC(lockErr)
+		}
+		defer release()
 	}
 	traceID, spanID := trace.GetContextID(ctx)
 	start := time.Now()
@@ -329,6 +334,10 @@ func (h *sandboxService) deleteSandboxRuntime(ctx context.Context, sandboxID str
 		return err
 	}
 	if h.aclMgr != nil {
+		// Runtime deletion and filesystem teardown do not mutate the ACL owner.
+		// Protect only ACL retirement, lease release and metadata removal.
+		h.aclRecoveryMu.RLock()
+		defer h.aclRecoveryMu.RUnlock()
 		aclErr := h.aclMgr.Remove(sandboxID)
 		if aclErr != nil {
 			return fmt.Errorf("remove network ACL for sandbox %s: %w", sandboxID, aclErr)
@@ -1141,7 +1150,7 @@ func (h *sandboxService) Delete(ctx context.Context, request *runtime.DeleteRequ
 }
 
 func (h *sandboxService) SetNetworkPolicy(
-	_ context.Context,
+	ctx context.Context,
 	request *runtime.SetNetworkPolicyRequest,
 ) (*runtime.SetNetworkPolicyResponse, error) {
 	if request == nil || strings.TrimSpace(request.SandboxID) == "" {
@@ -1155,6 +1164,13 @@ func (h *sandboxService) SetNetworkPolicy(
 		return nil, errord.ToGRPC(fmt.Errorf("network ACL is disabled: %w", errord.ErrFailedPrecondition))
 	}
 
+	// Deletion keeps this ID reserved until metadata removal. Share its lock
+	// across the status check and policy write so the checked instance survives.
+	release, err := h.aclSandboxLocks.Acquire(ctx, request.SandboxID)
+	if err != nil {
+		return nil, errord.ToGRPC(err)
+	}
+	defer release()
 	h.aclRecoveryMu.RLock()
 	defer h.aclRecoveryMu.RUnlock()
 	current, err := h.sandboxManager.Get(request.SandboxID)

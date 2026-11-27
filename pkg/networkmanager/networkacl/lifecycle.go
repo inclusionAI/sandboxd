@@ -31,21 +31,28 @@ type removal struct {
 func (m *Manager) Remove(sandboxID string) error {
 	m.lifecycleMu.RLock()
 	defer m.lifecycleMu.RUnlock()
-	return m.remove(sandboxID)
+	return m.remove(sandboxID, nil)
 }
 
-func (m *Manager) remove(id string) (result error) {
+func (m *Manager) remove(id string, expectedOrphan *persistedEntry) (result error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return errord.ErrUnavailable
+	}
+	entry, exists := m.entries[id]
+	// Register selected this orphan before releasing the index lock. A later
+	// registration may already own its ID; only claim the captured orphan.
+	if expectedOrphan != nil && (!exists || !entry.Orphaned || entry.Incarnation != expectedOrphan.Incarnation) {
+		m.mu.Unlock()
+		return nil
 	}
 	if pending := m.removals[id]; pending != nil {
 		m.mu.Unlock()
 		<-pending.done
 		return pending.err
 	}
-	if _, ok := m.entries[id]; !ok {
+	if !exists {
 		m.mu.Unlock()
 		return nil
 	}

@@ -500,6 +500,7 @@ func (m *Manager) Register(binding Binding, policy Policy) error {
 			return errord.ErrUnavailable
 		}
 		orphan := ""
+		var orphanEntry persistedEntry
 		for id, entry := range m.entries {
 			if id != binding.SandboxID && entry.IP != binding.IP.String() && entry.HostVeth != binding.HostVeth && entry.IfIndex != link.Attrs().Index {
 				continue
@@ -513,11 +514,12 @@ func (m *Manager) Register(binding Binding, policy Policy) error {
 				return fmt.Errorf("network ACL state for sandbox %s conflicts with active sandbox %s", binding.SandboxID, id)
 			}
 			orphan = id
+			orphanEntry = entry
 			break
 		}
 		if orphan != "" {
 			m.mu.Unlock()
-			if err := m.remove(orphan); err != nil {
+			if err := m.remove(orphan, &orphanEntry); err != nil {
 				return fmt.Errorf("reconcile orphaned network ACL: %w", err)
 			}
 			continue
