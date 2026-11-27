@@ -108,6 +108,7 @@ type sandboxService struct {
 	deleteGroup                       singleflight.Group
 	runtimeDeleteTimeout              time.Duration
 	aclRecoveryMu                     sync.RWMutex
+	aclStartingOwners                 sync.Map // string -> struct{}; mutations share aclRecoveryMu
 	aclSandboxLocks                   keyedlock.Locks
 	runscACLRecoveryPending           atomic.Bool
 	checkpointMu                      sync.Mutex
@@ -1557,12 +1558,8 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 	var dnatConfigured bool
 	var aclAttempted bool
 	var aclRegistered bool
-	var aclRecoveryHeld bool
 	var xpuAcquired bool
 	defer func() {
-		if aclRecoveryHeld {
-			defer h.aclRecoveryMu.RUnlock()
-		}
 		if startSucceeded {
 			return
 		}
@@ -1624,6 +1621,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		}
 		if sandboxFiles != nil {
 			sandboxFiles.Rollback()
+		}
+		if aclAttempted {
+			h.finishACLStart(sandboxID)
 		}
 		h.sandboxManager.ReleaseID(sandboxID)
 	}()
@@ -1715,10 +1715,9 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 				Code: -1, Message: err.Error(),
 			}, err
 		}
-		// Recovery snapshots sandbox metadata. Protect the new ACL owner until
-		// metadata publication or rollback; unrelated starts share this lock.
-		h.aclRecoveryMu.RLock()
-		aclRecoveryHeld = true
+		// Retain this owner before registration becomes visible to recovery.
+		// Runtime startup and rollback need not hold the recovery barrier.
+		h.beginACLStart(sandboxID)
 		aclAttempted = true
 		err = h.aclMgr.Register(networkacl.Binding{
 			SandboxID: sandboxID,
@@ -1818,7 +1817,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
 		Stdout:         startReq.Stdout,
 		Stderr:         startReq.Stderr,
 	}
-	if err := h.sandboxManager.StoreMetadata(sandboxID, metadata); err != nil {
+	if err := h.storeStartMetadata(ctx, metadata, aclEnabled); err != nil {
 		return &runtime.StartResponse{
 			Code:    -1,
 			Message: fmt.Sprintf("Failed to persist sandbox metadata: %v", err),

@@ -118,6 +118,63 @@ func TestACLRecoveryDeadlineDoesNotBlockHealthyRequests(t *testing.T) {
 	}, time.Second, 5*time.Millisecond, "recovery must release its poll lane after cancellation")
 }
 
+func TestACLStartOwnerHandoffDoesNotQueueGlobalWriter(t *testing.T) {
+	s := newTestService(t, map[string]svc.Handler{config.RuntimeNameKata: svc.NewFakeRuntimeHandler()})
+	t.Cleanup(s.sandboxManager.Stop)
+	// An unrelated policy update or ACL retirement may still hold a reader.
+	// Starting and publishing another owner must not queue a global writer.
+	s.aclRecoveryMu.RLock()
+	var once sync.Once
+	unblock := func() { once.Do(s.aclRecoveryMu.RUnlock) }
+	t.Cleanup(unblock)
+	done := make(chan error, 1)
+	go func() {
+		const id = "sbox-start-reader"
+		s.beginACLStart(id)
+		done <- s.storeStartMetadata(context.Background(), &runtime.SandboxMetadata{ID: id, RuntimeHandler: config.RuntimeNameKata}, true)
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		unblock()
+		<-done
+		t.Fatal("starting owner handoff blocked behind an unrelated reader")
+	}
+	_, retained := s.aclStartingOwners.Load("sbox-start-reader")
+	require.False(t, retained)
+}
+
+func TestACLStartPublicationSharesDeletionLock(t *testing.T) {
+	s, _ := recoveringACLService(t, map[string]svc.Handler{config.RuntimeNameKata: svc.NewFakeRuntimeHandler()})
+	const id = "sbox-start-publish"
+	release, err := s.aclSandboxLocks.Acquire(context.Background(), id)
+	require.NoError(t, err)
+	var once sync.Once
+	unblock := func() { once.Do(release) }
+	t.Cleanup(unblock)
+	s.beginACLStart(id)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.storeStartMetadata(context.Background(), &runtime.SandboxMetadata{ID: id, RuntimeHandler: config.RuntimeNameKata}, true)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("publication crossed the sandbox lifecycle lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	_, err = s.sandboxManager.RuntimeInventory(config.RuntimeNameRunsc, time.Second)
+	require.NoError(t, err, "waiting for publication must not stall recovery")
+	_, retained := s.aclStartingOwners.Load(id)
+	require.True(t, retained)
+	unblock()
+	require.NoError(t, <-done)
+	_, err = s.sandboxManager.Get(id)
+	require.NoError(t, err)
+	_, retained = s.aclStartingOwners.Load(id)
+	require.False(t, retained)
+}
+
 type blockingACLStatus struct {
 	sandbox.StatusStorage
 	entered chan struct{}

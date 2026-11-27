@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
 	"github.com/inclusionAI/sandboxd/pkg/networkmanager/networkacl"
@@ -16,6 +17,40 @@ import (
 )
 
 type aclRestoreFunc func(map[string]networkacl.Binding, map[string]bool) error
+
+// Starting owners are process-local: their durable ACL records already exist
+// before runtime startup, but sandbox metadata is not published until afterward.
+func (h *sandboxService) beginACLStart(id string) {
+	h.aclRecoveryMu.RLock()
+	defer h.aclRecoveryMu.RUnlock()
+	h.aclStartingOwners.Store(id, struct{}{})
+}
+
+func (h *sandboxService) finishACLStart(id string) {
+	h.aclRecoveryMu.RLock()
+	defer h.aclRecoveryMu.RUnlock()
+	h.aclStartingOwners.Delete(id)
+}
+
+func (h *sandboxService) storeStartMetadata(ctx context.Context, metadata *runtime.SandboxMetadata, aclEnabled bool) error {
+	if !aclEnabled {
+		return h.sandboxManager.StoreMetadata(metadata.ID, metadata)
+	}
+	// Keep deletion from releasing/reusing this ID during the ownership handoff.
+	// The pending owner protects the metadata write without a global I/O lock.
+	release, err := h.aclSandboxLocks.Acquire(ctx, metadata.ID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := h.sandboxManager.StoreMetadata(metadata.ID, metadata); err != nil {
+		return err
+	}
+	// Recovery sees either the retained owner or published metadata, with no gap.
+	// Failed publication leaves the owner retained through Start's rollback.
+	h.finishACLStart(metadata.ID)
+	return nil
+}
 
 func (h *sandboxService) lockACLRecovery(ctx context.Context) error {
 	// A queued RWMutex writer blocks new readers. Retry without queuing so a
@@ -114,6 +149,10 @@ func (h *sandboxService) restoreACLState(restore aclRestoreFunc, owners []string
 		if err != nil {
 			return err
 		}
+		h.aclStartingOwners.Range(func(id, _ any) bool {
+			retained[id.(string)] = true
+			return true
+		})
 		if err := restore(active, retained); err != nil {
 			return err
 		}
