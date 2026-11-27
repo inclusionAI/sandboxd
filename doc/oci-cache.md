@@ -20,3 +20,7 @@ The TTL starts when the last reference is released. A new reference clears that 
 Background GC checks run every two minutes. With a positive TTL, zero-reference entries become eligible after that interval and are removed by a later check. With `"0s"`, disk-pressure GC remains enabled: at 85% filesystem usage it removes unreferenced entries in least-recently-used order, aiming for 75% usage or until no eligible entries remain. Disk pressure can evict an entry before a positive TTL has elapsed.
 
 This setting does not change checkpoint retention, Nydus or distill-fs cache policies, or persistence when the image-manager root is replaced or deleted. It does not prefetch images or synchronize cache between nodes.
+
+## Nydus format probe
+
+When sandboxd initializes the Registry client from a credentials file or a managed Registry transport policy, it probes the image manifest on a format cache miss before choosing OCI or Nydus. The probe uses the `registry.proxy.url` from the `[plugin.image].nydus_template` file. With an empty Registry proxy address, the probe queries the registry directly. On a failed proxy lookup, sandboxd retries against the origin using the configured Registry transport policy.

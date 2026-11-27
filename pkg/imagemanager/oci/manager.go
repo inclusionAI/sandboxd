@@ -74,14 +74,21 @@ type ProxyConfig struct {
 
 // proxyURL returns the effective HTTP proxy URL from config.
 func (c *Config) proxyURL() string {
+	if proxy := c.registryProxyURL(); proxy != "" {
+		return proxy
+	}
 	if c == nil {
 		return ""
 	}
-	if c.Registry != nil && c.Registry.Proxy != nil && c.Registry.Proxy.Url != "" {
-		return c.Registry.Proxy.Url
-	}
 	if c.Oss != nil && c.Oss.Proxy != nil && c.Oss.Proxy.Url != "" {
 		return c.Oss.Proxy.Url
+	}
+	return ""
+}
+
+func (c *Config) registryProxyURL() string {
+	if c != nil && c.Registry != nil && c.Registry.Proxy != nil {
+		return c.Registry.Proxy.Url
 	}
 	return ""
 }
@@ -94,8 +101,9 @@ type Manager struct {
 	mountsDir string
 	proxy     string
 
-	registry *imageregistry.Client
-	store    *metadataStore
+	registryProxy string
+	registry      *imageregistry.Client
+	store         *metadataStore
 
 	mutex sync.Mutex
 	// image_url -> container info
@@ -158,13 +166,14 @@ func NewManagerWithZeroRefTTL(rootWorkDir string, cfgTempPath string, zeroRefTTL
 	mountsDir := filepath.Join(root, "mounts")
 	dbPath := filepath.Join(root, "metadata.db")
 
-	var proxy string
+	var proxy, registryProxy string
 	if cfgTempPath != "" {
 		cfg, err := loadConfig(cfgTempPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load config: %w", err)
 		}
 		proxy = cfg.proxyURL()
+		registryProxy = cfg.registryProxyURL()
 		if proxy != "" {
 			logrus.Infof("OCI manager HTTP proxy: %s", proxy)
 		} else {
@@ -199,11 +208,14 @@ func NewManagerWithZeroRefTTL(rootWorkDir string, cfgTempPath string, zeroRefTTL
 	}
 
 	mgr := &Manager{
-		root:       root,
-		layersDir:  layersDir,
-		chainsDir:  chainsDir,
-		mountsDir:  mountsDir,
-		proxy:      proxy,
+		root:      root,
+		layersDir: layersDir,
+		chainsDir: chainsDir,
+		mountsDir: mountsDir,
+		proxy:     proxy,
+
+		registryProxy: registryProxy,
+
 		registry:   registryClient,
 		store:      store,
 		containers: make(map[string]*ContainerInfo),
@@ -229,6 +241,14 @@ func NewManagerWithZeroRefTTL(rootWorkDir string, cfgTempPath string, zeroRefTTL
 
 	go mgr.pruneImagesLoop()
 	return mgr, nil
+}
+
+// RegistryProxyURL returns the Registry proxy from the image backend template.
+func (m *Manager) RegistryProxyURL() string {
+	if m == nil {
+		return ""
+	}
+	return m.registryProxy
 }
 
 // loadConfig loads the configuration from the given file path.
