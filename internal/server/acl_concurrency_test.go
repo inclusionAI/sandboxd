@@ -34,7 +34,7 @@ func recoveringACLService(t *testing.T, extra map[string]svc.Handler) (*sandboxS
 	s.aclMgr = &networkacl.Manager{}
 	storeACLRecoverySandbox(t, s, "sbox-recovering-acl", true)
 	calls := &atomic.Int32{}
-	require.NoError(t, s.restoreACLState(func(map[string]networkacl.Binding, map[string]bool) error {
+	require.NoError(t, s.restoreACLState(func(context.Context, map[string]networkacl.Binding, map[string]bool) error {
 		calls.Add(1)
 		return nil
 	}, nil))

@@ -9,6 +9,7 @@
 package networkacl
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/google/uuid"
+	"github.com/inclusionAI/sandboxd/internal/contextlock"
 	"github.com/inclusionAI/sandboxd/pkg/errord"
 	"github.com/inclusionAI/sandboxd/pkg/store"
 	"github.com/sirupsen/logrus"
@@ -228,7 +230,7 @@ type Manager struct {
 	persistMu   sync.Mutex
 	durable     map[string]persistedEntry
 	qdiscMu     sync.Mutex
-	lifecycleMu sync.RWMutex
+	lifecycleMu contextlock.RWMutex
 	closed      bool
 	removals    map[string]*removal
 
@@ -392,10 +394,21 @@ func (m *Manager) Restore(active map[string]Binding) error {
 // orphans, even if their current endpoint cannot be inspected. The caller must
 // keep their runtime admission closed and retry authoritative reconciliation.
 func (m *Manager) RestoreRetaining(active map[string]Binding, retained map[string]bool) error {
-	m.lifecycleMu.Lock()
+	return m.RestoreRetainingContext(context.Background(), active, retained)
+}
+
+// RestoreRetainingContext bounds the wait for in-flight manager operations.
+// Once reconciliation starts, its kernel and durable changes finish together.
+func (m *Manager) RestoreRetainingContext(ctx context.Context, active map[string]Binding, retained map[string]bool) error {
+	if err := m.lifecycleMu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer m.lifecycleMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if m.closed {
 		return errord.ErrUnavailable
 	}

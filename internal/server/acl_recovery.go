@@ -16,7 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type aclRestoreFunc func(map[string]networkacl.Binding, map[string]bool) error
+type aclRestoreFunc func(context.Context, map[string]networkacl.Binding, map[string]bool) error
 
 // Starting owners are process-local: their durable ACL records already exist
 // before runtime startup, but sandbox metadata is not published until afterward.
@@ -53,23 +53,10 @@ func (h *sandboxService) storeStartMetadata(ctx context.Context, metadata *runti
 }
 
 func (h *sandboxService) lockACLRecovery(ctx context.Context) error {
-	// A queued RWMutex writer blocks new readers. Retry without queuing so a
-	// recovery poll waiting for publication does not stall healthy backends.
-	retry := time.NewTicker(5 * time.Millisecond)
-	defer retry.Stop()
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if h.aclRecoveryMu.TryLock() {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-retry.C:
-		}
-	}
+	// Queue behind existing operations without letting later readers pass.
+	// Cancellation withdraws the writer, so healthy requests can continue even
+	// if an older operation has not finished yet.
+	return h.aclRecoveryMu.LockContext(ctx)
 }
 
 // A failed inventory is not evidence that retained instances stopped. Keep the
@@ -118,7 +105,7 @@ func (h *sandboxService) restoreACLState(restore aclRestoreFunc, owners []string
 			}
 		}
 	}
-	if err := restore(active, retained); err != nil {
+	if err := restore(context.Background(), active, retained); err != nil {
 		return err
 	}
 	if !h.runscACLRecoveryPending.Load() {
@@ -153,7 +140,7 @@ func (h *sandboxService) restoreACLState(restore aclRestoreFunc, owners []string
 			retained[id.(string)] = true
 			return true
 		})
-		if err := restore(active, retained); err != nil {
+		if err := restore(ctx, active, retained); err != nil {
 			return err
 		}
 		if err := ctx.Err(); err != nil {

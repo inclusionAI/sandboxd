@@ -32,6 +32,7 @@ import (
 
 	runtime "github.com/inclusionAI/sandboxd/api/runtime/v1"
 	"github.com/inclusionAI/sandboxd/config"
+	"github.com/inclusionAI/sandboxd/internal/contextlock"
 	"github.com/inclusionAI/sandboxd/internal/keyedlock"
 	"github.com/inclusionAI/sandboxd/internal/metrics"
 	"github.com/inclusionAI/sandboxd/internal/trace"
@@ -107,7 +108,7 @@ type sandboxService struct {
 	rebootGate                        *rebootGate
 	deleteGroup                       singleflight.Group
 	runtimeDeleteTimeout              time.Duration
-	aclRecoveryMu                     sync.RWMutex
+	aclRecoveryMu                     contextlock.RWMutex
 	aclStartingOwners                 sync.Map // string -> struct{}; mutations share aclRecoveryMu
 	aclSandboxLocks                   keyedlock.Locks
 	runscACLRecoveryPending           atomic.Bool
@@ -1103,7 +1104,7 @@ func NewSandboxService(root, configPath string) (result SandboxService, retErr e
 		return nil, fmt.Errorf("restore sandbox filesystem state: %w", err)
 	}
 	if s.aclMgr != nil {
-		if err := s.restoreACLState(s.aclMgr.RestoreRetaining, s.aclMgr.OwnerIDs()); err != nil {
+		if err := s.restoreACLState(s.aclMgr.RestoreRetainingContext, s.aclMgr.OwnerIDs()); err != nil {
 			return nil, fmt.Errorf("restore network ACL state: %w", err)
 		}
 	}

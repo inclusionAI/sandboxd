@@ -83,6 +83,11 @@ type aclStartFixture struct {
 
 func newACLStartFixture(t *testing.T, backend string) *aclStartFixture {
 	t.Helper()
+	return newACLStartFixtureWithStore(t, backend, func(db *store.BboltStoreImp) store.DbStore { return db })
+}
+
+func newACLStartFixtureWithStore(t *testing.T, backend string, wrap func(*store.BboltStoreImp) store.DbStore) *aclStartFixture {
+	t.Helper()
 	// The runtime handlers are controlled test doubles. Keep real interface,
 	// ACL and metadata operations, without creating host cgroups for fake VMs.
 	for _, name := range []string{config.RuntimeNameKata, config.RuntimeNameFirecracker} {
@@ -104,7 +109,7 @@ func newACLStartFixture(t *testing.T, backend string) *aclStartFixture {
 	t.Cleanup(func() { require.NoError(t, iface.ShutDown()) })
 	s.interfaceMgr = iface
 	s.networkMgr = newNetworkManager(iface, config.NatBackendIptables, false)
-	s.aclMgr, err = networkacl.New(networkacl.Config{Backend: backend, BridgeIP: iface.BridgeIp, Store: db, DisableProxy: true})
+	s.aclMgr, err = networkacl.New(networkacl.Config{Backend: backend, BridgeIP: iface.BridgeIp, Store: wrap(db), DisableProxy: true})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.aclMgr.Close()) })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -118,8 +123,8 @@ func newACLStartFixture(t *testing.T, backend string) *aclStartFixture {
 	})
 	_, err = s.sandboxManager.RuntimeInventory(config.RuntimeNameRunsc, time.Second)
 	require.Error(t, err)
-	require.NoError(t, s.restoreACLState(func(active map[string]networkacl.Binding, retained map[string]bool) error {
-		if err := s.aclMgr.RestoreRetaining(active, retained); err != nil {
+	require.NoError(t, s.restoreACLState(func(ctx context.Context, active map[string]networkacl.Binding, retained map[string]bool) error {
+		if err := s.aclMgr.RestoreRetainingContext(ctx, active, retained); err != nil {
 			return err
 		}
 		f.restored <- retained
@@ -131,7 +136,7 @@ func newACLStartFixture(t *testing.T, backend string) *aclStartFixture {
 	return f
 }
 
-func (f *aclStartFixture) start(t *testing.T, id, runtimeName string) (aclStartCall, <-chan error) {
+func (f *aclStartFixture) launch(t *testing.T, id, runtimeName string) <-chan error {
 	t.Helper()
 	request := &runtime.StartRequest{
 		SandboxID: id, Runtime: runtimeName,
@@ -145,6 +150,12 @@ func (f *aclStartFixture) start(t *testing.T, id, runtimeName string) (aclStartC
 		_, err := f.service.Start(f.ctx, request)
 		done <- err
 	}()
+	return done
+}
+
+func (f *aclStartFixture) start(t *testing.T, id, runtimeName string) (aclStartCall, <-chan error) {
+	t.Helper()
+	done := f.launch(t, id, runtimeName)
 	select {
 	case call := <-f.handler.started:
 		require.Equal(t, id, call.config.ID)
